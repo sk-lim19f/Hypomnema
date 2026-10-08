@@ -6066,6 +6066,44 @@ test('a project directory name with a real newline stays a single-line notice (s
   });
 });
 
+// A live close's lock file and a waiter's staging file are untracked, so they used to show up as
+// a second foreign change next to the one real draft.
+test('a foreign lock artifact is not counted as a foreign change', () => {
+  withTwoProjectWiki((dir, work) => {
+    const theirs = join(dir, 'projects', 'theirs');
+    writeFileSync(join(theirs, 'draft.md'), 'uncommitted draft\n');
+    writeFileSync(join(theirs, 'draft.md.lock'), '');
+    writeFileSync(join(theirs, 'draft.md.lock.0123456789abcdef.tmp'), '');
+    const r = runSessionStartFor(dir, work, 'issue99-lock-artifact');
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    assert.match(
+      r.stdout,
+      /\[WIKI: 현재 프로젝트 외 projects\/theirs 변경 1건이 있습니다\./,
+      `only the draft counts, got: ${r.stdout}`,
+    );
+  });
+});
+
+// The lock-artifact filter covers untracked records only: a tracked file that happens to end in
+// `.lock` and is edited is a person's work.
+test('a tracked foreign .lock file that was edited is counted as a foreign change', () => {
+  withTwoProjectWiki((dir, work) => {
+    const rel = join('projects', 'theirs', 'draft.md.lock');
+    writeFileSync(join(dir, rel), 'tracked on purpose\n');
+    const env = { ...process.env, HOME: SESSION_TMP_HOME };
+    spawnSync('git', ['add', '-f', rel], { cwd: dir, env });
+    spawnSync('git', ['commit', '-q', '-m', 'track a lock-named file'], { cwd: dir, env });
+    writeFileSync(join(dir, rel), 'edited by a person\n');
+    const r = runSessionStartFor(dir, work, 'issue99-tracked-lock');
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    assert.match(
+      r.stdout,
+      /\[WIKI: 현재 프로젝트 외 projects\/theirs 변경 1건이 있습니다\./,
+      `the tracked edit counts, got: ${r.stdout}`,
+    );
+  });
+});
+
 test('clean vault: no foreign notice at all (quiet at zero)', () => {
   withTwoProjectWiki((dir, work) => {
     const r = runSessionStartFor(dir, work, 'issue99-clean');

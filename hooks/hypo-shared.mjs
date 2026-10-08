@@ -477,6 +477,25 @@ function remainingSpawnTimeoutMs(deadline) {
   return Number.isSafeInteger(remaining) && remaining > 0 ? remaining : 0;
 }
 
+// True when `git status --porcelain -z` output names a path that is not a lock artifact.
+// `-uall` is what makes this sound: without it a directory holding only a lock file shows
+// as one untracked directory entry and the artifact cannot be told from real work. A
+// rename or copy record is followed by its source path as a bare record.
+function porcelainHasDirt(stdout) {
+  const records = (stdout || '').split('\0');
+  for (let i = 0; i < records.length; i++) {
+    const rec = records[i];
+    if (!rec) continue;
+    const xy = rec.slice(0, 2);
+    if (xy[0] === 'R' || xy[1] === 'R' || xy[0] === 'C' || xy[1] === 'C') {
+      i++;
+      if (records[i] && !isUntrackedLockArtifact(xy, records[i])) return true;
+    }
+    if (!isUntrackedLockArtifact(xy, rec.slice(3))) return true;
+  }
+  return false;
+}
+
 // `opts.deadline` is optional (session-close-scope-boundary spec §5): when
 // omitted, both spawns run exactly as before, no timeout, no status/error
 // check on the second one. hypo-compact-guard.mjs is the only caller that
@@ -496,7 +515,7 @@ export function hypoIsClean(dir = HYPO_DIR, opts = {}) {
     }
     const porcelain = spawnSync(
       'git',
-      ['--no-optional-locks', '-C', dir, 'status', '--porcelain'],
+      ['--no-optional-locks', '-C', dir, 'status', '--porcelain', '-uall', '-z'],
       t1 === undefined ? { encoding: 'utf-8' } : { encoding: 'utf-8', timeout: t1 },
     );
     if (porcelain.error || porcelain.status !== 0)
@@ -506,7 +525,7 @@ export function hypoIsClean(dir = HYPO_DIR, opts = {}) {
         ahead: false,
         reason: `git check failed in ${dir}`,
       };
-    const uncommitted = porcelain.stdout.trim() !== '';
+    const uncommitted = porcelainHasDirt(porcelain.stdout);
 
     const t2 = remainingSpawnTimeoutMs(deadline);
     if (t2 === 0) {
@@ -635,9 +654,9 @@ export function gitDirtyFiles(dir = HYPO_DIR, opts = {}) {
       fromFile = records[i] || null;
     }
     const rel = toDirRelative(file);
-    if (rel) out.push(rel);
+    if (rel && !isUntrackedLockArtifact(xy, rel)) out.push(rel);
     const relFrom = toDirRelative(fromFile);
-    if (relFrom) out.push(relFrom);
+    if (relFrom && !isUntrackedLockArtifact(xy, relFrom)) out.push(relFrom);
   }
   return out;
 }
@@ -3821,6 +3840,41 @@ export function recordShardAppend(hypoDir, sessionId, relPath, before, added, cl
   }
 }
 
+/**
+ * Take back the record `recordShardAppend` wrote for one append, once the append itself
+ * has been restored (the close's commit did not land). Left behind, the record would
+ * license the same bytes added later by hand as that close's own. Only a record that
+ * matches the path, the close id and both hashes goes; other records stay. Never throws.
+ *
+ * @returns {boolean} false when the records could not be rewritten (no matching record is
+ *   true: there was nothing to remove)
+ */
+export function removeShardAppend(hypoDir, sessionId, relPath, before, added, closeId = null) {
+  if (!isValidSessionId(sessionId)) return true;
+  const path = shardAppendsPath(hypoDir, sessionId);
+  if (!existsSync(path)) return true;
+  const beforeSha256 = sha256Hex(Buffer.from(before, 'utf-8'));
+  const addedSha256 = sha256Hex(Buffer.from(added, 'utf-8'));
+  try {
+    return withFileLock(path, () => {
+      const list = readShardAppends(path);
+      const kept = list.filter(
+        (r) =>
+          !(
+            r?.path === posixPath(relPath) &&
+            r.closeId === closeId &&
+            r.beforeSha256 === beforeSha256 &&
+            r.addedSha256 === addedSha256
+          ),
+      );
+      if (kept.length !== list.length) atomicWrite(path, JSON.stringify(kept));
+      return true;
+    });
+  } catch {
+    return false;
+  }
+}
+
 // Every other session's recorded appends to `relPath`.
 // ponytail: one small file read per session directory; index the records by shard if
 // a vault ever keeps thousands of session directories.
@@ -3967,6 +4021,14 @@ function checkCloseLogs(hypoDir, project, dates, stale, missing) {
 export const LEGACY_CLOSE_NOTICE_TYPE = 'close-legacy';
 
 /**
+ * Notice, on a session-scope check, that the project has no session-log heading or log.md line
+ * under the entry's date. It is a notice and not a gap: the heading and line carry no close id,
+ * so whatever the check finds there may belong to another close of the same day, and a close is
+ * proven by its own entry alone.
+ */
+export const CLOSE_LOGS_MISSING_NOTICE_TYPE = 'close-logs-missing';
+
+/**
  * Session-close verification (spec §5.2.7 / §8.3). A close writes one entry
  * `projects/<p>/sessions/<date>-<closeId>.md`, a session-log heading and a
  * log.md `## [<date>] session | <p>` line. The generated views (`hot.md`,
@@ -3979,10 +4041,14 @@ export const LEGACY_CLOSE_NOTICE_TYPE = 'close-legacy';
  *              it, the entry's disk bytes must hash to the close pin's
  *              `localProofs[closeId]` instead. Either way those bytes must be
  *              the entry the path names (entryMatchesPath): another close's
- *              entry committed under this close's name proves nothing. The session-log and log.md lines
- *              are looked up under the entry's own date, not today's, so a
- *              close committed before midnight still proves itself after it.
- *              Another close's entry, even one of the same session, proves nothing.
+ *              entry committed under this close's name proves nothing. Another
+ *              close's entry, even one of the same session, proves nothing.
+ *              The session-log heading and log.md line are NOT part of this proof:
+ *              they carry no close id, so a same-day heading of another close would
+ *              pass for this one. They are looked up under the entry's own date (a close
+ *              committed before midnight still reads right after it) and a gap
+ *              comes back as a `close-logs-missing` notice, never in `stale`/`missing`.
+ *              `sessionLogEvidence` is null for this scope.
  *   'global'   any close of the project today: an entry dated today on disk,
  *              plus today's session-log heading and log.md line. A project with
  *              today's heading and no entry dated today was closed by a writer
@@ -4062,7 +4128,21 @@ export function sessionCloseFileStatus(hypoDir, opts) {
         const blob = headBlob(hypoDir, entry);
         if (!blob || !entryMatchesPath(blob.toString('utf-8'), entry)) stale.push(entry);
       }
-      sessionLogEvidence = checkCloseLogs(hypoDir, project, dates, stale, missing);
+      const logStale = [];
+      const logMissing = [];
+      checkCloseLogs(hypoDir, project, dates, logStale, logMissing);
+      if (logStale.length > 0 || logMissing.length > 0) {
+        notices.push({
+          type: CLOSE_LOGS_MISSING_NOTICE_TYPE,
+          project,
+          reason:
+            `${project}: no session-log heading or log.md line dated ${dates[0]} was found (` +
+            [...logMissing.map((f) => `${f} missing`), ...logStale.map((f) => `${f} stale`)].join(
+              ', ',
+            ) +
+            `). 로그는 이 close의 증명에 쓰지 않습니다. 로그 줄이 빠졌는지 확인하세요`,
+        });
+      }
     }
   } else {
     const todays = datedEntryPaths(hypoDir, project, dates);
@@ -4498,6 +4578,23 @@ function isPidAlive(pid) {
   } catch (err) {
     return err.code === 'EPERM';
   }
+}
+
+/**
+ * Is this porcelain record a file `withFileLock` leaves on disk while it works: the lock
+ * itself (`<target>.lock`) or a waiter's staging file (`<target>.lock.<16 hex>.tmp`, present
+ * for the whole wait)? Both are transient and untracked, and a vault's `.gitignore` may not
+ * list either (an old vault lacks `*.lock`, the maintainer's does not ignore the staging
+ * file), so the dirty-tree judgments (`hypoIsClean`, `gitDirtyFiles`, and the SessionStart
+ * and resume copies) skip them rather than let one close's lock read as another close's
+ * uncommitted work. Only an untracked record (`??`) can be one: a tracked file that happens
+ * to be named `*.lock` and is edited, renamed or deleted is a person's work and stays dirty.
+ * The one rule all four callers share. Matches on the file name only.
+ * @param {string} xy the two-character porcelain status of the record
+ * @param {string} path
+ */
+export function isUntrackedLockArtifact(xy, path) {
+  return xy === '??' && /\.lock(\.[0-9a-f]{16}\.tmp)?$/.test(path);
 }
 
 /**
@@ -5267,7 +5364,7 @@ function headFileHash(hypoDir, relPath) {
 
 /** A vault path's blob in HEAD (or, with `index`, in the index at stage 0) as a
  * Buffer, `null` when git cannot give it. */
-function headBlob(hypoDir, relPath, { index = false } = {}) {
+export function headBlob(hypoDir, relPath, { index = false } = {}) {
   const spec = `${index ? ':0' : 'HEAD'}:./${relPath}`;
   const r = spawnSync('git', ['-C', hypoDir, 'cat-file', 'blob', spec], {
     timeout: 30000,
@@ -5834,7 +5931,7 @@ export function commitWikiChanges(hypoDir, paths) {
     }
     if (!file) continue;
     if (!supplied.has(file)) continue; // out of this caller's scope
-    if (ignorePatterns.length > 0 && isIgnored(join(hypoDir, file), hypoDir, ignorePatterns)) {
+    if (isExcludedFromCommit(hypoDir, file, ignorePatterns)) {
       ignoredPaths.push(file);
       continue;
     }
@@ -7829,6 +7926,10 @@ export function precompactGateStatus(hypoDir, opts = {}) {
         }),
         projectOverride: cwdProject,
       });
+      // The notices of the session-scope check (a project with no log lines under the
+      // entry's date) belong to the gate result: a caller that reads only `notices[]` would
+      // never see them otherwise.
+      for (const n of s.notices || []) notices.push(n);
       if (!s.ok) {
         // ALWAYS emit the typed close-cwd blocker when the cwd project's close is
         // incomplete — never suppress it as a duplicate of the global `close`
@@ -9727,6 +9828,30 @@ function _globToRegex(glob) {
         .replace(/\x00/g, '.*') +
       '$',
   );
+}
+
+/**
+ * Whether `commitWikiChanges` leaves this vault-relative path out of every commit because
+ * `.hypoignore` matches it. The one place that rule is composed: the commit and the
+ * session close's take-back of uncommitted appends both ask it. `patterns` lets a caller
+ * that already loaded the list skip a second read.
+ */
+export function isExcludedFromCommit(hypoDir, relPath, patterns = loadHypoIgnore(hypoDir)) {
+  return patterns.length > 0 && isIgnored(join(hypoDir, relPath), hypoDir, patterns);
+}
+
+/**
+ * Whether git's own ignore rules (`.gitignore`, `info/exclude`, `core.excludesFile`) keep this
+ * vault-relative path out of every commit. `git check-ignore` leaves tracked files out of its
+ * answer, so only an untracked, matched path is true. `commitWikiChanges` never sees such a
+ * path (`git status` does not list it), so it is not folded into `isExcludedFromCommit`.
+ * Exit 0 is ignored; 1 and any error (128) read as not ignored.
+ */
+export function isIgnoredByGit(hypoDir, relPath) {
+  const r = spawnSync('git', ['-C', hypoDir, 'check-ignore', '-q', '--', relPath], {
+    timeout: 30000,
+  });
+  return r.status === 0;
 }
 
 export function loadHypoIgnore(hypoDir) {

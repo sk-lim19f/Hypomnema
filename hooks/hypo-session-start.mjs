@@ -46,6 +46,7 @@ import {
   recordTouchedPaths,
   consumeRootHotHealthNotice,
   rootHotBackupRecoveryNotice,
+  isUntrackedLockArtifact,
 } from './hypo-shared.mjs';
 import {
   defaultCachePath,
@@ -790,10 +791,11 @@ function listDirtyPaths(hypoDir) {
       i++;
       fromFile = records[i] || null;
     }
+    // A live close's `.lock` (or a waiter's staging file) is not work to attribute.
     const rel = toVaultRelative(file);
-    if (rel) out.push(rel);
+    if (rel && !isUntrackedLockArtifact(xy, rel)) out.push(rel);
     const relFrom = toVaultRelative(fromFile);
-    if (relFrom) out.push(relFrom);
+    if (relFrom && !isUntrackedLockArtifact(xy, relFrom)) out.push(relFrom);
   }
   return out;
 }

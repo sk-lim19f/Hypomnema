@@ -43,7 +43,10 @@ import {
 import {
   closePinPath,
   findBackfillCandidate,
+  gitDirtyFiles,
+  isForeignAppendOnlyShard,
   precompactGateStatus,
+  recordShardAppend,
   readClosePin,
   readTouchedPathsStrict,
   writeClosePin,
@@ -65,6 +68,8 @@ import {
   closeIntentPath,
   writeCloseIntent,
   clearCloseIntent,
+  appendTarget,
+  withdrawUnlandedAppends,
 } from '../scripts/lib/crystallize-close-apply.mjs';
 import { test, testAsync, suite } from './harness.mjs';
 import {
@@ -73,6 +78,7 @@ import {
   SESSION_TMP_HOME,
   buildCleanWikiTree,
   gitHead,
+  gitRepo,
   hasLogEntry,
   makeMultiProjectWiki,
   payloadForCleanWiki,
@@ -149,7 +155,7 @@ test('append lock-timeout → proposal-pending, shard byte-untouched (FEAT-11 T5
     mkdirSync(dirname(shard), { recursive: true });
     const shardBefore = existsSync(shard) ? readFileSync(shard, 'utf-8') : null;
     writeFileSync(shardLock, ''); // fresh lock "held" by another writer, never released
-    process.env.HYPO_APPEND_LOCK_TIMEOUT_MS = '300'; // fast timeout instead of the 5s default
+    process.env.HYPO_APPEND_LOCK_TIMEOUT_MS = '300'; // fast timeout instead of the 20s default
     let r;
     try {
       r = runApply(dir, payload, { sessionId: 's-lockout' });
@@ -182,6 +188,84 @@ test('append lock-timeout → proposal-pending, shard byte-untouched (FEAT-11 T5
     if (shardAfter) {
       assert.ok(!shardAfter.includes('locked-out entry'), 'the withheld entry must not be written');
     }
+  });
+});
+
+// The two appends stand or fall together: a close whose shard append is withheld cannot
+// commit, so its log.md line must not land either. The shard lock is held by someone else
+// for the whole wait, and the close never takes the log.md lock at all.
+// Disabling the check: in runHoldingAppendLocks run the log.md hold even when the shard lock
+// was not taken (`hold(logTarget, ...)` for both branches). The close then writes its log.md
+// line and the log.md assertions below fail.
+test('a close whose session-log shard lock times out withholds the log.md append too', () => {
+  withWiki(null, (dir, today) => {
+    const payload = payloadForCleanWiki(dir, today);
+    payload.sessionLog = { entry: `## [${today}] locked-out entry\n\nbody\n` };
+    payload.log = { entry: `## [${today}] session | test-project: held-out log line\n` };
+    const shard = join(dir, 'projects', 'test-project', 'session-log', `${today}.md`);
+    const shardLock = `${shard}.lock`;
+    const logPath = join(dir, 'log.md');
+    mkdirSync(dirname(shard), { recursive: true });
+    const shardBefore = existsSync(shard) ? readFileSync(shard, 'utf-8') : null;
+    const logBefore = readFileSync(logPath, 'utf-8');
+    writeFileSync(shardLock, '');
+    process.env.HYPO_APPEND_LOCK_TIMEOUT_MS = '300';
+    let r;
+    try {
+      r = runApply(dir, payload, { sessionId: 's-lockout-both' });
+    } finally {
+      delete process.env.HYPO_APPEND_LOCK_TIMEOUT_MS;
+      rmSync(shardLock, { force: true });
+    }
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.ok, false, r.stdout);
+    assert.equal(out.stage, 'proposal-pending', r.stdout);
+    for (const key of ['sessionLog', 'log']) {
+      const c = (out.conflicts || []).find((x) => x.key === key);
+      assert.equal(c?.reason, 'append-lock-timeout', `${key}: ${JSON.stringify(out.conflicts)}`);
+    }
+    assert.equal(readFileSync(logPath, 'utf-8'), logBefore, 'log.md must be byte-untouched');
+    assert.ok(!readFileSync(logPath, 'utf-8').includes('held-out log line'));
+    assert.equal(existsSync(shard) ? readFileSync(shard, 'utf-8') : null, shardBefore);
+    assert.equal(existsSync(join(dir, 'log.md.lock')), false, 'no log.md lock is left behind');
+  });
+});
+
+// The mirror case: the shard lock is taken and the log.md lock times out. The shard append
+// must be withheld as well, because it would otherwise land on disk uncommitted and a second
+// close of the same project could commit it under its own name.
+// Disabling the check: in runHoldingAppendLocks pass `shardHeld` instead of `shardHeld: logHeld`
+// to run(). The shard entry then lands on disk and the shard assertions below fail.
+test('a close whose log.md lock times out withholds the session-log shard append too', () => {
+  withWiki(null, (dir, today) => {
+    const payload = payloadForCleanWiki(dir, today);
+    payload.sessionLog = { entry: `## [${today}] locked-out entry\n\nbody\n` };
+    payload.log = { entry: `## [${today}] session | test-project: held-out log line\n` };
+    const shard = join(dir, 'projects', 'test-project', 'session-log', `${today}.md`);
+    const logPath = join(dir, 'log.md');
+    const logLock = `${logPath}.lock`;
+    mkdirSync(dirname(shard), { recursive: true });
+    const shardBefore = existsSync(shard) ? readFileSync(shard, 'utf-8') : null;
+    const logBefore = readFileSync(logPath, 'utf-8');
+    writeFileSync(logLock, '');
+    process.env.HYPO_APPEND_LOCK_TIMEOUT_MS = '300';
+    let r;
+    try {
+      r = runApply(dir, payload, { sessionId: 's-lockout-log' });
+    } finally {
+      delete process.env.HYPO_APPEND_LOCK_TIMEOUT_MS;
+      rmSync(logLock, { force: true });
+    }
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.ok, false, r.stdout);
+    assert.equal(out.stage, 'proposal-pending', r.stdout);
+    for (const key of ['sessionLog', 'log']) {
+      const c = (out.conflicts || []).find((x) => x.key === key);
+      assert.equal(c?.reason, 'append-lock-timeout', `${key}: ${JSON.stringify(out.conflicts)}`);
+    }
+    assert.equal(existsSync(shard) ? readFileSync(shard, 'utf-8') : null, shardBefore);
+    assert.equal(readFileSync(logPath, 'utf-8'), logBefore, 'log.md must be byte-untouched');
+    assert.equal(existsSync(`${shard}.lock`), false, 'no shard lock is left behind');
   });
 });
 
@@ -372,6 +456,76 @@ test("probe: with --session-id, this session's own finished close reads as compl
       assert.equal(out.alreadyComplete, true);
       assert.equal(out.scope, 'session');
       assert.equal(out.project, 'test-project');
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+// The probe is the other place that has to say it: a session whose close left no log lines
+// answers alreadyComplete on its entry and carries the notice in its own result.
+// Disabling the check: drop `notices: probe.notices ?? []` from the probe result in
+// applySessionClose. The result has no `notices`.
+test('probe: with --session-id, a close with no session-log or log.md lines is complete and carries the close-logs-missing notice', () => {
+  withWiki(null, (dir, today) => {
+    const sid = `probe-nologs-${process.pid}`;
+    const cleanup = seedCloseTranscript(sid);
+    try {
+      const closed = JSON.parse(runApply(dir, v2Payload(today), { sessionId: sid }).stdout);
+      assert.equal(closed.markerWritten, true, JSON.stringify(closed));
+      // The close's own entry is committed. Take its log lines away, and commit that too.
+      rmSync(join(dir, 'projects', 'test-project', 'session-log'), { recursive: true });
+      rmSync(join(dir, 'log.md'));
+      const env = { ...process.env, HOME: SESSION_TMP_HOME };
+      spawnSync('git', ['-C', dir, 'add', '-A'], { env });
+      spawnSync('git', ['-C', dir, 'commit', '-q', '-m', 'drop logs'], { env });
+      const r = run('crystallize.mjs', [
+        `--hypo-dir=${dir}`,
+        '--apply-session-close',
+        '--json',
+        `--session-id=${sid}`,
+      ]);
+      assert.equal(r.status, 0, `${r.stdout}\n${r.stderr}`);
+      const out = JSON.parse(r.stdout);
+      assert.equal(out.alreadyComplete, true, r.stdout);
+      assert.equal(out.scope, 'session');
+      assert.ok(
+        out.notices.some((n) => n.type === 'close-logs-missing' && n.project === 'test-project'),
+        JSON.stringify(out.notices),
+      );
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+// The text-mode probe prints the notices its JSON result holds, one line each.
+// Disabling the check: drop the `for (const n of result.notices)` line from the probe's text
+// output in applySessionClose. The output has no `close-logs-missing` line.
+test('probe: the text output prints the close-logs-missing notice too', () => {
+  withWiki(null, (dir, today) => {
+    const sid = `probe-nologs-text-${process.pid}`;
+    const cleanup = seedCloseTranscript(sid);
+    try {
+      const closed = JSON.parse(runApply(dir, v2Payload(today), { sessionId: sid }).stdout);
+      assert.equal(closed.markerWritten, true, JSON.stringify(closed));
+      rmSync(join(dir, 'projects', 'test-project', 'session-log'), { recursive: true });
+      rmSync(join(dir, 'log.md'));
+      const env = { ...process.env, HOME: SESSION_TMP_HOME };
+      spawnSync('git', ['-C', dir, 'add', '-A'], { env });
+      spawnSync('git', ['-C', dir, 'commit', '-q', '-m', 'drop logs'], { env });
+      const r = run('crystallize.mjs', [
+        `--hypo-dir=${dir}`,
+        '--apply-session-close',
+        `--session-id=${sid}`,
+      ]);
+      assert.equal(r.status, 0, `${r.stdout}\n${r.stderr}`);
+      assert.match(r.stdout, /^✓ /m, r.stdout);
+      assert.match(
+        r.stdout,
+        /^ {2}· test-project: no session-log heading or log\.md line dated /m,
+        r.stdout,
+      );
     } finally {
       cleanup();
     }
@@ -3198,46 +3352,54 @@ test('--mark-session-closed reports a vault-commit lock timeout as JSON and exit
   });
 });
 
-// Disabling the check: in buildMarkCloseProof delete the `if (!status.ok ||
-// !status.sessionLogEvidence?.path)` early continue and restore the conditional
-// spread `...(status.sessionLogEvidence?.path ? [status.sessionLogEvidence.path] : [])`
-// in targets. The session-log target then silently drops out of the proof.
-test('buildMarkCloseProof marks a project incomplete when it has no session-log evidence file', () => {
+// A project with no session-log file is still certified on its own entry: the log lines carry
+// no close id (ISSUE-199), so they are reported as a notice and are not part of the proof.
+// Disabling the check: in sessionCloseFileStatus's 'session' branch push the log gaps into
+// `stale` / `missing`, and the project reads as incomplete again.
+test('buildMarkCloseProof certifies a project with no session-log file on its entry alone and carries a notice', () => {
   withWiki(
     (dir, today) => {
-      // No session-log file at all for the project: sessionCloseFileStatus then
-      // has no evidence path to name, and every OTHER target is committed and clean.
       rmSync(join(dir, 'projects', 'test-project', 'session-log', `${today.slice(0, 7)}.md`));
     },
     (dir, today) => {
       const closeId = closeIdFor('s-proof-nolog', 0);
-      writeEntryFile(dir, { closeId, date: today, tracks: [{ id: 'main', new: true }] });
+      const rel = writeEntryFile(dir, {
+        closeId,
+        date: today,
+        tracks: [{ id: 'main', new: true }],
+      });
       const proof = buildMarkCloseProof(dir, ['test-project'], false, { closeId });
-      assert.equal(
-        proof.ok,
-        false,
-        `an uncheckable session-log must not certify: ${JSON.stringify(proof)}`,
+      assert.equal(proof.ok, true, JSON.stringify(proof));
+      assert.deepEqual(proof.incompleteProjects, []);
+      assert.deepEqual(
+        proof.entries.map((e) => e.path),
+        [rel],
       );
-      assert.deepEqual(proof.incompleteProjects, ['test-project']);
-      assert.deepEqual(proof.entries, []);
+      assert.ok(
+        proof.notices.some(
+          (n) => n.type === 'close-logs-missing' && /session-log\//.test(n.reason),
+        ),
+        JSON.stringify(proof.notices),
+      );
     },
   );
 });
 
-test('buildMarkCloseProof certifies a project whose session-log evidence is committed (negative control)', () => {
+test('buildMarkCloseProof proves a project by its committed entry as a create, with no log file among the entries (negative control)', () => {
   withWiki(null, (dir, today) => {
     const closeId = closeIdFor('s-proof-ok', 0);
     const rel = writeEntryFile(dir, { closeId, date: today, tracks: [{ id: 'main', new: true }] });
     const proof = buildMarkCloseProof(dir, ['test-project'], false, { closeId });
     assert.equal(proof.ok, true, JSON.stringify(proof));
     assert.ok(
-      proof.entries.some((e) => /session-log\//.test(e.path)),
-      `the session-log evidence file must be among the proven paths: ${JSON.stringify(proof.entries)}`,
+      !proof.entries.some((e) => /session-log\/|^log\.md$/.test(e.path)),
+      `no log file is proven: ${JSON.stringify(proof.entries)}`,
     );
     assert.ok(
       proof.entries.some((e) => e.path === rel && e.kind === 'create'),
       `this close's committed entry is proven as a create: ${JSON.stringify(proof.entries)}`,
     );
+    assert.deepEqual(proof.notices, []);
   });
 });
 
@@ -4635,6 +4797,632 @@ await testAsync(
   () => closeTwiceInParallel(400),
 );
 
+// ISSUE-200: a commit takes each whole path (`--only`), so a second close appending to the
+// session-log shard or to log.md between the first one's append and its commit had its text
+// committed under the first close, before its own close finished. Held without timing:
+// close A is parked by the `beforeCommit` seam (its appends have landed, its commit has not)
+// until the test lets it go, and close B, a real process, is started in that window.
+// `pending` names what B has done once it is waiting for the lock under test, `parked` is
+// asserted while A is parked, `after` once both closes have finished.
+// B of the same project is waiting on the shard lock A holds: withFileLock leaves a staging
+// file `<shard>.lock.<hex>.tmp` for the whole wait, and a process that has not reached the
+// lock has none.
+function waitingOnShardLock({ dir, today }) {
+  const logDir = join(dir, 'projects', 'test-project', 'session-log');
+  return (
+    existsSync(logDir) &&
+    readdirSync(logDir).some((f) => f.startsWith(`${today}.md.lock.`) && f.endsWith('.tmp'))
+  );
+}
+
+async function withCloseParkedBeforeCommit(bProject, { pending, parked, after, gitignore }) {
+  const dir = mkdtempSync(join(tmpdir(), 'hypo-wiki-heldlock-'));
+  const cleanups = [];
+  try {
+    const today = todayLocal();
+    buildCleanWikiTree(dir, today);
+    // A vault's own `.gitignore` decides what a close's lock files look like to git.
+    if (gitignore !== undefined) writeFileSync(join(dir, '.gitignore'), gitignore);
+    if (bProject !== 'test-project') {
+      cpSync(join(dir, 'projects', 'test-project'), join(dir, 'projects', bProject), {
+        recursive: true,
+      });
+    }
+    const env = { ...process.env, HOME: SESSION_TMP_HOME };
+    spawnSync('git', ['init'], { cwd: dir, env });
+    spawnSync('git', ['config', 'user.email', 'test@test.com'], { cwd: dir, env });
+    spawnSync('git', ['config', 'user.name', 'Test'], { cwd: dir, env });
+    spawnSync('git', ['add', '-A'], { cwd: dir, env });
+    spawnSync('git', ['commit', '-m', 'init'], { cwd: dir, env });
+    const atCommit = join(dir, '.cache', 'a-at-commit');
+    const release = join(dir, '.cache', 'a-release');
+    mkdirSync(join(dir, '.cache'), { recursive: true });
+
+    const run = (label, project, tag, parkBeforeCommit) => {
+      const sessionId = newPinSession(label);
+      cleanups.push(seedCloseTranscript(sessionId));
+      const payloadPath = join(tmpdir(), `hypo-payload-${sessionId}.json`);
+      cleanups.push(() => rmSync(payloadPath, { force: true }));
+      writeFileSync(
+        payloadPath,
+        JSON.stringify(
+          v2Payload(today, { project, tracks: [{ id: tag, new: true, next: `- ${tag}` }], tag }),
+        ),
+      );
+      const argv = [
+        'node',
+        'crystallize.mjs',
+        `--hypo-dir=${dir}`,
+        '--apply-session-close',
+        `--payload=${payloadPath}`,
+        '--json',
+        `--session-id=${sessionId}`,
+      ];
+      const child = spawn(
+        process.execPath,
+        parkBeforeCommit
+          ? [
+              '--input-type=module',
+              '-e',
+              `
+              import { existsSync, writeFileSync } from 'node:fs';
+              import { parseArgs } from ${JSON.stringify(pathToFileURL(join(REPO, 'scripts', 'lib', 'crystallize-args.mjs')).href)};
+              import { applySessionClose } from ${JSON.stringify(pathToFileURL(join(REPO, 'scripts', 'lib', 'crystallize-close-apply.mjs')).href)};
+              applySessionClose(parseArgs(${JSON.stringify(argv)}), {
+                beforeCommit() {
+                  writeFileSync(${JSON.stringify(atCommit)}, '1');
+                  const until = Date.now() + 30000;
+                  while (!existsSync(${JSON.stringify(release)}) && Date.now() < until) {
+                    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
+                  }
+                },
+              });`,
+            ]
+          : [join(REPO, 'scripts', 'crystallize.mjs'), ...argv.slice(2)],
+        { env: { ...process.env, HYPO_DIR: '', HOME: SESSION_TMP_HOME } },
+      );
+      let stdout = '';
+      let stderr = '';
+      child.stdout.on('data', (d) => (stdout += d));
+      child.stderr.on('data', (d) => (stderr += d));
+      return new Promise((resolve) =>
+        child.on('exit', (code) => resolve({ code, stdout, stderr })),
+      );
+    };
+    const waitFor = async (check, what) => {
+      const deadline = Date.now() + 20000;
+      while (Date.now() < deadline) {
+        if (check()) return;
+        await sleep(10);
+      }
+      assert.fail(`timed out waiting for ${what}`);
+    };
+    const read = (rel) => readFileSync(join(dir, rel), 'utf-8');
+    const shaOf = (...args) =>
+      spawnSync('git', ['-C', dir, ...args], { encoding: 'utf-8', env }).stdout.trim();
+    const ctx = { dir, today, read, shaOf };
+
+    const a = run('heldlock-a', 'test-project', 'close-a-text', true);
+    await waitFor(() => existsSync(atCommit), 'close A to reach its commit');
+    const b = run('heldlock-b', bProject, 'close-b-text', false);
+    let bEnded = null;
+    b.then((res) => (bEnded = res));
+    await waitFor(() => {
+      // B can only finish early by failing: it is waiting on A's lock.
+      assert.equal(bEnded, null, `close B ended before reaching the lock: ${bEnded?.stdout}`);
+      return pending(ctx);
+    }, 'close B to reach the lock under test');
+    await sleep(500);
+    parked(ctx);
+    writeFileSync(release, '1');
+    const [one, two] = await Promise.all([a, b]);
+    for (const res of [one, two]) {
+      const out = JSON.parse(res.stdout);
+      assert.equal(out.ok, true, `${res.stdout}\n${res.stderr}`);
+      assert.equal(out.committed, true, res.stdout);
+      assert.equal(out.markerWritten, true, `${res.stdout}\n${res.stderr}`);
+    }
+    const commitsOf = (rel) => shaOf('log', '--reverse', '--format=%H', '--', rel).split('\n');
+    const inCommit = (sha, rel) => shaOf('show', `${sha}:${rel}`);
+    after({ ...ctx, commitsOf, inCommit });
+  } finally {
+    for (const c of cleanups) c();
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+// The log.md lock alone already keeps B out of the shard here (B takes the shard lock and
+// then waits on log.md before it writes anything), so disabling either lock on its own leaves
+// this test green: the shard lock is pinned by the old-close test below, and this test goes
+// red only if both locks are given per-process paths.
+await testAsync(
+  "a close that appends to the session-log shard after another close's append waits for that close's commit, and each commit holds only its own text",
+  () => {
+    const shard = (today) => `projects/test-project/session-log/${today}.md`;
+    return withCloseParkedBeforeCommit('test-project', {
+      // B's staging file is the sign it reached the shard lock and is waiting there.
+      pending: waitingOnShardLock,
+      parked: ({ read, today }) => {
+        assert.match(
+          read(shard(today)),
+          /close-a-text/,
+          "A's heading is in the shard before its commit",
+        );
+        assert.ok(
+          !read(shard(today)).includes('close-b-text'),
+          `B must not append while A holds the shard: ${read(shard(today))}`,
+        );
+      },
+      after: ({ dir, today, commitsOf, inCommit, shaOf }) => {
+        const rel = shard(today);
+        const commits = commitsOf(rel);
+        assert.equal(commits.length, 2, `the shard was committed twice: ${commits}`);
+        const [aCommit, bCommit] = commits;
+        assert.ok(inCommit(aCommit, rel).includes('close-a-text'), "A's commit has A's text");
+        assert.ok(!inCommit(aCommit, rel).includes('close-b-text'), "A's commit has none of B's");
+        assert.ok(inCommit(bCommit, rel).includes('close-b-text'), "B's own commit has B's text");
+        assert.ok(inCommit(bCommit, rel).includes('close-a-text'), 'and B appended after A');
+        assert.deepEqual(
+          shaOf('diff-tree', '--no-commit-id', '--name-only', '-r', bCommit, '--', rel).split('\n'),
+          [rel],
+        );
+        assert.equal(existsSync(join(dir, `${rel}.lock`)), false, 'no lock is left behind');
+      },
+    });
+  },
+);
+
+// Two closes of the same project overlap. While A holds the locks, A's own `.lock` and B's
+// staging file `.lock.<hex>.tmp` (present the whole wait) sit untracked in the project
+// folder, and once A releases, B's lock does until B's commit. Both closes must still write
+// their marker: a lock file is bookkeeping of a close in progress, not unsaved work. The
+// vault `.gitignore` is the shape real vaults have: one that lacks `*.lock.*.tmp` (the
+// maintainer's), and one that lacks `*.lock` (an old vault). The shared fixture's own
+// `.gitignore` lists neither, so it cannot hide this.
+// Disabling the check: in hooks/hypo-shared.mjs make isUntrackedLockArtifact return false. The
+// `parked` assertion fails in both variants (it matches the artifact names by its own regex,
+// not by the predicate), and the gate then counts the lock files, so a marker is withheld.
+const LOCK_ARTIFACT = /\.lock(\.[0-9a-f]{16}\.tmp)?$/;
+for (const [name, gitignore] of [
+  ['no `*.lock.*.tmp` line', '.cache/\n*.lock\n'],
+  ['no `*.lock` line', '.cache/\n*.lock.*.tmp\n'],
+]) {
+  await testAsync(
+    `two closes of one project overlap and both write their marker when the vault .gitignore has ${name}`,
+    () =>
+      withCloseParkedBeforeCommit('test-project', {
+        gitignore,
+        pending: waitingOnShardLock,
+        parked: ({ dir, today }) => {
+          // The lock artifacts are really there, untracked, and the dirty list skips them.
+          const status = spawnSync('git', ['-C', dir, 'status', '--porcelain', '-uall'], {
+            encoding: 'utf-8',
+            env: { ...process.env, HOME: SESSION_TMP_HOME },
+          }).stdout;
+          const shard = `projects/test-project/session-log/${today}.md`;
+          const lockLines = status.split('\n').filter((l) => LOCK_ARTIFACT.test(l));
+          assert.ok(lockLines.length > 0, `precondition: a lock artifact is untracked:\n${status}`);
+          const dirty = gitDirtyFiles(dir);
+          assert.ok(dirty.includes(shard), `real dirt is still listed: ${dirty}`);
+          assert.deepEqual(
+            dirty.filter((f) => LOCK_ARTIFACT.test(f)),
+            [],
+            `lock artifacts must not count as dirt: ${dirty}`,
+          );
+        },
+        after: ({ dir }) => {
+          assert.equal(existsSync(join(dir, 'log.md.lock')), false, 'no lock is left behind');
+        },
+      }),
+  );
+}
+
+// What an old-version close does: it takes only the shard lock and appends. The log.md lock
+// does not cover it, so the shard lock is the only thing that keeps its text out of A's commit.
+// Disabling the check: in applySessionClose give the shard lock a path of its own per
+// process (`${date}.md.${process.pid}`). The old close then gets the lock it asked for, its
+// text lands in the shard while A is parked, and the ELOCKTIMEOUT and `parked` assertions fail.
+await testAsync(
+  "a close that takes only the shard lock times out while another close holds it through its commit, and that close's commit holds none of its text",
+  () => {
+    const shard = (today) => `projects/test-project/session-log/${today}.md`;
+    return withCloseParkedBeforeCommit('test-project', {
+      pending: waitingOnShardLock,
+      parked: ({ dir, today, read }) => {
+        const oldClose = spawnSync(
+          process.execPath,
+          [
+            '--input-type=module',
+            '-e',
+            `
+            import { appendFileSync } from 'node:fs';
+            import { withFileLock } from ${JSON.stringify(pathToFileURL(join(REPO, 'hooks', 'hypo-shared.mjs')).href)};
+            try {
+              withFileLock(${JSON.stringify(join(dir, shard(today)))}, () => {
+                appendFileSync(${JSON.stringify(join(dir, shard(today)))}, 'OLD-CLOSE-TEXT\\n');
+              }, { timeoutMs: 300 });
+              console.log('LOCK-TAKEN');
+            } catch (err) {
+              console.log(err.code);
+            }`,
+          ],
+          { encoding: 'utf-8', env: { ...process.env, HOME: SESSION_TMP_HOME } },
+        );
+        assert.equal(
+          oldClose.stdout.trim(),
+          'ELOCKTIMEOUT',
+          `${oldClose.stdout}${oldClose.stderr}`,
+        );
+        assert.ok(!read(shard(today)).includes('OLD-CLOSE-TEXT'), 'the old close wrote nothing');
+      },
+      after: ({ today, commitsOf, inCommit, read }) => {
+        const rel = shard(today);
+        const [aCommit] = commitsOf(rel);
+        assert.ok(inCommit(aCommit, rel).includes('close-a-text'), "A's commit has A's text");
+        assert.ok(!inCommit(aCommit, rel).includes('OLD-CLOSE-TEXT'), "A's commit has none of it");
+        assert.ok(!read(rel).includes('OLD-CLOSE-TEXT'), 'and it never reached the shard');
+      },
+    });
+  },
+);
+
+// The log.md half. B closes another project, so it has its own shard and is not held up by
+// A's shard lock: it takes its own shard lock and waits for the log.md lock, the next one in
+// line, before it writes anything to either file.
+// Disabling the check: in applySessionClose give the log.md lock a path of its own per
+// process (`join(args.hypoDir, \`log.md.${process.pid}\`)`). B then appends its line to log.md
+// while A is parked, and the `parked` assertion fails (A's commit would carry B's line too).
+await testAsync(
+  "a close that appends to log.md after another close's append waits for that close's commit, and each commit holds only its own line",
+  () => {
+    const otherShard = (today) => `projects/other-project/session-log/${today}.md`;
+    return withCloseParkedBeforeCommit('other-project', {
+      // B takes the locks in order and has its shard's by now; the staging file it leaves while
+      // it spins on the log.md lock A holds is the sign it is waiting there.
+      pending: ({ dir, today }) =>
+        existsSync(join(dir, `${otherShard(today)}.lock`)) &&
+        readdirSync(dir).some((f) => /^log\.md\.lock\..+\.tmp$/.test(f)),
+      parked: ({ read }) => {
+        assert.match(read('log.md'), /close-a-text/, "A's line is in log.md before its commit");
+        assert.ok(
+          !read('log.md').includes('other-project'),
+          `B must not append while A holds log.md: ${read('log.md')}`,
+        );
+      },
+      after: ({ dir, commitsOf, inCommit }) => {
+        const commits = commitsOf('log.md');
+        // The fixture's own commit, then A, then B.
+        assert.equal(commits.length, 3, `log.md was committed by each close: ${commits}`);
+        const [, aCommit, bCommit] = commits;
+        assert.ok(inCommit(aCommit, 'log.md').includes('close-a-text'), "A's commit has A's line");
+        assert.ok(
+          !inCommit(aCommit, 'log.md').includes('other-project'),
+          "A's commit has none of B's lines",
+        );
+        assert.ok(inCommit(bCommit, 'log.md').includes('other-project'), "B's commit has B's line");
+        assert.ok(inCommit(bCommit, 'log.md').includes('close-a-text'), 'and B appended after A');
+        assert.equal(existsSync(join(dir, 'log.md.lock')), false, 'no lock is left behind');
+      },
+    });
+  },
+);
+
+// A close whose commit does not land takes its appended text back before it releases the
+// append locks. A commit takes each whole file (`--only`), so text left behind on disk would
+// be committed by the next close of that file, under the next close's name.
+// Disabling the check: in applySessionClose skip `withdrawUnlandedAppends` (make the finally
+// block's `if (!commitLanded)` never true). A's shard and log.md keep A's text after the
+// refused commit, and B's commit then carries it.
+function withRefusingPreCommit(dir, extraScript = '') {
+  const hooks = join(dir, '.git', 'x-test-hooks');
+  mkdirSync(hooks, { recursive: true });
+  writeFileSync(join(hooks, 'pre-commit'), `#!/bin/sh\n${extraScript}exit 1\n`);
+  chmodSync(join(hooks, 'pre-commit'), 0o755);
+  spawnSync('git', ['-C', dir, 'config', 'core.hooksPath', hooks]);
+  return () => spawnSync('git', ['-C', dir, 'config', '--unset', 'core.hooksPath']);
+}
+
+test("a close whose commit is refused takes its appended text back, and the next close's commit holds none of it", () => {
+  withWiki(null, (dir, today) => {
+    const shard = `projects/test-project/session-log/${today}.md`;
+    const bytes = (rel) => (existsSync(join(dir, rel)) ? readFileSync(join(dir, rel)) : null);
+    const seed = applyJson(
+      dir,
+      v2Payload(today, { tag: 'seed-close' }),
+      newPinSession('wd-seed'),
+    ).out;
+    assert.equal(seed.committed, true, JSON.stringify(seed));
+    const shardBefore = bytes(shard);
+    const logBefore = bytes('log.md');
+    assert.ok(shardBefore && logBefore, 'precondition: both files exist before the closes');
+
+    const lift = withRefusingPreCommit(dir);
+    const a = applyJson(
+      dir,
+      v2Payload(today, { tag: 'close-aaa-text', tracks: [{ id: 'a', new: true, next: '- a' }] }),
+      newPinSession('wd-a'),
+    ).out;
+    lift();
+    assert.equal(a.committed, false, JSON.stringify(a));
+    assert.equal(a.markerWritten, false, JSON.stringify(a));
+    assert.ok(bytes(shard).equals(shardBefore), 'the shard is back to its bytes before A');
+    assert.ok(bytes('log.md').equals(logBefore), 'log.md is back to its bytes before A');
+    assert.ok(
+      a.notices.some((n) => n.includes(shard) && n.includes('되돌렸')),
+      JSON.stringify(a.notices),
+    );
+
+    const b = applyJson(
+      dir,
+      v2Payload(today, { tag: 'close-bbb-text', tracks: [{ id: 'b', new: true, next: '- b' }] }),
+      newPinSession('wd-b'),
+    ).out;
+    assert.equal(b.committed, true, JSON.stringify(b));
+    assert.equal(b.markerWritten, true, JSON.stringify(b));
+    for (const rel of [shard, 'log.md']) {
+      const inHead = spawnSync('git', ['-C', dir, 'show', `HEAD:${rel}`], {
+        encoding: 'utf-8',
+        env: { ...process.env, HOME: SESSION_TMP_HOME },
+      }).stdout;
+      assert.match(inHead, /close-bbb-text|bbb/, `B's text is in HEAD:${rel}`);
+      assert.ok(!inHead.includes('close-aaa-text'), `A's text is not in HEAD:${rel}`);
+    }
+  });
+});
+
+// A restored append leaves no ownership witness behind: identical bytes added by hand later
+// must not read as this close's append, and a retry must not restage them by the old hash.
+// The entry file's journal record stays, because the retry still needs it.
+// Disabling the check: in withdrawUnlandedAppends make `witnessOk` always true without
+// calling removeJournalEntry and removeShardAppend. The journal and shard-append assertions
+// fail, and so does the foreign-append check.
+test('a withdrawn append takes its journal record and shard-append record with it, and a hand-added copy is nobody close', () => {
+  withWiki(null, (dir, today) => {
+    const shard = `projects/test-project/session-log/${today}.md`;
+    const seed = applyJson(
+      dir,
+      v2Payload(today, { tag: 'seed-close' }),
+      newPinSession('wit-seed'),
+    ).out;
+    assert.equal(seed.committed, true, JSON.stringify(seed));
+    const shardBefore = readFileSync(join(dir, shard));
+    const kept = join(dir, '.cache', 'kept-shard');
+    mkdirSync(dirname(kept), { recursive: true });
+    const lift = withRefusingPreCommit(dir, `cp '${join(dir, shard)}' '${kept}'\n`);
+    const sid = newPinSession('wit-a');
+    const payload = v2Payload(today, {
+      tag: 'close-aaa-text',
+      tracks: [{ id: 'a', new: true, next: '- a' }],
+    });
+    const a = applyJson(dir, payload, sid).out;
+    lift();
+    assert.equal(a.committed, false, JSON.stringify(a));
+    assert.ok(readFileSync(join(dir, shard)).equals(shardBefore), 'the shard is restored');
+
+    const journal = readJournal(dir, sid);
+    assert.equal(
+      journal[shard],
+      undefined,
+      `the shard's journal record is gone: ${JSON.stringify(journal)}`,
+    );
+    assert.ok(
+      Object.keys(journal).some((k) => k.includes('/sessions/')),
+      `the entry file's record stays for the retry: ${JSON.stringify(journal)}`,
+    );
+    const appendsFile = join(dir, '.cache', 'sessions', sid, 'shard-appends.json');
+    assert.ok(
+      existsSync(dirname(appendsFile)),
+      'the session cache folder is where this test looks',
+    );
+    const appends = existsSync(appendsFile) ? JSON.parse(readFileSync(appendsFile, 'utf-8')) : [];
+    assert.ok(
+      !appends.some((r) => r.path === shard),
+      `no append record: ${JSON.stringify(appends)}`,
+    );
+
+    // The same bytes, added by hand.
+    writeFileSync(join(dir, shard), readFileSync(kept));
+    assert.equal(isForeignAppendOnlyShard(dir, shard, newPinSession('wit-other')), false);
+    // The check does recognise those bytes once a close has recorded them.
+    const addedText = readFileSync(kept, 'utf-8').slice(shardBefore.toString('utf-8').length);
+    assert.ok(
+      recordShardAppend(dir, 'wit-writer', shard, shardBefore.toString('utf-8'), addedText, 'x-0'),
+    );
+    assert.equal(isForeignAppendOnlyShard(dir, shard, newPinSession('wit-other')), true);
+
+    // The retry does not restage the hand-added copy through the old hash.
+    const retry = applyJson(dir, payload, sid).out;
+    assert.ok(!gitShow(dir, shard).includes('close-aaa-text'), JSON.stringify(retry));
+    assert.equal(retry.markerWritten, false, JSON.stringify(retry));
+  });
+});
+
+// The other branch: the shard changed after A appended to it (here a pre-commit hook appends
+// a line), so its bytes are not what A left. The close leaves it alone and names it.
+// Disabling the check: in withdrawUnlandedAppends treat `unchanged` as always true. The restore
+// then overwrites the foreign line, and the "left as is" assertion fails.
+test('a close whose commit is refused leaves a shard that changed under it, and names the file', () => {
+  withWiki(null, (dir, today) => {
+    const shard = `projects/test-project/session-log/${today}.md`;
+    const seed = applyJson(
+      dir,
+      v2Payload(today, { tag: 'seed-close' }),
+      newPinSession('wc-seed'),
+    ).out;
+    assert.equal(seed.committed, true, JSON.stringify(seed));
+    const logBefore = readFileSync(join(dir, 'log.md'));
+    const lift = withRefusingPreCommit(dir, `echo 'FOREIGN-LINE' >> '${shard}'\n`);
+    const a = applyJson(
+      dir,
+      v2Payload(today, { tag: 'close-aaa-text', tracks: [{ id: 'a', new: true, next: '- a' }] }),
+      newPinSession('wc-a'),
+    ).out;
+    lift();
+    assert.equal(a.committed, false, JSON.stringify(a));
+    assert.equal(a.markerWritten, false, JSON.stringify(a));
+    const now = readFileSync(join(dir, shard), 'utf-8');
+    assert.ok(now.includes('FOREIGN-LINE') && now.includes('close-aaa-text'), `left as is: ${now}`);
+    assert.ok(
+      a.notices.some((n) => n.includes(shard) && n.includes('되돌리지 못했습니다')),
+      JSON.stringify(a.notices),
+    );
+    // The untouched file is still taken back.
+    assert.ok(readFileSync(join(dir, 'log.md')).equals(logBefore), 'log.md is back to its bytes');
+  });
+});
+
+function gitShow(dir, rel) {
+  return spawnSync('git', ['-C', dir, 'show', `HEAD:${rel}`], {
+    encoding: 'utf-8',
+    env: { ...process.env, HOME: SESSION_TMP_HOME },
+  }).stdout;
+}
+
+// A path the vault's ignore filter keeps out of every commit is the user's own file, so a
+// close never takes its appends back, whatever happens to its commit.
+// Disabling the check: in withdrawUnlandedAppends delete the `isExcludedFromCommit` line.
+// The close then restores the shard and log.md, and the "stay on disk" assertions fail.
+test('a close whose append targets .hypoignore keeps out of every commit leaves its appends on disk and claims no commit of them', () => {
+  withWiki(null, (dir, today) => {
+    const shard = `projects/test-project/session-log/${today}.md`;
+    const seed = applyJson(
+      dir,
+      v2Payload(today, { tag: 'seed-close' }),
+      newPinSession('ig-seed'),
+    ).out;
+    assert.equal(seed.committed, true, JSON.stringify(seed));
+    const shardBefore = readFileSync(join(dir, shard));
+    const logBefore = readFileSync(join(dir, 'log.md'));
+    writeFileSync(join(dir, '.hypoignore'), 'projects/test-project/\nlog.md\n');
+
+    const a = applyJson(
+      dir,
+      v2Payload(today, { tag: 'close-aaa-text', tracks: [{ id: 'a', new: true, next: '- a' }] }),
+      newPinSession('ig-a'),
+    ).out;
+    // Nothing was committed for the excluded paths, so no marker: the gate still names the shard.
+    assert.equal(a.markerWritten, false, JSON.stringify(a));
+    assert.ok(
+      a.gateBlockers.some((b) => b.file === shard),
+      JSON.stringify(a.gateBlockers),
+    );
+    const shardNow = readFileSync(join(dir, shard), 'utf-8');
+    const logNow = readFileSync(join(dir, 'log.md'), 'utf-8');
+    assert.ok(shardNow.startsWith(shardBefore.toString('utf-8')), 'the shard keeps its old bytes');
+    assert.match(shardNow, /close-aaa-text/, "the shard keeps A's append");
+    assert.ok(logNow.length > logBefore.length, "log.md keeps A's line");
+    assert.ok(
+      !a.notices.some((n) => n.includes('되돌렸') || n.includes('되돌리지 못했습니다')),
+      `nothing is withdrawn or reported: ${JSON.stringify(a.notices)}`,
+    );
+    assert.ok(!gitShow(dir, shard).includes('close-aaa-text'), 'HEAD never holds the shard text');
+    assert.equal(
+      gitShow(dir, 'log.md'),
+      logBefore.toString('utf-8'),
+      'HEAD never holds the log line',
+    );
+  });
+});
+
+// One target committed, the other left out of the commit by the filter: the committed one
+// stands and the excluded one stays on disk.
+test('a close whose log.md alone is .hypoignored commits the shard and leaves the log line on disk', () => {
+  withWiki(null, (dir, today) => {
+    const shard = `projects/test-project/session-log/${today}.md`;
+    const seed = applyJson(
+      dir,
+      v2Payload(today, { tag: 'seed-close' }),
+      newPinSession('ig2-seed'),
+    ).out;
+    assert.equal(seed.committed, true, JSON.stringify(seed));
+    const logBefore = readFileSync(join(dir, 'log.md'));
+    writeFileSync(join(dir, '.hypoignore'), 'log.md\n');
+    const a = applyJson(
+      dir,
+      v2Payload(today, { tag: 'close-aaa-text', tracks: [{ id: 'a', new: true, next: '- a' }] }),
+      newPinSession('ig2-a'),
+    ).out;
+    assert.equal(a.committed, true, JSON.stringify(a));
+    assert.match(gitShow(dir, shard), /close-aaa-text/, 'the shard append is committed');
+    assert.ok(readFileSync(join(dir, 'log.md')).length > logBefore.length, 'the log line stays');
+    assert.ok(!a.notices.some((n) => n.includes('되돌렸')), JSON.stringify(a.notices));
+  });
+});
+
+// An untracked path git's own ignore rules match never reaches a commit either (`git status`
+// does not list it, so commitWikiChanges drops it silently), so it is the user's file and
+// stays as written. The shard is not ignored, so its commit lands and the close succeeds.
+// Disabling the check: in withdrawUnlandedAppends delete the `isIgnoredByGit` line. The
+// close then restores log.md, a withdrawal notice names it, and the byte comparison fails.
+test('a close whose log.md is untracked and .gitignored leaves the log line on disk and withdraws nothing', () => {
+  withWiki(null, (dir, today) => {
+    const shard = `projects/test-project/session-log/${today}.md`;
+    const seed = applyJson(
+      dir,
+      v2Payload(today, { tag: 'seed-close' }),
+      newPinSession('gi-seed'),
+    ).out;
+    assert.equal(seed.committed, true, JSON.stringify(seed));
+    const git = (...args) =>
+      spawnSync('git', ['-C', dir, '-c', 'user.name=t', '-c', 'user.email=t@t', ...args], {
+        encoding: 'utf-8',
+        env: { ...process.env, HOME: SESSION_TMP_HOME },
+      });
+    assert.equal(git('rm', '--cached', '-q', 'log.md').status, 0);
+    assert.equal(git('commit', '-q', '-m', 'untrack log.md').status, 0);
+    writeFileSync(join(dir, '.gitignore'), 'log.md\n');
+    assert.equal(git('check-ignore', '-q', '--', 'log.md').status, 0, 'log.md is git-ignored');
+    const logBefore = readFileSync(join(dir, 'log.md'), 'utf-8');
+
+    const a = applyJson(
+      dir,
+      v2Payload(today, { tag: 'close-aaa-text', tracks: [{ id: 'a', new: true, next: '- a' }] }),
+      newPinSession('gi-a'),
+    ).out;
+    assert.equal(a.committed, true, JSON.stringify(a));
+    assert.match(gitShow(dir, shard), /close-aaa-text/, 'the shard append is committed');
+    const logNow = readFileSync(join(dir, 'log.md'), 'utf-8');
+    assert.ok(
+      logNow.length > logBefore.length && logNow.startsWith(logBefore),
+      'log.md gained a line',
+    );
+    assert.ok(
+      !a.notices.some((n) => n.includes('log.md')),
+      `no notice names log.md: ${JSON.stringify(a.notices)}`,
+    );
+    assert.equal(git('ls-files', '--', 'log.md').stdout, '', 'log.md is still untracked');
+  });
+});
+
+// The judgment per target, with a commit that landed for one of two appends: only the
+// uncommitted one is taken back. Through a whole close commitWikiChanges takes all of its
+// in-scope paths or none, so this split cannot be produced end to end.
+// Disabling the check: in withdrawUnlandedAppends delete the `headBlob(...)` line. The
+// committed shard is then restored too and the first assertion fails.
+test('withdrawUnlandedAppends takes back only the append HEAD does not hold', () => {
+  withTmpDir((dir) => {
+    gitRepo(dir);
+    writeFileSync(join(dir, 'a.md'), 'a0\n');
+    writeFileSync(join(dir, 'b.md'), 'b0\n');
+    spawnSync('git', ['add', '-A'], { cwd: dir });
+    spawnSync('git', ['commit', '-m', 'seed'], { cwd: dir });
+    const targets = ['a.md', 'b.md'].map((rel) => {
+      const t = appendTarget(rel, join(dir, rel));
+      t.before = readFileSync(t.full);
+      writeFileSync(t.full, `${t.before}${rel} close line\n`);
+      t.after = readFileSync(t.full);
+      return t;
+    });
+    spawnSync('git', ['commit', '--only', '-m', 'a lands', '--', 'a.md'], { cwd: dir });
+    const notices = [];
+    withdrawUnlandedAppends({ hypoDir: dir, sessionId: null, closeId: null }, targets, notices);
+    assert.equal(readFileSync(join(dir, 'a.md'), 'utf-8'), 'a0\na.md close line\n');
+    assert.equal(readFileSync(join(dir, 'b.md'), 'utf-8'), 'b0\n');
+    assert.equal(notices.length, 1, JSON.stringify(notices));
+    assert.ok(notices[0].includes('b.md'), notices[0]);
+  });
+});
+
 // X3 (wave B, third review): another session's gate tells a close's append from a hand
 // edit only by the record apply leaves before it writes. The fixture holds the moment
 // without timing: close A committed the day's shard, close B appended to it and its
@@ -4647,19 +5435,27 @@ test("a close whose commit was refused leaves its shard append recorded, so anot
     const first = applyJson(dir, v2Payload(today, { tag: 'close a' }), a).out;
     assert.equal(first.committed, true, JSON.stringify(first));
     const shard = `projects/test-project/session-log/${today}.md`;
-    const hooks = join(dir, '.git', 'x-test-hooks');
-    mkdirSync(hooks, { recursive: true });
-    writeFileSync(join(hooks, 'pre-commit'), '#!/bin/sh\nexit 1\n');
-    chmodSync(join(hooks, 'pre-commit'), 0o755);
-    spawnSync('git', ['-C', dir, 'config', 'core.hooksPath', hooks]);
+    // A refused commit takes the append back, so the append has to stay: the hook makes the
+    // shard folder read-only, which fails that restore and is reported (the notice below).
+    const logDir = join(dir, 'projects', 'test-project', 'session-log');
+    const lift = withRefusingPreCommit(dir, `chmod a-w '${logDir}'\n`);
     const b = newPinSession('rec-b');
-    const second = applyJson(
-      dir,
-      v2Payload(today, { tag: 'close b', tracks: [{ id: 'b', new: true, next: '- b' }] }),
-      b,
-    ).out;
-    spawnSync('git', ['-C', dir, 'config', '--unset', 'core.hooksPath']);
+    let second;
+    try {
+      second = applyJson(
+        dir,
+        v2Payload(today, { tag: 'close b', tracks: [{ id: 'b', new: true, next: '- b' }] }),
+        b,
+      ).out;
+    } finally {
+      chmodSync(logDir, 0o755);
+      lift();
+    }
     assert.notEqual(second.committed, true, JSON.stringify(second));
+    assert.ok(
+      second.notices.some((n) => n.includes(shard) && n.includes('되돌리지 못했습니다 (')),
+      `a failed restore is reported: ${JSON.stringify(second.notices)}`,
+    );
     assert.match(readFileSync(join(dir, shard), 'utf-8'), /close b/);
     const gateOf = (sessionId) =>
       precompactGateStatus(dir, {

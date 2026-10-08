@@ -36,6 +36,7 @@ import { recordJournalEntry } from '../hooks/close-journal.mjs';
 // The gate's own notion of "today", so the fixture below can place a project
 // strictly outside it instead of guessing with local-yesterday.
 import {
+  CLOSE_LOGS_MISSING_NOTICE_TYPE,
   freshDates,
   recordShardAppend,
   recordTouchedPaths,
@@ -3209,7 +3210,7 @@ test('--apply-session-close --session-id WITH user-close signal → commits payl
 // while the deadlock comes back on the entry instead. The first attempt is a REAL
 // failed commit (a pre-commit hook that rejects), so what it leaves dirty is the
 // pair a first attempt's own write leaves behind, journal included.
-test('--apply-session-close: a retry re-stages the entry and shard a failed commit left dirty', () => {
+test('--apply-session-close: a retry re-stages the entry and shard a killed close left dirty (killed-close fixture)', () => {
   withWiki(null, (dir, today) => {
     const sessionId = 's-apply-retry-payload';
     const entryDir = join('projects', 'test-project', 'sessions');
@@ -3248,11 +3249,25 @@ test('--apply-session-close: a retry re-stages the entry and shard a failed comm
 
     const hookPath = join(dir, '.git', 'hooks', 'pre-commit');
     mkdirSync(dirname(hookPath), { recursive: true });
-    writeFileSync(hookPath, '#!/bin/sh\nexit 1\n');
+    // A close whose commit fails takes its appended text back, along with the shard's journal
+    // record, which would leave no shard for the retry to re-stage. A close killed after its
+    // append leaves both, so the hook keeps a copy of the shard and of the journal (it runs
+    // after the append, before the take-back) and the test puts them back.
+    const shardPath = join(dir, shardRel);
+    const journalPath = join(dir, '.cache', 'close-journal', `${sessionId}.json`);
+    const keptShard = join(dir, '.cache', 'kept-shard');
+    const keptJournal = join(dir, '.cache', 'kept-journal');
+    mkdirSync(dirname(keptShard), { recursive: true });
+    writeFileSync(
+      hookPath,
+      `#!/bin/sh\ncp '${shardPath}' '${keptShard}'\ncp '${journalPath}' '${keptJournal}'\nexit 1\n`,
+    );
     chmodSync(hookPath, 0o755);
     try {
       const r1 = apply();
       assert.equal(JSON.parse(r1.stdout).committed, false, `commit must fail: ${r1.stdout}`);
+      writeFileSync(shardPath, readFileSync(keptShard));
+      writeFileSync(journalPath, readFileSync(keptJournal));
       const before = porcelain();
       assert.ok(
         before.includes(entryDir) && before.includes(shardRel),
@@ -3269,6 +3284,71 @@ test('--apply-session-close: a retry re-stages the entry and shard a failed comm
         `a retry must carry the bytes its first attempt already wrote, or the gate ` +
           `blocks on them forever: ${left}`,
       );
+    } finally {
+      rmSync(payloadPath, { force: true });
+    }
+  });
+});
+
+// An ordinary refused commit (no killed process): the close takes its shard append back,
+// and the retry appends the entry again and commits it.
+// Disabling the check: in withdrawUnlandedAppends skip the restore (see the how-to in
+// crystallize-apply.test.mjs). The shard then keeps the entry after the refused commit and
+// the first assertion fails.
+test('--apply-session-close: a refused commit takes the shard append back, and the retry appends the entry again and commits it', () => {
+  withWiki(null, (dir, today) => {
+    const sessionId = 's-apply-refused-retry';
+    const shardRel = join('projects', 'test-project', 'session-log', `${today}.md`);
+    const heading = `## [${today}] refused then retried`;
+    const payload = {
+      project: 'test-project',
+      date: today,
+      summary: 'refused then retried\n',
+      sessionLog: { entry: `${heading}\n` },
+      log: { entry: `## [${today}] session | test-project: refused then retried\n` },
+    };
+    const payloadPath = join(
+      tmpdir(),
+      `hypo-payload-${process.pid}-${Math.random().toString(36).slice(2, 10)}.json`,
+    );
+    writeFileSync(payloadPath, JSON.stringify(payload));
+    const apply = () => {
+      const cleanup = seedCloseTranscript(sessionId);
+      try {
+        return run('crystallize.mjs', [
+          `--hypo-dir=${dir}`,
+          '--apply-session-close',
+          `--payload=${payloadPath}`,
+          `--session-id=${sessionId}`,
+          '--json',
+        ]);
+      } finally {
+        cleanup();
+      }
+    };
+    const hookPath = join(dir, '.git', 'hooks', 'pre-commit');
+    mkdirSync(dirname(hookPath), { recursive: true });
+    writeFileSync(hookPath, '#!/bin/sh\nexit 1\n');
+    chmodSync(hookPath, 0o755);
+    try {
+      const r1 = JSON.parse(apply().stdout);
+      assert.equal(r1.committed, false, JSON.stringify(r1));
+      assert.ok(
+        !existsSync(join(dir, shardRel)) ||
+          !readFileSync(join(dir, shardRel), 'utf-8').includes(heading),
+        'the refused close took its shard append back',
+      );
+
+      rmSync(hookPath);
+      const r2 = apply();
+      assert.equal(r2.status, 0, `retry failed: ${r2.stdout}\n${r2.stderr}`);
+      const out = JSON.parse(r2.stdout);
+      assert.equal(out.committed, true, r2.stdout);
+      assert.equal(out.markerWritten, true, r2.stdout);
+      const inHead = spawnSync('git', ['-C', dir, 'show', `HEAD:${shardRel}`], {
+        encoding: 'utf-8',
+      }).stdout;
+      assert.equal(inHead.split(heading).length - 1, 1, `the entry is in HEAD once: ${inHead}`);
     } finally {
       rmSync(payloadPath, { force: true });
     }
@@ -4203,13 +4283,13 @@ test('checkpointMode: an unattributed dirty file is a notice, but a lint blocker
 // design.md test 34 / row g: `sessionCloseFileStatus` counts BOTH the local
 // and UTC calendar day as "today" (freshDates), because a KST session before
 // 09:00 local sees a local date one day ahead of the UTC date at that
-// instant. `--mark` must certify off whichever candidate freshness actually
-// picked and is actually committed, never assume the OTHER date's shard
-// exists too. Seeds only the LOCAL date's daily shard; when `freshDates()`
-// happens to return two distinct dates right now (the ~9-hour KST window),
-// this also asserts the UTC date's shard is genuinely absent, so a pass
-// here cannot be masking a proof that silently depended on it.
-test("--mark-session-closed: only the local date's session-log shard is committed, and the receipt certifies it", () => {
+// instant. The receipt used to certify the session-log shard that freshness
+// picked; it now names this close's entry alone (the log lines carry no close
+// id, see ISSUE-199), so this pins that no shard of either date is in it. Seeds
+// only the LOCAL date's daily shard; when `freshDates()` happens to return two
+// distinct dates right now (the ~9-hour KST window), this also asserts the UTC
+// date's shard is genuinely absent.
+test("--mark-session-closed: with only the local date's session-log shard committed, the receipt names the entry alone", () => {
   withWiki(
     (dir) => {
       const [localDate, utcDate] = freshDates();
@@ -4245,17 +4325,10 @@ test("--mark-session-closed: only the local date's session-log shard is committe
       assert.equal(out.ok, true);
       const receiptPath = join(dir, '.cache', 'sessions', sessionId, 'close-receipt.json');
       const receipt = JSON.parse(readFileSync(receiptPath, 'utf-8'));
-      const sessionLogEntry = (receipt.entries || []).find((e) =>
-        e.path.startsWith('projects/test-project/session-log/'),
-      );
-      assert.ok(
-        sessionLogEntry,
-        `receipt must name a session-log evidence file: ${JSON.stringify(receipt)}`,
-      );
-      assert.equal(
-        sessionLogEntry.path,
-        `projects/test-project/session-log/${localDate}.md`,
-        'the certified evidence file must be the LOCAL date shard, never a UTC-date one that was never committed',
+      assert.deepEqual(
+        (receipt.entries || []).map((e) => e.path),
+        [`projects/test-project/sessions/${localDate}-${closeIdFor(sessionId, 0)}.md`],
+        `the receipt proves this close's own entry and nothing else: ${JSON.stringify(receipt)}`,
       );
       if (utcDate && utcDate !== localDate) {
         assert.ok(
@@ -6675,6 +6748,139 @@ test("--mark issues the receipt when this close's own entry is committed", () =>
       cleanup();
     }
   });
+});
+
+// ISSUE-199. The session-log heading and the log.md line carry no close id, so a same-day
+// heading of another close used to complete this close's proof: A's entry committed, A's
+// logs never written, B closes the same project, and A's --mark certified A with B's lines.
+// The fixture's own today lines stand for B's here (buildCleanWikiTree writes them).
+// Disabling the check: in sessionCloseFileStatus's 'session' branch pass `stale, missing` to
+// checkCloseLogs instead of `logStale, logMissing`. Only the no-logs notice test below goes red
+// (the log gap reads as incomplete again); the two tests here stay green, since the fixture's
+// lines are present. The receipt half is pinned by the entry-only assertion here: a proof that
+// names a log file fails the deepEqual.
+test("--mark certifies a close by its own entry alone, never by another close's session-log and log.md lines", () => {
+  withWiki(null, (dir, today) => {
+    const sid = 's-199-own-entry';
+    const cleanup = seedCloseTranscript(sid);
+    try {
+      const rel = pinCommittedClose(dir, sid);
+      const { r, out } = markJson(dir, sid);
+      assert.equal(r.status, 0, `${r.stdout}\n${r.stderr}`);
+      assert.equal(out.ok, true);
+      const receipt = readReceiptStrict(dir, sid);
+      assert.equal(receipt.status, 'valid', JSON.stringify(receipt));
+      assert.deepEqual(
+        receipt.receipt.entries.map((e) => e.path),
+        [rel],
+        `the receipt names this close's entry and no log file: ${JSON.stringify(receipt.receipt.entries)}`,
+      );
+      assert.ok(
+        rel.endsWith(`${today}-${closeIdFor(sid, 0)}.md`),
+        `the proof is keyed by this close's id: ${rel}`,
+      );
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+test("--mark refuses a close with no entry of its own even when another close's logs are in place", () => {
+  withWiki(null, (dir, today) => {
+    const sid = 's-199-no-entry';
+    const cleanup = seedCloseTranscript(sid);
+    try {
+      commitEntry(dir, today, closeIdFor('s-199-the-other-close', 0));
+      writeClosePin(dir, sid, {
+        pending: {
+          closeId: closeIdFor(sid, 0),
+          openedAtIndex: 0,
+          entryRelPath: `projects/test-project/sessions/${today}-${closeIdFor(sid, 0)}.md`,
+          entrySha256s: [],
+        },
+        lastResolved: null,
+        localProofs: {},
+      });
+      const { r, out } = markJson(dir, sid);
+      assert.equal(r.status, 1, r.stdout);
+      assert.equal(out.reason, 'incomplete', r.stdout);
+      assert.deepEqual(out.incompleteProjects, ['test-project']);
+      assert.ok(!existsSync(join(dir, '.cache', 'sessions', sid, 'close-receipt.json')));
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+// A close whose date has no session-log heading and no log.md line is complete on its entry
+// and says what is missing. Paired with the fixture that has both lines: no notice.
+test('a session-scope check reports missing session-log and log.md lines as a notice, not as a gap', () => {
+  const check = (dir, sid) => {
+    pinCommittedClose(dir, sid);
+    return sessionCloseFileStatus(dir, {
+      scope: 'session',
+      closeId: closeIdFor(sid, 0),
+      projectOverride: 'test-project',
+    });
+  };
+  withWiki(
+    (dir, today) => {
+      rmSync(join(dir, 'projects', 'test-project', 'session-log', `${today.slice(0, 7)}.md`));
+      rmSync(join(dir, 'log.md'));
+    },
+    (dir) => {
+      const sid = 's-199-no-logs';
+      const s = check(dir, sid);
+      assert.equal(s.ok, true, JSON.stringify(s));
+      assert.deepEqual([s.stale, s.missing], [[], []]);
+      assert.equal(s.sessionLogEvidence, null);
+      const notice = s.notices.find((n) => n.type === CLOSE_LOGS_MISSING_NOTICE_TYPE);
+      assert.ok(notice, JSON.stringify(s.notices));
+      assert.match(notice.reason, /session-log\/.*missing/);
+      assert.match(notice.reason, /log\.md missing/);
+      const proof = buildMarkCloseProof(dir, ['test-project'], false, {
+        closeId: closeIdFor(sid, 0),
+      });
+      assert.equal(proof.ok, true, JSON.stringify(proof));
+      assert.deepEqual(
+        proof.entries.map((e) => e.kind),
+        ['create'],
+      );
+      assert.equal(proof.notices[0]?.type, CLOSE_LOGS_MISSING_NOTICE_TYPE);
+    },
+  );
+  withWiki(null, (dir) => {
+    const s = check(dir, 's-199-with-logs');
+    assert.equal(s.ok, true, JSON.stringify(s));
+    assert.deepEqual(s.notices, []);
+  });
+});
+
+// The notice has to reach someone: the cwd gate lifts it into its own `notices[]`, which is
+// where the PreCompact and Stop renderers and `--check-session-close` read from.
+// Disabling the check: delete the `for (const n of s.notices || []) notices.push(n)` loop in
+// precompactGateStatus's cwd branch. The notice is gone from the gate result.
+test('the cwd gate carries the close-logs-missing notice of the session-scope check and does not block on it', () => {
+  const sid = 's-199-gate-notice';
+  withWiki(
+    (dir, today) => {
+      anchorTestProject(dir, today);
+      rmSync(join(dir, 'projects', 'test-project', 'session-log', `${today.slice(0, 7)}.md`));
+      rmSync(join(dir, 'log.md'));
+    },
+    (dir) => {
+      const cleanup = seedCloseTranscript(sid);
+      try {
+        pinCommittedClose(dir, sid);
+        const gate = cwdGate(dir, sid);
+        assert.equal(hasCwdBlocker(gate), false, JSON.stringify(gate.blockers));
+        const notice = gate.notices.find((n) => n.type === CLOSE_LOGS_MISSING_NOTICE_TYPE);
+        assert.equal(notice?.project, 'test-project', JSON.stringify(gate.notices));
+      } finally {
+        cleanup();
+      }
+    },
+  );
 });
 
 test('generated views updated today with no entry of this close issue no receipt', () => {

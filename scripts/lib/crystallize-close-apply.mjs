@@ -53,8 +53,12 @@ import {
   revPathArg,
   recordTouchedPaths,
   recordShardAppend,
+  removeShardAppend,
   loadHypoIgnore,
   isIgnored,
+  isExcludedFromCommit,
+  isIgnoredByGit,
+  headBlob,
 } from '../../hooks/hypo-shared.mjs';
 import {
   TRACK_ID_RE,
@@ -99,7 +103,12 @@ import {
   closeGateStatus,
   hostTagWarningWithUndo,
 } from '../../hooks/close-gate-store.mjs';
-import { readJournal, recordJournalEntry, clearJournal } from '../../hooks/close-journal.mjs';
+import {
+  readJournal,
+  recordJournalEntry,
+  removeJournalEntry,
+  clearJournal,
+} from '../../hooks/close-journal.mjs';
 import { requireProjectDir } from './crystallize-close-gate.mjs';
 import { summarizeLintForOutput } from './crystallize-helpers.mjs';
 
@@ -206,11 +215,160 @@ function readPayload(source) {
 
 // How long an append waits for its per-target lock before withholding to the
 // proposal-pending gate (see withFileLock). A withheld append blocks the close but
-// is NOT parked as a proposal artifact — the next close re-appends. Default 5s is
-// generous for a real close;
-// the env override exists ONLY so tests can force a fast timeout instead of
-// spinning the full 5s. Not a documented production knob.
-const APPEND_LOCK_TIMEOUT_MS = Number(process.env.HYPO_APPEND_LOCK_TIMEOUT_MS) || 5000;
+// is NOT parked as a proposal artifact, the next close re-appends. The env override
+// exists ONLY so tests can force a fast timeout instead of spinning the full wait.
+// Not a documented production knob.
+//
+// The session-log shard lock and the log.md lock outlive their appends: both are held
+// through the commit (see runHoldingAppendLocks), so a second close waits for the first
+// one's lint and commit, not just its write, hence 20s and not a few seconds. A holder
+// killed mid-close leaves a lock that withFileLock steals after its 30s stale age once the
+// pid is gone; a waiter that gives up first withholds as a conflict and the next close
+// re-applies.
+const HELD_APPEND_LOCK_TIMEOUT_MS = Number(process.env.HYPO_APPEND_LOCK_TIMEOUT_MS) || 20000;
+
+/**
+ * Run `run({shardHeld, logHeld})` while holding the session-log shard lock and then the
+ * log.md lock (that order, always; the vault commit lock comes after both). Each commit
+ * takes its whole path (`--only`), so another close appending to the shard or to log.md
+ * between this close's append and this close's commit would have its text committed under
+ * this close, before its own close finishes. A flag is false when that lock could not be
+ * taken in time: the caller withholds the matching append as a conflict and goes on without
+ * writing that file. The two appends stand or fall together: when either lock times out
+ * both flags are false (a shard timeout never tries the log.md lock; a log.md timeout
+ * withholds the shard append too, still inside the shard lock), because a close that
+ * withholds one append cannot commit, and the other would sit on disk uncommitted for a
+ * second close of the same project to commit under its own name. Both
+ * locks are released on every exit of `run`, including a throw. A timeout that comes out of
+ * `run` itself (a different lock) is not ours and propagates.
+ */
+function runHoldingAppendLocks(shardTarget, logTarget, run) {
+  const hold = (target, inner) => {
+    let held = false;
+    try {
+      return withFileLock(
+        target,
+        () => {
+          held = true;
+          return inner(true);
+        },
+        { timeoutMs: HELD_APPEND_LOCK_TIMEOUT_MS },
+      );
+    } catch (err) {
+      if (held || err?.code !== 'ELOCKTIMEOUT') throw err;
+      return inner(false);
+    }
+  };
+  return hold(shardTarget, (shardHeld) =>
+    shardHeld
+      ? hold(logTarget, (logHeld) => run({ shardHeld: logHeld, logHeld }))
+      : run({ shardHeld: false, logHeld: false }),
+  );
+}
+
+// The caller already holds `target`'s lock (runHoldingAppendLocks), or failed to take it:
+// run `fn` under it, or raise the timeout the append sites turn into a withheld conflict.
+function underHeldLock(held, target, fn) {
+  if (!held) {
+    throw Object.assign(new Error(`lock-timeout: ${target}.lock`), { code: 'ELOCKTIMEOUT' });
+  }
+  return fn();
+}
+
+// One file this close appends to while it holds that file's append lock: `before` and
+// `after` are the exact bytes around the append (null = absent, undefined = unreadable).
+export const appendTarget = (rel, full) => ({ rel, full, before: undefined, after: undefined });
+
+function readBytes(path) {
+  if (!existsSync(path)) return null;
+  try {
+    return readFileSync(path);
+  } catch {
+    return undefined;
+  }
+}
+
+// Run one append under a held lock and record the bytes around it. `after` is read in a
+// finally, so an append that wrote and then threw is still withdrawn.
+function trackAppend(target, held, append) {
+  if (held) target.before = readBytes(target.full);
+  try {
+    append();
+  } finally {
+    if (held) target.after = readBytes(target.full);
+  }
+}
+
+/**
+ * Take back this close's appended bytes that no commit holds. Each commit takes a whole
+ * file (`--only`), so text this close left on disk would be committed by the next close of
+ * that file, under the next close's name. Judged per target, after the commit attempt:
+ * a target is withdrawn only when it was within the commit's scope (a path `.hypoignore`
+ * matches, or an untracked one git's own ignore rules match, is kept out of every commit
+ * and stays as written, it is the user's own log) and HEAD does not hold the bytes this
+ * close left (a commit that landed for it, however the others fared,
+ * stands). Called before the append locks are released. A file is restored only when its
+ * bytes are exactly what this close left (`after`); anything else means someone edited it
+ * under us, and it is left alone and named in a notice. A failed restore is reported the
+ * same way and never throws, so the locks still release.
+ *
+ * After a confirmed restore the append's ownership witnesses go too: this session's
+ * journal record for the path and, for a shard, its append record. Otherwise identical
+ * bytes added later by hand would pass as this close's own.
+ *
+ * @param {{hypoDir: string, sessionId: string|null, closeId: string|null}} ctx
+ */
+export function withdrawUnlandedAppends(ctx, targets, notices) {
+  const patterns = loadHypoIgnore(ctx.hypoDir);
+  for (const t of targets) {
+    if (t.before === undefined || t.after === undefined) continue;
+    if (t.before === t.after || (t.before && t.after && t.before.equals(t.after))) continue;
+    if (isExcludedFromCommit(ctx.hypoDir, t.rel, patterns)) continue;
+    if (isIgnoredByGit(ctx.hypoDir, t.rel)) continue;
+    if (headBlob(ctx.hypoDir, t.rel)?.equals(t.after)) continue;
+    const now = readBytes(t.full);
+    const unchanged = now && t.after && now.equals(t.after);
+    if (!unchanged) {
+      notices.push(
+        `커밋되지 않은 이번 close의 추가분을 ${t.rel}에서 되돌리지 못했습니다. 파일이 그 사이 다른 곳에서 바뀌었습니다. ` +
+          `내용을 확인하고 직접 정리하세요. 그대로 두면 다음 close가 이 추가분을 함께 커밋할 수 있습니다.`,
+      );
+      continue;
+    }
+    try {
+      if (t.before === null) unlinkSync(t.full);
+      else atomicWrite(t.full, t.before);
+    } catch (err) {
+      notices.push(
+        `커밋되지 않은 이번 close의 추가분을 ${t.rel}에서 되돌리지 못했습니다 (${err?.message || err}). ` +
+          `내용을 직접 정리하세요. 그대로 두면 다음 close가 이 추가분을 함께 커밋할 수 있습니다.`,
+      );
+      continue;
+    }
+    notices.push(
+      `커밋이 끝나지 않아 이번 close가 ${t.rel}에 추가한 내용을 되돌렸습니다. close를 다시 실행하세요.`,
+    );
+    const afterText = t.after.toString('utf-8');
+    const witnessOk =
+      removeJournalEntry(ctx.hypoDir, ctx.sessionId, t.rel, hashContent(afterText)) &&
+      (t.before === null ||
+        !t.after.subarray(0, t.before.length).equals(t.before) ||
+        removeShardAppend(
+          ctx.hypoDir,
+          ctx.sessionId,
+          t.rel,
+          t.before.toString('utf-8'),
+          t.after.subarray(t.before.length).toString('utf-8'),
+          ctx.closeId,
+        ));
+    if (!witnessOk) {
+      notices.push(
+        `${t.rel}의 추가분은 되돌렸지만, 이번 close가 남긴 기록(.cache/close-journal 또는 session-cache의 shard-appends.json)을 지우지 못했습니다. ` +
+          `같은 내용을 직접 다시 넣으면 이 close가 쓴 것으로 읽힐 수 있으니, 그 기록을 확인하세요.`,
+      );
+    }
+  }
+}
 
 // atomicWrite is now the shared hooks/atomic-write.mjs implementation
 // (imported above). Six byte-identical copies of this function used to live
@@ -612,13 +770,13 @@ const CLOSE_AWAITING_APPLY =
  * only `log.md` committed fresh. A project mark needs, for EVERY project in
  * `markerProjects`, THIS session's close proven by `sessionCloseFileStatus`
  * (scope 'session', the close id from sessionProofCloseId for that project): its entry
- * committed (or, for a `.hypoignore` project, locally proven), plus the exact
- * session-log evidence file that check accepted (never a different
- * hybrid-cutover candidate) and log.md, both committed, not merely present.
- * This function makes no judgment of its own: a project whose status is not
- * ok, or that has no session-log evidence file to name, is incomplete. One
- * incomplete project withholds the WHOLE certification and names which
- * project failed; this never partially certifies.
+ * committed (or, for a `.hypoignore` project, locally proven). The entry is the
+ * whole proof. The session-log heading and the log.md line carry no close id, so
+ * another close of the same day would satisfy them for this one; a gap there
+ * comes back in `notices` and neither gates the proof nor enters the receipt.
+ * This function makes no judgment of its own: a project whose status is not ok is
+ * incomplete. One incomplete project withholds the WHOLE certification and names
+ * which project failed; this never partially certifies.
  * `proof` carries `closeIdOf(project)`, the close that proves each project (one
  * session can close several projects in turn, each by its own close), or one
  * `closeId` for all of them (null when there is no close to prove).
@@ -627,47 +785,46 @@ const CLOSE_AWAITING_APPLY =
  * @param {string[]} markerProjects
  * @param {boolean} logOnly
  * @param {{closeId?: string|null, closeIdOf?: (project: string) => string|null}} [proof]
- * @returns {{ok: boolean, entries: object[], incompleteProjects: string[]}}
+ * @returns {{ok: boolean, entries: object[], incompleteProjects: string[], notices: object[]}}
  */
 export function buildMarkCloseProof(hypoDir, markerProjects, logOnly, proof = {}) {
   if (logOnly) {
     const e = markCloseWorktreeProofEntry(hypoDir, 'log.md');
     return e
-      ? { ok: true, entries: [e], incompleteProjects: [] }
-      : { ok: false, entries: [], incompleteProjects: ['(log-only)'] };
+      ? { ok: true, entries: [e], incompleteProjects: [], notices: [] }
+      : { ok: false, entries: [], incompleteProjects: ['(log-only)'], notices: [] };
   }
   const byPath = new Map();
   const incompleteProjects = [];
+  const notices = [];
   for (const p of markerProjects) {
     const status = sessionCloseFileStatus(hypoDir, {
       ...(proof.closeIdOf ? { closeId: proof.closeIdOf(p) } : proof),
       scope: 'session',
       projectOverride: p,
     });
-    if (!status.ok || !status.sessionLogEvidence?.path) {
+    if (!status.ok) {
       incompleteProjects.push(p);
       continue;
     }
+    notices.push(...status.notices);
     const ignorePatterns = loadHypoIgnore(hypoDir);
     const local =
       ignorePatterns.length > 0 && isIgnored(join(hypoDir, status.entry), hypoDir, ignorePatterns);
-    const projectEntries = [
-      local
-        ? markCloseLocalProofEntry(hypoDir, status.entry)
-        : markCloseWorktreeProofEntry(hypoDir, status.entry, 'create'),
-      markCloseWorktreeProofEntry(hypoDir, status.sessionLogEvidence.path),
-      markCloseWorktreeProofEntry(hypoDir, 'log.md'),
-    ];
-    if (projectEntries.some((e) => !e)) {
+    const e = local
+      ? markCloseLocalProofEntry(hypoDir, status.entry)
+      : markCloseWorktreeProofEntry(hypoDir, status.entry, 'create');
+    if (!e) {
       incompleteProjects.push(p);
       continue;
     }
-    for (const e of projectEntries) byPath.set(e.path, e);
+    byPath.set(e.path, e);
   }
   return {
     ok: incompleteProjects.length === 0 && markerProjects.length > 0,
     entries: [...byPath.values()],
     incompleteProjects,
+    notices,
   };
 }
 
@@ -1101,11 +1258,14 @@ export function runMarkSessionClosed(args, testHooks = null) {
   // exit 1 as every other refusal here (the apply path maps the same timeout
   // to commit-failed). Any other throw is a real fault and still propagates.
   let receiptResult;
+  // What the proof saw but did not gate on (a close with no log lines under its date).
+  let proofNotices = [];
   try {
     receiptResult = withFileLock(vaultCommitLockTarget(args.hypoDir), () => {
       const closeIdOf = (project) =>
         sessionProofCloseId(args.hypoDir, args.sessionId, { closeOpen, resolvedAtIndex, project });
       const proof = buildMarkCloseProof(args.hypoDir, markerProjects, args.logOnly, { closeIdOf });
+      proofNotices = proof.notices;
       if (!proof.ok)
         return {
           ok: false,
@@ -1201,7 +1361,7 @@ export function runMarkSessionClosed(args, testHooks = null) {
       receiptResult.reason === 'incomplete'
         ? receiptResult.awaitingApply
           ? `incomplete for project(s): ${receiptResult.incompleteProjects.join(', ')}. ${CLOSE_AWAITING_APPLY}`
-          : `incomplete for project(s): ${receiptResult.incompleteProjects.join(', ')} (this session's close entry, the session-log evidence file, and log.md must all be committed, not merely present)`
+          : `incomplete for project(s): ${receiptResult.incompleteProjects.join(', ')} (this session's own close entry must be committed, not merely present)`
         : receiptResult.reason === 'mismatch'
           ? `proof mismatch: ${JSON.stringify(receiptResult.mismatches)}`
           : receiptResult.reason === 'write-failed'
@@ -1242,7 +1402,7 @@ export function runMarkSessionClosed(args, testHooks = null) {
     project: markerProject,
     scope: args.logOnly ? 'log-only' : 'project',
     date: status.dates[0],
-    notices: gate.notices,
+    notices: [...gate.notices, ...proofNotices],
     // The close-time residual, on the success path this entry point owns.
     // Present exactly when closeGateStatus named a neutralized host tag, and
     // carrying the marker-only undo (no commit exists on this path).
@@ -1276,6 +1436,7 @@ export function runMarkSessionClosed(args, testHooks = null) {
     // computed once per run, so neither repeats on a later gate read.
     if (hostTagWarning) console.log(`\n⚠ ${hostTagWarning}`);
     if (receiptResult.leftUnverifiable) console.log(`  · ${LEFT_UNVERIFIABLE_NOTE}`);
+    for (const n of proofNotices) console.log(`  · ${n.reason}`);
   }
   process.exit(0);
 }
@@ -3318,7 +3479,7 @@ const entryAlreadyPresent = (entry) => (content) =>
 
 // Append this close's entry to the project's daily session-log shard, pushing the
 // outcome into the shared `acc` bag.
-function appendSessionLogEntry(args, payload, project, date, acc, closeId) {
+function appendSessionLogEntry(args, payload, project, date, acc, closeId, shardHeld) {
   const { applied, skipped, appliedPaths, conflicts, proofEntries } = acc;
   const rel = join('projects', project, 'session-log', `${date}.md`);
   const full = join(args.hypoDir, rel);
@@ -3331,7 +3492,8 @@ function appendSessionLogEntry(args, payload, project, date, acc, closeId) {
   // monthly file would never verify against the commit.
   let evidencePath = rel;
   // Serialize dedup + create/append on the daily shard so two concurrent
-  // closes never lose an entry: the second closer takes the lock only after
+  // closes never lose an entry: the caller holds the shard lock (runHoldingAppendLocks),
+  // and keeps it through the commit. The second closer takes the lock only after
   // the first committed, re-reads the shard under the lock, and appends onto
   // the committed bytes (temp+rename write-isolation is preserved — a partial
   // write never tears the target). Create and append share ONE lock, so the
@@ -3339,65 +3501,61 @@ function appendSessionLogEntry(args, payload, project, date, acc, closeId) {
   // each other — only one closer is ever in the create path (closes the
   // wx-window a bare exclusive-create would leave open).
   try {
-    const outcome = withFileLock(
-      full,
-      () => {
-        // Fallback-aware idempotency (hybrid cutover): during the month the
-        // shard takes over, today's entry may already live in the legacy monthly
-        // file from an earlier (pre-cutover) close. Treat presence in EITHER the
-        // daily shard or the legacy monthly file as "already written" so a same-day
-        // second close does not duplicate an identical entry across both files —
-        // and so an idempotent re-apply stays a true no-op (no shard is created).
-        for (const cand of sessionLogReadCandidates(project, date)) {
-          const cf = join(args.hypoDir, cand);
-          if (!existsSync(cf)) continue;
-          try {
-            if (isPresent(readFileSync(cf, 'utf-8'))) {
-              evidencePath = cand; // the candidate that actually carries the entry
-              return 'skipped';
-            }
-          } catch {
-            /* unreadable candidate — fall through to the write path */
+    const outcome = underHeldLock(shardHeld, full, () => {
+      // Fallback-aware idempotency (hybrid cutover): during the month the
+      // shard takes over, today's entry may already live in the legacy monthly
+      // file from an earlier (pre-cutover) close. Treat presence in EITHER the
+      // daily shard or the legacy monthly file as "already written" so a same-day
+      // second close does not duplicate an identical entry across both files —
+      // and so an idempotent re-apply stays a true no-op (no shard is created).
+      for (const cand of sessionLogReadCandidates(project, date)) {
+        const cf = join(args.hypoDir, cand);
+        if (!existsSync(cf)) continue;
+        try {
+          if (isPresent(readFileSync(cf, 'utf-8'))) {
+            evidencePath = cand; // the candidate that actually carries the entry
+            return 'skipped';
           }
+        } catch {
+          /* unreadable candidate — fall through to the write path */
         }
-        if (!existsSync(full)) {
-          // A daily shard is a new file most days. Seed minimal valid frontmatter
-          // (title + type, the two REQUIRED_FIELDS) so the shard is a first-class
-          // wiki page rather than a W1 "no frontmatter" warning, and write the header
-          // AND the first entry in ONE atomic write — never leave a header-only shard
-          // on disk, which freshness would skip (no dated heading) while derive could
-          // otherwise mistake it for the evidence file. The dated `## [date] ...`
-          // heading lives inside the entry, so freshness / derive / design-history
-          // are unchanged.
-          // No `device` or `session_id` in the header: the shard is git-tracked and two
-          // clones that each create today's first shard must write the same header bytes,
-          // or the union merge keeps both sets of lines. The per-session record of who
-          // wrote what lives in the local (.cache/, gitignored) index.jsonl written by
-          // hypo-session-record.mjs.
-          const header =
-            `---\ntitle: Session Log ${date} (${project})\n` +
-            `type: session-log\nupdated: ${date}\n---\n\n` +
-            `# Session Log ${date} (${project})\n`;
-          const entry = payload.sessionLog.entry;
-          const body = entry.endsWith('\n') ? entry : `${entry}\n`;
-          atomicWrite(full, `${header}\n${body}`);
-          return 'created';
-        }
-        // Another session's marker gate tells this append from a hand edit only by
-        // this record (isForeignAppendOnlyShard). Not recorded, the append still
-        // lands and those gates block on the shard until it is committed.
-        const recordAppend = (before, added) => {
-          if (!recordShardAppend(args.hypoDir, args.sessionId, rel, before, added, closeId))
-            process.stderr.write(
-              `[crystallize] warning: could not record this close's append to ${rel}; another session's close gate blocks on it until it is committed\n`,
-            );
-        };
-        return appendIfAbsent(full, payload.sessionLog.entry, isPresent, recordAppend)
-          ? 'appended'
-          : 'skipped';
-      },
-      { timeoutMs: APPEND_LOCK_TIMEOUT_MS },
-    );
+      }
+      if (!existsSync(full)) {
+        // A daily shard is a new file most days. Seed minimal valid frontmatter
+        // (title + type, the two REQUIRED_FIELDS) so the shard is a first-class
+        // wiki page rather than a W1 "no frontmatter" warning, and write the header
+        // AND the first entry in ONE atomic write — never leave a header-only shard
+        // on disk, which freshness would skip (no dated heading) while derive could
+        // otherwise mistake it for the evidence file. The dated `## [date] ...`
+        // heading lives inside the entry, so freshness / derive / design-history
+        // are unchanged.
+        // No `device` or `session_id` in the header: the shard is git-tracked and two
+        // clones that each create today's first shard must write the same header bytes,
+        // or the union merge keeps both sets of lines. The per-session record of who
+        // wrote what lives in the local (.cache/, gitignored) index.jsonl written by
+        // hypo-session-record.mjs.
+        const header =
+          `---\ntitle: Session Log ${date} (${project})\n` +
+          `type: session-log\nupdated: ${date}\n---\n\n` +
+          `# Session Log ${date} (${project})\n`;
+        const entry = payload.sessionLog.entry;
+        const body = entry.endsWith('\n') ? entry : `${entry}\n`;
+        atomicWrite(full, `${header}\n${body}`);
+        return 'created';
+      }
+      // Another session's marker gate tells this append from a hand edit only by
+      // this record (isForeignAppendOnlyShard). Not recorded, the append still
+      // lands and those gates block on the shard until it is committed.
+      const recordAppend = (before, added) => {
+        if (!recordShardAppend(args.hypoDir, args.sessionId, rel, before, added, closeId))
+          process.stderr.write(
+            `[crystallize] warning: could not record this close's append to ${rel}; another session's close gate blocks on it until it is committed\n`,
+          );
+      };
+      return appendIfAbsent(full, payload.sessionLog.entry, isPresent, recordAppend)
+        ? 'appended'
+        : 'skipped';
+    });
     (outcome === 'skipped' ? skipped : applied).push(`sessionLog (${rel})`);
     if (outcome !== 'skipped') {
       appliedPaths.push(rel);
@@ -3502,16 +3660,14 @@ function restageOrRecordLogMd(args, logFull, journal, wroteNew, acc) {
   }
 }
 
-function appendRootLogEntry(args, payload, project, date, acc) {
+function appendRootLogEntry(args, payload, project, date, acc, logHeld) {
   const { applied, skipped, conflicts, proofEntries } = acc;
   const logFull = join(args.hypoDir, 'log.md');
   const journal = readJournal(args.hypoDir, args.sessionId);
   if (payload.log) {
     try {
-      const wrote = withFileLock(
-        logFull,
-        () => appendIfAbsent(logFull, payload.log.entry, entryAlreadyPresent(payload.log.entry)),
-        { timeoutMs: APPEND_LOCK_TIMEOUT_MS },
+      const wrote = underHeldLock(logHeld, logFull, () =>
+        appendIfAbsent(logFull, payload.log.entry, entryAlreadyPresent(payload.log.entry)),
       );
       (wrote ? applied : skipped).push('log (log.md)');
       restageOrRecordLogMd(args, logFull, journal, wrote, acc);
@@ -3547,30 +3703,26 @@ function appendRootLogEntry(args, payload, project, date, acc) {
     // the commit with nothing here to catch it.
     const derivedBlocks = [];
     try {
-      const wroteAny = withFileLock(
-        logFull,
-        () => {
-          let w = false;
-          for (const m of (payload.sessionLog.entry || '').matchAll(headingRe)) {
-            const { heading, block } = rootLogEntry(project, date, m[1]);
-            // Earlier versions put an em dash after the slug where this one puts a
-            // colon. That heading is the same entry, and its block is what the
-            // receipt proof has to find in the file.
-            let proofBlock = block;
-            const wrote = appendIfAbsent(logFull, block, (c) => {
-              const lines = (c || '').split(/\r?\n/);
-              if (lines.includes(heading)) return true;
-              if (!lines.map(rootLogHeadingKey).includes(heading)) return false;
-              proofBlock = block.replace(`| ${project}: `, `| ${project} \u2014 `);
-              return true;
-            });
-            derivedBlocks.push(proofBlock);
-            w = w || wrote;
-          }
-          return w;
-        },
-        { timeoutMs: APPEND_LOCK_TIMEOUT_MS },
-      );
+      const wroteAny = underHeldLock(logHeld, logFull, () => {
+        let w = false;
+        for (const m of (payload.sessionLog.entry || '').matchAll(headingRe)) {
+          const { heading, block } = rootLogEntry(project, date, m[1]);
+          // Earlier versions put an em dash after the slug where this one puts a
+          // colon. That heading is the same entry, and its block is what the
+          // receipt proof has to find in the file.
+          let proofBlock = block;
+          const wrote = appendIfAbsent(logFull, block, (c) => {
+            const lines = (c || '').split(/\r?\n/);
+            if (lines.includes(heading)) return true;
+            if (!lines.map(rootLogHeadingKey).includes(heading)) return false;
+            proofBlock = block.replace(`| ${project}: `, `| ${project} \u2014 `);
+            return true;
+          });
+          derivedBlocks.push(proofBlock);
+          w = w || wrote;
+        }
+        return w;
+      });
       (wroteAny ? applied : skipped).push('log (log.md, derived)');
       restageOrRecordLogMd(args, logFull, journal, wroteAny, acc);
       if (derivedBlocks.length > 0) {
@@ -3999,13 +4151,74 @@ function repoIdentity(hypoDir) {
   return { toplevel, prefix };
 }
 
-function runMarkerPhase(args, project, appliedPaths, ok, hostTagWarning, receiptCtx = {}) {
+// The commit step of a close: stage and commit what this apply wrote, under the vault
+// commit lock. Runs inside the session-log shard lock (see runHoldingAppendLocks), so no
+// other close can append to the shard between this close's append and this commit.
+function commitCloseWrites(args, appliedPaths, receiptCtx) {
   const {
     preflightLint = null,
     hasConflicts = false,
     proofEntries = [],
     attemptId = null,
     testHooks = null,
+  } = receiptCtx;
+  // Scope this commit to the paths THIS apply actually wrote
+  // (appliedPaths), never the broader payloadScope, which also
+  // names lint/evidence candidates apply may not have touched a byte of.
+  // Locked against the SAME target the auto-commit Stop hook holds, so a
+  // concurrent Stop-chain commit on this vault can't interleave with this
+  // apply's stage+commit. A lock-timeout is treated exactly like any other
+  // commit failure below (skip the marker, surface the reason) rather than
+  // crashing the apply.
+  //
+  // registerPendingTagsLocked runs INSIDE this same lock, right before the
+  // commit: a SCHEMA.md registration it makes here
+  // pushes 'SCHEMA.md' onto `appliedPaths` first, so commitWikiChanges below
+  // picks it up in the SAME commit this apply is already making, atomically.
+  // The HEAD read happens in this same critical section too, never a
+  // second, unlocked `git rev-parse HEAD` afterwards, which a concurrent
+  // close landing in the gap could move.
+  let headAfterCommit = null;
+  let commitOutcome;
+  // Test seam: this close's session-log append has landed and its commit has not,
+  // the window in which another close must not be able to append to the shard.
+  testHooks?.beforeCommit?.();
+  try {
+    const locked = withFileLock(vaultCommitLockTarget(args.hypoDir), () => {
+      registerPendingTagsLocked(
+        args,
+        preflightLint,
+        hasConflicts,
+        appliedPaths,
+        proofEntries,
+        attemptId,
+      );
+      const outcome = commitWikiChanges(args.hypoDir, appliedPaths);
+      const head = readHeadShaLocked(args.hypoDir);
+      return { outcome, head };
+    });
+    commitOutcome = locked.outcome;
+    headAfterCommit = locked.head;
+    if (commitOutcome.indexWarning)
+      process.stderr.write(`[crystallize] warning: ${commitOutcome.indexWarning}\n`);
+  } catch (err) {
+    commitOutcome = { committed: false, reason: `vault-commit-lock: ${err?.message || err}` };
+  }
+  // Once these bytes are committed, the journal's only job (telling a
+  // retry's own uncommitted work apart from someone else's) is done —
+  // clear it rather than let a stale record outlive this close and later
+  // match a coincidence it was never meant to license. A commit that
+  // failed leaves the journal in place on purpose: that is exactly the
+  // case the next retry needs it for.
+  if (commitOutcome.committed) clearJournal(args.hypoDir, args.sessionId);
+  return { outcome: commitOutcome, head: headAfterCommit };
+}
+
+function runMarkerPhase(args, project, appliedPaths, ok, hostTagWarning, receiptCtx = {}) {
+  const {
+    proofEntries = [],
+    testHooks = null,
+    commit = null,
     verify,
     closeOpen = false,
     resolvedAtIndex = null,
@@ -4030,58 +4243,18 @@ function runMarkerPhase(args, project, appliedPaths, ok, hostTagWarning, receipt
   // already explains a missing entry, and keeps its own outcome.
   let verification = null;
   let verificationCounts = false;
-  if (ok && args.sessionId) {
+  if (ok && args.sessionId && commit) {
     // IO stays lazy so this preserves the exact side-effect order (codex design
     // review): commit first (the only mutation), then resolve the
     // transcript, then run the compact gate with that transcript, then scan the
     // user-close signal ONLY once the gate passes. planMarkerDecision owns the
     // branch priority + reason strings; the booleans below are computed in that
     // same short-circuiting order so no read runs earlier than it does today.
-    // Scope this commit to the paths THIS apply actually wrote
-    // (appliedPaths), never the broader payloadScope, which also
-    // names lint/evidence candidates apply may not have touched a byte of.
-    // Locked against the SAME target the auto-commit Stop hook holds, so a
-    // concurrent Stop-chain commit on this vault can't interleave with this
-    // apply's stage+commit. A lock-timeout is treated exactly like any other
-    // commit failure below (skip the marker, surface the reason) rather than
-    // crashing the apply.
-    //
-    // registerPendingTagsLocked runs INSIDE this same lock, right before the
-    // commit: a SCHEMA.md registration it makes here
-    // pushes 'SCHEMA.md' onto `appliedPaths` first, so commitWikiChanges below
-    // picks it up in the SAME commit this apply is already making, atomically.
-    // The HEAD read happens in this same critical section too, never a
-    // second, unlocked `git rev-parse HEAD` afterwards, which a concurrent
-    // close landing in the gap could move.
-    let headAfterCommit = null;
-    try {
-      const locked = withFileLock(vaultCommitLockTarget(args.hypoDir), () => {
-        registerPendingTagsLocked(
-          args,
-          preflightLint,
-          hasConflicts,
-          appliedPaths,
-          proofEntries,
-          attemptId,
-        );
-        const outcome = commitWikiChanges(args.hypoDir, appliedPaths);
-        const head = readHeadShaLocked(args.hypoDir);
-        return { outcome, head };
-      });
-      commitOutcome = locked.outcome;
-      headAfterCommit = locked.head;
-      if (commitOutcome.indexWarning)
-        process.stderr.write(`[crystallize] warning: ${commitOutcome.indexWarning}\n`);
-    } catch (err) {
-      commitOutcome = { committed: false, reason: `vault-commit-lock: ${err?.message || err}` };
-    }
-    // Once these bytes are committed, the journal's only job (telling a
-    // retry's own uncommitted work apart from someone else's) is done —
-    // clear it rather than let a stale record outlive this close and later
-    // match a coincidence it was never meant to license. A commit that
-    // failed leaves the journal in place on purpose: that is exactly the
-    // case the next retry needs it for.
-    if (commitOutcome.committed) clearJournal(args.hypoDir, args.sessionId);
+    // The commit itself ran earlier, inside the session-log shard lock (commitCloseWrites),
+    // so the lock is released before this gate looks at the project folder: its lock file
+    // is an untracked file there.
+    commitOutcome = commit.outcome;
+    const headAfterCommit = commit.head;
     verification = verify();
     verificationCounts = commitOutcome.committed === true;
     let closeTranscript = null;
@@ -4585,6 +4758,8 @@ function printCloseReport({
   // for. Printed before the rest so an old payload's author sees it even when
   // the close otherwise succeeds and they stop reading at the ✓ line.
   for (const n of obsoleteNotices || []) console.log(`  · ${n}`);
+  // What the verification saw but did not gate on (this close has no log lines under its date).
+  for (const n of verification?.notices || []) console.log(`  · ${n.reason}`);
   // Surfaced unconditionally, success or failure. `restructure: true` no
   // longer waives the guard: the target below is still WITHHELD
   // and shows up in the conflicts loop right after this one. This line only
@@ -4774,9 +4949,7 @@ function printCloseReport({
         ...verification.stale.map((f) => `${f} (stale)`),
       ].join(', ');
       console.log(`\n✗ session-close still incomplete after apply: ${bad}`);
-      console.log(
-        "  This close's entry, its session-log heading and its log.md line must all be in place, the entry committed. Check them and retry.",
-      );
+      console.log("  This close's own entry must be in place and committed. Check it and retry.");
     }
     if (!postLintOk) {
       console.log('\n✗ post-apply lint failed:');
@@ -4880,6 +5053,7 @@ export function applySessionClose(args, testHooks = null) {
         project: probe.project,
         date: probe.dates[0],
         scope: args.sessionId ? 'session' : 'global',
+        notices: probe.notices ?? [],
         message: args.sessionId
           ? '이 세션의 close가 이미 완료됨 (probe 모드: payload 미지정).'
           : '이 프로젝트에 오늘 close가 있음. 이 세션의 close인지는 확인하지 않았음 (probe 모드: payload와 --session-id 미지정).',
@@ -4889,6 +5063,7 @@ export function applySessionClose(args, testHooks = null) {
       } else {
         console.log(`✓ ${result.message}`);
         console.log(`  project: ${result.project} / date: ${result.date}`);
+        for (const n of result.notices) console.log(`  · ${n.reason}`);
       }
       process.exit(0);
     }
@@ -5020,92 +5195,154 @@ export function applySessionClose(args, testHooks = null) {
     intentResult.attemptId,
   );
   markCloseIntentApplied(args.hypoDir, args.sessionId, intentResult.attemptId);
-  appendSessionLogEntry(args, payload, project, date, acc, closeId);
-  appendRootLogEntry(args, payload, project, date, acc);
+  // The session-log shard lock and the log.md lock are held from the appends below through
+  // the commit (commitCloseWrites), and released before the marker phase. The commit takes
+  // each whole path (`--only`), so another close appending in between would have its text
+  // committed under this close, before its own close finishes. The locks are the same
+  // primitive the appends always used. The order is shard, then log.md, then the vault
+  // commit lock, and no path takes any two of them the other way round.
+  const shardTarget = join(args.hypoDir, 'projects', project, 'session-log', `${date}.md`);
+  const appendTargets = [
+    appendTarget(join('projects', project, 'session-log', `${date}.md`), shardTarget),
+    appendTarget('log.md', join(args.hypoDir, 'log.md')),
+  ];
+  const held = runHoldingAppendLocks(shardTarget, join(args.hypoDir, 'log.md'), (locks) => {
+    // Appended text no commit holds is taken back before the locks release
+    // (withdrawUnlandedAppends), or the next close would commit it as its own.
+    try {
+      trackAppend(appendTargets[0], locks.shardHeld, () =>
+        appendSessionLogEntry(args, payload, project, date, acc, closeId, locks.shardHeld),
+      );
+      trackAppend(appendTargets[1], locks.logHeld, () =>
+        appendRootLogEntry(args, payload, project, date, acc, locks.logHeld),
+      );
 
-  // A migrated vault shows the new entry in its generated views right away. A vault
-  // that has not moved to entries has nothing to render (this is a no-op there).
-  try {
-    writeGeneratedViews(args.hypoDir, { projects: [project] });
-  } catch (err) {
-    process.stderr.write(
-      `[crystallize] warning: could not refresh the generated session views (${err?.message || err}); the next session start or stop rewrites them\n`,
-    );
-  }
+      // A migrated vault shows the new entry in its generated views right away. A vault
+      // that has not moved to entries has nothing to render (this is a no-op there).
+      // Cost: this runs inside the held section, so the two append locks stay held for as long
+      // as the vault lock wait (about 5s) when another writer holds the vault lock. It stays
+      // here because lint may read the generated views and they should match the appends it
+      // judges; that dependency is not verified, so moving it out is open if the hold time
+      // ever shows up as lock timeouts.
+      try {
+        writeGeneratedViews(args.hypoDir, { projects: [project] });
+      } catch (err) {
+        process.stderr.write(
+          `[crystallize] warning: could not refresh the generated session views (${err?.message || err}); the next session start or stop rewrites them\n`,
+        );
+      }
 
-  const { proposals, proposalStoreFailures } = parkOverwriteConflicts(args, conflicts);
-  const proposalStoreFailed = proposalStoreFailures.length > 0;
-  // Vault-wide total, not just what THIS close just parked: `proposals` above is
-  // this run's own new artifacts, and a close that never parks anything can still
-  // sit behind dozens accumulated by earlier sessions with no path here that says
-  // so. This used to reuse `doctor`'s `classifyProposals` judgment so the two
-  // surfaces could never disagree about the number, but that judgment reads the
-  // WHOLE audit log and re-hashes every recoverable candidate's target file, on
-  // every close, whether or not anything here needs the pending/recoverable/
-  // evidence-broken breakdown. `listProposalsChecked` counts the SAME artifacts
-  // (classifyProposals emits exactly one entry per valid artifact, so the totals
-  // agree) without either cost: a directory listing plus each artifact's own
-  // JSON, nothing from `applied.log` and no target re-read. The breakdown by
-  // state still lives in `hypomnema doctor`, which is what actually tells a
-  // human whether a parked artifact needs review or just a `proposal reconcile`.
-  // `ok: false` here means the inventory itself could not be enumerated
-  // (permissions, or a file sitting where the directory should be): a real
-  // "unmeasured", not "empty", so `parkedTotal` stays `null` rather than lie
-  // that the backlog is zero.
-  const proposalInventory = listProposalsChecked(args.hypoDir);
-  const parkedTotal = proposalInventory.ok ? proposalInventory.proposals.length : null;
-  // Candidate `.json` files inside a LISTABLE `.cache/proposals` that
-  // listProposalsChecked could not parse into an artifact (corrupt, permission-
-  // denied, or hand-edited into an unrecognizable shape). These are not folded
-  // into parkedTotal above (that count stays "artifacts this close's callers
-  // can actually act on"), but a close must never let one sit invisible: before
-  // this field, an unreadable artifact simply vanished from the count, and a
-  // vault with nothing BUT unreadable ones reported `parkedTotal: 0` with no
-  // line anywhere naming the file. Always an array (empty when nothing is
-  // wrong, or when the whole directory could not even be listed, that failure
-  // already reads as `parkedTotal: null`, not a lying zero here).
-  const parkedUnreadable = proposalInventory.unreadable;
-  // Subset of the line above whose bytes are probably intact: the writer
-  // finished and only the rename never landed. Carried as its own field
-  // rather than carved out of parkedUnreadable, so a `--json` consumer that
-  // already counts unreadable files keeps counting the same set.
-  const parkedOrphanTmp = proposalInventory.orphanTmp || [];
+      const { proposals, proposalStoreFailures } = parkOverwriteConflicts(args, conflicts);
+      const proposalStoreFailed = proposalStoreFailures.length > 0;
+      // Vault-wide total, not just what THIS close just parked: `proposals` above is
+      // this run's own new artifacts, and a close that never parks anything can still
+      // sit behind dozens accumulated by earlier sessions with no path here that says
+      // so. This used to reuse `doctor`'s `classifyProposals` judgment so the two
+      // surfaces could never disagree about the number, but that judgment reads the
+      // WHOLE audit log and re-hashes every recoverable candidate's target file, on
+      // every close, whether or not anything here needs the pending/recoverable/
+      // evidence-broken breakdown. `listProposalsChecked` counts the SAME artifacts
+      // (classifyProposals emits exactly one entry per valid artifact, so the totals
+      // agree) without either cost: a directory listing plus each artifact's own
+      // JSON, nothing from `applied.log` and no target re-read. The breakdown by
+      // state still lives in `hypomnema doctor`, which is what actually tells a
+      // human whether a parked artifact needs review or just a `proposal reconcile`.
+      // `ok: false` here means the inventory itself could not be enumerated
+      // (permissions, or a file sitting where the directory should be): a real
+      // "unmeasured", not "empty", so `parkedTotal` stays `null` rather than lie
+      // that the backlog is zero.
+      const proposalInventory = listProposalsChecked(args.hypoDir);
+      const parkedTotal = proposalInventory.ok ? proposalInventory.proposals.length : null;
+      // Candidate `.json` files inside a LISTABLE `.cache/proposals` that
+      // listProposalsChecked could not parse into an artifact (corrupt, permission-
+      // denied, or hand-edited into an unrecognizable shape). These are not folded
+      // into parkedTotal above (that count stays "artifacts this close's callers
+      // can actually act on"), but a close must never let one sit invisible: before
+      // this field, an unreadable artifact simply vanished from the count, and a
+      // vault with nothing BUT unreadable ones reported `parkedTotal: 0` with no
+      // line anywhere naming the file. Always an array (empty when nothing is
+      // wrong, or when the whole directory could not even be listed, that failure
+      // already reads as `parkedTotal: null`, not a lying zero here).
+      const parkedUnreadable = proposalInventory.unreadable;
+      // Subset of the line above whose bytes are probably intact: the writer
+      // finished and only the rename never landed. Carried as its own field
+      // rather than carved out of parkedUnreadable, so a `--json` consumer that
+      // already counts unreadable files keeps counting the same set.
+      const parkedOrphanTmp = proposalInventory.orphanTmp || [];
 
-  const { postApplyLint, postBlocking, postNotice, postLintOk, w19Notice } = runPostApplyLint(
-    args,
-    payloadScope,
-  );
+      const { postApplyLint, postBlocking, postNotice, postLintOk, w19Notice } = runPostApplyLint(
+        args,
+        payloadScope,
+      );
 
-  // What decides the commit. The post-apply verification joins it once the
-  // commit has landed (runMarkerPhase, below).
-  //
-  // A withheld conflict target must fail the close on its own, not merely via the
-  // freshness gate. If the other session already touched that page TODAY, freshness
-  // sees a fresh file and passes — and the close would report ok:true, write the
-  // marker, and drop this session's payload silently. `conflicts` closes that hole.
-  const preCommitOk = postLintOk && conflicts.length === 0;
+      // What decides the commit. The post-apply verification joins it once the
+      // commit has landed (runMarkerPhase, below).
+      //
+      // A withheld conflict target must fail the close on its own, not merely via the
+      // freshness gate. If the other session already touched that page TODAY, freshness
+      // sees a fresh file and passes — and the close would report ok:true, write the
+      // marker, and drop this session's payload silently. `conflicts` closes that hole.
+      const preCommitOk = postLintOk && conflicts.length === 0;
 
-  // Scope the non-blocking notice to the close-target project: debt under
-  // projects/<project>/ stays listed; debt elsewhere folds to a count so the
-  // same untouched-file debt does not re-list its filenames on every close.
-  const closeScopeNotice = postNotice.filter((e) => isUnderProjectDirs(e.file, [project]));
-  const otherDebtCount = postNotice.length - closeScopeNotice.length;
+      // Scope the non-blocking notice to the close-target project: debt under
+      // projects/<project>/ stays listed; debt elsewhere folds to a count so the
+      // same untouched-file debt does not re-list its filenames on every close.
+      const closeScopeNotice = postNotice.filter((e) => isUnderProjectDirs(e.file, [project]));
+      const otherDebtCount = postNotice.length - closeScopeNotice.length;
 
+      const commit =
+        preCommitOk && args.sessionId
+          ? commitCloseWrites(args, appliedPaths, {
+              preflightLint,
+              hasConflicts: conflicts.length > 0,
+              proofEntries,
+              attemptId: intentResult.attemptId,
+              testHooks,
+            })
+          : null;
+      return {
+        proposals,
+        proposalStoreFailures,
+        proposalStoreFailed,
+        parkedTotal,
+        parkedUnreadable,
+        parkedOrphanTmp,
+        postApplyLint,
+        postBlocking,
+        postLintOk,
+        w19Notice,
+        preCommitOk,
+        closeScopeNotice,
+        otherDebtCount,
+        commit,
+      };
+    } finally {
+      withdrawUnlandedAppends(
+        { hypoDir: args.hypoDir, sessionId: args.sessionId, closeId },
+        appendTargets,
+        notices,
+      );
+    }
+  });
   const {
-    markerWritten,
-    markerSkipReason,
-    markerGateReason,
-    commitOutcome,
-    gateNotices,
-    gateBlockers,
-    receiptMismatches,
-    verification,
-    verificationCounts,
-  } = runMarkerPhase(args, project, appliedPaths, preCommitOk, hostTagWarning, {
-    preflightLint,
-    hasConflicts: conflicts.length > 0,
+    proposals,
+    proposalStoreFailures,
+    proposalStoreFailed,
+    parkedTotal,
+    parkedUnreadable,
+    parkedOrphanTmp,
+    postApplyLint,
+    postBlocking,
+    postLintOk,
+    w19Notice,
+    preCommitOk,
+    closeScopeNotice,
+    otherDebtCount,
+    commit,
+  } = held;
+  const markerPhase = runMarkerPhase(args, project, appliedPaths, preCommitOk, hostTagWarning, {
+    commit,
     proofEntries,
-    attemptId: intentResult.attemptId,
     testHooks,
     // This close, by its pinned close id, in the project the payload named (the
     // same-date-tie fix: never re-derived from root hot.md, which on a tie can
@@ -5116,6 +5353,17 @@ export function applySessionClose(args, testHooks = null) {
     resolvedAtIndex,
     openedAtIndex,
   });
+  const {
+    markerWritten,
+    markerSkipReason,
+    markerGateReason,
+    commitOutcome,
+    gateNotices,
+    gateBlockers,
+    receiptMismatches,
+    verification,
+    verificationCounts,
+  } = markerPhase;
   const verificationOk = !verificationCounts || verification.ok;
   // `let` (not const): the close-result invariant self-check below may flip this
   // to false when the settled close result is internally contradictory.

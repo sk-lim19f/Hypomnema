@@ -1059,6 +1059,76 @@ for (const parentName of ['parent ', ' parent']) {
   });
 }
 
+// ── hypoIsClean / gitDirtyFiles: a live close's lock files are not uncommitted work.
+//    withFileLock leaves `<target>.lock` and a waiter's `<target>.lock.<16 hex>.tmp` untracked
+//    in the vault while a close runs, and neither is guaranteed to be gitignored. ────────────
+suite('hypoIsClean / gitDirtyFiles: lock artifacts');
+
+const STAGING_ARTIFACT = 'x.md.lock.0123456789abcdef.tmp';
+
+function pinnedGit(dir, args) {
+  const r = spawnSync('git', args, {
+    cwd: dir,
+    encoding: 'utf-8',
+    env: { ...process.env, HOME: SESSION_TMP_HOME },
+  });
+  assert.equal(r.status, 0, `git ${args.join(' ')}: ${r.stderr}`);
+}
+
+test('hypoIsClean / gitDirtyFiles: lock artifacts next to a modified page leave only the page', () => {
+  withCleanWiki((dir) => {
+    writeFileSync(join(dir, 'x.md.lock'), '');
+    writeFileSync(join(dir, STAGING_ARTIFACT), '');
+    appendFileSync(join(dir, 'log.md'), '\nedited\n');
+    assert.equal(hypoIsClean(dir).uncommitted, true);
+    assert.deepEqual(gitDirtyFiles(dir), ['log.md']);
+  });
+});
+
+test('hypoIsClean / gitDirtyFiles: lock artifacts alone are not uncommitted work', () => {
+  withCleanWiki((dir) => {
+    writeFileSync(join(dir, 'x.md.lock'), '');
+    writeFileSync(join(dir, STAGING_ARTIFACT), '');
+    const st = hypoIsClean(dir);
+    assert.equal(st.uncommitted, false, JSON.stringify(st));
+    assert.equal(st.clean, true, JSON.stringify(st));
+    assert.deepEqual(gitDirtyFiles(dir), []);
+  });
+});
+
+test('hypoIsClean / gitDirtyFiles: a staged rename whose source is a tracked .lock file reports both paths', () => {
+  withCleanWiki((dir) => {
+    writeFileSync(join(dir, 'a.md.lock'), 'tracked on purpose\n');
+    pinnedGit(dir, ['add', '-f', 'a.md.lock']);
+    pinnedGit(dir, ['commit', '-q', '-m', 'track a lock file']);
+    pinnedGit(dir, ['mv', 'a.md.lock', 'b.md']);
+    assert.equal(hypoIsClean(dir).uncommitted, true);
+    assert.deepEqual(gitDirtyFiles(dir), ['b.md', 'a.md.lock']);
+  });
+});
+
+// The filter covers untracked records only. A tracked file whose name ends in `.lock` is a
+// person's work when edited, deleted or renamed, whatever its name looks like.
+for (const [label, change] of [
+  ['edited', (dir, rel) => writeFileSync(join(dir, rel), 'edited by a person\n')],
+  ['deleted', (dir, rel) => rmSync(join(dir, rel))],
+  ['renamed', (dir, rel) => pinnedGit(dir, ['mv', rel, join('projects', 'p', 'draft.md')])],
+]) {
+  test(`hypoIsClean / gitDirtyFiles: a tracked .lock file that was ${label} is still dirty`, () => {
+    withCleanWiki((dir) => {
+      const rel = join('projects', 'p', 'draft.md.lock');
+      mkdirSync(join(dir, 'projects', 'p'), { recursive: true });
+      writeFileSync(join(dir, rel), 'tracked on purpose\n');
+      pinnedGit(dir, ['add', '-f', rel]);
+      pinnedGit(dir, ['commit', '-q', '-m', 'track a lock-named file']);
+      change(dir, rel);
+      const st = hypoIsClean(dir);
+      assert.equal(st.uncommitted, true, JSON.stringify(st));
+      assert.ok(gitDirtyFiles(dir).includes(rel), JSON.stringify(gitDirtyFiles(dir)));
+    });
+  });
+}
+
 suite('hypo-personal-check.mjs — close-intent enrichment (#20)');
 
 test('close intent in transcript → systemMessage includes close-intent note, never blocks', () => {
