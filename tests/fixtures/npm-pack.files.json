@@ -524,6 +524,10 @@
     "exec": false
   },
   {
+    "path": "templates/gitattributes",
+    "exec": false
+  },
+  {
     "path": "templates/gitignore",
     "exec": false
   },
@@ -560,19 +564,11 @@
     "exec": false
   },
   {
-    "path": "templates/projects/_template/hot.md",
-    "exec": false
-  },
-  {
     "path": "templates/projects/_template/index.md",
     "exec": false
   },
   {
     "path": "templates/projects/_template/prd.md",
-    "exec": false
-  },
-  {
-    "path": "templates/projects/_template/session-state.md",
     "exec": false
   },
   {

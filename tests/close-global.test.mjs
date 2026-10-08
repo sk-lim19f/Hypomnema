@@ -16,6 +16,7 @@ import {
   readFileSync,
   readdirSync,
   existsSync,
+  cpSync,
 } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -37,6 +38,7 @@ import { recordJournalEntry } from '../hooks/close-journal.mjs';
 // strictly outside it instead of guessing with local-yesterday.
 import {
   freshDates,
+  currentDevice,
   recordShardAppend,
   recordTouchedPaths,
   rootLogHeadingKey,
@@ -46,6 +48,9 @@ import {
   readClosePin,
   sessionCloseFileStatus,
   sessionProofCloseId,
+  VIEW_BACKUP_DIR_REL,
+  rootHotBackupRecoveryNotice,
+  consumeRootHotHealthNotice,
 } from '../hooks/hypo-shared.mjs';
 import {
   RECEIPT_SCHEMA_VERSION,
@@ -55,8 +60,14 @@ import {
   closeCheckpointState,
   verifyEntriesInCommit,
 } from '../hooks/close-receipt.mjs';
-import { createProject } from '../scripts/lib/project-create.mjs';
-import { GITIGNORE_BLOCK, closeIdFor, formatSessionEntry } from '../hooks/session-entries.mjs';
+import { createProject, TEMPLATE_DIR } from '../scripts/lib/project-create.mjs';
+import { loadSessionModel } from '../hooks/session-views.mjs';
+import {
+  GITIGNORE_BLOCK,
+  closeIdFor,
+  formatSessionEntry,
+  renderViews,
+} from '../hooks/session-entries.mjs';
 import { closeGateStatus } from '../hooks/close-gate-store.mjs';
 import { buildMarkCloseProof } from '../scripts/lib/crystallize-close-apply.mjs';
 import { test, suite } from './harness.mjs';
@@ -1100,6 +1111,9 @@ test('hypo-hot-rebuild Stop hook fills the missing log.md entry end-to-end', () 
     const today = todayLocal();
     writeFileSync(join(dir, 'hypo-config.md'), '# config');
     makeMultiProjectWiki(dir, today, [{ slug: 'alpha', date: today, logEntry: false }]);
+    // The Stop hook regenerates the root table from the session projects (a directory with an
+    // index.md or a sessions/ directory), so alpha has to be one, as every real project is.
+    writeFileSync(join(dir, 'projects', 'alpha', 'index.md'), '---\ntitle: alpha\n---\n');
     const r = runStop('hypo-hot-rebuild.mjs', dir);
     assert.equal(r.status, 0, `stderr: ${r.stderr}`);
     const log = readFileSync(join(dir, 'log.md'), 'utf-8');
@@ -6186,8 +6200,8 @@ test('a held vault lock reports "hot.md row (lock timeout)", distinct from an or
     const prevTimeout = process.env.HYPO_VAULT_LOCK_TIMEOUT_MS;
     process.env.HYPO_VAULT_LOCK_TIMEOUT_MS = '200'; // fail fast instead of the 5s default
     try {
-      // Same technique as writeRootHotProjection's own lock-refusal test
-      // (tests/session-hooks.test.mjs): the lock file's content is a live
+      // Same technique as the view writer's own lock-refusal test
+      // (tests/session-entries.test.mjs): the lock file's content is a live
       // pid, so the acquire below polls and times out rather than stealing it.
       const lockPath = `${vaultCommitLockTarget(dir)}.lock`;
       mkdirSync(dirname(lockPath), { recursive: true });
@@ -6220,7 +6234,7 @@ test('a held vault lock reports "hot.md row (lock timeout)", distinct from an or
 
 test('an ordinary create (no lock contention) still reports the plain "hot.md row" skip label', () => {
   // Contrast half: with no lock held, an unchanged table (or a fresh one that
-  // writeRootHotProjection did create) must NOT pick up the lock-specific
+  // generator did create) must NOT pick up the lock-specific
   // label: proves the new branch is scoped to lockTimeout, not swallowing
   // the ordinary case too.
   withTmpDir((dir) => {
@@ -6230,6 +6244,129 @@ test('an ordinary create (no lock contention) still reports the plain "hot.md ro
         !result.created.includes('hot.md row (lock timeout)'),
       `an uncontended create must never report a lock timeout: ${JSON.stringify(result)}`,
     );
+  });
+});
+
+// ── project-create: the two views come from the generator ─────────────────────
+suite('project-create.mjs: hot.md and session-state.md are written by the view generator');
+
+// A committed vault whose HEAD `.gitignore` carries the block (`migrated`), or the same vault
+// without it (the views of an older vault are tracked files, `not-migrated`).
+function withProjectVault(migrated, fn) {
+  withTmpDir((dir) => {
+    writeFileSync(join(dir, '.gitignore'), migrated ? `.cache/\n${GITIGNORE_BLOCK}` : '.cache/\n');
+    writeFileSync(join(dir, 'log.md'), '# log\n');
+    const git = (...a) => spawnSync('git', ['-C', dir, ...a], { encoding: 'utf-8' });
+    git('init', '-q');
+    git('config', 'user.email', 't@t.test');
+    git('config', 'user.name', 'T');
+    git('add', '-A');
+    git('commit', '-q', '-m', 'init');
+    fn(dir, git);
+  });
+}
+
+test('project-create in a migrated vault leaves projects/new/hot.md and session-state.md on disk, untracked', () => {
+  withProjectVault(true, (dir, git) => {
+    const r = createProject({ hypoDir: dir, name: 'new', workingDir: '/tmp/new' });
+    assert.deepEqual(r.warnings, []);
+    assert.ok(r.created.includes('hot.md row'), JSON.stringify(r));
+    for (const f of ['hot.md', 'session-state.md']) {
+      assert.ok(existsSync(join(dir, 'projects', 'new', f)), `${f} is on disk`);
+      assert.equal(git('check-ignore', '-q', `projects/new/${f}`).status, 0, `${f} is ignored`);
+    }
+    assert.equal(git('ls-files', '--', 'projects/new').stdout.includes('hot.md'), false);
+  });
+});
+
+test('project-create in a vault that is not migrated writes no view and says nothing is missing', () => {
+  withProjectVault(false, (dir) => {
+    const r = createProject({ hypoDir: dir, name: 'old', workingDir: '/tmp/old' });
+    assert.ok(r.created.includes('projects/old/index.md'), JSON.stringify(r));
+    assert.equal(existsSync(join(dir, 'projects', 'old', 'hot.md')), false);
+    assert.equal(existsSync(join(dir, 'projects', 'old', 'session-state.md')), false);
+    assert.equal(
+      r.warnings.some((w) => w.startsWith('template missing')),
+      false,
+      JSON.stringify(r.warnings),
+    );
+    // The skip names its reason, and a warning says when the views will appear.
+    assert.ok(r.skipped.includes('hot.md row (vault not migrated)'), JSON.stringify(r.skipped));
+    assert.equal(r.skipped.includes('hot.md row'), false, 'not the reasonless label');
+    assert.ok(
+      r.warnings.some((w) => w.includes('/hypo:upgrade --migrate-sessions')),
+      JSON.stringify(r.warnings),
+    );
+  });
+});
+
+// A project view backup carries the one shared recovery sentence: it names the view that was
+// backed up (not the root hot.md) and sends what to keep to the next close or notes.md, never to
+// another generated view. The generator's own health notice says the same words.
+// The head of the sentence is asserted on its own: the backup path later in it also contains
+// 'projects/new/hot.md', so an includes() on the whole sentence would stay green.
+// Disabling: in `rootHotBackupRecoveryNotice` (hooks/hypo-shared.mjs) put back a fixed 'hot.md'
+// in place of `viewRelPath`; the startsWith assertions go red.
+test('project-create backs up a hand-written project view and gives the shared recovery sentence', () => {
+  withProjectVault(true, (dir) => {
+    mkdirSync(join(dir, 'projects', 'new'), { recursive: true });
+    writeFileSync(join(dir, 'projects', 'new', 'hot.md'), 'my own notes\n');
+    const r = createProject({ hypoDir: dir, name: 'new', workingDir: '/tmp/new' });
+    const backup = join(
+      dir,
+      VIEW_BACKUP_DIR_REL,
+      'projects',
+      'new',
+      'hot.md.pre-projection-backup.md',
+    );
+    assert.equal(readFileSync(backup, 'utf-8'), 'my own notes\n');
+    const sentence = rootHotBackupRecoveryNotice('projects/new/hot.md', backup);
+    const head = '생성 파일 projects/new/hot.md에 ';
+    assert.ok(sentence.startsWith(head), sentence);
+    assert.ok(r.warnings[0]?.startsWith(head), JSON.stringify(r.warnings));
+    assert.ok(sentence.includes('notes.md'), sentence);
+    assert.ok(!sentence.includes('루트'), 'not the root hot.md wording');
+    assert.deepEqual(r.warnings, [sentence]);
+    assert.equal(consumeRootHotHealthNotice(dir), sentence, 'the generator says the same words');
+  });
+});
+
+// A template directory that still holds the old hot.md and session-state.md must not leak them:
+// the generator is the only writer of the two views. If the copy list named hot.md again, the
+// sentinel bytes would land first and the generator would back them up as bytes it did not write.
+test('project-create ignores a hot.md and session-state.md in the template directory (generator is the source)', () => {
+  withProjectVault(true, (dir) => {
+    const tpl = join(dir, '..', `tpl-${process.pid}-${Date.now()}`);
+    try {
+      cpSync(TEMPLATE_DIR, tpl, { recursive: true });
+      writeFileSync(join(tpl, 'hot.md'), 'TEMPLATE-HOT-SENTINEL\n');
+      writeFileSync(join(tpl, 'session-state.md'), 'TEMPLATE-HOT-SENTINEL\n');
+      const r = createProject({
+        hypoDir: dir,
+        name: 'new',
+        workingDir: '/tmp/new',
+        testHooks: { templateDir: tpl },
+      });
+      assert.ok(r.created.includes('projects/new/index.md'), 'the injected template dir is used');
+      const model = loadSessionModel(dir, 'new', { state: 'migrated' });
+      const views = renderViews([model], { device: currentDevice(), only: ['new'] });
+      const hot = readFileSync(join(dir, 'projects', 'new', 'hot.md'), 'utf-8');
+      assert.equal(hot, views.projects.new.hot, 'the bytes are the generator output');
+      assert.ok(!hot.includes('TEMPLATE-HOT-SENTINEL'));
+      // Backups never sit next to the view: they live under the exported backup directory.
+      const backupDir = join(dir, VIEW_BACKUP_DIR_REL, 'projects', 'new');
+      const left = existsSync(backupDir)
+        ? readdirSync(backupDir).filter((f) => f.includes('pre-projection-backup'))
+        : [];
+      assert.deepEqual(left, [], 'the generator met no bytes it did not write');
+      assert.deepEqual(r.warnings, [], 'and so it had nothing to warn about');
+      assert.equal(
+        r.warnings.some((w) => w.includes('template missing: hot.md')),
+        false,
+      );
+    } finally {
+      rmSync(tpl, { recursive: true, force: true });
+    }
   });
 });
 

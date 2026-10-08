@@ -7,17 +7,17 @@
  * CwdChanged auto-project offer. One call materializes a whole project:
  *
  *   1. mkdir projects/<name>/{decisions,session-log}
- *   2. copy templates/projects/_template/*.md with token substitution
+ *   2. copy templates/projects/_template/{index,prd}.md with token substitution
  *        <project-name> → name, <started> → date, <working_dir> → cwd,
  *        YYYY-MM-DD     → today  (frontmatter `updated:` only)
- *   3. regenerate root hot.md's "Active Projects" table via the canonical
- *      projection (writeRootHotProjection, hooks/hypo-shared.mjs), which
- *      picks up this project's own row from the directory scan step 2 just
- *      wrote, never a hand-inserted row. A direct table edit here (the old
- *      insertHotRow) left the ownership hash pointing at whatever a
- *      session's projection write last produced, so the next SessionStart or
- *      Stop read this edit as external and backed it up with a false "손으로
- *      편집한 내용이 있었습니다" alarm on every normal project creation.
+ *   3. regenerate this project's views and root hot.md's "Active Projects"
+ *      table with the view generator (writeGeneratedViews,
+ *      hooks/session-views.mjs), never a hand-inserted row. A direct table
+ *      edit here (the old insertHotRow) left the ownership record pointing at
+ *      whatever the generator last wrote, so the next SessionStart or Stop
+ *      read this edit as external and backed it up with a false "손으로
+ *      편집한 내용이 있었습니다" alarm on every normal project creation. A vault
+ *      that is not migrated to session entries is left as it is.
  *   4. append a `## [today] project-create | <name>` entry to log.md
  *
  * Idempotent: existing files/rows/entries are preserved, never overwritten or
@@ -32,7 +32,8 @@ import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync } from 
 import { join, dirname, resolve, sep } from 'path';
 import { fileURLToPath } from 'url';
 import { resolveHypoRoot, expandHome } from './hypo-root.mjs';
-import { writeRootHotProjection, rootHotBackupRecoveryNotice } from '../../hooks/hypo-shared.mjs';
+import { rootHotBackupRecoveryNotice } from '../../hooks/hypo-shared.mjs';
+import { writeGeneratedViews } from '../../hooks/session-views.mjs';
 
 const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url));
 const PKG_ROOT = join(SCRIPT_DIR, '..', '..');
@@ -42,7 +43,9 @@ const PKG_ROOT = join(SCRIPT_DIR, '..', '..');
 // re-deriving the path.
 export const TEMPLATE_DIR = join(PKG_ROOT, 'templates', 'projects', '_template');
 
-const TEMPLATE_FILES = ['index.md', 'prd.md', 'hot.md', 'session-state.md'];
+// `hot.md` and `session-state.md` are not here: they are generated views. The generator writes them
+// (step 3 below), and a copy placed first would be bytes it did not write.
+const TEMPLATE_FILES = ['index.md', 'prd.md'];
 
 function todayISO() {
   return new Date().toISOString().slice(0, 10);
@@ -70,7 +73,8 @@ export function substituteTokens(content, { name, started, workingDir, today }) 
  * hot.md / log.md is reported in `warnings` rather than thrown, so the core
  * project files still land.
  *
- * @param {{hypoDir: string, name: string, workingDir: string, started?: string, today?: string}} opts
+ * @param {{hypoDir: string, name: string, workingDir: string, started?: string, today?: string, testHooks?: {templateDir?: string}}} opts
+ *   `testHooks.templateDir` replaces the shipped template directory (tests only).
  * @returns {{created: string[], skipped: string[], warnings: string[], projectDir: string}}
  */
 /**
@@ -108,6 +112,7 @@ export function createProject(opts) {
   const today = opts.today || todayISO();
   const started = opts.started || today;
   const vars = { name, started, workingDir, today };
+  const templateDir = opts.testHooks?.templateDir ?? TEMPLATE_DIR;
 
   const created = [];
   const skipped = [];
@@ -127,7 +132,7 @@ export function createProject(opts) {
   }
 
   for (const file of TEMPLATE_FILES) {
-    const src = join(TEMPLATE_DIR, file);
+    const src = join(templateDir, file);
     const dest = join(projectDir, file);
     if (!existsSync(src)) {
       warnings.push(`template missing: ${file}`);
@@ -141,39 +146,51 @@ export function createProject(opts) {
     created.push(`projects/${name}/${file}`);
   }
 
-  // root hot.md pointer row: regenerate via the canonical projection (n2 fix,
-  // see this function's own doc comment above) rather than hand-inserting a
-  // row. The directory scan already sees this project's own hot.md, written
-  // by the TEMPLATE_FILES loop above, so the new row lands in the same pass.
-  const hotResult = writeRootHotProjection(hypoDir);
-  if (hotResult.scanError) {
-    warnings.push('root hot.md: projects/ 디렉터리를 읽지 못해 표를 갱신하지 못했습니다');
-  } else if (hotResult.lockTimeout) {
-    // Distinct from the plain "already current" skip below: the row was
-    // never even attempted this run because another session held the vault
-    // lock, not because there was nothing new to write. `warnings` already
-    // carries writeRootHotProjection's own lock-busy message; this label is
-    // what lets a caller reading only `skipped` tell "not created" apart
-    // from "could not check whether it needed creating".
+  // root hot.md pointer row: regenerate through the view generator (n2 fix, see
+  // this function's own doc comment above) rather than hand-inserting a row.
+  // The generator lists the session projects itself, so the new row lands in
+  // the same pass.
+  let views = null;
+  try {
+    views = writeGeneratedViews(hypoDir, { projects: [name] });
+  } catch (err) {
+    skipped.push('hot.md row (views not rendered)');
+    warnings.push(`세션 현황 파일을 만들지 못했습니다: ${err?.message ?? String(err)}`);
+  }
+  if (!views) {
+    // reported just above
+  } else if (views.notMigrated) {
+    // Nothing is rendered in a vault that has not moved to session entries, and the generator
+    // says nothing about it there. Without a reason the caller reads "hot.md row" as "already
+    // current" and goes looking for a row that will not appear.
+    if (views.state === 'not-migrated') {
+      skipped.push('hot.md row (vault not migrated)');
+      warnings.push(
+        '이 저장소는 아직 세션 항목으로 옮기지 않아 세션 현황 파일(루트 hot.md 행 포함)을 만들지 않았습니다. `/hypo:upgrade --migrate-sessions` 뒤에 나타납니다.',
+      );
+    } else {
+      skipped.push(`hot.md row (views not written: ${views.state})`);
+    }
+  } else if (views.lockTimeout) {
+    // Distinct from the plain "already current" skip below: the row was never
+    // even attempted this run because another session held the vault lock, not
+    // because there was nothing new to write. The label is what lets a caller
+    // reading only `skipped` tell "not created" apart from "could not check
+    // whether it needed creating".
     skipped.push('hot.md row (lock timeout)');
-  } else if (hotResult.written) {
+    warnings.push(
+      'root hot.md: 다른 세션이 저장소 잠금을 쥐고 있어 이번에는 갱신하지 않았습니다 (이전 내용을 그대로 둡니다).',
+    );
+  } else if (views.written.includes('hot.md')) {
     created.push('hot.md row');
   } else {
     skipped.push('hot.md row');
   }
-  if (hotResult.warnings.length > 0) warnings.push(...hotResult.warnings);
-  // MAJOR fix (codex 3rd-tier finding 6): a hand-authored root hot.md this
-  // scaffold's own writeRootHotProjection call just backed up never reached
-  // the user at all here. `backedUp`/`backupPath` were read by
-  // SessionStart and the Stop-hook rebuild but silently dropped on this
-  // third writer, the one call site with the least excuse for it (`main`'s
-  // own CLI output prints every entry in `warnings`). Same shared sentence
-  // the other two writers use, so a person who created a project right
-  // after hand-editing root hot.md gets the SAME recovery guidance, not a
-  // silently vanished edit.
-  if (hotResult.backedUp && hotResult.backupPath) {
-    warnings.push(rootHotBackupRecoveryNotice(hotResult.backupPath));
-  }
+  // A view whose unowned bytes the generator just backed up (a person's hand edit)
+  // reaches the caller with the same recovery sentence the hooks use, not just
+  // the generator's health notice for the next SessionStart.
+  for (const b of views?.backedUp ?? [])
+    warnings.push(rootHotBackupRecoveryNotice(b.relPath, b.backupPath));
 
   // log.md entry
   const logPath = join(hypoDir, 'log.md');

@@ -139,7 +139,8 @@ test('resume picks real project over _template fallback (even when _template is 
     );
     // Touch _template/session-state.md to be 1 second newer than foo's.
     const templateSS = join(hypoDir, 'projects', '_template', 'session-state.md');
-    assert.ok(existsSync(templateSS), 'fixture: _template/session-state.md must exist after init');
+    // init no longer ships this file, so the fixture writes the stray one it is about.
+    writeFileSync(templateSS, '---\ntitle: session-state\ntype: session-state\n---\n');
     const fooSS = join(hypoDir, 'projects', 'foo', 'session-state.md');
     const fooMtime = statSync(fooSS).mtimeMs;
     const newer = new Date(fooMtime + 5000);

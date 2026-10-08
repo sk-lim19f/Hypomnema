@@ -51,7 +51,8 @@ import {
   uniqueBakPath,
 } from './lib/git-hooks-dir.mjs';
 import { loadHookInventory } from './lib/hook-inventory.mjs';
-import { formatRootHotProjection } from '../hooks/hypo-shared.mjs';
+import { renderViews, missingBlockLines, GITATTRIBUTES_BLOCK } from '../hooks/session-entries.mjs';
+import { readGeneratedViewsRecord, writeGeneratedViewsRecord } from '../hooks/hypo-shared.mjs';
 import {
   readPkgJson as readPkgJsonSafe,
   writePkgJsonAtomic,
@@ -304,11 +305,11 @@ function copyTemplate(srcName, destPath, dryRun, transform) {
   log('created', destPath);
 }
 
-// Root hot.md is generated, not copied. The hooks rebuild it from
-// projects/*/hot.md with formatRootHotProjection, and the first rebuild in a new
-// vault treats any bytes it did not produce as a hand edit (backup file plus a
-// notice). A templates/hot.md kept equal to the generator by hand was a second
-// copy of that body, and every edit to the generator had to be mirrored into it.
+// Root hot.md is generated, not copied. The hooks rebuild it from the session
+// entries with renderViews, and the first rebuild in a new vault treats any
+// bytes it did not produce as a hand edit (backup file plus a notice). A
+// templates/hot.md kept equal to the generator by hand was a second copy of
+// that body, and every edit to the generator had to be mirrored into it.
 // Writing the generator's own empty-vault output here leaves one body.
 function writeRootHot(hypoDir, dryRun) {
   const dest = join(hypoDir, 'hot.md');
@@ -316,7 +317,15 @@ function writeRootHot(hypoDir, dryRun) {
     log('skipped', dest);
     return;
   }
-  if (!dryRun) writeFileSync(dest, formatRootHotProjection([]));
+  if (!dryRun) {
+    const text = renderViews([]).root;
+    writeFileSync(dest, text);
+    // Record that the generator wrote these bytes, or the first project-create backs up its own
+    // output as a hand edit.
+    const { views } = readGeneratedViewsRecord(hypoDir);
+    views['hot.md'] = createHash('sha256').update(text, 'utf-8').digest('hex');
+    writeGeneratedViewsRecord(hypoDir, views);
+  }
   log('created', dest);
 }
 
@@ -380,6 +389,30 @@ function writeGitignore(hypoDir, dryRun) {
   const content = existsSync(src) ? readFileSync(src, 'utf-8') : '.cache/\n';
   if (!dryRun) writeFileSync(dest, content);
   log('created', dest);
+}
+
+// ── .gitattributes ───────────────────────────────────────────────────────────
+
+// The block is `templates/gitattributes` (a test pins it to GITATTRIBUTES_BLOCK). A vault that
+// already has a `.gitattributes` keeps every line it has: the block goes after them, and only when
+// its first line is not there yet (`missingBlockLines` is the judgment the migration state uses).
+function writeGitattributes(hypoDir, dryRun) {
+  const dest = join(hypoDir, '.gitattributes');
+  const src = join(TEMPLATES, 'gitattributes');
+  const block = existsSync(src) ? readFileSync(src, 'utf-8') : GITATTRIBUTES_BLOCK;
+  if (!existsSync(dest)) {
+    if (!dryRun) writeFileSync(dest, block);
+    log('created', dest);
+    return;
+  }
+  const have = readFileSync(dest, 'utf-8');
+  if (missingBlockLines(have, block) !== null) {
+    log('skipped', dest);
+    return;
+  }
+  if (!dryRun)
+    writeFileSync(dest, `${have}${have === '' || have.endsWith('\n') ? '' : '\n'}${block}`);
+  log('merged', dest);
 }
 
 // ── hook installation ────────────────────────────────────────────────────────
@@ -1131,11 +1164,6 @@ if (args.fromRemote) {
   ensureDir(join(args.hypoDir, 'projects', '_template', 'decisions'), args.dryRun);
   ensureDir(join(args.hypoDir, 'projects', '_template', 'session-log'), args.dryRun);
   copyTemplate(
-    join('projects', '_template', 'hot.md'),
-    join(args.hypoDir, 'projects', '_template', 'hot.md'),
-    args.dryRun,
-  );
-  copyTemplate(
     join('projects', '_template', 'index.md'),
     join(args.hypoDir, 'projects', '_template', 'index.md'),
     args.dryRun,
@@ -1145,17 +1173,13 @@ if (args.fromRemote) {
     join(args.hypoDir, 'projects', '_template', 'prd.md'),
     args.dryRun,
   );
-  copyTemplate(
-    join('projects', '_template', 'session-state.md'),
-    join(args.hypoDir, 'projects', '_template', 'session-state.md'),
-    args.dryRun,
-  );
 
   // 3. hypo-config.md + .hypoignore + .hyposcanignore + .gitignore
   writeHypoConfig(args.hypoDir, args.dryRun);
   writeWikiignore(args.hypoDir, args.dryRun);
   writeScanIgnore(args.hypoDir, args.dryRun);
   writeGitignore(args.hypoDir, args.dryRun);
+  writeGitattributes(args.hypoDir, args.dryRun);
 }
 
 // 4. hooks
