@@ -5141,6 +5141,51 @@ test('a resume that finds the record naming a backup that is gone keeps the reco
   });
 });
 
+// One archived view is shared and another one's backup is gone: the kept record holds the missing
+// one only, not the view that is already a baseline. Disabling: in `resumePullArchive` delete the
+// `writePullArchive(hypoDir, { ...rec, views: shared.unresolved });` call in the `lost` branch. The
+// record-views assertion goes red.
+test('a resume with one backup gone and another view shared keeps only the missing member in the record', () => {
+  withCatchUp(({ b }) => {
+    put(b, 'projects/p/hot.md', W1);
+    const r = clear(b);
+    assert.equal(r.ok, true, JSON.stringify(r));
+    assert.equal(ffTo(b), 0);
+    const recordPath = join(b, '.cache/pull-archive.json');
+    const rec = JSON.parse(readFileSync(recordPath, 'utf-8'));
+    const [missing] = rec.views;
+    unlinkSync(missing.backupPath);
+    const goodPath = join(b, '.cache', 'second-run-hot.md');
+    writeFileSync(goodPath, W2);
+    const good = { ...missing, backupPath: goodPath, sha256: sha(W2), run: (missing.run ?? 0) + 1 };
+    writeFileSync(recordPath, JSON.stringify({ ...rec, views: [missing, good] }));
+
+    const first = resumePullArchive(b);
+    assert.equal(first.resumed, true);
+    assert.equal(first.created.length, 1, `the other view is shared: ${first.notices.join('\n')}`);
+    assert.ok(
+      first.notices.some((n) => n.includes(missing.backupPath)),
+      first.notices.join('\n'),
+    );
+    const kept = JSON.parse(readFileSync(recordPath, 'utf-8'));
+    assert.deepEqual(
+      kept.views.map((v) => v.backupPath),
+      [missing.backupPath],
+      'only the unresolved member stays',
+    );
+
+    // The next resume still reports the missing one and shares nothing twice.
+    const second = resumePullArchive(b);
+    assert.equal(second.resumed, true);
+    assert.deepEqual(second.created, []);
+    assert.ok(
+      second.notices.some((n) => n.includes(missing.backupPath)),
+      second.notices.join('\n'),
+    );
+    assert.equal(existsSync(recordPath), true, 'the record stays until the member is resolved');
+  });
+});
+
 test('the archive record names a cleared file backup before the file is removed, and a resume after a crash announces it', () => {
   withCatchUp(({ a, b }) => {
     rollbackTarget(a, b);

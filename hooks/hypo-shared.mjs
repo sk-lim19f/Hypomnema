@@ -2976,6 +2976,14 @@ export function resumePullArchive(hypoDir, { announced = [] } = {}) {
     (v) => !existsSync(v.backupPath),
   );
   if (lost.length) {
+    // A view that was shared and is in HEAD is done; the kept record holds only the unresolved
+    // ones, as in the branch below. A baseline not in HEAD yet keeps the whole record for a retry.
+    if (
+      shared.unresolved.length < rec.views.length &&
+      shared.created.every((rel) => pathInHead(hypoDir, rel))
+    ) {
+      writePullArchive(hypoDir, { ...rec, views: shared.unresolved });
+    }
     notices.push(
       `보관 기록이 가리키는 백업 파일이 없어 기록을 지우지 않고 남겼습니다: ${lost.map((v) => `${v.relPath} (${v.backupPath})`).join(', ')}. 내용을 확인한 뒤 ${PULL_ARCHIVE_REL}를 직접 지우세요.`,
     );
@@ -6534,25 +6542,28 @@ export function commitWikiChanges(hypoDir, paths) {
   //
   // Only a path whose index blob is still the one journaled before the commit is reset. Any other
   // blob was staged after that by something else (a person's post-commit hook, say) and is theirs:
-  // it stays, and a notice names it. An index that cannot be read resets everything, as before.
+  // it stays, and a notice names it. An index that cannot be read resets nothing: which blob each
+  // path holds is unknown, so a reset could take away someone else's stage. The journal stays, and
+  // the next call's reconcile resets only a path whose index still holds the journaled blob.
   const after = git('ls-files', '-s', '-z', '--', ...commitScope);
+  const indexRead = after.status === 0;
   const indexNow = new Map();
   for (const rec of (after.stdout || '').split('\0')) {
     const m = /^\d+ ([0-9a-f]+) 0\t([\s\S]*)$/.exec(rec);
     if (m) indexNow.set(m[2], m[1]);
   }
-  const resetScope =
-    after.status === 0
-      ? commitScope.filter((p) => (indexNow.get(p) ?? null) === (added.get(p) ?? null))
-      : commitScope;
-  const kept = commitScope.filter((p) => !resetScope.includes(p));
+  const resetScope = indexRead
+    ? commitScope.filter((p) => (indexNow.get(p) ?? null) === (added.get(p) ?? null))
+    : [];
+  const kept = indexRead ? commitScope.filter((p) => !resetScope.includes(p)) : [];
   const sync =
     resetScope.length > 0 ? git('reset', '-q', 'HEAD', '--', ...resetScope) : { status: 0 };
   dropAutoStagedBlobs(hypoDir, commitScope);
   // The reset brought these paths to HEAD, which also settles an older entry for the same path.
-  if (sync.status === 0 && headKnown) dropIndexJournal(hypoDir, [...added.keys()]);
-  const ownWarning =
-    sync.status === 0
+  if (indexRead && sync.status === 0 && headKnown) dropIndexJournal(hypoDir, [...added.keys()]);
+  const ownWarning = !indexRead
+    ? `the index of the committed paths could not be read after the commit (${(after.stderr || '').trim() || 'unknown'}); nothing was reset, and the next commit call finishes it`
+    : sync.status === 0
       ? undefined
       : `the index of the committed paths was not brought to HEAD (${(sync.stderr || '').trim() || 'unknown'}); run \`git reset -q HEAD -- ${resetScope.map(shellQuote).join(' ')}\` before any plain git commit`;
   const keptWarning = noticeStagedAfterCommit(hypoDir, git, kept);

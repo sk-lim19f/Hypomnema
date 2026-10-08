@@ -5163,6 +5163,76 @@ test('ISSUE-198: a blob a post-commit hook staged is left in the index and named
   });
 });
 
+// The same post-commit hook, but the read of the index after the commit fails once (a git on PATH
+// that fails only the first `ls-files -s -z --` after the hook has run). Which blob each path holds
+// is then unknown, so nothing is reset: the hook's stage survives, the journal entry stays, and the
+// warning names the failed read. The next call, with the read working, sees that the index blob is
+// not the journaled one, leaves it, and drops the entry.
+// Disabling: in `commitWikiChanges` change the `: [];` after the `resetScope` filter to
+// `: commitScope;`. The staged-bytes assertion goes red.
+test('ISSUE-198: a failed index read after the commit resets nothing, keeps the journal, and the next call leaves a hook-staged blob alone', () => {
+  withSyncedWiki((dir) => {
+    withTmpDir((bin) => {
+      const rel = 'read-fails.md';
+      writeFileSync(join(dir, rel), 'committed\n');
+      assert.equal(commitWikiChanges(dir, [rel]).committed, true);
+      appendFileSync(join(dir, rel), 'this close\n');
+      const real = spawnSync('which', ['git'], { encoding: 'utf-8' }).stdout.trim();
+      const flag = join(bin, 'hook-ran');
+      const wrapper = join(bin, 'git');
+      writeFileSync(
+        wrapper,
+        `#!/bin/sh\nif [ -f '${flag}' ]; then\n  case " $* " in\n    *" ls-files -s -z -- "*) rm -f '${flag}'; echo 'simulated ls-files failure' >&2; exit 1;; esac\nfi\nexec '${real}' "$@"\n`,
+      );
+      chmodSync(wrapper, 0o755);
+      const savedPath = process.env.PATH;
+      let res;
+      try {
+        process.env.PATH = `${bin}:${savedPath}`;
+        withPostCommitHook(
+          dir,
+          `blob=$(printf 'bytes only in the index\\n' | git hash-object -w --stdin)\ngit update-index --cacheinfo "100644,$blob,${rel}"\n: > '${flag}'`,
+          () => {
+            res = commitWikiChanges(dir, [rel]);
+          },
+        );
+      } finally {
+        process.env.PATH = savedPath;
+      }
+      assert.equal(res.committed, true, JSON.stringify(res));
+      assert.deepEqual(res.committedPaths, [rel]);
+      assert.match(
+        res.indexWarning ?? '',
+        /could not be read after the commit/,
+        JSON.stringify(res),
+      );
+      assert.match(res.indexWarning ?? '', /simulated ls-files failure/, JSON.stringify(res));
+      assert.equal(headText(dir, rel), 'committed\nthis close\n', 'the commit landed');
+      assert.equal(
+        indexBlob(dir, rel),
+        'bytes only in the index\n',
+        'the hook staged bytes survive',
+      );
+      assert.ok(reconcileJournal(dir)[rel], 'the journal entry is kept for the next call');
+
+      // The next call, read working: the hook's blob is not the journaled one, so it stays.
+      writeFileSync(join(dir, 'after-read-fails.md'), 'next\n');
+      const next = commitWikiChanges(dir, ['after-read-fails.md']);
+      assert.equal(next.committed, true, JSON.stringify(next));
+      assert.deepEqual(next.committedPaths, ['after-read-fails.md']);
+      assert.equal(next.indexWarning, undefined, JSON.stringify(next));
+      assert.equal(
+        indexBlob(dir, rel),
+        'bytes only in the index\n',
+        'the later call left it alone',
+      );
+      assert.equal(reconcileJournal(dir)[rel], undefined, 'the entry is settled and dropped');
+      assert.equal(headText(dir, rel), 'committed\nthis close\n', 'HEAD is untouched');
+      assert.equal(readFileSync(join(dir, rel), 'utf-8'), 'committed\nthis close\n');
+    });
+  });
+});
+
 // The pair: with nothing staged after the commit the same call still brings the path to HEAD and
 // leaves no notice, so the check above is not "never reset".
 test('ISSUE-198: without a stage made after the commit the path is reset to HEAD and no notice is left', () => {
