@@ -18,6 +18,7 @@ import {
   lstatSync,
   chmodSync,
   cpSync,
+  realpathSync,
 } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { join } from 'node:path';
@@ -1885,25 +1886,21 @@ for (const [form, handLine] of [
   });
 }
 
-test('feedback-sync-bootstrap-record-failure-is-a-warning: an unwritable line record does not abort bootstrap', () => {
+test('feedback-sync-bootstrap-record-failure-stops-before-any-draft: an unwritable line record fails bootstrap with exit 1 and the JSON error body names it', () => {
   const memoryMd = `# Memory Index\n${FB_HAND_COLON}\n`;
   withFeedbackEnv(
     {},
     ({ wiki, runFb }) => {
-      // a directory where the record file should be makes its rename throw; the drafts,
-      // beside it under .cache/, are still written
+      // a directory where the record file should be makes its rename throw
       mkdirSync(fbHandRecord(wiki), { recursive: true });
       const r = runFb(['--bootstrap']);
-      assert.equal(r.status, 0, r.stderr);
-      assert.ok(existsSync(join(fbDraftsDir(wiki), 'rule-b.md')), 'drafted');
-      assert.match(r.stderr, /could not record hand lines; they will not be removed on promotion/);
-      rmSync(join(fbDraftsDir(wiki), 'rule-b.md'));
+      assert.equal(r.status, 1, r.stderr);
+      assert.match(r.stderr, /no draft was written: cannot record the hand lines/);
+      assert.ok(!existsSync(join(fbDraftsDir(wiki), 'rule-b.md')), 'nothing was drafted');
       const j = runFb(['--bootstrap', '--json']);
-      assert.equal(j.status, 0, j.stderr);
-      assert.ok(
-        (JSON.parse(j.stdout).warnings || []).some((w) => /could not record hand lines/.test(w)),
-        'the --json report carries the same warning',
-      );
+      assert.equal(j.status, 1, j.stderr);
+      assert.match(JSON.parse(j.stdout).error, /cannot record the hand lines/);
+      assert.deepEqual(JSON.parse(j.stdout).created, []);
     },
     { memoryMd },
   );
@@ -2472,7 +2469,7 @@ STDOUT
 STDERR
 [feedback-sync] created draft: .cache/feedback-drafts/legacy-claude-20260501-legacy-rule-one.md (claude-learned)
 [feedback-sync] created draft: .cache/feedback-drafts/loose-y.md (memory-index)
-[feedback-sync] bootstrap: 2 created, 0 skipped. Fill scope/tier/sensitivity/targets/promote_to_global and move into pages/feedback/. The drafts are in .cache/feedback-drafts/: not synced to other machines, and kept out of git when the vault is a git work tree (feedback-sync checked that git ignores .cache/).
+[feedback-sync] bootstrap: 2 created, 0 skipped. Fill scope/tier/sensitivity/targets/promote_to_global and move into pages/feedback/. The drafts are in .cache/feedback-drafts/: not synced to other machines, and kept out of git (in a git work tree feedback-sync checked that git ignores .cache/; in a vault that is not one it made sure the .gitignore does).
 
 ### FILE CLAUDE.md
 # Global
@@ -2786,10 +2783,10 @@ test('doctor names --ensure-container and the exact path for a build-failed targ
 // goes through tmp+rename now.
 suite('feedback-sync.mjs — atomic writes + symlink safety (BLOCKER 1)');
 
-test('--ensure-container writes via tmp+rename (the target inode CHANGES, no tmp left behind)', () => {
-  // The direct, unfakeable signature of tmp+rename: rename(2) swaps a NEW inode
-  // into the path. An in-place writeFileSync keeps the old inode. Turn atomicWrite
-  // back into writeFileSync and this assertion goes red immediately.
+test('--ensure-container appends in place (same inode, every existing byte first, no tmp file)', () => {
+  // The design changed from a tmp+rename rewrite to one append-mode write: a rename from bytes
+  // read earlier replaces an editor save that landed in between, an append cannot. The
+  // unfakeable signature is the inode staying put; atomicWrite would swap a new one in.
   if (process.platform === 'win32') return;
   withFeedbackEnv(
     {},
@@ -2801,11 +2798,11 @@ test('--ensure-container writes via tmp+rename (the target inode CHANGES, no tmp
       assert.equal(runFb(['--ensure-container']).status, 0);
       const after = readFileSync(claudeMdPath, 'utf-8');
       assert.ok(after.startsWith(before), 'every existing byte must survive verbatim');
-      assert.notEqual(
-        statSync(claudeMdPath).ino,
-        inoBefore,
-        'a tmp+rename write replaces the inode; an in-place overwrite would keep it',
+      assert.ok(
+        after.includes('<learned_behaviors>\n</learned_behaviors>\n'),
+        'and the pair is there',
       );
+      assert.equal(statSync(claudeMdPath).ino, inoBefore, 'an append keeps the inode');
       assert.deepEqual(
         readdirSync(claudeHome).filter((f) => f.endsWith('.tmp')),
         [],
@@ -2838,10 +2835,8 @@ test('--write writes the projection via tmp+rename too (inode changes, content c
 });
 
 test('--ensure-container: a FAILED write leaves the original file byte-identical', () => {
-  // The whole point of tmp+rename. The tmp write fails (read-only directory), so
-  // the rename never runs and the target keeps every byte it had. The old
-  // writeFileSync path would have opened the EXISTING file for writing (the
-  // directory mode does not gate that), truncated it, and written the new content.
+  // The append is refused by the file itself now (a read-only file), not by an unwritable
+  // directory: no tmp file is made, so the directory mode no longer gates anything.
   if ((process.getuid && process.getuid() === 0) || process.platform === 'win32') return;
   withFeedbackEnv(
     {},
@@ -2849,17 +2844,14 @@ test('--ensure-container: a FAILED write leaves the original file byte-identical
       const claudeMdPath = join(claudeHome, 'CLAUDE.md');
       const before = '# Global\n\nIrreplaceable hand-written prose.\n';
       writeFileSync(claudeMdPath, before);
-      chmodSync(claudeHome, 0o500); // dir not writable → the tmp file cannot be created
+      chmodSync(claudeMdPath, 0o400);
       try {
         const r = runFb(['--ensure-container']);
         assert.notEqual(r.status, 0, 'a write that cannot complete must fail loudly');
-        assert.equal(
-          readFileSync(claudeMdPath, 'utf-8'),
-          before,
-          'a failed atomic write must not have touched the original file',
-        );
+        assert.match(r.stderr, /cannot write .*CLAUDE\.md/);
+        assert.equal(readFileSync(claudeMdPath, 'utf-8'), before, 'the file is untouched');
       } finally {
-        chmodSync(claudeHome, 0o700);
+        chmodSync(claudeMdPath, 0o600);
       }
     },
     { claudeMd: '# placeholder' },
@@ -3254,9 +3246,12 @@ test('doctor WARNS (never fails) on a side-file permission error and names the p
 
 suite('feedback-sync.mjs — Track B source-loader golden (byte-identical)');
 
+// the vault already ignores .cache/, so the golden does not carry the run's note about adding the rule
+const fbIgnoreCache = (ctx) => writeFileSync(join(ctx.wiki, '.gitignore'), '.cache/\n');
+
 test('feedback-sync-golden-write: check/write loader full output is byte-identical', () => {
   assert.equal(
-    fbGolden({ 'rule-a': FB_GLOBAL_L1, 'rule-b': FB_PROJECT_L2 }, {}, () => {}, ['--write']),
+    fbGolden({ 'rule-a': FB_GLOBAL_L1, 'rule-b': FB_PROJECT_L2 }, {}, fbIgnoreCache, ['--write']),
     FB_GOLDEN_WRITE,
   );
 });
@@ -3266,7 +3261,7 @@ test('feedback-sync-golden-bootstrap: bootstrap loader full output is byte-ident
     '# Global\n<learned_behaviors>\n- [2026-05-01] legacy rule one\n</learned_behaviors>\n';
   const memoryMd = '# Memory Index\n- [Loose Y](feedback_loose_y.md) — legacy hand entry\n';
   assert.equal(
-    fbGolden({ 'rule-a': FB_GLOBAL_L1 }, { claudeMd, memoryMd }, () => {}, ['--bootstrap']),
+    fbGolden({ 'rule-a': FB_GLOBAL_L1 }, { claudeMd, memoryMd }, fbIgnoreCache, ['--bootstrap']),
     FB_GOLDEN_BOOTSTRAP,
   );
 });
@@ -4670,6 +4665,782 @@ test('feedback-sync-draft-write-cut-short-leaves-no-half-draft: a tmp file that 
   );
 });
 
+// a git command in the vault with the session's pinned HOME
+const fbGit = (wiki, ...argv) => {
+  const r = spawnSync('git', ['-C', wiki, ...argv], {
+    encoding: 'utf-8',
+    env: { ...process.env, HOME: SESSION_TMP_HOME },
+  });
+  assert.equal(r.status, 0, r.stderr);
+  return r.stdout;
+};
+const FB_HAND_C = '- [Rule C](feedback_rule-c.md): another by hand';
+
+test('feedback-sync-non-git-vault-gets-a-cache-rule-before-it-writes: a draft, the line record and a kept copy are not staged by a later git init and git add -A', () => {
+  const memoryMd = `# Memory Index\n${FB_HAND_COLON}\n`;
+  withFeedbackEnv(
+    {},
+    ({ wiki, runFb }) => {
+      assert.ok(!existsSync(join(wiki, '.git')), 'precondition: not a repository');
+      assert.ok(!existsSync(join(wiki, '.gitignore')), 'precondition: no .gitignore');
+      const r = runFb(['--bootstrap', '--json']);
+      assert.equal(r.status, 0, r.stderr);
+      assert.deepEqual(
+        JSON.parse(r.stdout).created.map((c) => c.slug),
+        ['rule-b'],
+        'the success signal: the draft was made',
+      );
+      assert.ok(existsSync(join(fbDraftsDir(wiki), 'rule-b.md')));
+      assert.ok(existsSync(fbHandRecord(wiki)));
+      assert.equal(readFileSync(join(wiki, '.gitignore'), 'utf-8'), '.cache/\n');
+      // a kept copy: promote the draft, then --write removes the hand line and keeps it
+      fbPromoteB(wiki);
+      const w = runFb(['--write', '--json']);
+      assert.equal(w.status, 0, w.stderr);
+      assert.ok(JSON.parse(w.stdout).targets.memory.handRemovedCopy, 'the removed line was kept');
+      // what a killed run leaves: a temp file beside the draft and beside the record
+      writeFileSync(join(fbDraftsDir(wiki), '.rule-c.md.123.abcd1234.tmp'), 'half a draft');
+      writeFileSync(join(wiki, '.cache', '.feedback-bootstrap-lines.json.123.abcd1234.tmp'), '{');
+      assert.ok(readdirSync(fbKeptDir(wiki)).length > 0, 'precondition: a kept copy exists');
+      fbGit(wiki, 'init', '-q');
+      fbGit(wiki, 'add', '-A');
+      const staged = fbGit(wiki, 'diff', '--cached', '--name-only').split('\n').filter(Boolean);
+      assert.ok(staged.includes('.gitignore'), `the rule file itself is staged: ${staged}`);
+      assert.deepEqual(
+        staged.filter((f) => f.startsWith('.cache/')),
+        [],
+        `nothing under .cache/ is staged: ${staged}`,
+      );
+    },
+    { memoryMd },
+  );
+});
+
+test('feedback-sync-cache-rule-is-appended-never-rewritten: existing .gitignore lines stay byte for byte, a second run adds nothing, and a dry run or a git vault is left alone', () => {
+  const memoryMd = `# Memory Index\n${FB_HAND_COLON}\n`;
+  withFeedbackEnv(
+    {},
+    ({ wiki, runFb }) => {
+      const mine = '# mine\nnode_modules/\n*.log'; // no trailing newline on purpose
+      writeFileSync(join(wiki, '.gitignore'), mine);
+      assert.equal(runFb(['--bootstrap', '--dry-run']).status, 0);
+      assert.equal(
+        readFileSync(join(wiki, '.gitignore'), 'utf-8'),
+        mine,
+        'a dry run writes nothing',
+      );
+      assert.equal(runFb(['--bootstrap']).status, 0);
+      const after = readFileSync(join(wiki, '.gitignore'), 'utf-8');
+      assert.equal(after, `${mine}\n.cache/\n`);
+      rmSync(join(fbDraftsDir(wiki), 'rule-b.md'));
+      assert.equal(runFb(['--bootstrap']).status, 0);
+      assert.equal(readFileSync(join(wiki, '.gitignore'), 'utf-8'), after, 'idempotent');
+    },
+    { memoryMd },
+  );
+  // a git vault whose .gitignore lacks the rule is still refused, and its file is not touched
+  withFeedbackEnv(
+    {},
+    ({ wiki, runFb }) => {
+      fbGitInit(wiki, 'node_modules/\n');
+      const r = runFb(['--bootstrap']);
+      assert.equal(r.status, 1, r.stderr);
+      assert.match(r.stderr, /not ignored by the vault's git/);
+      assert.equal(readFileSync(join(wiki, '.gitignore'), 'utf-8'), 'node_modules/\n');
+    },
+    { memoryMd },
+  );
+  // a .gitignore that cannot be written refuses the draft instead of writing it unprotected
+  withFeedbackEnv(
+    {},
+    ({ wiki, runFb }) => {
+      mkdirSync(join(wiki, '.gitignore'));
+      const r = runFb(['--bootstrap']);
+      assert.equal(r.status, 1, r.stderr);
+      assert.match(
+        r.stderr,
+        /no draft was written: could not add \.cache\/ to the vault's \.gitignore/,
+      );
+      assert.ok(!existsSync(fbDraftsDir(wiki)), 'no draft');
+      assert.ok(!existsSync(fbHandRecord(wiki)), 'no record');
+    },
+    { memoryMd },
+  );
+});
+
+test('feedback-sync-symlinked-gitignore-is-refused-before-any-append: it stays a link, its target and mode are untouched, and nothing is written (git does not read a symlinked .gitignore)', () => {
+  if (process.platform === 'win32') return;
+  withFeedbackEnv(
+    {},
+    ({ base, wiki, runFb }) => {
+      const real = join(base, 'dotfiles-gitignore');
+      writeFileSync(real, 'node_modules/\n');
+      chmodSync(real, 0o640);
+      symlinkSync(real, join(wiki, '.gitignore'));
+      // git (2.32 and later) does not follow a symlinked .gitignore: a later git init would not
+      // read the rule, so the run is refused and nothing is appended through the link
+      const r = runFb(['--bootstrap']);
+      assert.equal(r.status, 1, r.stderr);
+      assert.match(r.stderr, /would still be staged/);
+      assert.ok(!existsSync(join(wiki, '.cache')), 'nothing was written under .cache/');
+      assert.ok(lstatSync(join(wiki, '.gitignore')).isSymbolicLink(), 'still a symlink');
+      assert.equal(readFileSync(real, 'utf-8'), 'node_modules/\n', 'link target unchanged');
+      assert.equal(statSync(real).mode & 0o777, 0o640, 'mode unchanged');
+    },
+    { memoryMd: `# Memory Index\n${FB_HAND_COLON}\n` },
+  );
+});
+
+test('feedback-sync-cache-rule-is-announced-once: the run that adds the rule says so in its text and JSON warnings, the next run does not', () => {
+  withFeedbackEnv(
+    {},
+    ({ wiki, runFb }) => {
+      const first = runFb(['--bootstrap', '--json']);
+      assert.equal(first.status, 0, first.stderr);
+      const warned = JSON.parse(first.stdout).warnings || [];
+      assert.equal(warned.filter((w) => /^added \.cache\/ to .*\.gitignore/.test(w)).length, 1);
+      rmSync(join(fbDraftsDir(wiki), 'rule-b.md'));
+      const text = runFb(['--bootstrap']);
+      assert.equal(text.status, 0, text.stderr);
+      assert.doesNotMatch(text.stderr, /added \.cache\//, 'already there: nothing to announce');
+    },
+    { memoryMd: `# Memory Index\n${FB_HAND_COLON}\n` },
+  );
+  withFeedbackEnv(
+    {},
+    ({ runFb }) => {
+      const t = runFb(['--bootstrap']);
+      assert.match(t.stderr, /warn: added \.cache\/ to .*\.gitignore/, 'the text mode prints it');
+    },
+    { memoryMd: `# Memory Index\n${FB_HAND_COLON}\n` },
+  );
+});
+
+test('feedback-sync-no-git-binary-still-gets-the-cache-rule: with git not on PATH the rule is added and the draft is written', () => {
+  withFeedbackEnv(
+    {},
+    (ctx) => {
+      const { wiki, base } = ctx;
+      const empty = join(base, 'no-bin');
+      mkdirSync(empty);
+      const was = process.env.PATH;
+      process.env.PATH = empty;
+      let out;
+      try {
+        out = fbInProcess(ctx, ['--bootstrap']);
+      } finally {
+        process.env.PATH = was;
+      }
+      assert.equal(out.code, 0, out.error);
+      assert.deepEqual(
+        out.report.created.map((c) => c.slug),
+        ['rule-b'],
+      );
+      assert.equal(readFileSync(join(wiki, '.gitignore'), 'utf-8'), '.cache/\n');
+    },
+    { memoryMd: `# Memory Index\n${FB_HAND_COLON}\n` },
+  );
+});
+
+// the script run with git hidden from it (an empty PATH), restoring PATH afterwards
+const fbWithoutGit = (ctx, flags) => {
+  const empty = join(ctx.base, 'no-bin');
+  mkdirSync(empty, { recursive: true });
+  const was = process.env.PATH;
+  process.env.PATH = empty;
+  try {
+    return fbInProcess(ctx, flags);
+  } finally {
+    process.env.PATH = was;
+  }
+};
+
+test('feedback-sync-no-git-binary-makes-the-last-cache-line-the-rule: a !.cache/ exception gets a plain .cache/ appended after it, and a later git init stages nothing under .cache/', () => {
+  const memoryMd = `# Memory Index\n${FB_HAND_COLON}\n`;
+  for (const [mine, expected] of [
+    ['.cache/\n!.cache/\n', '.cache/\n!.cache/\n.cache/\n'],
+    ['.cache/\n!/.cache/foo', '.cache/\n!/.cache/foo\n.cache/\n'],
+    ['.cache\n', '.cache\n.cache/\n'],
+    ['!.cache/\n.cache/\n', '!.cache/\n.cache/\n'],
+  ]) {
+    withFeedbackEnv(
+      {},
+      (ctx) => {
+        const { wiki } = ctx;
+        writeFileSync(join(wiki, '.gitignore'), mine);
+        const out = fbWithoutGit(ctx, ['--bootstrap']);
+        assert.equal(out.code, 0, out.error);
+        assert.deepEqual(
+          out.report.created.map((c) => c.slug),
+          ['rule-b'],
+          'the success signal: the draft was made',
+        );
+        assert.equal(readFileSync(join(wiki, '.gitignore'), 'utf-8'), expected);
+        assert.ok(
+          out.warnings.some((w) => /whether the rule takes effect was not checked/.test(w)) ||
+            mine === expected,
+          'the unverified note stays when a rule was added',
+        );
+        fbGit(wiki, 'init', '-q');
+        fbGit(wiki, 'add', '-A');
+        assert.deepEqual(
+          fbGit(wiki, 'diff', '--cached', '--name-only')
+            .split('\n')
+            .filter((f) => f.startsWith('.cache/')),
+          [],
+          `nothing under .cache/ is staged for ${JSON.stringify(mine)}`,
+        );
+      },
+      { memoryMd },
+    );
+  }
+});
+
+test('feedback-sync-no-git-binary-refuses-a-symlinked-gitignore-before-appending: the link target is unchanged and no draft is written', () => {
+  if (process.platform === 'win32') return;
+  withFeedbackEnv(
+    {},
+    (ctx) => {
+      const { base, wiki } = ctx;
+      const real = join(base, 'dotfiles-gitignore');
+      writeFileSync(real, 'node_modules/\n');
+      symlinkSync(real, join(wiki, '.gitignore'));
+      const out = fbWithoutGit(ctx, ['--bootstrap']);
+      assert.equal(out.code, 1);
+      assert.match(out.error, /would still be staged/);
+      assert.equal(readFileSync(real, 'utf-8'), 'node_modules/\n');
+      assert.ok(!existsSync(join(wiki, '.cache')), 'nothing was written under .cache/');
+    },
+    { memoryMd: `# Memory Index\n${FB_HAND_COLON}\n` },
+  );
+});
+
+test('feedback-sync-rollback-keeps-what-another-bootstrap-recorded: a winner that took the name and recorded its lines is not erased by this run', () => {
+  withFeedbackEnv(
+    {},
+    (ctx) => {
+      const { wiki } = ctx;
+      const winnerLine = (slug) => ({
+        slug,
+        target: 'memory',
+        file: join(ctx.claudeHome, 'projects', 'proj', 'memory', 'MEMORY.md'),
+        line: `- [${slug}](feedback_${slug}.md): theirs`,
+        section: '',
+      });
+      const out = fbInProcess(ctx, ['--bootstrap'], {
+        // another run drafts rule-b first (a real bootstrap draft) and records it, plus its own other line
+        beforePublish: (tmp, file) => {
+          mkdirSync(fbDraftsDir(wiki), { recursive: true });
+          writeFileSync(file, '<!-- HYPO:FEEDBACK-SYNC:DRAFT origin=memory-index -->\nTHEIRS\n');
+          writeFileSync(
+            fbHandRecord(wiki),
+            JSON.stringify({ version: 1, lines: [winnerLine('rule-b'), winnerLine('rule-w')] }),
+          );
+        },
+      });
+      assert.equal(out.code, 0, out.error);
+      assert.deepEqual(out.report.created, []);
+      const slugs = JSON.parse(readFileSync(fbHandRecord(wiki), 'utf-8')).lines.map((l) => l.slug);
+      assert.deepEqual(slugs.sort(), ['rule-b', 'rule-w'], "the winner's entries survive");
+    },
+    { memoryMd: `# Memory Index\n${FB_HAND_COLON}\n` },
+  );
+});
+
+test('feedback-sync-record-is-written-before-the-draft-is-published: a run that dies after the draft appears has already recorded the hand line, and promotion removes it', () => {
+  const memoryMd = `# Memory Index\n${FB_HAND_COLON}\n`;
+  withFeedbackEnv(
+    {},
+    (ctx) => {
+      const { wiki, memDir, runFb } = ctx;
+      let atPublish = null;
+      const out = fbInProcess(ctx, ['--bootstrap'], {
+        beforePublish: () => {
+          atPublish = existsSync(fbHandRecord(wiki))
+            ? readFileSync(fbHandRecord(wiki), 'utf-8')
+            : null;
+        },
+      });
+      assert.equal(out.code, 0, out.error);
+      assert.ok(atPublish, 'the record is on disk when the draft is linked into place');
+      assert.equal(JSON.parse(atPublish).lines[0].slug, 'rule-b');
+      assert.equal(
+        readFileSync(fbHandRecord(wiki), 'utf-8'),
+        atPublish,
+        'and the run did not change it afterwards',
+      );
+      // the state a kill right after the record leaves: record there, draft not
+      rmSync(join(fbDraftsDir(wiki), 'rule-b.md'));
+      const again = fbInProcess(ctx, ['--bootstrap']);
+      assert.equal(again.code, 0, again.error);
+      assert.deepEqual(
+        again.report.created.map((c) => c.slug),
+        ['rule-b'],
+      );
+      fbPromoteB(wiki);
+      assert.equal(runFb(['--write']).status, 0);
+      assert.deepEqual(fbBLines(memDir), [FB_MANAGED_B], 'the hand line is removed on promotion');
+      // a draft that was published before the record existed (the old order's crash state) is
+      // no longer reachable, but the pairing it left is: a draft with no record is skipped
+      // as draft-exists and its hand line stays, which is exactly what the new order prevents
+    },
+    { memoryMd },
+  );
+});
+
+const FB_LONG_NAME = 'x'.repeat(240);
+test('feedback-sync-failed-bootstrap-names-the-drafts-it-made: the text error lists the draft made before the failure and, on a re-run, the one that was already there', () => {
+  const memoryMd = `# Memory Index\n${FB_HAND_COLON}\n- [Long](feedback_${FB_LONG_NAME}.md): long one\n`;
+  withFeedbackEnv(
+    {},
+    ({ wiki, runFb }) => {
+      // the second draft's temp file name is longer than the file system allows
+      const first = runFb(['--bootstrap']);
+      assert.equal(first.status, 1, first.stderr);
+      assert.match(first.stderr, /created draft: \.cache\/feedback-drafts\/rule-b\.md/);
+      assert.match(first.stderr, /cannot write the draft .*ENAMETOOLONG/);
+      const again = runFb(['--bootstrap']);
+      assert.equal(again.status, 1, again.stderr);
+      assert.match(again.stderr, /draft already there: \.cache\/feedback-drafts\/rule-b\.md/);
+      assert.match(again.stderr, /cannot write the draft .*ENAMETOOLONG/);
+      assert.ok(existsSync(join(fbDraftsDir(wiki), 'rule-b.md')));
+    },
+    { memoryMd },
+  );
+});
+
+test('feedback-sync-failed-write-reports-the-target-it-already-wrote: MEMORY.md was replaced and CLAUDE.md could not be, and both the JSON and the text say so', () => {
+  if ((process.getuid && process.getuid() === 0) || process.platform === 'win32') return;
+  withFeedbackEnv({ 'rule-a': FB_GLOBAL_L1 }, ({ claudeHome, memDir, runFb }) => {
+    // CLAUDE.md sits in the claude home, MEMORY.md two levels down: only the first is unwritable
+    const memBefore = readFileSync(join(memDir, 'MEMORY.md'), 'utf-8');
+    chmodSync(claudeHome, 0o500);
+    try {
+      const t = runFb(['--write']);
+      assert.equal(t.status, 1, t.stderr);
+      assert.match(t.stderr, /already written before the failure: .*MEMORY\.md/);
+      // MEMORY.md is stale again, so the next run replaces it once more before CLAUDE.md fails
+      writeFileSync(join(memDir, 'MEMORY.md'), memBefore);
+      const j = runFb(['--write', '--json']);
+      assert.equal(j.status, 1, j.stderr);
+      const body = JSON.parse(j.stdout);
+      assert.match(body.error, /cannot write .*CLAUDE\.md/);
+      assert.deepEqual(body.written, [{ target: 'memory', file: join(memDir, 'MEMORY.md') }]);
+      assert.match(readFileSync(join(memDir, 'MEMORY.md'), 'utf-8'), /HYPO:FEEDBACK-SYNC:START/);
+    } finally {
+      chmodSync(claudeHome, 0o700);
+    }
+  });
+});
+
+test('feedback-sync-failed-write-lists-the-side-files-of-a-target-it-completed: a side-only change names the side files it replaced and not the unchanged MEMORY.md', () => {
+  if ((process.getuid && process.getuid() === 0) || process.platform === 'win32') return;
+  withFeedbackEnv(
+    { 'rule-a': FB_GLOBAL_L1, 'rule-b': FB_PROJECT_L2 },
+    ({ wiki, claudeHome, memDir, runFb }) => {
+      assert.equal(runFb(['--write']).status, 0, 'precondition: everything is synced');
+      const side = join(memDir, 'feedback_rule-b.md');
+      assert.ok(existsSync(side), 'precondition: the side file exists');
+      // MEMORY.md stays as it is, its side file is gone, and CLAUDE.md has drifted
+      rmSync(side);
+      writeFileSync(
+        join(wiki, 'pages', 'feedback', 'rule-a.md'),
+        fbPage({ ...FB_GLOBAL_L1, global_summary: 'always do A, changed' }),
+      );
+      chmodSync(claudeHome, 0o500);
+      try {
+        const j = runFb(['--write', '--json']);
+        assert.equal(j.status, 1, `${j.stdout}${j.stderr}`);
+        const body = JSON.parse(j.stdout);
+        assert.match(body.error, /cannot write .*CLAUDE\.md/);
+        assert.ok(existsSync(side), 'precondition: the side file was written again');
+        // the changed summary also rewrites rule-a's side file: both are listed, MEMORY.md is not
+        assert.deepEqual(body.written, [
+          { target: 'memory', file: join(memDir, 'feedback_rule-a.md') },
+          { target: 'memory', file: side },
+        ]);
+      } finally {
+        chmodSync(claudeHome, 0o700);
+      }
+    },
+  );
+});
+
+// the feedback command's post-step, with a notice an older hook run left behind
+const fbPostStep = ({ wiki, claudeHome }) =>
+  run('feedback.mjs', [
+    '--topic=rule-a',
+    '--entry=one more line.',
+    `--hypo-dir=${wiki}`,
+    `--claude-home=${claudeHome}`,
+    '--project-id=proj',
+  ]);
+const FB_PENDING =
+  'memory: kept the hand-written line in MEMORY.md that bootstrap drafted "rule-b" from';
+// where a machine keeps the notices an unseen write left for this vault: outside the vault,
+// under the claude home's state/, one file per vault
+const fbPendingFile = (claudeHome, wiki) =>
+  join(
+    claudeHome,
+    'state',
+    `feedback-pending-notices-${createHash('sha256').update(realpathSync(wiki)).digest('hex').slice(0, 16)}.json`,
+  );
+const fbSeedPending = (claudeHome, wiki, notices = [FB_PENDING]) => {
+  mkdirSync(join(claudeHome, 'state'), { recursive: true });
+  writeFileSync(fbPendingFile(claudeHome, wiki), JSON.stringify({ version: 1, notices }));
+};
+
+test('feedback-command-post-step-reports-and-clears-pending-notices: exit 0 shows the notice and removes the file, a failed post-step shows it and keeps it', () => {
+  withFeedbackEnv({ 'rule-a': FB_GLOBAL_L1 }, (ctx) => {
+    fbSeedPending(ctx.claudeHome, ctx.wiki);
+    const ok = fbPostStep(ctx);
+    assert.equal(ok.status, 0, ok.stderr);
+    assert.match(ok.stdout, /Projection refreshed/, 'the post-step exited 0');
+    assert.ok(ok.stderr.includes(`⚠ ${FB_PENDING}`), `the notice is shown: ${ok.stderr}`);
+    assert.ok(!existsSync(fbPendingFile(ctx.claudeHome, ctx.wiki)), 'and cleared');
+  });
+  // no container in CLAUDE.md: --write exits 1, a state that lasts until someone fixes it
+  withFeedbackEnv(
+    { 'rule-a': FB_GLOBAL_L1 },
+    (ctx) => {
+      fbSeedPending(ctx.claudeHome, ctx.wiki);
+      const bad = fbPostStep(ctx);
+      assert.equal(bad.status, 0, 'the page itself is saved either way');
+      assert.match(bad.stderr, /did not complete cleanly/, `precondition: the post-step failed`);
+      assert.ok(bad.stderr.includes(`⚠ ${FB_PENDING}`), 'the notice is shown on the failure too');
+      assert.ok(
+        existsSync(fbPendingFile(ctx.claudeHome, ctx.wiki)),
+        'and stays, because nobody was told what to do about it',
+      );
+    },
+    { claudeMd: '# Global\n' },
+  );
+});
+
+// a bootstrap hand line the user then reworded: the next --write keeps it and says so once
+const fbKeptLineSetup = (wiki, memDir) => {
+  const p = join(memDir, 'MEMORY.md');
+  writeFileSync(p, readFileSync(p, 'utf-8').replace('written by hand', 'reworded by hand'));
+  fbPromoteB(wiki);
+};
+const FB_KEPT_NOTICE = /kept the hand-written line in .*MEMORY\.md.*"rule-b"/;
+
+test('feedback-sync-kept-notice-survives-a-run-nobody-sees: an unseen --write keeps it, machine checks leave it, a text --check shows it once and clears it', () => {
+  const memoryMd = `# Memory Index\n${FB_HAND_COLON}\n`;
+  withFeedbackEnv(
+    {},
+    ({ wiki, memDir, claudeHome, runFb }) => {
+      assert.equal(runFb(['--bootstrap']).status, 0);
+      fbKeptLineSetup(wiki, memDir);
+      // what an older PreCompact hook runs: --write --no-input, output thrown away
+      const heal = runFb(['--write', '--no-input']);
+      assert.equal(heal.status, 0, heal.stderr);
+      assert.match(heal.stderr, FB_KEPT_NOTICE, 'the one-shot notice is still printed');
+      assert.ok(!existsSync(fbHandRecord(wiki)), 'and the record behind it is dropped');
+      assert.match(
+        readFileSync(fbPendingFile(claudeHome, wiki), 'utf-8'),
+        /kept the hand-written line/,
+      );
+      // what the gate and doctor run: they read a JSON report for fields they know
+      const gate = runFb(['--check', '--strict', '--no-input', '--json']);
+      assert.equal(gate.status, 0, gate.stderr);
+      assert.equal(JSON.parse(gate.stdout).warnings, undefined, 'not reported to a machine');
+      assert.ok(existsSync(fbPendingFile(claudeHome, wiki)), 'and not cleared by one');
+      // a person runs --check
+      const seen = runFb(['--check']);
+      assert.equal(seen.status, 0, seen.stderr);
+      assert.match(seen.stderr, FB_KEPT_NOTICE);
+      assert.ok(!existsSync(fbPendingFile(claudeHome, wiki)), 'shown, so cleared');
+      assert.doesNotMatch(runFb(['--check']).stderr, FB_KEPT_NOTICE, 'and not shown twice');
+    },
+    { memoryMd },
+  );
+});
+
+test('feedback-sync-kept-notice-is-filed-before-any-target-is-written: an unwritable state dir stops an unseen write with nothing changed, and a later CLAUDE.md failure leaves the notice pending', () => {
+  if ((process.getuid && process.getuid() === 0) || process.platform === 'win32') return;
+  const memoryMd = `# Memory Index\n${FB_HAND_COLON}\n`;
+  // (a) a file where the state/ directory goes: the notice cannot be filed, so nothing is written
+  withFeedbackEnv(
+    { 'rule-a': FB_GLOBAL_L1 },
+    ({ wiki, memDir, claudeHome, runFb }) => {
+      assert.equal(runFb(['--bootstrap']).status, 0);
+      fbKeptLineSetup(wiki, memDir);
+      writeFileSync(join(claudeHome, 'state'), 'not a directory');
+      const memBefore = readFileSync(join(memDir, 'MEMORY.md'), 'utf-8');
+      const claudeBefore = readFileSync(join(claudeHome, 'CLAUDE.md'), 'utf-8');
+      const recordBefore = readFileSync(fbHandRecord(wiki), 'utf-8');
+      const r = runFb(['--write', '--no-input']);
+      assert.equal(r.status, 1, r.stderr);
+      assert.match(
+        r.stderr,
+        /cannot keep the notice about a hand line .*No target file was written/,
+      );
+      assert.equal(readFileSync(join(memDir, 'MEMORY.md'), 'utf-8'), memBefore);
+      assert.equal(readFileSync(join(claudeHome, 'CLAUDE.md'), 'utf-8'), claudeBefore);
+      assert.equal(readFileSync(fbHandRecord(wiki), 'utf-8'), recordBefore, 'record unchanged');
+    },
+    { memoryMd },
+  );
+  // (b) MEMORY.md keeps a hand line, then CLAUDE.md cannot be written: the notice is pending
+  withFeedbackEnv(
+    { 'rule-a': FB_GLOBAL_L1 },
+    ({ wiki, memDir, claudeHome, runFb }) => {
+      assert.equal(runFb(['--bootstrap']).status, 0);
+      fbKeptLineSetup(wiki, memDir);
+      mkdirSync(join(claudeHome, 'state'), { recursive: true });
+      chmodSync(claudeHome, 0o500);
+      try {
+        const bad = runFb(['--write', '--no-input']);
+        assert.equal(bad.status, 1, bad.stderr);
+        assert.match(bad.stderr, /cannot write .*CLAUDE\.md/);
+        assert.match(readFileSync(join(memDir, 'MEMORY.md'), 'utf-8'), /HYPO:FEEDBACK-SYNC:START/);
+        assert.match(
+          readFileSync(fbPendingFile(claudeHome, wiki), 'utf-8'),
+          /kept the hand-written line/,
+          'the notice was filed before the failing write',
+        );
+      } finally {
+        chmodSync(claudeHome, 0o700);
+      }
+      const seen = runFb(['--check']);
+      assert.match(seen.stderr, FB_KEPT_NOTICE, 'a later attended run shows it');
+    },
+    { memoryMd },
+  );
+});
+
+test('feedback-sync-kept-notice-clears-where-the-caller-shows-it: --write --json --ack-notices puts it in report.warnings, and a write that shows its own notice keeps none', () => {
+  const memoryMd = `# Memory Index\n${FB_HAND_COLON}\n`;
+  withFeedbackEnv(
+    {},
+    ({ wiki, memDir, claudeHome, runFb }) => {
+      assert.equal(runFb(['--bootstrap']).status, 0);
+      fbKeptLineSetup(wiki, memDir);
+      assert.equal(runFb(['--write', '--no-input']).status, 0);
+      assert.ok(existsSync(fbPendingFile(claudeHome, wiki)), 'precondition: pending');
+      // what the current hook runs
+      const j = runFb(['--write', '--no-input', '--json', '--ack-notices']);
+      assert.equal(j.status, 0, j.stderr);
+      assert.ok(
+        (JSON.parse(j.stdout).warnings || []).some((w) => FB_KEPT_NOTICE.test(w)),
+        'the report carries it',
+      );
+      assert.ok(!existsSync(fbPendingFile(claudeHome, wiki)), 'and the file is gone');
+    },
+    { memoryMd },
+  );
+  // a write that is itself shown to a person has already said it: nothing is kept for later
+  withFeedbackEnv(
+    {},
+    ({ wiki, memDir, claudeHome, runFb }) => {
+      assert.equal(runFb(['--bootstrap']).status, 0);
+      fbKeptLineSetup(wiki, memDir);
+      const w = runFb(['--write', '--no-input', '--ack-notices']);
+      assert.equal(w.status, 0, w.stderr);
+      assert.match(w.stderr, FB_KEPT_NOTICE);
+      assert.ok(!existsSync(fbPendingFile(claudeHome, wiki)));
+    },
+    { memoryMd },
+  );
+});
+
+test('feedback-sync-pending-notice-lives-outside-the-vault: a git vault that does not ignore .cache/ still keeps the notice, a later attended run shows it, and another vault does not see it', () => {
+  const memoryMd = `# Memory Index\n${FB_HAND_COLON}\n`;
+  withFeedbackEnv(
+    {},
+    ({ wiki, memDir, claudeHome, runFb }) => {
+      assert.equal(runFb(['--bootstrap']).status, 0);
+      fbKeptLineSetup(wiki, memDir);
+      // from here the vault is a repository whose .gitignore says nothing about .cache/
+      fbGit(wiki, 'init', '-q');
+      writeFileSync(join(wiki, '.gitignore'), 'node_modules/\n');
+      const heal = runFb(['--write', '--no-input']);
+      assert.equal(heal.status, 0, heal.stderr);
+      assert.match(heal.stderr, FB_KEPT_NOTICE, 'the one-shot notice is printed');
+      assert.doesNotMatch(heal.stderr, /could not keep the hand line notice/, heal.stderr);
+      assert.match(
+        readFileSync(fbPendingFile(claudeHome, wiki), 'utf-8'),
+        /kept the hand-written line/,
+        'the notice is kept, outside the vault',
+      );
+      assert.ok(!existsSync(join(wiki, '.cache', 'feedback-pending-notices.json')));
+      // another vault on this machine does not see it
+      const other = join(wiki, '..', 'other-wiki');
+      mkdirSync(join(other, 'pages', 'feedback'), { recursive: true });
+      writeFileSync(join(other, 'hypo-config.md'), '# config');
+      const o = run('feedback-sync.mjs', [
+        '--check',
+        `--hypo-dir=${other}`,
+        `--claude-home=${claudeHome}`,
+        '--project-id=proj',
+      ]);
+      assert.doesNotMatch(o.stderr, FB_KEPT_NOTICE, 'not shown for another vault');
+      assert.ok(existsSync(fbPendingFile(claudeHome, wiki)), 'and not cleared by it');
+      // an attended run in the first vault shows it and clears it
+      const seen = runFb(['--check']);
+      assert.match(seen.stderr, FB_KEPT_NOTICE);
+      assert.ok(!existsSync(fbPendingFile(claudeHome, wiki)), 'shown, so cleared');
+    },
+    { memoryMd },
+  );
+});
+
+test('feedback-sync-pending-notice-file-of-an-earlier-version-is-migrated: read once, shown with the new ones, and deleted', () => {
+  withFeedbackEnv({ 'rule-a': FB_GLOBAL_L1 }, ({ wiki, claudeHome, runFb }) => {
+    const legacy = join(wiki, '.cache', 'feedback-pending-notices.json');
+    mkdirSync(join(wiki, '.cache'), { recursive: true });
+    writeFileSync(legacy, JSON.stringify({ version: 1, notices: [FB_PENDING] }));
+    const r = runFb(['--write']);
+    assert.equal(r.status, 0, r.stderr);
+    assert.match(r.stderr, new RegExp(FB_PENDING.slice(0, 40)), `shown: ${r.stderr}`);
+    assert.ok(!existsSync(legacy), 'the old file is deleted');
+    assert.ok(!existsSync(fbPendingFile(claudeHome, wiki)), 'and nothing is left pending');
+    // an unattended failure to show it leaves it in the new place only
+    writeFileSync(legacy, JSON.stringify({ version: 1, notices: [FB_PENDING] }));
+    writeFileSync(
+      join(wiki, 'pages', 'feedback', 'rule-a.md'),
+      fbPage({ ...FB_GLOBAL_L1, title: 'Rule A2' }),
+    );
+    assert.equal(runFb(['--check', '--no-input', '--json']).status, 1, 'precondition: drift');
+    assert.ok(existsSync(legacy), 'a machine run does not read or move it');
+  });
+});
+
+test('feedback-sync-ignore-override-is-refused: .cache/ followed by !.cache/ does not count as ignored, nothing is written under .cache/, and a later .cache/ line is accepted', () => {
+  const memoryMd = `# Memory Index\n${FB_HAND_COLON}\n`;
+  withFeedbackEnv(
+    {},
+    ({ wiki, runFb }) => {
+      writeFileSync(join(wiki, '.gitignore'), '.cache/\n!.cache/\n');
+      const r = runFb(['--bootstrap']);
+      assert.equal(r.status, 1, r.stderr);
+      assert.match(r.stderr, /no draft was written/);
+      assert.match(r.stderr, /overrides the \.cache\/ line/, 'names the overriding rule');
+      assert.ok(!existsSync(join(wiki, '.cache')), 'nothing was written under .cache/');
+      assert.equal(readFileSync(join(wiki, '.gitignore'), 'utf-8'), '.cache/\n!.cache/\n');
+      fbGit(wiki, 'init', '-q');
+      fbGit(wiki, 'add', '-A');
+      assert.deepEqual(
+        fbGit(wiki, 'diff', '--cached', '--name-only')
+          .split('\n')
+          .filter((f) => f.startsWith('.cache/')),
+        [],
+      );
+      // the other way out: a later .cache/ line puts the rule back in force
+      rmSync(join(wiki, '.git'), { recursive: true, force: true });
+      writeFileSync(join(wiki, '.gitignore'), '.cache/\n!.cache/\n.cache/\n');
+      const ok = runFb(['--bootstrap', '--json']);
+      assert.equal(ok.status, 0, ok.stderr);
+      assert.deepEqual(
+        JSON.parse(ok.stdout).created.map((c) => c.slug),
+        ['rule-b'],
+        'the success signal: the draft was made',
+      );
+    },
+    { memoryMd },
+  );
+});
+
+test('feedback-sync-record-save-failure-publishes-no-draft: the bootstrap stops with the record failure, and a run once the record can be saved drafts it', () => {
+  const memoryMd = `# Memory Index\n${FB_HAND_COLON}\n`;
+  withFeedbackEnv(
+    {},
+    ({ wiki, runFb }) => {
+      // a directory where the record file goes: the save fails, the .cache/ rule is fine
+      mkdirSync(join(fbHandRecord(wiki), 'x'), { recursive: true });
+      const r = runFb(['--bootstrap']);
+      assert.equal(r.status, 1, r.stderr);
+      assert.match(r.stderr, /no draft was written: cannot record the hand lines/);
+      assert.ok(!existsSync(join(fbDraftsDir(wiki), 'rule-b.md')), 'no draft was published');
+      rmSync(fbHandRecord(wiki), { recursive: true });
+      const again = runFb(['--bootstrap', '--json']);
+      assert.equal(again.status, 0, again.stderr);
+      assert.deepEqual(
+        JSON.parse(again.stdout).created.map((c) => c.slug),
+        ['rule-b'],
+        'not skipped as draft-exists',
+      );
+      assert.ok(existsSync(fbHandRecord(wiki)), 'and now recorded');
+    },
+    { memoryMd },
+  );
+});
+
+test('feedback-sync-failed-write-reports-the-side-files-it-already-wrote: the primary write failed after them, and the JSON error body names them and keeps the warnings', () => {
+  if ((process.getuid && process.getuid() === 0) || process.platform === 'win32') return;
+  withFeedbackEnv({ 'rule-b': FB_PROJECT_L2 }, ({ base, memDir, runFb }) => {
+    // MEMORY.md is a link into a directory nobody can write: its replace fails after the side file
+    const ro = join(base, 'ro');
+    mkdirSync(ro);
+    writeFileSync(join(ro, 'MEMORY.md'), '# Memory Index\n');
+    rmSync(join(memDir, 'MEMORY.md'));
+    symlinkSync(join(ro, 'MEMORY.md'), join(memDir, 'MEMORY.md'));
+    chmodSync(ro, 0o500);
+    try {
+      const j = runFb(['--write', '--json']);
+      assert.equal(j.status, 1, j.stderr);
+      const body = JSON.parse(j.stdout);
+      assert.match(body.error, /cannot write .*MEMORY\.md/);
+      assert.ok(existsSync(join(memDir, 'feedback_rule-b.md')), 'precondition: side file landed');
+      assert.deepEqual(body.written, [
+        { target: 'memory', file: join(memDir, 'feedback_rule-b.md') },
+      ]);
+      assert.ok(Array.isArray(body.warnings), 'the error body carries the warnings list');
+      rmSync(join(memDir, 'feedback_rule-b.md'));
+      const t = runFb(['--write']);
+      assert.match(t.stderr, /already written before the failure: .*feedback_rule-b\.md/);
+    } finally {
+      chmodSync(ro, 0o700);
+    }
+  });
+});
+
+test('feedback-sync-failed-write-json-keeps-the-cache-rule-note: the run added .cache/ to .gitignore and then failed, and the JSON error body still says so', () => {
+  withFeedbackEnv({ 'rule-a': FB_GLOBAL_L1 }, ({ wiki, runFb }) => {
+    // a file where the kept-copy directory goes: the before-write copy of CLAUDE.md fails
+    mkdirSync(join(wiki, '.cache'), { recursive: true });
+    writeFileSync(join(wiki, '.cache', 'feedback-kept'), 'in the way');
+    const j = runFb(['--write', '--json']);
+    assert.equal(j.status, 1, j.stderr);
+    const body = JSON.parse(j.stdout);
+    assert.match(body.error, /cannot keep a copy/);
+    assert.ok(
+      (body.warnings || []).some((w) => /^added \.cache\/ to .*\.gitignore/.test(w)),
+      `the rule note is in the error body: ${j.stdout}`,
+    );
+  });
+});
+
+test('feedback.mjs post-step forwards the cache rule note and the old-draft warning, not just the kept-line notice', () => {
+  const memoryMd = `# Memory Index\n${FB_HAND_COLON}\n`;
+  withFeedbackEnv(
+    { 'rule-a': FB_GLOBAL_L1 },
+    (ctx) => {
+      const { wiki, runFb } = ctx;
+      assert.equal(runFb(['--bootstrap']).status, 0);
+      fbPromoteB(wiki);
+      // the vault lost its rule and holds a draft from an earlier version
+      rmSync(join(wiki, '.gitignore'));
+      mkdirSync(join(wiki, 'pages', 'feedback', '_drafts'), { recursive: true });
+      writeFileSync(join(wiki, 'pages', 'feedback', '_drafts', 'rule-z.md'), 'old draft\n');
+      const r = fbPostStep(ctx);
+      assert.equal(r.status, 0, r.stderr);
+      assert.match(r.stdout, /Projection refreshed/, 'the post-step succeeded');
+      assert.ok(
+        r.stderr.includes(`⚠ added .cache/ to ${join(wiki, '.gitignore')} so a later git init`),
+        `the rule note is forwarded: ${r.stderr}`,
+      );
+      assert.match(
+        r.stderr,
+        /⚠ pages\/feedback\/_drafts\/rule-z\.md was written by an earlier version/,
+        'and so is the old-draft warning',
+      );
+    },
+    { memoryMd },
+  );
+});
+
 test('feedback-sync-legacy-drafts-are-still-read: a draft in the old pages/feedback/_drafts/ is neither redrafted nor lets its hand line record go', () => {
   const memoryMd = `# Memory Index\n${FB_HAND_COLON}\n`;
   withFeedbackEnv(
@@ -4689,7 +5460,12 @@ test('feedback-sync-legacy-drafts-are-still-read: a draft in the old pages/feedb
       assert.deepEqual(r.skipped, [
         { slug: 'rule-b', reason: 'draft-exists-legacy', path: legacy },
       ]);
-      assert.equal(r.warnings, undefined, 'a vault that is not a git tree has nothing to warn of');
+      // not a git tree today, but a later git init and git add -A would stage the old draft
+      assert.equal(r.warnings.length, 1, 'the old draft is named even though git is not there yet');
+      assert.match(
+        r.warnings[0],
+        /pages\/feedback\/_drafts\/rule-b\.md .*not a git repository now.*git add -A/,
+      );
       assert.ok(!existsSync(join(fbDraftsDir(wiki), 'rule-b.md')), 'no second copy');
       // a write with neither page nor new-place draft keeps the record while the old draft is there
       assert.equal(runFb(['--write']).status, 0);
@@ -4705,59 +5481,107 @@ test('feedback-sync-legacy-drafts-are-still-read: a draft in the old pages/feedb
   );
 });
 
-test('feedback-sync-ensure-container-reads-again-and-keeps-a-copy: a CLAUDE.md saved after it was read is not replaced, a normal run keeps the original', () => {
+test('feedback-sync-ensure-container-appends-and-never-rewrites: a CLAUDE.md saved after it was read keeps the saved line and still gets the container, and no copy is needed', () => {
   const original = '# Global\n\nprose the user cares about\n';
   withFeedbackEnv(
     {},
     (ctx) => {
       const { wiki, claudeHome } = ctx;
       const p = join(claudeHome, 'CLAUDE.md');
-      const edited = original + 'a line saved a moment ago\n';
+      // the editor saves a line with no trailing newline between the first read and the
+      // write: the separator has to come from the bytes as they are then
+      const late = 'a line saved a moment ago';
       const out = fbInProcess(ctx, ['--ensure-container'], {
-        beforeEnsureWrite: () => writeFileSync(p, edited),
+        beforeEnsureWrite: () => writeFileSync(p, original + late),
       });
-      assert.equal(out.code, 1);
-      assert.match(
-        out.error,
-        /CLAUDE\.md changed after it was read for this write.*not overwritten/,
-      );
-      assert.equal(readFileSync(p, 'utf-8'), edited, 'the saved bytes are still there');
-      // run from the start: the container is added, and the file as it was is kept
-      const ok = fbInProcess(ctx, ['--ensure-container']);
-      assert.equal(ok.code, 0, ok.error);
-      assert.ok(readFileSync(p, 'utf-8').startsWith(edited));
-      const copies = readdirSync(fbKeptDir(wiki)).filter((f) =>
-        /claude-before-ensure-container/.test(f),
-      );
-      assert.equal(copies.length, 2, 'one copy per run that reached the write step');
-      assert.ok(
-        copies.some((f) => readFileSync(join(fbKeptDir(wiki), f), 'utf-8') === edited),
-        'the copy holds the bytes the replace was about to cover',
+      assert.equal(out.code, 0, out.error);
+      assert.equal(out.report.action, 'created');
+      const after = readFileSync(p, 'utf-8');
+      assert.ok(after.startsWith(`${original}${late}\n\n<!-- Added by `), after);
+      assert.equal(after.split('<learned_behaviors>').length - 1, 1, 'exactly one container');
+      assert.ok(after.endsWith('<learned_behaviors>\n</learned_behaviors>\n'));
+      assert.ok(!existsSync(fbKeptDir(wiki)), 'no user byte is rewritten, so no copy is made');
+      // a save that brought the container itself in between: nothing is added
+      writeFileSync(p, original);
+      const dup = fbInProcess(ctx, ['--ensure-container'], {
+        beforeEnsureWrite: () =>
+          writeFileSync(p, `${original}<learned_behaviors>\n</learned_behaviors>\n`),
+      });
+      assert.equal(dup.code, 0, dup.error);
+      assert.equal(dup.report.action, 'noop-already-present');
+      assert.equal(
+        readFileSync(p, 'utf-8'),
+        `${original}<learned_behaviors>\n</learned_behaviors>\n`,
       );
     },
     { claudeMd: original },
   );
-  // a vault whose git would stage .cache/ gets no copy: the append goes on, with a warning
+});
+
+for (const [form, original] of [
+  ['ends with a newline', '# Global\n\nprose\n'],
+  ['has no trailing newline', '# Global\n\nprose'],
+]) {
+  test(`feedback-sync-ensure-container-completes-a-cut-append: a file that ${form} and ends inside our own addition is completed to exactly one pair`, () => {
+    withFeedbackEnv(
+      {},
+      ({ claudeHome, runFb }) => {
+        const p = join(claudeHome, 'CLAUDE.md');
+        writeFileSync(p, original);
+        assert.equal(runFb(['--ensure-container']).status, 0);
+        const whole = readFileSync(p, 'utf-8');
+        const add = whole.slice(original.length);
+        const cuts = [
+          add.indexOf('<!-- Added by') + 30, // inside the comment text
+          add.indexOf('-->') + 4, // the comment is whole, the tags are not there yet
+          add.indexOf('<learned_behaviors>') + '<learned_behaviors>\n'.length, // open tag only
+          add.length - 2, // the closing tag lacks its last character
+        ];
+        for (const cut of cuts) {
+          writeFileSync(p, original + add.slice(0, cut));
+          const r = runFb(['--ensure-container', '--json']);
+          assert.equal(r.status, 0, `cut ${cut}: ${r.stderr}`);
+          const rep = JSON.parse(r.stdout);
+          assert.equal(rep.action, 'created', `cut ${cut}`);
+          assert.equal(rep.recovered, true, `cut ${cut}: reported as a completion`);
+          assert.equal(
+            readFileSync(p, 'utf-8'),
+            whole,
+            `cut ${cut}: the same bytes as a whole run`,
+          );
+        }
+        // a cut after the whole pair but for its last newline is already a container
+        writeFileSync(p, whole.slice(0, -1));
+        const done = JSON.parse(runFb(['--ensure-container', '--json']).stdout);
+        assert.equal(done.action, 'noop-already-present');
+      },
+      { claudeMd: '# placeholder' },
+    );
+  });
+}
+
+test('feedback-sync-ensure-container-refuses-a-tail-that-is-not-our-prefix: a dangling open tag after other text, or after a cut plus extra bytes, stays corrupt and untouched', () => {
   withFeedbackEnv(
     {},
-    ({ wiki, claudeHome, runFb }) => {
-      // a child process, so the vault's git sees the pinned HOME and not the runner's
-      // global excludes
-      fbGitInit(wiki, 'node_modules/\n');
+    ({ claudeHome, runFb }) => {
       const p = join(claudeHome, 'CLAUDE.md');
-      const warned = /no copy of .*CLAUDE\.md was kept.*not ignored/;
-      const j = runFb(['--ensure-container', '--json']);
-      assert.equal(j.status, 0, j.stderr);
-      assert.match(JSON.parse(j.stdout).warnings[0], warned, 'the --json report carries it');
-      assert.ok(readFileSync(p, 'utf-8').includes('<learned_behaviors>'), 'the append went on');
-      assert.ok(!existsSync(fbKeptDir(wiki)), 'nothing went under .cache/');
-      // the text mode prints it
-      writeFileSync(p, original);
-      const t = runFb(['--ensure-container']);
-      assert.equal(t.status, 0, t.stderr);
-      assert.match(t.stderr, /warn: no copy of .*CLAUDE\.md was kept.*not ignored/);
+      writeFileSync(p, '# Global\n');
+      assert.equal(runFb(['--ensure-container']).status, 0);
+      const add = readFileSync(p, 'utf-8').slice('# Global\n'.length);
+      const openCut = add.indexOf('<learned_behaviors>') + '<learned_behaviors>\n'.length;
+      for (const junk of [
+        '# Global\n<!-- somebody else wrote this -->\n<learned_behaviors>\n',
+        '# Global\n' + add.slice(0, openCut) + 'and then more text\n',
+        '# Global\n' + add.slice(0, openCut).replace('Added by', 'Added by hand,'),
+      ]) {
+        writeFileSync(p, junk);
+        const r = runFb(['--ensure-container']);
+        assert.equal(r.status, 1, r.stderr);
+        assert.match(r.stderr, /refusing to append .*corrupt <learned_behaviors>/);
+        assert.equal(readFileSync(p, 'utf-8'), junk, 'not a byte added');
+      }
     },
-    { claudeMd: original },
+    { claudeMd: '# placeholder' },
   );
 });
 
@@ -5404,6 +6228,70 @@ test('precompact-edited-side-file-is-reported: the gate names the side file and 
     assert.match(msg, /feedback projection conflict/, r.stdout);
     assert.ok(msg.includes(side), `names the side file: ${msg}`);
     assert.match(msg, /Copy your edits out of/, 'and the way out');
+  });
+});
+
+test('precompact-self-heal-reports-notices-an-older-hook-run-left: a pending kept-line notice reaches the hook message and is cleared', () => {
+  withPrecompactFeedbackHome(FB_GLOBAL_L1, null, ({ dir, home, claudeHome }) => {
+    fbSeedPending(claudeHome, dir);
+    const r = runHook('hypo-personal-check.mjs', '', { HYPO_DIR: dir, HOME: home });
+    const msg = JSON.parse(r.stdout).systemMessage || '';
+    assert.match(msg, /re-synced/, `precondition: self-healed: ${r.stdout}`);
+    assert.ok(msg.includes(FB_PENDING), `the pending notice is shown: ${msg}`);
+    assert.ok(!existsSync(fbPendingFile(claudeHome, dir)), 'and cleared once shown');
+  });
+});
+
+test('precompact-without-drift-still-reports-a-pending-notice: an older hook left one and no drift remains, the hook shows it once and clears it; with none pending there is no extra message', () => {
+  withPrecompactFeedbackHome(FB_GLOBAL_L1, null, ({ dir, home, claudeHome }) => {
+    // bring the projection in sync first, so the hook has no drift to repair
+    const fbArgs = [
+      `--hypo-dir=${dir}`,
+      `--claude-home=${claudeHome}`,
+      `--project-id=${process.cwd().replace(/[/.]/g, '-')}`,
+    ];
+    assert.equal(run('feedback-sync.mjs', ['--write', ...fbArgs]).status, 0);
+    const quiet = runHook('hypo-personal-check.mjs', '', { HYPO_DIR: dir, HOME: home });
+    const quietMsg = JSON.parse(quiet.stdout).systemMessage || '';
+    assert.doesNotMatch(
+      quietMsg,
+      /feedback/i,
+      `nothing pending: no feedback line: ${quiet.stdout}`,
+    );
+    fbSeedPending(claudeHome, dir);
+    const r = runHook('hypo-personal-check.mjs', '', { HYPO_DIR: dir, HOME: home });
+    const msg = JSON.parse(r.stdout).systemMessage || '';
+    assert.doesNotMatch(msg, /re-synced/, `precondition: no drift to repair: ${r.stdout}`);
+    assert.ok(msg.includes(FB_PENDING), `the pending notice is shown: ${msg}`);
+    assert.ok(!existsSync(fbPendingFile(claudeHome, dir)), 'and cleared once shown');
+    const again = runHook('hypo-personal-check.mjs', '', { HYPO_DIR: dir, HOME: home });
+    assert.ok(
+      !(JSON.parse(again.stdout).systemMessage || '').includes(FB_PENDING),
+      'and not shown twice',
+    );
+  });
+});
+
+test('precompact-bypassed-gate-still-shows-a-pending-notice: HYPO_SKIP_GATE answers with the notice the no-drift check took off the file', () => {
+  withPrecompactFeedbackHome(FB_GLOBAL_L1, null, ({ dir, home, claudeHome }) => {
+    const fbArgs = [
+      `--hypo-dir=${dir}`,
+      `--claude-home=${claudeHome}`,
+      `--project-id=${process.cwd().replace(/[/.]/g, '-')}`,
+    ];
+    assert.equal(run('feedback-sync.mjs', ['--write', ...fbArgs]).status, 0);
+    fbSeedPending(claudeHome, dir);
+    // an uncommitted file in the vault makes the gate fail, so the bypass is what answers
+    writeFileSync(join(dir, 'uncommitted.txt'), 'x');
+    const r = runHook('hypo-personal-check.mjs', '', {
+      HYPO_DIR: dir,
+      HOME: home,
+      HYPO_SKIP_GATE: '1',
+    });
+    const msg = JSON.parse(r.stdout).systemMessage || '';
+    assert.match(msg, /gate bypassed via HYPO_SKIP_GATE=1/, `precondition: bypassed: ${r.stdout}`);
+    assert.ok(msg.includes(FB_PENDING), `the pending notice is shown: ${msg}`);
+    assert.ok(!existsSync(fbPendingFile(claudeHome, dir)), 'and cleared once shown');
   });
 });
 

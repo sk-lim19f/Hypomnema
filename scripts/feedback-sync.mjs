@@ -47,6 +47,9 @@
  *     --no-input             Never prompt; treat unresolved project-id non-interactively
  *     --strict               Promote warnings to failures (PreCompact gate)
  *     --json                 Machine-readable output
+ *     --ack-notices          The caller shows this run's warnings to a person: a notice kept for later
+ *                            (see PENDING_NOTICES_FILE) is reported and cleared. Runs with neither
+ *                            --no-input nor --json count as shown too.
  *     --accept-wiki=<slug>   keep the wiki version of one conflicted block (see above)
  *     --dry-run              (bootstrap/import/accept) report the plan, write nothing
  *
@@ -56,9 +59,10 @@
  * PreCompact gate's "feedback projection cannot be built" blocker). If
  * `<claude-home>/CLAUDE.md` EXISTS and has no container, appends a short
  * guidance comment plus an empty `<learned_behaviors></learned_behaviors>`
- * pair to the end of the file — the existing bytes are re-written verbatim ahead
- * of the addition, through an ATOMIC tmp+rename (see atomicWrite), so a crash or
- * a full disk mid-write leaves the user's file exactly as it was. If the
+ * pair to the end of the file with one append-mode write: the existing bytes are
+ * never rewritten, so a save an editor lands at the same moment cannot be
+ * overwritten (it can only cost the addition, which a re-run adds again), and an
+ * append that was cut short is completed by the next run. If the
  * container is already there, it is a no-op (idempotent, safe to re-run). If
  * the file does not exist at all, it is ALSO a no-op ('target-missing' is the
  * ordinary first-run state, not something to provision here). If the file
@@ -95,9 +99,11 @@ import {
   chmodSync,
   renameSync,
   linkSync,
+  appendFileSync,
+  mkdtempSync,
 } from 'node:fs';
 import { join, basename, dirname, resolve, relative, sep } from 'node:path';
-import { homedir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { createHash } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
@@ -106,7 +112,7 @@ import { fencedLineMask } from './lib/code-fence.mjs';
 import { resolveHypoRoot, expandHome } from './lib/hypo-root.mjs';
 // scripts/ may import hooks/ (never the reverse): the same lock the vault's other
 // append-only writers take, so two feedback-sync runs cannot interleave.
-import { withFileLock } from '../hooks/hypo-shared.mjs';
+import { withFileLock, ensureVaultGitignorePattern } from '../hooks/hypo-shared.mjs';
 
 const HOME = homedir();
 
@@ -124,6 +130,7 @@ function parseArgs(argv) {
     skipMemory: false,
     strict: false,
     json: false,
+    ackNotices: false,
     dryRun: false,
     cwd: process.cwd(),
   };
@@ -148,6 +155,7 @@ function parseArgs(argv) {
     else if (arg === '--no-input') args.noInput = true;
     else if (arg === '--strict') args.strict = true;
     else if (arg === '--json') args.json = true;
+    else if (arg === '--ack-notices') args.ackNotices = true;
     else if (arg === '--dry-run') args.dryRun = true;
   }
   if (!args.hypoDir) args.hypoDir = resolveHypoRoot();
@@ -706,6 +714,63 @@ function handKeptNotice(r) {
   );
 }
 
+// A kept hand line is announced once, by the --write that meets it, and that same write
+// drops the bootstrap record the notice came from. An older PreCompact hook runs this
+// script's --write with its output thrown away (no --json, stderr unread), so the notice
+// would be gone before anyone saw it. So a --write whose output may go unseen also writes
+// the notice here, and the runs that do reach a person (see shownToPerson) report it and
+// clear it. A missing or unreadable file means no pending notices.
+// The file is per machine and lives under the Claude home's state/ directory, not in the
+// vault: it holds only notices this machine produced and is shown on this machine, and a
+// vault whose git does not ignore .cache/ must not cost the notice. One file per vault
+// (keyed by the vault's real path), so two vaults on one machine do not mix.
+// A notice file an earlier version kept in the vault's .cache/ is read once, merged and deleted.
+const PENDING_NOTICES_FILE = (args) => {
+  let vault = args.hypoDir;
+  try {
+    vault = realpathSync(vault);
+  } catch {
+    /* not there: key it by the path as given */
+  }
+  return join(
+    args.claudeHome,
+    'state',
+    `feedback-pending-notices-${sha256(vault).slice(0, 16)}.json`,
+  );
+};
+const LEGACY_PENDING_NOTICES_FILE = (hypoDir) =>
+  join(hypoDir, '.cache', 'feedback-pending-notices.json');
+
+function readNoticeFile(file) {
+  try {
+    const j = JSON.parse(readFileSync(file, 'utf-8'));
+    return (Array.isArray(j.notices) ? j.notices : []).filter((n) => typeof n === 'string' && n);
+  } catch {
+    return [];
+  }
+}
+
+function loadPendingNotices(args) {
+  const own = readNoticeFile(PENDING_NOTICES_FILE(args));
+  const legacy = readNoticeFile(LEGACY_PENDING_NOTICES_FILE(args.hypoDir));
+  return [...own, ...legacy.filter((n) => !own.includes(n))];
+}
+
+function savePendingNotices(args, notices) {
+  const file = PENDING_NOTICES_FILE(args);
+  if (notices.length) atomicWrite(file, JSON.stringify({ version: 1, notices }, null, 2) + '\n');
+  else rmSync(file, { force: true });
+  // load merged the old in-vault file into `notices`, so it can go once they are saved
+  rmSync(LEGACY_PENDING_NOTICES_FILE(args.hypoDir), { force: true });
+}
+
+// Does this run's output reach a person? The PreCompact hook, doctor and the post-step of
+// the feedback command all pass --no-input, and the hook and doctor read --json reports
+// for fields they know, so neither counts. The two that do show warnings say so with
+// --ack-notices (the current hook, the feedback command); a hand-run text command shows them
+// by being one.
+const shownToPerson = (args) => args.ackNotices || (!args.noInput && !args.json);
+
 // Compute the next file content for a target. Returns { content } on success or
 // { error, remedy } when the region cannot be placed (missing / corrupt
 // container). Pure — no disk writes — so run() can preflight every target before
@@ -842,9 +907,29 @@ function saveHandLines(hypoDir, lines) {
   const file = HAND_LINES_FILE(hypoDir);
   if (!lines.length) rmSync(file, { force: true });
   else {
-    assertCacheIgnored(hypoDir, file);
+    assertCacheIgnored(hypoDir, [file]);
     atomicWrite(file, JSON.stringify({ version: 1, lines }, null, 2) + '\n');
   }
+}
+
+// For a vault with no git to judge it: make sure the last line of its .gitignore that names
+// .cache is a plain `.cache/`, appending one when it is not (an append, never a rewrite, with the
+// same newline handling as ensureVaultGitignorePattern). Any `!` line that names .cache counts,
+// since an exception is what undoes an earlier rule.
+function appendFinalCacheRule(hypoDir) {
+  const path = join(hypoDir, '.gitignore');
+  const content = existsSync(path) ? readFileSync(path, 'utf-8') : '';
+  const names = (l) =>
+    ['.cache/', '.cache', '/.cache/', '/.cache'].includes(l) ||
+    (l.startsWith('!') && l.includes('.cache'));
+  const last = content
+    .split('\n')
+    .map((l) => l.trim())
+    .filter(names)
+    .pop();
+  if (last === '.cache/') return false;
+  appendFileSync(path, `${content.length > 0 && !content.endsWith('\n') ? '\n' : ''}.cache/\n`);
+  return true;
 }
 
 // Which of `relPaths` (vault-relative, forward slashes) the vault's git would NOT ignore.
@@ -852,14 +937,24 @@ function saveHandLines(hypoDir, lines) {
 // and the vault's auto-commit stages whatever git does not ignore. The default
 // .gitignore ignores .cache/, but a hand-written one may not.
 //   not a git work tree (git says "not a git repository" and there is no .git entry in the
-//   vault or above it, or there is no git at all): nothing can stage it, so nothing is
-//   unignored. A .git entry that git still calls "not a git repository" (a .git file pointing
+//   vault or above it, or there is no git at all): nothing can stage it today, so with
+//   `ensureRule` false nothing is unignored. With `ensureRule` true the rule is added and then
+//   judged as a later `git init` would read it (a throwaway repository over the vault, see
+//   unignoredByFutureRepo): an override such as `!.cache/` is reported as unignored. With no git
+//   at all the judgment is not possible: the last line touching .cache is made the plain rule
+//   instead (appendFinalCacheRule) and the result is flagged info.unverified. A .git entry that git still calls "not a git repository" (a .git file pointing
 //   at a gitdir that is gone) is a repository that is broken for now, not an absent one.
 //   git fails any other way (a broken config, an ownership refusal), answers anything but 0
 //   or 1, or times out: unknown, counted as unignored. A vault git cannot read may still be
 //   one the auto-commit stages, so "unknown" must never read as "not a repository".
 //   LC_ALL=C pins the language of the "not a git repository" message that is matched.
-function unignoredCachePaths(hypoDir, relPaths) {
+// `ensureRule`: in a vault that is not a git work tree, first make sure its .gitignore ignores
+// .cache/ (creating the file, or appending one line, never rewriting the others). Nothing can
+// stage the copy today, but a later `git init && git add -A` would, and so would a temp file a
+// killed run left behind. A .gitignore that cannot be written throws.
+// `info` (an object the caller passes in) gets `notRepo: true` when the vault is not a git
+// work tree (or there is no git at all), and `ruleAdded: true` when this call wrote the rule.
+function unignoredCachePaths(hypoDir, relPaths, { ensureRule = false, info = {} } = {}) {
   if (!relPaths.length) return [];
   const git = (argv, input) =>
     spawnSync('git', ['-C', hypoDir, ...argv], {
@@ -869,7 +964,30 @@ function unignoredCachePaths(hypoDir, relPaths) {
       env: { ...process.env, LC_ALL: 'C' },
     });
   const probe = git(['rev-parse', '--is-inside-work-tree']);
-  if (probe.error?.code === 'ENOENT') return [];
+  // A symlinked .gitignore is refused before anything is appended: git does not read one, so
+  // the rule would not take effect, and the append would still change the link's target.
+  const linkedGitignore = () => {
+    try {
+      return lstatSync(join(hypoDir, '.gitignore')).isSymbolicLink();
+    } catch {
+      return false;
+    }
+  };
+  const addRule = () => {
+    if (ensureRule && ensureVaultGitignorePattern(hypoDir, '.cache/')) info.ruleAdded = true;
+  };
+  if (probe.error?.code === 'ENOENT') {
+    // no git here: nothing can stage the copy today, but a git installed later would, and the
+    // effective-ignore check cannot run. So make the LAST line that touches .cache/ the plain
+    // rule: a later `!.cache/` would otherwise undo an earlier `.cache/`.
+    info.notRepo = true;
+    info.unverified = true;
+    if (ensureRule) {
+      if (linkedGitignore()) return [...relPaths];
+      if (appendFinalCacheRule(hypoDir)) info.ruleAdded = true;
+    }
+    return [];
+  }
   const hasGitEntry = () => {
     for (let d = resolve(hypoDir); ; d = dirname(d)) {
       try {
@@ -883,26 +1001,103 @@ function unignoredCachePaths(hypoDir, relPaths) {
   };
   const notRepo =
     probe.status === 128 && /not a git repository/i.test(probe.stderr ?? '') && !hasGitEntry();
+  if (notRepo) {
+    info.notRepo = true;
+    if (ensureRule && linkedGitignore()) return [...relPaths];
+    addRule();
+    // With `ensureRule` the copy is about to be written: judge the .gitignore as git reads it,
+    // not by the presence of a line (a later `!.cache/` undoes it). A dry run writes nothing.
+    if (ensureRule) {
+      const bad = unignoredByFutureRepo(hypoDir, relPaths);
+      if (bad === null) info.unverified = true;
+      else return bad;
+    }
+  }
   if (notRepo || (probe.status === 0 && probe.stdout.trim() !== 'true')) return [];
   if (probe.error || probe.status !== 0) return [...relPaths];
-  const r = git(['check-ignore', '--stdin', '-z'], relPaths.join('\0') + '\0');
+  return gitUnignored(['-C', hypoDir], relPaths);
+}
+
+// The paths of `relPaths` that git (run with `gitArgv` in front) does not ignore. Anything
+// but an answer of 0 or 1 is unknown, counted as unignored.
+function gitUnignored(gitArgv, relPaths, extra = []) {
+  const r = spawnSync('git', [...gitArgv, 'check-ignore', '--stdin', '-z', ...extra], {
+    input: relPaths.join('\0') + '\0',
+    encoding: 'utf-8',
+    timeout: 10000,
+    env: { ...process.env, LC_ALL: 'C' },
+  });
   if (r.error || (r.status !== 0 && r.status !== 1)) return [...relPaths];
   const ignored = new Set(r.stdout.split('\0').filter(Boolean));
   return relPaths.filter((p) => !ignored.has(p));
 }
 
+// What a later `git init && git add -A` in a vault that is not a repository yet would stage:
+// the vault's .gitignore judged by git itself, in a throwaway empty repository that has the
+// vault as its work tree (--no-index: nothing is tracked there). The rule check above only
+// sees that a `.cache/` line exists, and a later `!.cache/` undoes it. Returns null when git
+// cannot be run at all (nothing to judge with), else the unignored paths; any other failure
+// is unknown and counts as unignored.
+function unignoredByFutureRepo(hypoDir, relPaths) {
+  let tmp;
+  try {
+    tmp = mkdtempSync(join(tmpdir(), 'hypo-ignore-probe-'));
+    const init = spawnSync('git', ['init', '-q', tmp], {
+      encoding: 'utf-8',
+      timeout: 10000,
+      env: { ...process.env, LC_ALL: 'C' },
+    });
+    if (init.error?.code === 'ENOENT') return null;
+    if (init.error || init.status !== 0) return [...relPaths];
+    return gitUnignored(
+      [`--git-dir=${join(tmp, '.git')}`, `--work-tree=${resolve(hypoDir)}`],
+      relPaths,
+      ['--no-index'],
+    );
+  } catch {
+    return [...relPaths];
+  } finally {
+    if (tmp) rmSync(tmp, { recursive: true, force: true });
+  }
+}
+
 // Throws when any of `files` (under the vault's .cache/) is a path the vault's git would
 // not ignore, or when .cache/ itself is not: a rule that names only the final file leaves
 // the temp file written next to it, and an import's next numbered name, open to `git add -A`.
-function assertCacheIgnored(hypoDir, ...files) {
-  const bad = unignoredCachePaths(hypoDir, [
-    '.cache/',
-    ...files.map((f) => relative(hypoDir, f).split(sep).join('/')),
-  ]);
+// `ensureRule: false` is for a dry run, which must not touch the vault's .gitignore.
+// A rule it wrote is announced in the run's warnings (cacheRuleNotes, see runAndPrune).
+const cacheRuleNotes = [];
+function assertCacheIgnored(hypoDir, files, { ensureRule = true } = {}) {
+  let bad;
+  const info = {};
+  try {
+    bad = unignoredCachePaths(
+      hypoDir,
+      ['.cache/', ...files.map((f) => relative(hypoDir, f).split(sep).join('/'))],
+      { ensureRule, info },
+    );
+    if (info.ruleAdded) {
+      const note =
+        `added .cache/ to ${join(hypoDir, '.gitignore')} so a later git init does not stage the copies of your text kept there` +
+        (info.unverified
+          ? ' (git cannot be run here, so whether the rule takes effect was not checked)'
+          : '');
+      if (!cacheRuleNotes.includes(note)) cacheRuleNotes.push(note);
+    }
+  } catch (err) {
+    throw Object.assign(
+      new Error(
+        `could not add .cache/ to the vault's .gitignore (${err.message}), so a copy of your own file there could be staged if the vault becomes a git repository. Add .cache/ to the vault's .gitignore first`,
+      ),
+      { code: 'EUNIGNORED' },
+    );
+  }
   if (bad.length)
     throw Object.assign(
       new Error(
-        `${bad.join(', ')} is not ignored by the vault's git, so a copy of your own file there would be staged by the auto-commit. Add .cache/ to the vault's .gitignore first`,
+        info.notRepo && ensureRule
+          ? `${bad.join(', ')} would still be staged by a later git init and git add -A: the vault's .gitignore overrides the .cache/ line (a \`!\` exception such as \`!.cache/\`), is a symlink (git does not read those), or git could not judge it. Remove the exception, replace the symlink with a file, or add a \`.cache/\` line after it`
+          : `${bad.join(', ')} is not ignored by the vault's git, so a copy of your own file there would be staged by the auto-commit. Add .cache/ to the vault's .gitignore first`,
       ),
       { code: 'EUNIGNORED' },
     );
@@ -937,7 +1132,7 @@ function keepCopy(hypoDir, label, text) {
   const base = `${new Date().toISOString().replace(/[:.]/g, '-')}-${safeLabel}`;
   let file = join(dir, `${base}.txt`);
   for (let n = 2; existsSync(file); n++) file = join(dir, `${base}-${n}.txt`);
-  assertCacheIgnored(hypoDir, file);
+  assertCacheIgnored(hypoDir, [file]);
   atomicWrite(file, text);
   keptLabels.add(safeLabel);
   return file;
@@ -1322,28 +1517,41 @@ function assertUnchanged(path, before) {
 function applyTarget(target, res) {
   const warnings = [];
   const failed = new Set();
+  // side files already replaced or removed: a throw below carries them (err.sideDone), so the
+  // caller can report them and record their hashes (the primary write comes after them)
+  const sideDone = [];
+  // every file this call replaced or removed, the primary included: the caller lists them
+  const done = [];
   if (target.dir) mkdirSync(target.dir, { recursive: true });
-  for (const w of plannedWrites(target, res)) {
-    if (w.kind === 'primary') {
-      assertUnchanged(w.path, w.before);
-      atomicWrite(w.path, w.content);
-      continue;
+  try {
+    for (const w of plannedWrites(target, res)) {
+      if (w.kind === 'primary') {
+        assertUnchanged(w.path, w.before);
+        atomicWrite(w.path, w.content);
+        done.push(w.path);
+        continue;
+      }
+      try {
+        assertUnchanged(w.path, w.before);
+        if (w.kind === 'side') atomicWrite(w.path, w.content);
+        else rmSync(w.path);
+        sideDone.push({ path: w.path, kind: w.kind });
+        done.push(w.path);
+      } catch (err) {
+        if (err.code === 'ECHANGED') throw err;
+        failed.add(w.path);
+        warnings.push(
+          w.kind === 'side'
+            ? `cannot write side file ${w.path}: ${err.message}`
+            : `cannot remove stale side file ${w.path}: ${err.message}`,
+        );
+      }
     }
-    try {
-      assertUnchanged(w.path, w.before);
-      if (w.kind === 'side') atomicWrite(w.path, w.content);
-      else rmSync(w.path);
-    } catch (err) {
-      if (err.code === 'ECHANGED') throw err;
-      failed.add(w.path);
-      warnings.push(
-        w.kind === 'side'
-          ? `cannot write side file ${w.path}: ${err.message}`
-          : `cannot remove stale side file ${w.path}: ${err.message}`,
-      );
-    }
+  } catch (err) {
+    err.sideDone = sideDone;
+    throw err;
   }
-  return { warnings, failed };
+  return { warnings, failed, done };
 }
 
 // ── project-id derivation ─────────────────────────────────────────────────────
@@ -1436,8 +1644,8 @@ const draftExists = (hypoDir, slug) =>
   [DRAFTS_DIR, LEGACY_DRAFTS_DIR].some((dir) => existsSync(join(dir(hypoDir), `${slug}.md`)));
 
 // The notice for old-place drafts the vault's git could stage (unignored, or git cannot
-// say), null when there are none: no such dir, or git ignores them, or the vault is not a
-// git work tree. Nothing is moved or deleted; that stays the user's call.
+// say), null when there are none: no such dir, or git ignores them. In a vault that is not a
+// git work tree they are named too, with what a later git init would do. Nothing is moved or deleted; that stays the user's call.
 function legacyDraftWarning(hypoDir) {
   let names = [];
   try {
@@ -1448,7 +1656,17 @@ function legacyDraftWarning(hypoDir) {
     return null;
   }
   const rels = names.map((f) => `pages/feedback/_drafts/${f}`);
-  const bad = unignoredCachePaths(hypoDir, rels);
+  const info = {};
+  const bad = unignoredCachePaths(hypoDir, rels, { info });
+  if (info.notRepo) {
+    // git cannot say "ignored" here, but a later `git init && git add -A` stages them
+    return (
+      `${rels.join(', ')} ${rels.length === 1 ? 'was' : 'were'} written by an earlier version: a copy of your own text. ` +
+      `This vault is not a git repository now, but making it one would let \`git add -A\` stage ${rels.length === 1 ? 'it' : 'them'}. ` +
+      `Move ${rels.length === 1 ? 'it' : 'them'} to .cache/feedback-drafts/ or delete ${rels.length === 1 ? 'it' : 'them'}; ` +
+      `--bootstrap and --write read drafts from there just the same`
+    );
+  }
   if (!bad.length) return null;
   return (
     `${bad.join(', ')} ${bad.length === 1 ? 'was' : 'were'} written by an earlier version: a copy of your own text that git can see ` +
@@ -1740,9 +1958,63 @@ function runBootstrap(args) {
   }
   // nothing to write, nothing to check: a vault with no candidates is not an error
   try {
-    if (planned.length) assertCacheIgnored(args.hypoDir, ...planned.map((p) => p.draftPath));
+    if (planned.length)
+      assertCacheIgnored(
+        args.hypoDir,
+        planned.map((p) => p.draftPath),
+        { ensureRule: !args.dryRun },
+      );
   } catch (err) {
     return { code: 1, error: `no draft was written: ${err.message}`, report, warnings };
+  }
+
+  // The hand line record is written BEFORE the first draft is published: a run that dies
+  // after a draft is linked into place would otherwise leave a draft the next bootstrap skips
+  // as "draft-exists" and a hand line nothing ever removes on promotion. The other order's
+  // worst case is a record for a draft that was never made, which the next --write drops
+  // (neither draft nor page exists) and which a promotion cannot consume (no bootstrap_origin).
+  // That drop can also come early: a locked --write that runs between this record write and
+  // the draft publish sees the entry with no draft yet and treats it as stale. The hand line
+  // then survives one promotion as a duplicate of the page. No data is lost, and bootstrap
+  // does not take the write lock, so this window is accepted rather than closed.
+  const recordOf = (c) => ({
+    slug: c.slug,
+    target: c.target,
+    file: c.file,
+    line: c.line,
+    section: c.section,
+  });
+  const sameEntry = (a, b) => a.slug === b.slug && a.target === b.target;
+  const prior = loadHandLines(args.hypoDir);
+  const recordLines = (lines) => {
+    try {
+      saveHandLines(args.hypoDir, lines);
+    } catch (err) {
+      // also in the --json report: taking back an entry whose draft was not made failed, so
+      // a record for a draft that does not exist is left (the next --write drops it)
+      const w = `could not update the hand line record after a draft failed: ${err.message}`;
+      if (!warnings.includes(w)) {
+        warnings.push(w);
+        (report.warnings ||= []).push(w);
+      }
+    }
+  };
+  if (planned.length && !args.dryRun) {
+    try {
+      saveHandLines(args.hypoDir, [
+        ...prior.filter((r) => !planned.some((p) => sameEntry(r, p.c))),
+        ...planned.map((p) => recordOf(p.c)),
+      ]);
+    } catch (err) {
+      // A draft without its record is skipped as draft-exists by every later bootstrap, so
+      // the record could never be made up: publish nothing, and the next run starts clean.
+      return {
+        code: 1,
+        error: `no draft was written: cannot record the hand lines the drafts are made from (${err.message}). Without that record a promoted draft's hand line would never be removed`,
+        report,
+        warnings,
+      };
+    }
   }
 
   const recorded = [];
@@ -1758,28 +2030,30 @@ function runBootstrap(args) {
         failure = `cannot write the draft ${draftPath}: ${err.message}`;
         break;
       }
-      recorded.push({
-        slug: c.slug,
-        target: c.target,
-        file: c.file,
-        line: c.line,
-        section: c.section,
-      });
+      recorded.push(recordOf(c));
     }
     report.created.push({ slug: c.slug, origin: c.origin, path: draftPath });
   }
-  if (recorded.length) {
-    const kept = loadHandLines(args.hypoDir).filter(
-      (r) => !recorded.some((n) => n.slug === r.slug && n.target === r.target),
+  // An entry whose draft was not made (a failure, or another run took the name) is taken
+  // back, from the record as it is NOW: a bootstrap that won the name has recorded its own
+  // line since this run read `prior`. An entry stays when the draft that took the name is a
+  // bootstrap draft (its run records the line); the entries `prior` held for a taken-back
+  // slug come back.
+  if (!args.dryRun && recorded.length < planned.length) {
+    const taken = (draftPath) => {
+      try {
+        return readFileSync(draftPath, 'utf-8').includes('<!-- HYPO:FEEDBACK-SYNC:DRAFT origin=');
+      } catch {
+        return false;
+      }
+    };
+    const back = planned.filter(
+      (p) => !recorded.some((n) => sameEntry(n, p.c)) && !taken(p.draftPath),
     );
-    try {
-      saveHandLines(args.hypoDir, [...kept, ...recorded]);
-    } catch (err) {
-      // also in the --json report: a draft was made whose hand line will now never be removed
-      const w = `could not record hand lines; they will not be removed on promotion: ${err.message}`;
-      warnings.push(w);
-      (report.warnings ||= []).push(w);
-    }
+    recordLines([
+      ...loadHandLines(args.hypoDir).filter((r) => !back.some((p) => sameEntry(r, p.c))),
+      ...prior.filter((r) => back.some((p) => sameEntry(r, p.c))),
+    ]);
   }
   if (failure) return { code: 1, error: failure, report, warnings };
   return { code: 0, report, warnings };
@@ -1847,7 +2121,12 @@ function runImport(args) {
     planned.push({ slug, path, n, inner: b.inner });
   }
   try {
-    if (planned.length) assertCacheIgnored(args.hypoDir, ...planned.map((p) => p.path));
+    if (planned.length)
+      assertCacheIgnored(
+        args.hypoDir,
+        planned.map((p) => p.path),
+        { ensureRule: !args.dryRun },
+      );
   } catch (err) {
     return { code: 1, error: `no draft was written: ${err.message}`, report, warnings };
   }
@@ -2055,16 +2334,42 @@ function removeBlock(content, b) {
 //     predicate still reads "no container", the next run appends ANOTHER pair, and
 //     --write fails forever. Refusing is the only honest move.
 //   file exists, no container → append a short guidance comment plus an empty
-//     `<learned_behaviors></learned_behaviors>` pair to the END of the file. The
-//     existing bytes are re-written verbatim ahead of the addition through
-//     atomicWrite (tmp+rename), so a crash or a full disk mid-write cannot leave
-//     the user's global config truncated — the file is either wholly old or
-//     wholly new. (The previous writeFileSync(file, content + addition) truncated
-//     first and wrote second: the one command that promises "existing content is
-//     never touched" was the one that could shred it.)
-//     The file as read is kept under .cache/feedback-kept/ first and is read again
-//     just before the replace (assertUnchanged), so a save that landed in between
-//     stops the run instead of being overwritten.
+//     `<learned_behaviors></learned_behaviors>` pair to the END of the file, with ONE
+//     append-mode write. The file is never rewritten: a rename from bytes read earlier
+//     replaces whatever an editor saved in between, and no guard closes that window (the
+//     read-again and the kept copy this command used to make only narrowed it). An
+//     append touches no byte the user has, so a save that lands around it can lose
+//     only OUR addition, and that loss shows itself: the container is absent again,
+//     the gate and doctor point back here, and a re-run is idempotent. The separator
+//     (a newline when the file does not end in one) comes from a read taken right
+//     before the write. There is nothing to keep a copy of: every byte the file had is
+//     still in it afterwards.
+//   file ends with a TRUNCATED PREFIX of our own addition (an earlier run died inside
+//     the write) → append the missing rest. The container is then one valid pair
+//     again; without this the dangling `<learned_behaviors>` would read as corrupt and
+//     the command would refuse for good. Only a byte-exact prefix counts, and only when
+//     finishing it yields exactly one pair: any other junk stays corrupt and refused.
+const ENSURE_BODY =
+  '\n' +
+  '<!-- Added by `hypomnema feedback-sync --ensure-container`: this pair is the managed\n' +
+  'region feedback-sync projects wiki-sourced learned behaviors into. Do not hand-edit its\n' +
+  'contents: a hand-edit becomes a sync conflict. -->\n' +
+  '<learned_behaviors>\n</learned_behaviors>\n';
+// A cut shorter than this is just a blank line, or too little to tell from a file's own text.
+const ENSURE_MIN_PREFIX = '\n<!-- Added by '.length;
+
+// The missing rest of our addition when `content` ends with a truncated prefix of it, or
+// null. The prefix may be preceded by the separator newline the run added (the prefix's own
+// leading newline then reads as a second one), which is why the match is on the tail.
+function truncatedEnsureTail(content) {
+  for (let k = ENSURE_BODY.length - 1; k >= ENSURE_MIN_PREFIX; k--) {
+    if (!content.endsWith(ENSURE_BODY.slice(0, k))) continue;
+    const base = content.slice(0, content.length - k);
+    return classifyContainer(base + ENSURE_BODY).state === 'present' ? ENSURE_BODY.slice(k) : null;
+  }
+  return null;
+}
+
 function runEnsureContainer(args) {
   const target = claudeTarget(args);
   const file = target.file;
@@ -2079,71 +2384,69 @@ function runEnsureContainer(args) {
     }
     return { code: 0, report: { mode: 'ensure-container', file, action: 'target-missing' } };
   }
-  let content;
-  try {
-    content = readFileSync(file, 'utf-8');
-  } catch (err) {
-    return { code: 1, error: `cannot read ${file}: ${err.message} — ${REMEDY.io(file)}` };
-  }
-  const c = classifyContainer(content);
-  if (c.state === 'present') {
-    return { code: 0, report: { mode: 'ensure-container', file, action: 'noop-already-present' } };
-  }
-  if (c.state === 'corrupt') {
-    return {
-      code: 1,
-      error:
-        `refusing to append to ${file}: it already carries a corrupt <learned_behaviors> ` +
-        `container — ${c.reason}. ${REMEDY.containerCorrupt(file, c.reason)}`,
-    };
-  }
+  const read = () => {
+    try {
+      return { content: readFileSync(file, 'utf-8') };
+    } catch (err) {
+      return { error: `cannot read ${file}: ${err.message} — ${REMEDY.io(file)}` };
+    }
+  };
+  const first = read();
+  if (first.error) return { code: 1, error: first.error };
+  // Order: a present container is a no-op, then a truncated tail of our own addition is
+  // completed, and only then corrupt is refused and absent appended. The tail check has to
+  // precede those two: a cut inside the comment holds no tag at all (it would classify as
+  // absent, and a second whole addition would land behind it), and a cut inside the pair
+  // classifies as corrupt (and would be refused for good).
+  const plan = (content) => {
+    const c = classifyContainer(content);
+    if (c.state === 'present') return { action: 'noop-already-present' };
+    const rest = truncatedEnsureTail(content);
+    if (rest !== null) return { action: 'created', text: rest, recovered: true };
+    if (c.state === 'corrupt') return { action: 'corrupt', reason: c.reason };
+    return { action: 'created', text: `${content.endsWith('\n') ? '' : '\n'}${ENSURE_BODY}` };
+  };
+  const refusal = (reason) => ({
+    code: 1,
+    error:
+      `refusing to append to ${file}: it already carries a corrupt <learned_behaviors> ` +
+      `container — ${reason}. ${REMEDY.containerCorrupt(file, reason)}`,
+  });
+  const firstPlan = plan(first.content);
+  if (firstPlan.action === 'noop-already-present')
+    return { code: 0, report: { mode: 'ensure-container', file, action: firstPlan.action } };
+  if (firstPlan.action === 'corrupt') return refusal(firstPlan.reason);
   if (args.dryRun)
     return {
       code: 0,
       report: { mode: 'ensure-container', file, action: 'would-create', dryRun: true },
     };
-  const sep = content.endsWith('\n') ? '' : '\n';
-  const addition =
-    `${sep}\n` +
-    '<!-- Added by `hypomnema feedback-sync --ensure-container`: this pair is the managed\n' +
-    'region feedback-sync projects wiki-sourced learned behaviors into. Do not hand-edit its\n' +
-    'contents: a hand-edit becomes a sync conflict. -->\n' +
-    '<learned_behaviors>\n</learned_behaviors>\n';
-  // The write rewrites the whole file from the bytes read above, so it goes through the
-  // same two guards as --write: the file as read goes aside first (when git ignores
-  // .cache/; no user bytes are removed, so a vault that does not gets a warning and the
-  // write goes on), and it is read again right before the replace, because the lock does
-  // not stop an editor.
-  const warnings = [];
-  try {
-    keepCopy(args.hypoDir, 'claude-before-ensure-container', content);
-  } catch (err) {
-    if (err.code !== 'EUNIGNORED')
-      return {
-        code: 1,
-        error: `cannot keep a copy of ${file} before replacing it: ${err.message}. Nothing was written.`,
-      };
-    warnings.push(`no copy of ${file} was kept before replacing it: ${err.message}`);
-  }
   try {
     args.testHooks?.beforeEnsureWrite?.(file);
-    assertUnchanged(file, content);
-    atomicWrite(file, content + addition);
+    // read again and decide again from these bytes: a save since the first read can have
+    // changed how the file ends, or added the container itself. A save that lands between
+    // this read and the append and already carries a container makes the append a second
+    // pair: the file then reads as corrupt and needs a hand fix (no user byte is lost).
+    const now = read();
+    if (now.error) return { code: 1, error: now.error };
+    const p = plan(now.content);
+    if (p.action === 'noop-already-present')
+      return { code: 0, report: { mode: 'ensure-container', file, action: p.action } };
+    if (p.action === 'corrupt') return refusal(p.reason);
+    appendFileSync(file, p.text);
+    return {
+      code: 0,
+      report: {
+        mode: 'ensure-container',
+        file,
+        action: 'created',
+        ...(p.recovered ? { recovered: true } : {}),
+      },
+      warnings: [],
+    };
   } catch (err) {
-    if (err.code === 'ECHANGED')
-      return { code: 1, error: `${err.message}. It was not overwritten; run it again.` };
     return { code: 1, error: `cannot write ${file}: ${err.message} — ${REMEDY.io(file)}` };
   }
-  return {
-    code: 0,
-    report: {
-      mode: 'ensure-container',
-      file,
-      action: 'created',
-      ...(warnings.length ? { warnings } : {}),
-    },
-    warnings,
-  };
 }
 
 // ── modes ─────────────────────────────────────────────────────────────────────
@@ -2151,7 +2454,12 @@ function runEnsureContainer(args) {
 // The modes that replace MEMORY.md, CLAUDE.md or a side file run under one lock on the
 // vault, so two feedback-sync runs (two PreCompact heals, a feedback post-step beside a
 // hand-run --write) cannot read the same files and then write over each other. check and
-// --dry-run only read. bootstrap and import write drafts and the line record, where a lost
+// --dry-run read the vault's files, except that a --check shown to a person also removes the
+// notices it just showed from the pending-notice file, without the lock. A notice that an
+// unattended --write (the old PreCompact hook, which prints to nobody) saves between that
+// check's read and its save can be lost: the check saves the list it read minus what it
+// showed, which does not hold the new notice.
+// bootstrap and import write drafts and the line record, where a lost
 // update only leaves a duplicate line, so they do not wait for it.
 function run(args, resolvedPid = null) {
   const locked = ['write', 'accept', 'ensure-container'].includes(args.mode) && !args.dryRun;
@@ -2183,8 +2491,13 @@ function run(args, resolvedPid = null) {
 // copy that could still undo an earlier one.
 function runAndPrune(args, resolvedPid) {
   keptLabels.clear();
+  cacheRuleNotes.length = 0;
   try {
     const out = runUnlocked(args, resolvedPid);
+    if (cacheRuleNotes.length) {
+      (out.warnings ||= []).push(...cacheRuleNotes);
+      if (out.report) (out.report.warnings ||= []).push(...cacheRuleNotes);
+    }
     if (!out.error && (out.code === 0 || out.code === 3) && keptLabels.size) {
       const warns = pruneKept(args.hypoDir, [...keptLabels]);
       if (warns.length) {
@@ -2195,6 +2508,7 @@ function runAndPrune(args, resolvedPid) {
     return out;
   } finally {
     keptLabels.clear();
+    cacheRuleNotes.length = 0;
   }
 }
 
@@ -2254,6 +2568,13 @@ function runUnlocked(args, resolvedPid = null) {
   const strictWarnings = [];
   // not a strict warning: it is about files an earlier version left, not about drift
   if (args.mode === 'write') warnLegacyDrafts(args.hypoDir, warnings, report);
+  // Notices an earlier --write kept for a run that reaches a person (see PENDING_NOTICES_FILE).
+  const attended = shownToPerson(args);
+  const pending = attended ? loadPendingNotices(args) : [];
+  for (const n of pending) {
+    warnings.push(n);
+    (report.warnings ||= []).push(n);
+  }
   if (pid.skipMemory) {
     warnings.push(
       `project-id "${pid.id}" dir not found under ${args.claudeHome}/projects — MEMORY projection skipped (pass --project-id to override)`,
@@ -2438,6 +2759,37 @@ function runUnlocked(args, resolvedPid = null) {
       };
     }
     const spent = [];
+    // A hand line kept by this write is announced once, and the record entry behind it is
+    // dropped below. A run whose output may go unseen therefore files every notice BEFORE the
+    // first target is replaced: when the state file cannot be written nothing has changed yet
+    // and the run stops, and a target that fails later cannot take the notice with it. A
+    // notice filed for a target whose write then failed stays pending: its hand line is still
+    // in the file, so a later run shows it for a line that is really there.
+    const ownNotices = evals.flatMap(({ target, res }) =>
+      res.hand.kept.map((r) => `${target.name}: ${handKeptNotice(r)}`),
+    );
+    if (ownNotices.length && !attended) {
+      try {
+        const now = loadPendingNotices(args);
+        savePendingNotices(args, [...now, ...ownNotices.filter((n) => !now.includes(n))]);
+      } catch (err) {
+        return {
+          code: 1,
+          error: `cannot keep the notice about a hand line it would leave in place for a later run: ${err.message}. No target file was written (copies kept under .cache/ before this step stay there).`,
+          report,
+          warnings,
+        };
+      }
+    }
+    // The targets this write already replaced: a later failure names them, because the
+    // run did change those files (the report of a failed run used to say only `error`).
+    const written = [];
+    const failed = (error) => ({
+      code: 1,
+      error,
+      report: written.length ? { ...report, written } : report,
+      warnings,
+    });
     try {
       for (const { target, res } of evals) {
         // a side file that already holds the generated bytes is recorded as ours too
@@ -2446,6 +2798,7 @@ function runUnlocked(args, resolvedPid = null) {
         try {
           if (res.dirty) {
             const out = applyTarget(target, res);
+            for (const file of out.done) written.push({ target: target.name, file });
             out.warnings.forEach((w) => writeWarn(`${target.name}: ${w}`));
             for (const sf of res.sideWrites)
               if (res.sidePre.get(sf.path) !== sf.content && !out.failed.has(sf.path))
@@ -2453,13 +2806,16 @@ function runUnlocked(args, resolvedPid = null) {
             for (const p of res.sideDeletes) if (!out.failed.has(p)) delete sideHashes[p];
           }
         } catch (err) {
+          // side files this target replaced before it failed are on disk: name them, and keep
+          // their hashes so the next run does not read its own output as a hand edit
+          for (const d of err.sideDone ?? []) {
+            written.push({ target: target.name, file: d.path });
+            if (d.kind === 'side')
+              sideHashes[d.path] = sha256(res.sideWrites.find((sf) => sf.path === d.path).content);
+            else delete sideHashes[d.path];
+          }
           if (err.code === 'ECHANGED') {
-            return {
-              code: 1,
-              error: `${err.message}. It was not overwritten; run feedback-sync again.`,
-              report,
-              warnings,
-            };
+            return failed(`${err.message}. It was not overwritten; run feedback-sync again.`);
           }
           // A PRIMARY-target write failure (ENOSPC, EACCES, a read-only mount).
           // Reported, not thrown: an uncaught throw prints no JSON, and every
@@ -2470,12 +2826,7 @@ function runUnlocked(args, resolvedPid = null) {
           // contract holds up to that point and no further (documented, not fixed
           // here: a two-phase commit across two independent files is a different
           // change).
-          return {
-            code: 1,
-            error: `cannot write ${target.file}: ${err.message} — ${REMEDY.io(target.file)}`,
-            report,
-            warnings,
-          };
+          return failed(`cannot write ${target.file}: ${err.message} — ${REMEDY.io(target.file)}`);
         }
         // The record entry is dropped below, so this run is the only one that can say
         // so: put it in the JSON report as well as on stderr (--json prints no warnings).
@@ -2518,6 +2869,21 @@ function runUnlocked(args, resolvedPid = null) {
   }
 
   if (strictFail) code = Math.max(code, 1);
+  // The notices above were shown by this run: take them off the file (the ones another run
+  // added since stay).
+  // Only a run that ends with exit 0 clears them: the feedback command prints just the last
+  // line of a failed post-step, and a non-zero exit is a long-lived state (no container,
+  // over the cap, a conflict) that would otherwise eat the notice every time.
+  if (pending.length && !args.dryRun && code === 0) {
+    try {
+      savePendingNotices(
+        args,
+        loadPendingNotices(args).filter((n) => !pending.includes(n)),
+      );
+    } catch (err) {
+      warnings.push(`could not clear the notices kept for a later run: ${err.message}`);
+    }
+  }
   return { code, report, warnings };
 }
 
@@ -2565,10 +2931,28 @@ async function main() {
                 skipped: out.report.skipped,
                 warnings: out.warnings ?? [],
               }
-            : { error: out.error };
+            : {
+                error: out.error,
+                ...(out.report?.written ? { written: out.report.written } : {}),
+                warnings: out.warnings ?? [],
+              };
     console.log(JSON.stringify(out.error ? errBody : out.report, null, 2));
   } else if (out.error) {
     for (const w of out.warnings || []) console.error(`[feedback-sync] warn: ${w}`);
+    // what a failed run had already done, so the error is not read as "nothing happened"
+    const rel = (p) => relative(args.hypoDir, p).split(sep).join('/');
+    const r = out.report ?? {};
+    for (const c of r.created ?? [])
+      console.error(`[feedback-sync] created draft: ${rel(c.path)} (${c.origin})`);
+    for (const s of r.skipped ?? [])
+      if (s.reason === 'draft-exists')
+        console.error(
+          `[feedback-sync] draft already there: ${rel(join(DRAFTS_DIR(args.hypoDir), `${s.slug}.md`))}`,
+        );
+    for (const i of r.imported ?? [])
+      console.error(`[feedback-sync] imported ${i.slug} → ${i.path}`);
+    for (const w of r.written ?? [])
+      console.error(`[feedback-sync] already written before the failure: ${w.file}`);
     console.error(`[feedback-sync] ${out.error}`);
   } else if (out.report.mode === 'ensure-container') {
     for (const w of out.warnings || []) console.error(`[feedback-sync] warn: ${w}`);
@@ -2610,7 +2994,8 @@ async function main() {
         (out.report.created.length && !out.report.dryRun
           ? ` Fill scope/tier/sensitivity/targets/promote_to_global and move into pages/feedback/. ` +
             `The drafts are in .cache/feedback-drafts/: not synced to other machines, and kept out of git ` +
-            `when the vault is a git work tree (feedback-sync checked that git ignores .cache/).`
+            `(in a git work tree feedback-sync checked that git ignores .cache/; in a vault that is not one ` +
+            `it made sure the .gitignore does).`
           : ''),
     );
   } else if (out.report.mode === 'accept') {

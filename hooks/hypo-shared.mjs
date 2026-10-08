@@ -1793,15 +1793,14 @@ function backUpOnce(hotPath, content, testHooks) {
  * one must never proceed once this step has been skipped by a thrown error.
  * @returns {boolean} true when the file was actually changed
  */
-function ensureVaultGitignorePattern(hypoDir, pattern) {
+export function ensureVaultGitignorePattern(hypoDir, pattern) {
   const path = join(hypoDir, '.gitignore');
   const content = existsSync(path) ? readFileSync(path, 'utf-8') : '';
   if (content.split('\n').some((l) => l.trim() === pattern)) return false;
-  const next =
-    content.length > 0 && !content.endsWith('\n')
-      ? `${content}\n${pattern}\n`
-      : `${content}${pattern}\n`;
-  atomicWrite(path, next);
+  // An append, not a rewrite: the file may be a symlink into a dotfiles repo, have a mode of
+  // its own, or be saved by an editor at this moment; a replace would change the first two
+  // and could drop the third.
+  appendFileSync(path, `${content.length > 0 && !content.endsWith('\n') ? '\n' : ''}${pattern}\n`);
   return true;
 }
 
