@@ -60,11 +60,15 @@ process.stdin.on('end', () => {
     // then has every reason to author a fresh hot.md over the one that exists on
     // the owning machine. Never name the withheld contents, only the fact.
     const scopedOut = marker.scopedOut === true;
+    // A session state that exists but could not be loaded this time is not an absent one either.
+    const unavailable = marker.unavailable === true;
     const snapshotNote = hasSnapshot
       ? ''
-      : scopedOut
-        ? ' (snapshot scoped to another machine)'
-        : ' (no snapshot yet — first session)';
+      : unavailable
+        ? ' (session state could not be read)'
+        : scopedOut
+          ? ' (snapshot scoped to another machine)'
+          : ' (no snapshot yet — first session)';
     // a cwd-change re-trigger says "Resuming"; a fresh session start
     // (default source) says "Previously working on".
     const verb = marker.source === 'cwd-change' ? 'Resuming' : 'Previously working on';
@@ -73,7 +77,7 @@ process.stdin.on('end', () => {
     // the wrapper tag, smuggle newlines/control chars, or inject conflicting
     // directives into the resume contract (codex v2 review 2026-05-26).
     const projSafe = sanitizeProjForPrompt(marker.proj);
-    // When there is no snapshot, the [HOT] / [SESSION STATE] context has nothing
+    // When there is no snapshot, the [WIKI HOT CACHE] context has nothing
     // for the model to fill the placeholders with. Provide a concrete fallback
     // line so the model doesn't leak literal `[one-line summary]` text on a
     // first-ever session (codex v2 review 2026-05-26).
@@ -81,7 +85,7 @@ process.stdin.on('end', () => {
     // document whether CwdChanged's systemMessage reaches the model; as of
     // Claude Code 2.1.276 (checked 2026-09-18), tracing the installed binary
     // shows it does not (see the transmission note in README.md), so this
-    // hook does not rely on [HOT] / [SESSION STATE] having reached the model
+    // hook does not rely on [WIKI HOT CACHE] having reached the model
     // for that move. Asking for a summary on context that never arrived
     // would risk the model inventing one, or emitting the literal brackets.
     // This is not a temporary branch: it holds until the documentation says
@@ -91,19 +95,25 @@ process.stdin.on('end', () => {
       ? `${verb} ${projSafe}. What would you like to work on here?`
       : hasSnapshot
         ? `${verb} ${projSafe}: [one-line summary]. Continue with [next task]?`
-        : scopedOut
-          ? `${projSafe}: this project has a prior snapshot, but it is scoped to another machine and is not visible here. What would you like to work on?`
-          : `${verb} ${projSafe}: no prior snapshot yet — first session. What would you like to start with?`;
+        : unavailable
+          ? `${projSafe}: this project has prior session state, but it could not be read this time. What would you like to work on?`
+          : scopedOut
+            ? `${projSafe}: this project has a prior snapshot, but it is scoped to another machine and is not visible here. What would you like to work on?`
+            : `${verb} ${projSafe}: no prior snapshot yet — first session. What would you like to start with?`;
     const fillNote = cwdMove
       ? `Use the line above verbatim. No prior context was injected for this move.`
       : hasSnapshot
-        ? `Replace the bracketed placeholders using the [HOT] / [SESSION STATE] ` +
-          `context already injected this session — do NOT emit the literal brackets.`
-        : scopedOut
-          ? `Use the line above verbatim. The project has prior work; its snapshot ` +
-            `simply belongs to another machine, so treat it as an existing project ` +
+        ? `Replace the bracketed placeholders using the project context under [WIKI HOT CACHE] ` +
+          `(Active tracks, Latest session) already injected this session — do NOT emit the literal brackets.`
+        : unavailable
+          ? `Use the line above verbatim. The project has prior work, but its session ` +
+            `state could not be loaded this time, so treat it as an existing project ` +
             `whose history you cannot see from here.`
-          : `Use the line above verbatim — there is no prior snapshot to summarize.`;
+          : scopedOut
+            ? `Use the line above verbatim. The project has prior work; its snapshot ` +
+              `simply belongs to another machine, so treat it as an existing project ` +
+              `whose history you cannot see from here.`
+            : `Use the line above verbatim — there is no prior snapshot to summarize.`;
 
     console.log(
       JSON.stringify(

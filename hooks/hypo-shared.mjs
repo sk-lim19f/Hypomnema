@@ -30,14 +30,13 @@ import { isValidSessionId } from './proposal-store.mjs';
 import {
   GITIGNORE_BLOCK,
   LEGACY_TRACK_ID,
-  buildBaselineEntry,
+  buildLegacyBaselines,
   generatedViewSlug,
   isGeneratedViewPath,
   isSessionEntryPath,
   isSessionProjectDir,
   mergeAdditiveGitignore,
   missingBlockLines,
-  narrowestVisibilityScope,
   parseSessionEntry,
   scopeVisible,
   sessionViewPathsOf,
@@ -1947,6 +1946,18 @@ function hasGitEntry(dir) {
 }
 
 /**
+ * True for a vault that is not a git repository and has no `.git` entry in it or any parent. Such a
+ * vault tracks nothing, so `migrationState` calls it `migrated`, and its old `hot.md` and
+ * `session-state.md` are moved to baseline entries by the generator instead of a migration commit.
+ * Git failing to answer while the entry is there is not this (the vault may well track views).
+ */
+export function vaultHasNoGit(hypoDir) {
+  return (
+    vaultGit(hypoDir, ['rev-parse', '--is-inside-work-tree']).status !== 0 && !hasGitEntry(hypoDir)
+  );
+}
+
+/**
  * `'migrated' | 'not-migrated' | 'opted-out' | 'incomplete-block'`, read from HEAD's tree only (the real index is not
  * consulted: a migration commit moves HEAD and the index together). The off marker in HEAD is
  * `opted-out`; the `.gitignore` block in HEAD plus no tracked generated view in HEAD is
@@ -2122,6 +2133,32 @@ export function readGeneratedViewsRecord(hypoDir) {
   } catch {
     return { views: {}, state: 'invalid' };
   }
+}
+
+const LEGACY_MOVE_PENDING_REL = join('.cache', 'legacy-move-pending.json');
+
+/**
+ * The slugs of the projects whose move of old `hot.md` / `session-state.md` into baseline entries
+ * (a vault with no git) has not happened yet: hidden by `.hypoignore` or stopped by a name clash
+ * when the first pass ran. A missing or unreadable file is the empty set.
+ */
+export function readLegacyMovePending(hypoDir) {
+  try {
+    const slugs = JSON.parse(readFileSync(join(hypoDir, LEGACY_MOVE_PENDING_REL), 'utf-8'))?.slugs;
+    return new Set(Array.isArray(slugs) ? slugs.filter((x) => typeof x === 'string') : []);
+  } catch {
+    return new Set();
+  }
+}
+
+/** Save the set `readLegacyMovePending` reads; an empty set removes the file. */
+export function writeLegacyMovePending(hypoDir, slugs) {
+  if (slugs.size === 0) rmSync(join(hypoDir, LEGACY_MOVE_PENDING_REL), { force: true });
+  else
+    atomicWrite(
+      join(hypoDir, LEGACY_MOVE_PENDING_REL),
+      JSON.stringify({ slugs: [...slugs].sort() }),
+    );
 }
 
 /** Save `views` (`{relPath: sha256}`) as the ownership record. The one writer of the file `readGeneratedViewsRecord` reads. */
@@ -2898,54 +2935,67 @@ export function shareLegacyBytes(hypoDir, archived) {
       (a, b) => a.sort[0] - b.sort[0] || a.sort[1] - b.sort[1],
     );
     for (const group of ordered) {
-      // A side with no version in this group comes from `companionRev`'s tree, else it is empty.
-      const side = (name, list, i) =>
+      // Only what this group set aside becomes a baseline. The side it did not set aside comes
+      // from `companionRev`'s tree for the date alone: that file is not this machine's memory, and
+      // a baseline of it would be a stale copy of the other machine's bytes.
+      const companion = (name, list, i) =>
         list[i] ??
         (group.rev ? gitShowText(hypoDir, group.rev, `projects/${slug}/${name}.md`) : null) ??
         '';
       for (let i = 0; i < Math.max(group.hot.length, group.state.length); i++) {
         const pair = {
-          hotText: side('hot', group.hot, i),
-          stateText: side('session-state', group.state, i),
+          hotText: group.hot[i] ?? '',
+          stateText: group.state[i] ?? '',
+          dateTexts: [companion('hot', group.hot, i), companion('session-state', group.state, i)],
         };
-        pairs.set(JSON.stringify(pair), pair);
+        pairs.set(JSON.stringify([pair.hotText, pair.stateText]), pair);
       }
     }
     const indexText = readTextOrNull(join(hypoDir, 'projects', slug, 'index.md')) ?? '';
     let existing = null;
-    for (const { hotText, stateText } of pairs.values()) {
-      const built = buildBaselineEntry({
+    for (const { hotText, stateText, dateTexts } of pairs.values()) {
+      // One entry per old file, each with its own scope.
+      const builtPair = buildLegacyBaselines({
         hotText,
         stateText,
-        date: legacyBaselineDate(hypoDir, slug, [hotText, stateText]),
-        visibilityScope: narrowestVisibilityScope([
-          readVisibilityScope(indexText),
-          readVisibilityScope(hotText),
-          readVisibilityScope(stateText),
-        ]).scope,
+        date: legacyBaselineDate(hypoDir, slug, dateTexts),
         project: slug,
+        scopes: {
+          index: readVisibilityScope(indexText),
+          hot: readVisibilityScope(hotText),
+          state: readVisibilityScope(stateText),
+        },
         legacyDone: false,
       });
-      const mine = parseSessionEntry(built.text).entry;
-      existing ??= committedBaselines(hypoDir, slug);
-      const rel = `projects/${slug}/sessions/${built.fileName}`;
-      if (
-        existing.some(
-          (e) => e.summary === mine.summary && e.legacy === mine.bodies[LEGACY_TRACK_ID],
-        )
-      ) {
-        skipped.push(rel);
-        continue;
+      for (const built of builtPair) {
+        const mine = parseSessionEntry(built.text).entry;
+        existing ??= committedBaselines(hypoDir, slug);
+        const rel = `projects/${slug}/sessions/${built.fileName}`;
+        // A baseline made before the split held both files in one entry, so the section of this
+        // kind is what is compared, not the whole entry.
+        const same =
+          built.kind === 'hot'
+            ? (e) => e.summary === mine.summary
+            : (e) => e.legacy === mine.bodies[LEGACY_TRACK_ID];
+        if (existing.some(same)) {
+          skipped.push(rel);
+          continue;
+        }
+        if (publishNoClobber(join(hypoDir, rel), built.text) === 'conflict') {
+          skipped.push(rel);
+          notices.push(`${rel}에 다른 내용의 파일이 이미 있어 추가 기준선을 쓰지 않았습니다.`);
+          continue;
+        }
+        toCommit.push(rel);
+        // A later pair in this run can name the same file (two groups with one hot text): it is
+        // taken now, not published twice.
+        existing.push({ summary: mine.summary, legacy: mine.bodies[LEGACY_TRACK_ID] });
+        notices.push(
+          built.kind === 'state'
+            ? `이 기계에만 있던 옛 세션 현황을 추가 기준선 ${rel}로 기록했습니다. legacy 트랙에 머리가 여럿 보일 수 있습니다.`
+            : `이 기계에만 있던 옛 hot.md를 추가 기준선 ${rel}로 기록했습니다. 최근 세션 요약에 따로 보일 수 있습니다.`,
+        );
       }
-      if (publishNoClobber(join(hypoDir, rel), built.text) === 'conflict') {
-        skipped.push(rel);
-        notices.push(`${rel}에 다른 내용의 파일이 이미 있어 추가 기준선을 쓰지 않았습니다.`);
-        continue;
-      }
-      toCommit.push(rel);
-      notices.push(
-        `이 기계에만 있던 옛 세션 현황을 추가 기준선 ${rel}로 기록했습니다. legacy 트랙에 머리가 여럿 보일 수 있습니다.`,
-      );
     }
   }
   if (toCommit.length) {

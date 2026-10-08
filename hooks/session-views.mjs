@@ -22,11 +22,12 @@ import {
   GITIGNORE_BLOCK,
   LEGACY_TRACK_ID,
   TRACK_ID_RE,
-  buildBaselineEntry,
+  buildLegacyBaselines,
   generatedViewSlug,
   isBaselineId,
   isGeneratedViewPath,
   isSessionEntryPath,
+  isSessionProjectDir,
   missingBlockLines,
   narrowestVisibilityScope,
   parseSessionEntry,
@@ -40,6 +41,7 @@ import {
   clearGeneratedPathsBlockingPull,
   currentDevice,
   frontmatterScalar,
+  isIgnored,
   legacyBaselineDate,
   listSessionProjects,
   listTrackedGeneratedViews,
@@ -49,6 +51,7 @@ import {
   pathInHead,
   projectHiddenByHypoignore,
   readGeneratedViewsRecord,
+  readLegacyMovePending,
   readRootHotProjectionOwnership,
   readVisibilityScope,
   resumePullArchive,
@@ -59,7 +62,9 @@ import {
   unignoredCachePaths,
   vaultCommitLockTarget,
   vaultGitPrefix,
+  vaultHasNoGit,
   withFileLock,
+  writeLegacyMovePending,
   writeGeneratedViewsRecord,
   writeRootHotHealthNotice,
 } from './hypo-shared.mjs';
@@ -72,6 +77,13 @@ export {
   listTrackedGeneratedViews,
   migrationState,
 } from './hypo-shared.mjs';
+
+/**
+ * How long into a SessionStart the hook may still begin moving a vault to the scheme. Past this the
+ * move waits for the next session; a move that has begun always runs to its end. A first value
+ * without a measurement behind it.
+ */
+export const MIGRATION_START_DEADLINE_MS = 20000;
 
 // `entry_scope` has the grammar of `visibility_scope`; anything else closes the project.
 const ENTRY_SCOPE_RE = /^(shared|machine:\S*|agent:\S+)$/;
@@ -156,41 +168,62 @@ function entryScopeOf(indexText) {
   return ENTRY_SCOPE_RE.test(raw) ? raw : 'machine:';
 }
 
-// The in-memory entry that stands for a not-yet-migrated project's old `hot.md` and
-// `session-state.md` (whichever of them HEAD tracks), built from HEAD's committed bytes: the same
-// bytes, so the same id, as the baseline the migration commit makes. `null` when neither is.
-function virtualBaseline(hypoDir, project, tracked, indexText) {
-  const rels = [`projects/${project}/hot.md`, `projects/${project}/session-state.md`];
-  // HEAD's bytes, as the migration commit reads them, not the index or the working tree.
-  const [hotText, stateText] = rels.map((rel) =>
-    tracked.has(rel) ? showText(hypoDir, 'HEAD', rel) : null,
-  );
-  if (hotText === null && stateText === null) return null;
-  const { scope } = narrowestVisibilityScope([
-    readVisibilityScope(indexText ?? ''),
-    readVisibilityScope(hotText ?? ''),
-    readVisibilityScope(stateText ?? ''),
-  ]);
-  const built = buildBaselineEntry({
+// The baseline scopes `buildLegacyBaselines` takes, read from the three texts.
+const baselineScopes = (indexText, hotText, stateText) => ({
+  index: readVisibilityScope(indexText ?? ''),
+  hot: readVisibilityScope(hotText ?? ''),
+  state: readVisibilityScope(stateText ?? ''),
+});
+
+// An old file's bytes as the baseline would hold them: `null` when the file is absent, or when the
+// bytes are what the generator itself last wrote at that path (`views` is the ownership record).
+// The generator's own output is not old memory. A file the generator wrote and a person then edited
+// has other bytes, so it still counts, whatever its frontmatter says.
+function oldFileText(views, rel, text) {
+  if (text === null || views[rel] === sha256(text)) return null;
+  return text;
+}
+
+// The in-memory entries that stand for a not-yet-migrated project's old `hot.md` and
+// `session-state.md` (whichever of them is on disk), one entry per file, built from the bytes in
+// the working tree: a hand edit or a write git has not committed yet is part of what the session
+// is told, and a file the vault's own `.gitignore` keeps out of git is not hidden. The migration
+// commit reads HEAD instead, so a file that differs from HEAD gets another id than the baseline the
+// migration will make; the additional baseline made from this machine's local bytes covers that.
+// `[]` when neither file is there. After the move (`afterMove`) a file carrying the generator's
+// marker is a view, not old memory, whatever its hash says.
+function virtualBaselines(hypoDir, project, indexText, views, afterMove) {
+  const [hotText, stateText] = ['hot.md', 'session-state.md'].map((name) => {
+    const rel = `projects/${project}/${name}`;
+    const text = oldFileText(views, rel, lenientRead(join(hypoDir, rel)));
+    return afterMove && text !== null && frontmatterScalar(text, 'generated') === 'sessions'
+      ? null
+      : text;
+  });
+  if (hotText === null && stateText === null) return [];
+  return buildLegacyBaselines({
     hotText,
     stateText,
     date: legacyBaselineDate(hypoDir, project, [hotText ?? '', stateText ?? '']),
-    visibilityScope: scope,
     project,
+    scopes: baselineScopes(indexText, hotText, stateText),
     legacyDone: false,
+  }).map((built) => {
+    const parsed = parseSessionEntry(built.text);
+    if (!parsed.ok) throw new Error(parsed.reason);
+    return parsed.entry;
   });
-  const parsed = parseSessionEntry(built.text);
-  if (!parsed.ok) throw new Error(parsed.reason);
-  return parsed.entry;
 }
 
 /**
  * The model one project's views are made from: `{project, migrated, entries, unreadable, notes,
- * entryScope}`. `migrated` is whether `migrationState` is `migrated`; before that the model also
- * holds a virtual baseline entry built from the tracked old files (nothing is written). `notes`
- * is the body of `notes.md` or `null`; `entryScope` is the `entry_scope` of `index.md` (a value
+ * notesScope, entryScope}`. `migrated` is whether `migrationState` is `migrated`; before that the model also
+ * holds a virtual baseline entry for each old file on disk (nothing is written). `notes`
+ * is the body of `notes.md` or `null` (`null` for a note `.hypoignore` hides; `notesScope` is its
+ * `visibility_scope`, `''` when it has none); `entryScope` is the `entry_scope` of `index.md` (a value
  * that is not a valid scope closes the project as `machine:`) or `null`. `opts.state` passes an
- * already known `migrationState`; `opts.testHooks` goes to `listSessionEntries`.
+ * already known `migrationState`; `opts.testHooks` goes to `listSessionEntries`; `opts.localOld`
+ * adds the virtual baselines of old files on disk to a migrated model too (injection only).
  */
 export function loadSessionModel(hypoDir, project, opts = {}) {
   const state = opts.state ?? migrationState(hypoDir);
@@ -198,18 +231,22 @@ export function loadSessionModel(hypoDir, project, opts = {}) {
   const { entries, unreadable } = listSessionEntries(hypoDir, project, opts);
   const base = join(hypoDir, 'projects', project);
   const indexText = lenientRead(join(base, 'index.md'));
-  const notesText = lenientRead(join(base, 'notes.md'));
-  if (!migrated) {
+  // A note `.hypoignore` hides is not read at all; its `visibility_scope` travels with it, and the
+  // injection applies the same device judgment the entries get.
+  const notesPath = join(base, 'notes.md');
+  const notesText = isIgnored(notesPath, hypoDir, opts.patterns ?? loadHypoIgnore(hypoDir))
+    ? null
+    : lenientRead(notesPath);
+  // `opts.localOld` also reads the old files still on disk after the move: one git did not track
+  // is not in a baseline, and the session that starts right after the move should still be told it
+  // (the writer backs it up next). Never used for a view: the text would be published.
+  if (!migrated || opts.localOld) {
     try {
-      let tracked = new Set();
-      try {
-        tracked = new Set(listTrackedGeneratedViews(hypoDir, { source: 'head' }));
-      } catch {
-        // git cannot say what is tracked: no baseline rather than a guessed one
+      const { views } = readGeneratedViewsRecord(hypoDir);
+      for (const baseline of virtualBaselines(hypoDir, project, indexText, views, migrated)) {
+        // A real baseline file with this id (an interrupted move) stands for it already.
+        if (!entries.some((e) => e.closeId === baseline.closeId)) entries.push(baseline);
       }
-      const baseline = virtualBaseline(hypoDir, project, tracked, indexText);
-      // A real baseline file with this id (an interrupted move) stands for it already.
-      if (baseline && !entries.some((e) => e.closeId === baseline.closeId)) entries.push(baseline);
     } catch (err) {
       unreadable.push({ fileName: 'session-state.md', reason: `baseline: ${err?.message ?? err}` });
     }
@@ -220,22 +257,28 @@ export function loadSessionModel(hypoDir, project, opts = {}) {
     entries,
     unreadable,
     notes: notesText === null ? null : splitLegacyFrontmatter(notesText).body.trim() || null,
+    notesScope: notesText === null ? '' : readVisibilityScope(notesText),
     entryScope: indexText === null ? null : entryScopeOf(indexText),
   };
 }
 
 /**
  * The `visibility_scope` a new entry of `project` carries. An `entry_scope` in `index.md` wins as
- * it is; otherwise the narrowest of the `index.md` value and every baseline entry's value, so an
- * old file's machine scope carries over without `index.md` being edited. `model` is optional.
+ * it is; otherwise the narrowest of the `index.md` value and the `session-state.md` baseline's value
+ * (the entry that carries the `legacy` track, which new entries continue). The old `hot.md`
+ * baseline's value is left out: it hides only its own summary, and letting it narrow every new entry
+ * would hide the closes of a project whose state file is shared. `model` is optional.
  */
 export function projectEntryScope(hypoDir, project, model) {
   const m = model ?? loadSessionModel(hypoDir, project);
   if (typeof m.entryScope === 'string') return m.entryScope;
   const indexText = lenientRead(join(hypoDir, 'projects', project, 'index.md'));
+  const stateBaselines = m.entries.filter(
+    (e) => isBaselineId(e.closeId) && e.tracks.some((t) => t.id === LEGACY_TRACK_ID),
+  );
   return narrowestVisibilityScope([
     readVisibilityScope(indexText ?? ''),
-    ...m.entries.filter((e) => isBaselineId(e.closeId)).map((e) => e.visibilityScope),
+    ...stateBaselines.map((e) => e.visibilityScope),
   ]).scope;
 }
 
@@ -251,7 +294,7 @@ function readOwnership(hypoDir) {
     const { lastHash } = readRootHotProjectionOwnership(hypoDir);
     if (lastHash) views['hot.md'] = lastHash;
   }
-  return { views, dirty: state !== 'ok' };
+  return { views, dirty: state !== 'ok', fresh: state === 'missing' };
 }
 
 // Write one view if its bytes differ. Bytes this writer did not last write at this very path are
@@ -331,6 +374,150 @@ function skipUnignoredCache(hypoDir, state, unignored) {
   return emptyResult({ notMigrated: true, state, unignoredCache: unignored });
 }
 
+// What to tell the user about the scope a baseline took: two scopes that name different machines
+// close it for everyone, and a scope that differs from `index.md`'s is carried into new entries.
+function baselineScopeNotices(slug, built, indexScope) {
+  const file = built.kind === 'hot' ? 'hot.md' : 'session-state.md';
+  if (built.conflict) {
+    return [
+      `프로젝트 ${slug}: 옛 ${file}와 프로젝트의 범위가 서로 다른 기계를 가리켜 그 기준선을 machine:으로 닫았습니다. 어느 기계에서도 보이지 않습니다.`,
+    ];
+  }
+  if (built.scope !== null && built.scope !== indexScope) {
+    return [
+      `이행 뒤 프로젝트 ${slug}의 원본은 옛 파일의 범위를 이어받습니다: ${indexScope || '(없음)'} → ${built.scope} (${file})`,
+    ];
+  }
+  return [];
+}
+
+// ── moving a vault that is not a git repository ──────────────────────────────
+
+const VIEW_NAMES = ['hot.md', 'session-state.md'];
+
+/**
+ * Move the old `hot.md` and `session-state.md` of a vault that is not a git repository into
+ * baseline entries (one per file, the same entries a git vault's migration makes, only without a
+ * repository to record it in), so the generator that follows does not meet them as bytes it never
+ * wrote. `own` is the ownership record `readOwnership` returned; the moved files' bytes are
+ * claimed in it (they are kept whole in the entry, so the generator may replace them without a
+ * backup) and the record is saved at once. Returns `{created: [relPath], notices: [string],
+ * blocked: [slug]}`. The caller holds the vault commit lock.
+ *
+ * Which projects are looked at: every one while the vault has no ownership record (the generator
+ * has not written a view yet), afterwards only those that were set aside then (hidden by
+ * `.hypoignore`, or blocked, see below) and are visible now. The record is vault wide and a
+ * project can miss the first pass, so it cannot say that a given project was moved; the set aside
+ * list does. A visible project outside both is judged as before: a file that is foreign to the
+ * generator is an edit to a generated view, not old memory, and the generator backs it up and
+ * reports it, as in a git vault. A file the generator wrote (`generated: sessions`) is not an old file.
+ *
+ * Per project, the move is complete when every baseline file the old files would make is in
+ * `sessions/` with the bytes the move would write: a run that died part way writes only the
+ * missing ones next time, and one that died before saving the record claims the old files without
+ * writing anything. A file already at a baseline's name with other bytes is not that baseline, and
+ * claiming the old file on its word would let the generator replace the only copy of it: the
+ * project is `blocked` (nothing written, nothing claimed, the old files untouched), a notice names
+ * the path, and the caller leaves the project's views alone until the clash is resolved.
+ */
+export function moveLegacyFilesToEntriesUnlocked(hypoDir, own) {
+  const created = [];
+  const notices = [];
+  const blocked = [];
+  const pendingBefore = readLegacyMovePending(hypoDir);
+  if (!own.fresh && pendingBefore.size === 0) return { created, notices, blocked };
+  const pending = new Set(pendingBefore);
+  const patterns = loadHypoIgnore(hypoDir);
+  let names = [];
+  try {
+    names = readdirSync(join(hypoDir, 'projects'));
+  } catch {
+    // no projects/: nothing to move
+  }
+  let claimed = false;
+  for (const slug of names.sort((a, b) => (a < b ? -1 : a > b ? 1 : 0))) {
+    if (slug === '_template' || !isSessionProjectDir({ slug, hasIndex: true })) continue;
+    if (!own.fresh && !pending.has(slug)) continue;
+    // A view of this project already has an ownership record: its move completed earlier and the
+    // slug is stale. Moving now would baseline a later hand edit instead of letting the writer back it up.
+    if (!own.fresh && VIEW_NAMES.some((n) => Object.hasOwn(own.views, `projects/${slug}/${n}`))) {
+      pending.delete(slug);
+      continue;
+    }
+    const base = join(hypoDir, 'projects', slug);
+    const [hotText, stateText] = ['hot.md', 'session-state.md'].map((name) => {
+      const text = lenientRead(join(base, name));
+      if (text === null || frontmatterScalar(text, 'generated') === 'sessions') return null;
+      return own.views[`projects/${slug}/${name}`] === sha256(text) ? null : text;
+    });
+    if (hotText === null && stateText === null) {
+      pending.delete(slug);
+      continue;
+    }
+    if (projectHiddenByHypoignore(hypoDir, slug, patterns)) {
+      pending.add(slug);
+      continue;
+    }
+    const indexText = lenientRead(join(base, 'index.md'));
+    const legacy = trackHeads(listSessionEntries(hypoDir, slug).entries).find(
+      (t) => t.trackId === LEGACY_TRACK_ID,
+    );
+    const indexScope = readVisibilityScope(indexText ?? '');
+    const plan = buildLegacyBaselines({
+      hotText,
+      stateText,
+      date: legacyBaselineDate(hypoDir, slug, [hotText ?? '', stateText ?? '']),
+      project: slug,
+      scopes: baselineScopes(indexText, hotText, stateText),
+      legacyDone: legacy?.done === true,
+    }).map((built) => ({
+      built,
+      relPath: `projects/${slug}/sessions/${built.fileName}`,
+    }));
+    const clash = plan.find(({ built, relPath }) => {
+      const there = lenientRead(join(hypoDir, relPath));
+      return there !== null && there !== built.text;
+    });
+    if (clash) {
+      pending.add(slug);
+      blocked.push(slug);
+      notices.push(
+        `프로젝트 ${slug}: ${clash.relPath}에 이미 다른 내용의 파일이 있어 옛 hot.md와 session-state.md를 옮기지 않았습니다. ` +
+          '옛 파일은 그대로 두었고 이 프로젝트의 현황 파일은 갱신하지 않습니다. 그 파일을 확인하고 치운 뒤 다시 시작하세요.',
+      );
+      continue;
+    }
+    for (const { built, relPath } of plan) {
+      if (lenientRead(join(hypoDir, relPath)) !== null) continue; // an earlier run wrote it
+      atomicWrite(join(hypoDir, relPath), built.text);
+      created.push(relPath);
+      notices.push(...baselineScopeNotices(slug, built, indexScope));
+    }
+    pending.delete(slug);
+    for (const [name, text] of [
+      ['hot.md', hotText],
+      ['session-state.md', stateText],
+    ]) {
+      if (text !== null) own.views[`projects/${slug}/${name}`] = sha256(text);
+      claimed ||= text !== null;
+    }
+  }
+  // The list goes first: a run that dies before the record is saved still knows who is waiting.
+  if (pending.size !== pendingBefore.size || [...pending].some((x) => !pendingBefore.has(x)))
+    writeLegacyMovePending(hypoDir, pending);
+  if (claimed) {
+    writeGeneratedViewsRecord(hypoDir, own.views);
+    own.dirty = false;
+    own.fresh = false;
+  }
+  if (created.length) {
+    notices.unshift(
+      `git 저장소가 아닌 볼트라 옛 hot.md와 session-state.md를 세션 원본(기준선)으로 옮겼습니다: ${created.join(', ')}`,
+    );
+  }
+  return { created, notices, blocked };
+}
+
 /**
  * `writeGeneratedViews` for a caller that already holds the vault commit lock (the lock is not
  * reentrant). `opts`: `projects` (slugs, default every session project), `root` (write the root
@@ -349,12 +536,24 @@ export function writeGeneratedViewsUnlocked(hypoDir, opts = {}) {
   if (state !== 'migrated') return emptyResult({ notMigrated: true, state });
   const unignored = unignoredCachePaths(hypoDir);
   if (unignored.length) return skipUnignoredCache(hypoDir, state, unignored);
+  // A vault with no git has no migration to move its old `hot.md` and `session-state.md`: they
+  // move into baseline entries here, before anything is rendered over them.
+  const own = readOwnership(hypoDir);
+  let blocked = [];
+  if (vaultHasNoGit(hypoDir)) {
+    const moved = moveLegacyFilesToEntriesUnlocked(hypoDir, own);
+    blocked = moved.blocked;
+    if (moved.notices.length) writeRootHotHealthNotice(hypoDir, moved.notices.join('\n'));
+  }
   // A project the `.hypoignore` hides gets no views and no row in the root table: its entries are
   // never committed, so a table row would publish a project the owner chose to keep local.
   const patterns = loadHypoIgnore(hypoDir);
   const hidden = (p) => projectHiddenByHypoignore(hypoDir, p, patterns);
   const all = listSessionProjects(hypoDir).filter((p) => !hidden(p));
-  const only = opts.projects ? all.filter((p) => opts.projects.includes(p)) : all;
+  // A project whose move was blocked keeps its old files: rendering would back them up and replace them.
+  const only = (opts.projects ? all.filter((p) => opts.projects.includes(p)) : all).filter(
+    (p) => !blocked.includes(p),
+  );
   const models = all.map((p) => loadSessionModel(hypoDir, p, { state, testHooks }));
   const views = renderViews(models, { device, only });
   const targets = only.flatMap((slug) => [
@@ -364,7 +563,6 @@ export function writeGeneratedViewsUnlocked(hypoDir, opts = {}) {
   if (root) targets.push(['hot.md', views.root]);
 
   const result = emptyResult({ state });
-  const own = readOwnership(hypoDir);
   let failure = null;
   try {
     for (const [relPath, content] of targets) {
@@ -642,9 +840,11 @@ const deferredMigration = (reason, detail) =>
 
 /**
  * Move a vault from tracked `hot.md`/`session-state.md` files to session entries: one commit with a
- * baseline entry per project (the old two files whole, as HEAD has them), the `.gitignore` and
- * `.gitattributes` blocks, and the generated views untracked, applied with `fastForwardTo`.
- * `index.md` is not changed (the baseline carries the old files' `visibility_scope`), and
+ * baseline entry per old file HEAD tracks, in each project (each whole, as HEAD has it, with its own
+ * `visibility_scope`; bytes the generator wrote are not old files; an old file git does not track
+ * stays where it is for the writer to back up, and a notice says so), the `.gitignore` and `.gitattributes` blocks, and the generated views
+ * untracked, applied with `fastForwardTo`. `index.md` is not changed (the baselines carry the old
+ * files' `visibility_scope`), and
  * `projects/_template` is not touched (it is not a generated path). For a caller that already
  * holds the vault commit lock; `migrateVaultToSessionEntries` takes it. `opts`: `reenable` (also
  * move a vault rolled back on purpose, removing the off marker in the same commit), `testHooks`
@@ -686,11 +886,34 @@ export function migrateVaultToSessionEntriesUnlocked(hypoDir, opts = {}) {
   }
   const notices = [];
   const patterns = loadHypoIgnore(hypoDir);
+  const { views: ownViews } = readGeneratedViewsRecord(hypoDir);
   const writes = [];
   const baselines = [];
+  // Only an old file HEAD tracks becomes a baseline, read from HEAD. One git does not track (never
+  // committed, or kept out of git by a rule of the vault's own `.gitignore`) is not published and
+  // not claimed: whether it is the owner's private file or an edited generated view cannot be told
+  // from here, and its `index.md` scope may be just as untracked. The writer that follows backs it
+  // up as foreign bytes, and the notice below says so.
+  const trackedSet = new Set(tracked);
+  const OLD_NAMES = ['hot.md', 'session-state.md'];
   const slugs = [...new Set(tracked.map((rel) => generatedViewSlug(rel)))]
     .filter(Boolean)
     .sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+  const leftLocal = listSessionProjects(hypoDir)
+    .filter((slug) => !projectHiddenByHypoignore(hypoDir, slug, patterns))
+    .flatMap((slug) => OLD_NAMES.map((name) => `projects/${slug}/${name}`))
+    .filter((rel) => {
+      if (trackedSet.has(rel)) return false;
+      const text = lenientRead(join(hypoDir, rel));
+      return text !== null && ownViews[rel] !== sha256(text);
+    });
+  if (leftLocal.length) {
+    notices.push(
+      `git이 추적하지 않는 옛 파일은 세션 원본으로 옮기지 않았습니다: ${leftLocal.join(', ')}. ` +
+        '다음 생성 때 .cache/backups/ 아래에 보관하고 그 위치를 알립니다. ' +
+        '남길 내용은 다음 close의 요약이나 projects/<p>/notes.md로 옮기세요.',
+    );
+  }
   // A rule of the user's own `.gitignore` (or an exclude file) that covers an entry directory would
   // keep every close out of git once the views stop being tracked: the move waits for that rule.
   // Every project that is not hidden by `.hypoignore` is probed in one call, so the answer does not
@@ -717,41 +940,36 @@ export function migrateVaultToSessionEntriesUnlocked(hypoDir, opts = {}) {
     // A hidden project's entries are never committed, so it gets no baseline. The catch-up step
     // keeps a local copy of its old files before the merge removes them.
     if (projectHiddenByHypoignore(hypoDir, slug, patterns)) continue;
-    const hotText = showText(hypoDir, 'HEAD', `projects/${slug}/hot.md`);
-    const stateText = showText(hypoDir, 'HEAD', `projects/${slug}/session-state.md`);
+    // HEAD can track a generated view too (a vault that ran `git init` and committed everything
+    // after a move): the generator's own bytes are not old memory, so they get no baseline.
+    const [hotText, stateText] = OLD_NAMES.map((name) => {
+      const rel = `projects/${slug}/${name}`;
+      return trackedSet.has(rel)
+        ? oldFileText(ownViews, rel, showText(hypoDir, 'HEAD', rel))
+        : null;
+    });
     const indexScope = readVisibilityScope(showText(hypoDir, 'HEAD', `projects/${slug}/index.md`));
-    const { scope, conflict } = narrowestVisibilityScope([
-      indexScope,
-      readVisibilityScope(hotText ?? ''),
-      readVisibilityScope(stateText ?? ''),
-    ]);
-    if (conflict) {
-      notices.push(
-        `프로젝트 ${slug}: 옛 파일들의 범위가 서로 다른 기계를 가리켜 기준선을 machine:으로 닫았습니다. 어느 기계에서도 보이지 않습니다.`,
-      );
-    } else if (scope !== null && scope !== indexScope) {
-      notices.push(
-        `이행 뒤 프로젝트 ${slug}의 원본은 옛 파일의 범위를 이어받습니다: ${indexScope || '(없음)'} → ${scope}`,
-      );
-    }
     // An update the old scheme already sent to `legacy` with `done` replaced the virtual baseline,
     // whose id covers the bytes of this moment. The real baseline gets another id when the files
     // changed since, so it is built folded to keep that `done` effective.
     const legacy = trackHeads(listSessionEntries(hypoDir, slug).entries).find(
       (t) => t.trackId === LEGACY_TRACK_ID,
     );
-    const built = buildBaselineEntry({
+    const built = buildLegacyBaselines({
       hotText,
       stateText,
       date: legacyBaselineDate(hypoDir, slug, [hotText ?? '', stateText ?? '']),
-      visibilityScope: scope,
       project: slug,
+      scopes: { ...baselineScopes('', hotText, stateText), index: indexScope },
       legacyDone: legacy?.done === true,
     });
-    const relPath = `projects/${slug}/sessions/${built.fileName}`;
-    if (pathInHead(hypoDir, relPath)) continue; // the same content is already there
-    writes.push({ relPath, text: built.text });
-    baselines.push(relPath);
+    for (const b of built) {
+      notices.push(...baselineScopeNotices(slug, b, indexScope));
+      const relPath = `projects/${slug}/sessions/${b.fileName}`;
+      if (pathInHead(hypoDir, relPath)) continue; // the same content is already there
+      writes.push({ relPath, text: b.text });
+      baselines.push(relPath);
+    }
   }
 
   const headText = (rel) => showText(hypoDir, 'HEAD', rel) ?? '';

@@ -999,6 +999,35 @@ test('first-prompt still calls a genuinely snapshot-less project a first session
   }
 });
 
+test('first-prompt does not call a project whose session state could not be read a first session', () => {
+  const sid = `fp-unavailable-${process.pid}-${Date.now()}`;
+  writeMarker(sid, { proj: 'demo', hotPath: null, hasSnapshot: false, unavailable: true });
+  try {
+    const r = runFirstPrompt(sid);
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    const out = injectedContext(JSON.parse(r.stdout)) || '';
+    assert.match(out, /session state could not be read/, 'must name the failure as the reason');
+    assert.doesNotMatch(out, /first session/, 'an unreadable state is not a first session');
+    assert.doesNotMatch(out, /scoped to another machine/, 'and not a scope hide');
+  } finally {
+    if (existsSync(markerPath(sid))) unlinkSync(markerPath(sid));
+  }
+});
+
+test('first-prompt points the summary at the label the session-start injection really carries', () => {
+  const sid = `fp-label-${process.pid}-${Date.now()}`;
+  writeMarker(sid, { proj: 'demo', hotPath: null, hasSnapshot: true });
+  try {
+    const r = runFirstPrompt(sid);
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    const out = injectedContext(JSON.parse(r.stdout)) || '';
+    assert.match(out, /\[WIKI HOT CACHE\]/, 'names the label session-start emits');
+    assert.doesNotMatch(out, /\[HOT\]|\[SESSION STATE\]/, 'the old labels no injection has');
+  } finally {
+    if (existsSync(markerPath(sid))) unlinkSync(markerPath(sid));
+  }
+});
+
 // The two files are scoped independently. When hot is hidden but state is shared,
 // session-start must take the CONTENT branch: inject the state, withhold the hot
 // body, and report hasSnapshot truthfully (a snapshot really was injected). The

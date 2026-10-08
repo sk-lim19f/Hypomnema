@@ -24,17 +24,19 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { createRequire, syncBuiltinESMExports } from 'node:module';
-import { basename, dirname, join } from 'node:path';
+import { basename, dirname, join, relative } from 'node:path';
 import {
   GITATTRIBUTES_BLOCK,
   GITIGNORE_BLOCK,
   LEGACY_TRACK_ID,
   TRACK_ID_RE,
   assertNoEntryMarkers,
-  buildBaselineEntry,
+  baselineIdMismatch,
+  buildLegacyBaselines,
   closeIdFor,
   entryFileName,
   entryMarker,
+  entryVisible,
   buildInjection,
   generatedViewSlug,
   formatSessionEntry,
@@ -442,44 +444,80 @@ const OLD_STATE = [
   '',
 ].join('\n');
 
-function baseline(over = {}) {
-  return buildBaselineEntry({
+const NO_SCOPES = { index: null, hot: null, state: null };
+
+// The baselines of one project's old files, hot first: [{kind, closeId, fileName, text, scope, conflict}].
+function baselines(over = {}) {
+  return buildLegacyBaselines({
     hotText: OLD_HOT,
     stateText: OLD_STATE,
     date: '2026-09-30',
-    visibilityScope: null,
     project: 'p',
+    scopes: NO_SCOPES,
     legacyDone: false,
     ...over,
   });
 }
+const baselineOf = (kind, over) => baselines(over).find((x) => x.kind === kind);
+const baselineEntries = (over) => baselines(over).map((x) => parseSessionEntry(x.text).entry);
 
-test('a baseline keeps both old files whole, frontmatter included', () => {
-  const b = baseline();
-  const parsed = parseSessionEntry(b.text);
-  assert.equal(parsed.ok, true);
-  assert.equal(parsed.entry.summary, OLD_HOT);
-  assert.equal(parsed.entry.bodies[LEGACY_TRACK_ID], OLD_STATE);
-  assert.equal(parsed.entry.closeId, b.closeId);
-  assert.match(b.closeId, /^baseline-[0-9a-f]{16}$/);
-  assert.equal(b.fileName, `2026-09-30-${b.closeId}.md`);
-  assert.equal(parsed.entry.sessionId, null);
-  assert.deepEqual(parsed.entry.tracks, [{ id: 'legacy', title: '이행 전 기록', new: true }]);
+test('each old file is its own baseline entry and keeps its bytes whole, frontmatter included', () => {
+  const [hot, state] = baselines();
+  assert.deepEqual([hot.kind, state.kind], ['hot', 'state']);
+  const h = parseSessionEntry(hot.text);
+  const st = parseSessionEntry(state.text);
+  assert.equal(h.ok, true);
+  assert.equal(st.ok, true);
+  assert.equal(h.entry.summary, OLD_HOT);
+  assert.deepEqual(h.entry.tracks, [], 'the hot baseline carries no track');
+  assert.deepEqual(h.entry.bodies, {});
+  assert.equal(st.entry.summary, '', 'the state baseline has no summary');
+  assert.equal(st.entry.bodies[LEGACY_TRACK_ID], OLD_STATE);
+  assert.deepEqual(st.entry.tracks, [{ id: 'legacy', title: '이행 전 기록', new: true }]);
+  for (const [built, parsed] of [
+    [hot, h],
+    [state, st],
+  ]) {
+    assert.equal(parsed.entry.closeId, built.closeId);
+    assert.match(built.closeId, /^baseline-[0-9a-f]{16}$/);
+    assert.equal(built.fileName, `2026-09-30-${built.closeId}.md`);
+    assert.equal(parsed.entry.sessionId, null);
+  }
+  assert.notEqual(hot.closeId, state.closeId, 'the two files of one project never share an id');
 });
 
-test('a baseline from CRLF files is the baseline from the same LF files, with no CR in it', () => {
+test('a file that is absent or empty gets no baseline entry', () => {
+  assert.deepEqual(
+    baselines({ hotText: null }).map((x) => x.kind),
+    ['state'],
+  );
+  assert.deepEqual(
+    baselines({ stateText: '' }).map((x) => x.kind),
+    ['hot'],
+  );
+  assert.deepEqual(baselines({ hotText: null, stateText: undefined }), []);
+});
+
+test('identical bytes in the two old files still give two different ids', () => {
+  const [hot, state] = baselines({ hotText: 'same', stateText: 'same' });
+  assert.notEqual(hot.closeId, state.closeId);
+  assert.notEqual(hot.fileName, state.fileName);
+});
+
+test('baselines from CRLF files are the baselines from the same LF files, with no CR in them', () => {
   const crlf = (t) => t.replace(/\n/g, '\r\n');
   assert.equal(OLD_HOT.includes('\r') || OLD_STATE.includes('\r'), false);
-  const fromLf = baseline();
-  const fromCrlf = baseline({ hotText: crlf(OLD_HOT), stateText: crlf(OLD_STATE) });
-  assert.equal(fromCrlf.closeId, fromLf.closeId);
-  assert.equal(fromCrlf.fileName, fromLf.fileName);
-  assert.equal(fromCrlf.text, fromLf.text);
-  assert.equal(fromCrlf.text.includes('\r'), false);
+  const fromLf = baselines();
+  const fromCrlf = baselines({ hotText: crlf(OLD_HOT), stateText: crlf(OLD_STATE) });
+  assert.deepEqual(
+    fromCrlf.map((x) => [x.closeId, x.fileName, x.text]),
+    fromLf.map((x) => [x.closeId, x.fileName, x.text]),
+  );
+  for (const x of fromCrlf) assert.equal(x.text.includes('\r'), false);
 });
 
 test('--- lines and frontmatter-shaped text inside a section do not leak into the entry frontmatter', () => {
-  const b = baseline();
+  const b = baselineOf('state');
   const parsed = parseSessionEntry(b.text);
   assert.equal(parsed.entry.closeId, b.closeId);
   assert.equal(parsed.entry.tracks.length, 1);
@@ -488,14 +526,14 @@ test('--- lines and frontmatter-shaped text inside a section do not leak into th
 });
 
 test('splitLegacyFrontmatter separates the old frontmatter, machine_note included, from the body', () => {
-  const { entry } = parseSessionEntry(baseline().text);
-  const state = splitLegacyFrontmatter(entry.bodies[LEGACY_TRACK_ID]);
+  const [hotEntry, stateEntry] = baselineEntries();
+  const state = splitLegacyFrontmatter(stateEntry.bodies[LEGACY_TRACK_ID]);
   assert.match(state.frontmatter, /^---\ntype: session-state\n/);
   assert.match(state.frontmatter, /machine_note: next, finish the masking pipeline\n---\n$/);
   assert.ok(state.body.startsWith('\n## Next Up'));
   assert.ok(state.body.includes('Body with a rule\n---\nand text after it.'));
   assert.equal(state.frontmatter + state.body, OLD_STATE);
-  const hot = splitLegacyFrontmatter(entry.summary);
+  const hot = splitLegacyFrontmatter(hotEntry.summary);
   assert.match(hot.frontmatter, /tags: \[a, b\]\nrelated: \["\[\[x\]\]"\]\n---\n$/);
   assert.equal(hot.frontmatter + hot.body, OLD_HOT);
 });
@@ -506,37 +544,88 @@ test('splitLegacyFrontmatter returns frontmatter null when the first line is not
   }
 });
 
-test('legacyDone marks the legacy update done, keeps the body, and changes the close id', () => {
-  const open = baseline();
-  const done = baseline({ legacyDone: true });
-  const parsed = parseSessionEntry(done.text);
+test('legacyDone marks only the state baseline done, keeps the body, and changes its close id', () => {
+  const open = baselines();
+  const done = baselines({ legacyDone: true });
+  const parsed = parseSessionEntry(done.find((x) => x.kind === 'state').text);
   assert.deepEqual(parsed.entry.tracks, [
     { id: 'legacy', title: '이행 전 기록', new: true, done: true },
   ]);
   assert.equal(parsed.entry.bodies[LEGACY_TRACK_ID], OLD_STATE);
-  assert.equal(parsed.entry.summary, OLD_HOT);
-  assert.notEqual(done.closeId, open.closeId);
-});
-
-test('two baselines that differ only in visibility scope get different close ids and paths', () => {
-  const shared = baseline({ visibilityScope: null });
-  const devA = baseline({ visibilityScope: 'machine:devA' });
-  const devB = baseline({ visibilityScope: 'machine:devB' });
-  assert.notEqual(shared.closeId, devA.closeId);
-  assert.notEqual(devA.closeId, devB.closeId);
-  assert.notEqual(devA.fileName, devB.fileName);
-  assert.match(devA.text, /^visibility_scope: machine:devA$/m);
-  assert.ok(!/^visibility_scope:/m.test(shared.text));
-});
-
-test('the same inputs give the same close id and bytes on any machine', () => {
-  assert.deepEqual(baseline(), baseline());
-  assert.notEqual(baseline().closeId, baseline({ stateText: `${OLD_STATE}x` }).closeId);
-  assert.notEqual(baseline().closeId, baseline({ hotText: `${OLD_HOT}x` }).closeId);
-  // Moving text between the two files must not collide with the original split.
   assert.notEqual(
-    baseline({ hotText: 'ab', stateText: 'c' }).closeId,
-    baseline({ hotText: 'a', stateText: 'bc' }).closeId,
+    done.find((x) => x.kind === 'state').closeId,
+    open.find((x) => x.kind === 'state').closeId,
+  );
+  assert.equal(
+    done.find((x) => x.kind === 'hot').closeId,
+    open.find((x) => x.kind === 'hot').closeId,
+    'the hot baseline has no track to fold',
+  );
+});
+
+test('baselines that differ only in visibility scope get different close ids and paths', () => {
+  const scoped = (scope) => baselines({ scopes: { ...NO_SCOPES, hot: scope, state: scope } });
+  const [shared, devA, devB] = [scoped(null), scoped('machine:devA'), scoped('machine:devB')];
+  for (const kind of [0, 1]) {
+    assert.notEqual(shared[kind].closeId, devA[kind].closeId);
+    assert.notEqual(devA[kind].closeId, devB[kind].closeId);
+    assert.notEqual(devA[kind].fileName, devB[kind].fileName);
+    assert.match(devA[kind].text, /^visibility_scope: machine:devA$/m);
+    assert.ok(!/^visibility_scope:/m.test(shared[kind].text));
+  }
+});
+
+test('each baseline takes the narrower of the project scope and its own file scope only', () => {
+  const only = (scopes) =>
+    Object.fromEntries(baselines({ scopes: { ...NO_SCOPES, ...scopes } }).map((x) => [x.kind, x]));
+  const hotScoped = only({ hot: 'machine:devA' });
+  assert.equal(hotScoped.hot.scope, 'machine:devA');
+  assert.equal(hotScoped.state.scope, null, 'a scoped hot.md must not hide the state baseline');
+  assert.ok(!/^visibility_scope:/m.test(hotScoped.state.text));
+  const stateScoped = only({ state: 'machine:devB' });
+  assert.equal(stateScoped.hot.scope, null);
+  assert.equal(stateScoped.state.scope, 'machine:devB');
+  const projectScoped = only({ index: 'machine:devA' });
+  assert.deepEqual(
+    [projectScoped.hot.scope, projectScoped.state.scope],
+    ['machine:devA', 'machine:devA'],
+  );
+  const clash = only({ index: 'machine:devA', state: 'machine:devB' });
+  assert.deepEqual([clash.hot.scope, clash.hot.conflict], ['machine:devA', false]);
+  assert.deepEqual([clash.state.scope, clash.state.conflict], ['machine:', true]);
+});
+
+test('the same inputs give the same close ids and bytes on any machine', () => {
+  assert.deepEqual(baselines(), baselines());
+  assert.notEqual(
+    baselineOf('state').closeId,
+    baselineOf('state', { stateText: `${OLD_STATE}x` }).closeId,
+  );
+  assert.notEqual(baselineOf('hot').closeId, baselineOf('hot', { hotText: `${OLD_HOT}x` }).closeId);
+  assert.equal(
+    baselineOf('hot').closeId,
+    baselineOf('hot', { stateText: `${OLD_STATE}x` }).closeId,
+    'a change to the state file leaves the hot baseline where it was',
+  );
+});
+
+test('baselineIdMismatch: a baseline names its content, and an edit merged into it breaks the name', () => {
+  for (const kind of ['hot', 'state']) {
+    const built = baselineOf(kind);
+    assert.equal(baselineIdMismatch(built.fileName, built.text), null, `${kind}: untouched`);
+    const bodyEdit = built.text.replace(kind === 'hot' ? '# Hot' : 'Body with a rule', 'EDITED');
+    assert.notEqual(bodyEdit, built.text);
+    const m = baselineIdMismatch(built.fileName, bodyEdit);
+    assert.ok(m, `${kind}: an edited body is reported`);
+    assert.equal(m.inName, built.closeId, 'the name still carries the old hash');
+    assert.notEqual(m.expected, built.closeId, 'the content hashes to another id');
+    const renamed = built.fileName.replace(/baseline-[0-9a-f]{16}/, 'baseline-0000000000000000');
+    assert.equal(baselineIdMismatch(renamed, built.text)?.inName, 'baseline-0000000000000000');
+  }
+  assert.equal(
+    baselineIdMismatch('2026-10-01-c1.md', 'not an entry'),
+    null,
+    'a file that is not a readable baseline is not this check',
   );
 });
 
@@ -991,12 +1080,19 @@ test('hypo-shared re-exports the one scopeVisible, and the machine filter answer
   }
 });
 
-test('entryScope, when set, replaces every entry scope', () => {
-  const entries = [E('c1', { visibilityScope: 'machine:devB' }), E('c2')];
-  const open = M(entries, { entryScope: 'shared' });
-  assert.deepEqual(ids(nextUpItems(open, { device: 'devA' })), ['c1', 'c2']);
-  const closed = M(entries, { entryScope: 'machine:devB' });
+test('an entry is visible only when both its own scope and entryScope admit the device', () => {
+  const own = [E('c1', { visibilityScope: 'machine:devB' }), E('c2')];
+  // a wide entry_scope does not expose an entry scoped to another machine
+  const open = M(own, { entryScope: 'shared' });
+  assert.deepEqual(ids(nextUpItems(open, { device: 'devA' })), ['c2']);
+  assert.deepEqual(ids(nextUpItems(open, { device: 'devB' })), ['c1', 'c2']);
+  // a narrow entry_scope hides entries whose own scope is shared
+  const closed = M(own, { entryScope: 'machine:devB' });
   assert.deepEqual(nextUpItems(closed, { device: 'devA' }), []);
+  assert.deepEqual(ids(nextUpItems(closed, { device: 'devB' })), ['c1', 'c2']);
+  assert.equal(entryVisible(closed, E('c3'), 'devA'), false);
+  assert.equal(entryVisible(closed, E('c3'), 'devB'), true);
+  assert.equal(entryVisible(open, own[0], 'devA'), false);
 });
 
 test('isSessionProjectDir wants index.md or sessions/ and refuses _template', () => {
@@ -1175,8 +1271,7 @@ test('only limits the per-project files; the root still has a row for every proj
 
 test('a baseline head: nextUpItems keeps the whole body and splits the old frontmatter off', () => {
   const state = `${OLD_STATE}\n## Notes\n\nlast line of the old file\n`;
-  const b = baseline({ stateText: state });
-  const model = M([parseSessionEntry(b.text).entry]);
+  const model = M(baselineEntries({ stateText: state }));
   const [item] = nextUpItems(model);
   const split = splitLegacyFrontmatter(state);
   assert.equal(item.body, split.body);
@@ -1186,7 +1281,7 @@ test('a baseline head: nextUpItems keeps the whole body and splits the old front
 });
 
 test('a baseline head folds the old frontmatter into <details> and the body starts without it', () => {
-  const model = M([parseSessionEntry(baseline().text).entry]);
+  const model = M(baselineEntries());
   const { sessionState, hot } = renderViews([model]).projects.p;
   assert.match(sessionState, /<details><summary>[^<]+<\/summary>\n\n```yaml\n---\n/);
   assert.ok(sessionState.includes('machine_note: next, finish the masking pipeline'));
@@ -1198,8 +1293,7 @@ test('a baseline head folds the old frontmatter into <details> and the body star
 
 test('a track and a summary with a fence in their text still render the old frontmatter safely', () => {
   const state = '---\nnote: |\n  ```\n---\nbody\n';
-  const b = baseline({ stateText: state });
-  const out = renderViews([M([parseSessionEntry(b.text).entry])]).projects.p.sessionState;
+  const out = renderViews([M(baselineEntries({ stateText: state }))]).projects.p.sessionState;
   assert.ok(out.includes('````yaml'), 'the fence is longer than any backtick run inside');
 });
 
@@ -1207,7 +1301,7 @@ test('generated text holds no em dash or en dash', () => {
   const model = M([
     E('c1'),
     E('c2', { tracks: [{ id: 'flow', title: 'Flow', done: true }], bodies: {} }),
-    parseSessionEntry(baseline().text).entry,
+    ...baselineEntries(),
   ]);
   const out = renderViews([model]);
   const injected = buildInjection(model, 4000).text;
@@ -1304,7 +1398,7 @@ test('21 active heads: 20 pointer lines and "외 1개" even with no room, the 21
 
 test('the pointer target follows migration: entry file before, session-state.md after, baseline always session-state.md', () => {
   const real = E('c1', { date: '2026-10-02', bodies: { masking: 'R'.repeat(9000) } });
-  const base = parseSessionEntry(baseline().text).entry;
+  const base = baselineEntries()[1];
   const target = (migrated) => {
     const { text } = buildInjection(M([real, base], { migrated }), 800);
     return { real: lineWith(text, 'c1'), base: lineWith(text, base.closeId), text };
@@ -1323,7 +1417,7 @@ test('the pointer target follows migration: entry file before, session-state.md 
 });
 
 test('a baseline head carries its old frontmatter into the injection, and the nextUp body does not', () => {
-  const model = M([parseSessionEntry(baseline().text).entry]);
+  const model = M(baselineEntries());
   const { text } = buildInjection(model, 4000);
   assert.ok(text.includes('machine_note: next, finish the masking pipeline'));
   assert.match(text, /```yaml\n---\n/);
@@ -1511,17 +1605,22 @@ test('an entry_scope that is not a scope closes the project instead of being ign
   });
 });
 
-test('before the move the model holds a virtual baseline of the old files and nothing on disk changes', () => {
+test('before the move the model holds one virtual baseline per old file and nothing on disk changes', () => {
   withOldVault((dir) => {
     putEntry(dir, 'p', 'c1');
     const model = loadSessionModel(dir, 'p');
     assert.equal(model.migrated, false);
-    const base = model.entries.find((e) => isBaselineId(e.closeId));
-    assert.ok(base, 'a virtual baseline entry');
-    assert.equal(base.summary, OLD_HOT_FILE);
-    assert.equal(base.bodies[LEGACY_TRACK_ID], OLD_STATE_FILE);
-    assert.equal(base.date, '2026-09-25');
-    assert.equal(base.visibilityScope, 'machine:devA');
+    const bases = model.entries.filter((e) => isBaselineId(e.closeId));
+    assert.equal(bases.length, 2, 'one virtual baseline entry per old file');
+    const hot = bases.find((e) => e.summary !== '');
+    const state = bases.find((e) => e.bodies[LEGACY_TRACK_ID] !== undefined);
+    assert.ok(hot && state && hot !== state);
+    assert.equal(hot.summary, OLD_HOT_FILE);
+    assert.equal(state.bodies[LEGACY_TRACK_ID], OLD_STATE_FILE);
+    assert.equal(hot.date, '2026-09-25');
+    assert.equal(state.date, '2026-09-25');
+    assert.equal(hot.visibilityScope, 'machine:devA', 'the hot file is machine-scoped');
+    assert.equal(state.visibilityScope, null, 'the state file is not: its entry stays shared');
     assert.deepEqual(
       model.entries.map((e) => e.closeId).filter((id) => !isBaselineId(id)),
       ['c1'],
@@ -1547,14 +1646,27 @@ test('a migrated vault has no virtual baseline even when old view files linger o
   );
 });
 
-test('projectEntryScope: the narrowest of index.md and the baselines, or the entry_scope as written', () => {
+test('projectEntryScope: the narrowest of index.md and the state baseline, or the entry_scope as written', () => {
   withOldVault((dir) => {
     put(dir, 'projects/p/index.md', '---\nvisibility_scope: shared\n---\n');
-    assert.equal(projectEntryScope(dir, 'p', loadSessionModel(dir, 'p')), 'machine:devA');
-    assert.equal(projectEntryScope(dir, 'p'), 'machine:devA', 'model is optional');
+    // only the old hot.md is machine-scoped: the shared state file keeps new entries shared
+    assert.equal(projectEntryScope(dir, 'p', loadSessionModel(dir, 'p')), 'shared');
+    assert.equal(projectEntryScope(dir, 'p'), 'shared', 'model is optional');
     put(dir, 'projects/p/index.md', '---\nvisibility_scope: shared\nentry_scope: shared\n---\n');
     assert.equal(projectEntryScope(dir, 'p'), 'shared', 'entry_scope skips the calculation');
   });
+  withOldVault(
+    (dir) => {
+      put(dir, 'projects/p/index.md', '---\nvisibility_scope: shared\n---\n');
+      assert.equal(projectEntryScope(dir, 'p'), 'machine:devA', 'the state file is machine-scoped');
+    },
+    {
+      'projects/p/session-state.md': OLD_STATE_FILE.replace(
+        'machine_note: keep me',
+        'machine_note: keep me\nvisibility_scope: machine:devA',
+      ),
+    },
+  );
   withTmpDir((dir) => {
     put(dir, 'projects/p/index.md', '---\nvisibility_scope: shared\n---\n');
     putEntry(dir, 'p', 'c1', { visibilityScope: 'machine:devB' });
@@ -1707,7 +1819,8 @@ test('the first write creates the project views and the root, the second changes
 });
 
 test('bytes the writer did not write are backed up before they are replaced, and a notice is left', () => {
-  withTmpDir((dir) => {
+  // A migrated git vault: a vault with no git moves such a file into a baseline entry instead.
+  withMigratedVault((dir) => {
     seedProjects(dir);
     put(dir, VIEW, 'hand written\n');
     const r = writeGeneratedViews(dir, WRITE);
@@ -1745,6 +1858,313 @@ test('an unreadable ownership record makes every file unowned, and the record is
     );
     const record = JSON.parse(readRel(dir, '.cache/generated-views.json'));
     assert.equal(record.views[VIEW], sha(readRel(dir, VIEW)));
+  });
+});
+
+// ── a vault that is not a git repository: the old files move into baseline entries ───────────
+
+const gitlessBaselines = (dir, slug = 'p') => {
+  try {
+    return readdirSync(join(dir, 'projects', slug, 'sessions'))
+      .filter((n) => /-baseline-[0-9a-f]{16}\.md$/.test(n))
+      .sort();
+  } catch {
+    return [];
+  }
+};
+const gitlessLegacyVault = (dir, extra = {}) => {
+  put(dir, 'projects/p/index.md', '---\ntitle: p\n---\n');
+  put(dir, 'projects/p/hot.md', OLD_HOT_FILE);
+  put(dir, 'projects/p/session-state.md', OLD_STATE_FILE);
+  for (const [rel, text] of Object.entries(extra)) put(dir, rel, text);
+};
+
+test('a vault with no git moves its old files into two baseline entries before the first write, and backs nothing up', () => {
+  withTmpDir((dir) => {
+    gitlessLegacyVault(dir);
+    assert.equal(migrationState(dir), 'migrated', 'no git: nothing is tracked');
+    const r = writeGeneratedViews(dir, WRITE);
+    assert.deepEqual(r.backedUp, [], 'the old files are not unowned bytes');
+    const names = gitlessBaselines(dir);
+    assert.equal(names.length, 2);
+    const entries = names.map((n) => parseSessionEntry(readRel(dir, `projects/p/sessions/${n}`)));
+    assert.deepEqual(
+      entries.map((e) => e.ok),
+      [true, true],
+    );
+    assert.deepEqual(entries.map((e) => e.entry.summary).sort(), ['', OLD_HOT_FILE].sort());
+    assert.ok(entries.some((e) => e.entry.bodies[LEGACY_TRACK_ID] === OLD_STATE_FILE));
+    // the views are rendered from the entries, so the old content is in them
+    assert.match(readRel(dir, 'projects/p/session-state.md'), /old state body/);
+    assert.match(readRel(dir, 'projects/p/hot.md'), /old hot body/);
+    assert.match(readRel(dir, 'projects/p/hot.md'), /generated: sessions/);
+    assert.equal(existsSync(join(dir, BACKUP_DIR)), false, 'no backup directory was made');
+    // the same entries a git vault's move makes: one model, the old state body as the head
+    const model = loadSessionModel(dir, 'p');
+    assert.equal(model.entries.filter((e) => isBaselineId(e.closeId)).length, 2);
+    assert.equal(nextUpItems(model).length, 1);
+  });
+});
+
+test('the move in a vault with no git is idempotent: a second write moves and rewrites nothing', () => {
+  withTmpDir((dir) => {
+    gitlessLegacyVault(dir);
+    writeGeneratedViews(dir, WRITE);
+    const names = gitlessBaselines(dir);
+    const before = names.map((n) => readRel(dir, `projects/p/sessions/${n}`));
+    const record = readRel(dir, '.cache/generated-views.json');
+    const second = writeGeneratedViews(dir, WRITE);
+    assert.deepEqual(second.written, []);
+    assert.deepEqual(second.backedUp, []);
+    assert.deepEqual(gitlessBaselines(dir), names);
+    assert.deepEqual(
+      gitlessBaselines(dir).map((n) => readRel(dir, `projects/p/sessions/${n}`)),
+      before,
+    );
+    assert.equal(readRel(dir, '.cache/generated-views.json'), record);
+  });
+});
+
+test('in a vault with no git, each old file keeps its own scope and the moved bytes are the old bytes', () => {
+  withTmpDir((dir) => {
+    gitlessLegacyVault(dir, {
+      'projects/p/session-state.md': OLD_STATE_FILE.replace(
+        'machine_note: keep me',
+        'machine_note: keep me\nvisibility_scope: machine:devB',
+      ),
+    });
+    writeGeneratedViews(dir, WRITE);
+    const scopes = Object.fromEntries(
+      gitlessBaselines(dir).map((n) => {
+        const { entry } = parseSessionEntry(readRel(dir, `projects/p/sessions/${n}`));
+        return [entry.summary === '' ? 'state' : 'hot', entry.visibilityScope];
+      }),
+    );
+    assert.deepEqual(scopes, { hot: 'machine:devA', state: 'machine:devB' });
+    // devA sees the hot file only, devB the state file only: neither hides the other
+    const sees = (device) => {
+      const m = loadSessionModel(dir, 'p');
+      return renderViews([m], { device }).projects.p;
+    };
+    assert.match(sees('devA').hot, /old hot body/);
+    assert.doesNotMatch(sees('devA').sessionState, /old state body/);
+    assert.match(sees('devB').sessionState, /old state body/);
+    assert.doesNotMatch(sees('devB').hot, /old hot body/);
+  });
+});
+
+test('in a vault with no git, entry_scope never widens an old file scoped to another machine, and a narrow one hides shared ones', () => {
+  withTmpDir((dir) => {
+    gitlessLegacyVault(dir, {
+      'projects/p/session-state.md': OLD_STATE_FILE.replace(
+        'machine_note: keep me',
+        'machine_note: keep me\nvisibility_scope: shared',
+      ),
+    });
+    writeGeneratedViews(dir, WRITE);
+    const sees = (device) => renderViews([loadSessionModel(dir, 'p')], { device }).projects.p;
+    // the hot baseline is machine:devA, the state baseline is shared
+    put(dir, 'projects/p/index.md', '---\ntitle: p\nentry_scope: shared\n---\n');
+    assert.match(sees('devA').hot, /old hot body/);
+    assert.doesNotMatch(sees('devB').hot, /old hot body/, 'a wide entry_scope does not widen it');
+    assert.match(sees('devB').sessionState, /old state body/, 'the shared one stays visible');
+    put(dir, 'projects/p/index.md', '---\ntitle: p\nentry_scope: machine:devA\n---\n');
+    assert.match(sees('devA').hot, /old hot body/);
+    assert.match(sees('devA').sessionState, /old state body/);
+    assert.doesNotMatch(
+      sees('devB').sessionState,
+      /old state body/,
+      'a narrow entry_scope hides a shared entry',
+    );
+  });
+});
+
+test('a stale pending slug for a project whose move completed neither baselines a later edit nor survives', () => {
+  withTmpDir((dir) => {
+    gitlessLegacyVault(dir);
+    writeGeneratedViews(dir, WRITE);
+    const names = gitlessBaselines(dir);
+    assert.equal(names.length, 2, 'the move happened');
+    put(dir, VIEW, 'typed over the view\n');
+    const pendingFile = join(dir, '.cache', 'legacy-move-pending.json');
+    writeFileSync(pendingFile, JSON.stringify({ slugs: ['p'] }));
+    const r = writeGeneratedViews(dir, WRITE);
+    assert.equal(r.backedUp.length, 1, 'the edit is backed up');
+    assert.equal(r.backedUp[0].relPath, VIEW);
+    assert.equal(
+      readRel(dir, `${BACKUP_DIR}/${VIEW}.pre-projection-backup.md`),
+      'typed over the view\n',
+    );
+    assert.deepEqual(gitlessBaselines(dir), names, 'no new baseline');
+    assert.equal(existsSync(pendingFile), false, 'the stale slug is gone');
+  });
+});
+
+test('a file edited after the move in a vault with no git is backed up like any foreign bytes, not turned into a baseline', () => {
+  withTmpDir((dir) => {
+    gitlessLegacyVault(dir);
+    writeGeneratedViews(dir, WRITE);
+    const names = gitlessBaselines(dir);
+    put(dir, VIEW, 'typed over the view\n');
+    const r = writeGeneratedViews(dir, WRITE);
+    assert.equal(r.backedUp.length, 1);
+    assert.equal(r.backedUp[0].relPath, VIEW);
+    assert.equal(
+      readRel(dir, `${BACKUP_DIR}/${VIEW}.pre-projection-backup.md`),
+      'typed over the view\n',
+    );
+    assert.deepEqual(gitlessBaselines(dir), names, 'no third baseline');
+  });
+});
+
+test('a vault with no git that was never given old files treats a later hand edit as foreign bytes, with no baseline', () => {
+  withTmpDir((dir) => {
+    seedProjects(dir);
+    writeGeneratedViews(dir, WRITE); // the record exists from here on
+    put(dir, VIEW, 'hand written\n');
+    const r = writeGeneratedViews(dir, WRITE);
+    assert.equal(r.backedUp.length, 1);
+    assert.deepEqual(gitlessBaselines(dir), []);
+  });
+});
+
+test('every baseline already on disk but no record (a move that stopped before the record) claims the old files and moves nothing again', () => {
+  withTmpDir((dir) => {
+    gitlessLegacyVault(dir);
+    writeGeneratedViews(dir, WRITE);
+    assert.match(
+      consumeRootHotHealthNotice(dir) ?? '',
+      /기준선/,
+      'the first run tells of the move',
+    );
+    const names = gitlessBaselines(dir);
+    assert.equal(names.length, 2, 'one baseline per old file');
+    // The state a run killed after writing the entries leaves: the old files as they were, no record.
+    unlinkSync(join(dir, '.cache', 'generated-views.json'));
+    put(dir, 'projects/p/hot.md', OLD_HOT_FILE);
+    put(dir, 'projects/p/session-state.md', OLD_STATE_FILE);
+    const r = writeGeneratedViews(dir, WRITE);
+    assert.deepEqual(gitlessBaselines(dir), names, 'no second pair of baselines');
+    // the entries hold the old bytes whole, so the views replace them without a backup
+    assert.deepEqual(r.backedUp, []);
+    assert.equal(existsSync(join(dir, '.cache', 'generated-views.json')), true);
+    assert.match(readRel(dir, 'projects/p/hot.md'), /generated: sessions/);
+    assert.equal(consumeRootHotHealthNotice(dir), null, 'no backup notice');
+  });
+});
+
+test('a move that wrote only some of its baselines writes the missing ones and backs up nothing', () => {
+  withTmpDir((dir) => {
+    gitlessLegacyVault(dir);
+    writeGeneratedViews(dir, WRITE);
+    consumeRootHotHealthNotice(dir);
+    const names = gitlessBaselines(dir);
+    // Killed between the two baseline writes: the state baseline is missing and there is no record.
+    const stateName = names.find((n) =>
+      readRel(dir, `projects/p/sessions/${n}`).includes('legacy'),
+    );
+    assert.ok(stateName, names.join(', '));
+    unlinkSync(join(dir, 'projects', 'p', 'sessions', stateName));
+    unlinkSync(join(dir, '.cache', 'generated-views.json'));
+    put(dir, 'projects/p/hot.md', OLD_HOT_FILE);
+    put(dir, 'projects/p/session-state.md', OLD_STATE_FILE);
+    const r = writeGeneratedViews(dir, WRITE);
+    assert.deepEqual(gitlessBaselines(dir), names, 'the missing baseline is back, nothing else');
+    assert.deepEqual(r.backedUp, [], 'the state file is not backed up as foreign bytes');
+    const notice = consumeRootHotHealthNotice(dir) ?? '';
+    assert.ok(notice.includes(stateName), 'the notice names the baseline it wrote');
+    assert.equal(notice.includes('pre-projection-backup'), false, notice);
+    assert.match(
+      readRel(dir, `projects/p/sessions/${stateName}`),
+      /old state body/,
+      'the old state is in its baseline',
+    );
+  });
+});
+
+test('a baseline name already taken by other bytes stops the move for that project: old files untouched, nothing claimed, the notice names the path', () => {
+  withTmpDir((dir) => {
+    gitlessLegacyVault(dir);
+    writeGeneratedViews(dir, WRITE);
+    consumeRootHotHealthNotice(dir);
+    const names = gitlessBaselines(dir);
+    const hotName = names.find((n) => !readRel(dir, `projects/p/sessions/${n}`).includes('legacy'));
+    assert.ok(hotName, names.join(', '));
+    const clashPath = `projects/p/sessions/${hotName}`;
+    // the state of a first start whose baseline name already holds other bytes
+    unlinkSync(join(dir, '.cache', 'generated-views.json'));
+    put(dir, clashPath, 'NOT THE BASELINE, someone else wrote this\n');
+    put(dir, 'projects/p/hot.md', OLD_HOT_FILE);
+    put(dir, 'projects/p/session-state.md', OLD_STATE_FILE);
+    const r = writeGeneratedViews(dir, WRITE);
+    assert.equal(readRel(dir, 'projects/p/hot.md'), OLD_HOT_FILE, 'the old hot.md is untouched');
+    assert.equal(readRel(dir, 'projects/p/session-state.md'), OLD_STATE_FILE);
+    assert.equal(readRel(dir, clashPath), 'NOT THE BASELINE, someone else wrote this\n');
+    assert.deepEqual(r.backedUp, [], 'nothing was backed up: nothing was replaced');
+    assert.equal(existsSync(join(dir, BACKUP_DIR)), false);
+    assert.equal(r.written.includes('projects/p/hot.md'), false, JSON.stringify(r.written));
+    const record = JSON.parse(readRel(dir, '.cache/generated-views.json')).views;
+    assert.equal(record['projects/p/hot.md'], undefined, 'the old file is not claimed');
+    assert.equal(record['projects/p/session-state.md'], undefined);
+    assert.ok(
+      (consumeRootHotHealthNotice(dir) ?? '').includes(clashPath),
+      'the notice names the conflicting path',
+    );
+    // the clash resolved: the next write finishes the move without a backup
+    unlinkSync(join(dir, clashPath));
+    const again = writeGeneratedViews(dir, WRITE);
+    assert.deepEqual(again.backedUp, []);
+    assert.equal(gitlessBaselines(dir).length, 2);
+    assert.match(readRel(dir, 'projects/p/hot.md'), /generated: sessions/);
+    assert.match(readRel(dir, 'projects/p/hot.md'), /old hot body/);
+  });
+});
+
+test('a project hidden by .hypoignore on the first write and visible later is moved on the write that first sees it, without a backup', () => {
+  withTmpDir((dir) => {
+    gitlessLegacyVault(dir, { '.hypoignore': 'projects/p/\n' });
+    writeGeneratedViews(dir, WRITE);
+    assert.deepEqual(gitlessBaselines(dir), [], 'hidden: not touched');
+    assert.equal(readRel(dir, 'projects/p/hot.md'), OLD_HOT_FILE);
+    assert.equal(
+      existsSync(join(dir, '.cache', 'generated-views.json')),
+      true,
+      'the record exists',
+    );
+    unlinkSync(join(dir, '.hypoignore'));
+    const r = writeGeneratedViews(dir, WRITE);
+    assert.deepEqual(r.backedUp, [], 'the old bytes are not set aside as foreign');
+    assert.equal(existsSync(join(dir, BACKUP_DIR)), false);
+    assert.equal(gitlessBaselines(dir).length, 2);
+    const model = loadSessionModel(dir, 'p');
+    assert.equal(model.entries.filter((e) => isBaselineId(e.closeId)).length, 2);
+    assert.match(readRel(dir, 'projects/p/hot.md'), /old hot body/);
+    assert.match(readRel(dir, 'projects/p/session-state.md'), /old state body/);
+    // once moved it is an ordinary project: a later edit is foreign bytes and no baseline
+    put(dir, VIEW, 'typed over the view\n');
+    assert.equal(writeGeneratedViews(dir, WRITE).backedUp.length, 1);
+    assert.equal(gitlessBaselines(dir).length, 2);
+  });
+});
+
+test('a generated view left over without a record is not read as an old file, and a hidden project is not touched', () => {
+  withTmpDir((dir) => {
+    gitlessLegacyVault(dir, {
+      'projects/p/hot.md':
+        '---\ntype: reference\ngenerated: sessions\n---\nwritten by a generator\n',
+      'projects/p/session-state.md': '',
+      '.hypoignore': 'projects/secret/\n',
+      'projects/secret/index.md': '---\ntitle: secret\n---\n',
+      'projects/secret/hot.md': 'secret hot\n',
+    });
+    writeGeneratedViews(dir, WRITE);
+    assert.deepEqual(
+      gitlessBaselines(dir),
+      [],
+      'a generated file and an empty one are not old memory',
+    );
+    assert.deepEqual(gitlessBaselines(dir, 'secret'), []);
+    assert.equal(readRel(dir, 'projects/secret/hot.md'), 'secret hot\n');
   });
 });
 
@@ -2282,15 +2702,19 @@ function withCatchUp(fn, opts = {}) {
       ];
       cgitOk(a, ['rm', '-q', ...gone]);
       put(a, '.gitignore', `.cache/\n${GITIGNORE_BLOCK}`);
-      const remote = buildBaselineEntry({
+      const remote = buildLegacyBaselines({
         hotText: OLD_HOT_FILE,
         stateText: OLD_STATE_FILE,
         date: '2026-09-25',
-        visibilityScope: 'machine:devA',
         project: 'p',
+        scopes: {
+          index: null,
+          hot: readVisibilityScope(OLD_HOT_FILE),
+          state: readVisibilityScope(OLD_STATE_FILE),
+        },
         legacyDone: opts.migrate?.legacyDone === true,
       });
-      put(a, `projects/p/sessions/${remote.fileName}`, remote.text);
+      for (const r of remote) put(a, `projects/p/sessions/${r.fileName}`, r.text);
       for (const [rel, text] of Object.entries(opts.migrate?.touch ?? {})) {
         put(a, rel, text);
         cgitOk(a, ['add', '-f', rel]); // the block ignores generated view paths
@@ -2739,7 +3163,7 @@ test('a .gitignore that names only the three probe files is not an ignored .cach
 });
 
 test('(a) the notices of the generator and of the root hot.md name the backup under .cache/backups', () => {
-  withTmpDir((dir) => {
+  withMigratedVault((dir) => {
     assert.match(
       rootHotBackupRecoveryNotice(join(dir, '.cache/backups/hot.md.pre-projection-backup.md')),
       /\.cache\/backups\/hot\.md\.pre-projection-backup\.md/,
@@ -2909,11 +3333,11 @@ const legacyHeads = (dir, state = 'migrated') => {
   return trackHeads(model.entries).find((t) => t.trackId === LEGACY_TRACK_ID)?.heads ?? [];
 };
 
-test('(g) bytes that differ from the remote baseline become a new committed baseline and a second legacy head', () => {
+test('(g) a hot.md that differs from the remote baseline becomes a new committed baseline, and the unchanged state file makes none', () => {
   withCatchUp(({ b, remote }) => {
     put(b, 'projects/p/hot.md', W1);
     const pre = catchUpAndMerge(b);
-    assert.deepEqual(baselinesOf(b), [remote.fileName]);
+    assert.deepEqual(baselinesOf(b), remote.map((r) => r.fileName).sort());
     const before = commitCount(b);
     const shared = shareLegacyBytes(b, pre.archived);
     assert.equal(shared.created.length, 1);
@@ -2921,11 +3345,92 @@ test('(g) bytes that differ from the remote baseline become a new committed base
       shared.created[0],
       /^projects\/p\/sessions\/2026-09-25-baseline-[0-9a-f]{16}\.md$/,
     );
-    assert.equal(baselinesOf(b).length, 2);
+    assert.equal(baselinesOf(b).length, 3);
     assert.equal(commitCount(b), before + 1, 'one commit');
     assert.equal(pathInHead(b, shared.created[0]), true);
-    assert.equal(legacyHeads(b).length, 2);
+    assert.equal(parseSessionEntry(readRel(b, shared.created[0])).entry.summary, W1);
+    assert.equal(legacyHeads(b).length, 1, 'a hot baseline has no legacy track');
     assert.ok(shared.notices.some((n) => n.includes(shared.created[0])));
+  });
+});
+
+test('(g) a session-state.md that differs from the remote baseline becomes a second legacy head, and the unchanged hot file makes none', () => {
+  withCatchUp(({ b, remote }) => {
+    put(b, 'projects/p/session-state.md', OLD_STATE_FILE.replace('old state body', 'local state'));
+    const pre = catchUpAndMerge(b);
+    const shared = shareLegacyBytes(b, pre.archived);
+    assert.equal(shared.created.length, 1);
+    const made = parseSessionEntry(readRel(b, shared.created[0])).entry;
+    assert.match(made.bodies[LEGACY_TRACK_ID], /local state/);
+    assert.equal(made.summary, '');
+    assert.equal(baselinesOf(b).length, remote.length + 1);
+    assert.equal(legacyHeads(b).length, 2);
+  });
+});
+
+test('(g) only the file this machine set aside becomes a baseline: a stale companion in the other file makes none', () => {
+  withCatchUp(({ b, remote }) => {
+    // a revision whose session-state.md is not any baseline: what the companion read finds
+    put(
+      b,
+      'projects/p/session-state.md',
+      OLD_STATE_FILE.replace('old state body', 'stale companion'),
+    );
+    commitIn(b);
+    const staleRev = headOf(b);
+    cgitOk(b, ['reset', '-q', '--hard', 'HEAD~1']);
+    catchUpAndMerge(b);
+    const backup = join(b, 'held-hot.txt');
+    writeFileSync(backup, W1);
+    const held = [
+      {
+        relPath: 'projects/p/hot.md',
+        kind: 'worktree',
+        backupPath: backup,
+        sha256: sha(W1),
+        companionRev: staleRev,
+      },
+    ];
+    const shared = shareLegacyBytes(b, held);
+    assert.equal(shared.created.length, 1, JSON.stringify(shared));
+    const made = parseSessionEntry(readRel(b, shared.created[0])).entry;
+    assert.equal(made.summary, W1, 'the hot.md this machine held');
+    assert.equal(made.bodies[LEGACY_TRACK_ID], undefined);
+    assert.equal(baselinesOf(b).length, remote.length + 1, 'no baseline of the stale companion');
+    assert.equal(
+      baselinesOf(b).some((n) =>
+        readRel(b, `projects/p/sessions/${n}`).includes('stale companion'),
+      ),
+      false,
+    );
+  });
+});
+
+test('(g) two groups that set aside the same hot.md publish its baseline once', () => {
+  withCatchUp(({ b, remote }) => {
+    catchUpAndMerge(b);
+    const mk = (name, text) => {
+      const path = join(b, name);
+      writeFileSync(path, text);
+      return path;
+    };
+    const hot = mk('held-hot.txt', W1);
+    const state = mk('held-state.txt', OLD_STATE_FILE.replace('old state body', 'held state'));
+    const held = [
+      { relPath: 'projects/p/hot.md', kind: 'worktree', backupPath: hot, sha256: sha(W1), run: 0 },
+      { relPath: 'projects/p/hot.md', kind: 'stage', backupPath: hot, sha256: sha(W1), run: 0 },
+      {
+        relPath: 'projects/p/session-state.md',
+        kind: 'stage',
+        backupPath: state,
+        sha256: sha(readFileSync(state, 'utf-8')),
+        run: 0,
+      },
+    ];
+    const shared = shareLegacyBytes(b, held);
+    assert.equal(new Set(shared.created).size, shared.created.length, JSON.stringify(shared));
+    assert.equal(shared.created.length, 2, 'one hot baseline, one state baseline');
+    assert.equal(baselinesOf(b).length, remote.length + 2);
   });
 });
 
@@ -2950,7 +3455,7 @@ test('(g) the same bytes as the remote baseline make no new file, even when the 
         const shared = shareLegacyBytes(b, held);
         assert.deepEqual(shared.created, [], `legacyDone ${legacyDone}`);
         assert.equal(commitCount(b), before);
-        assert.equal(baselinesOf(b).length, 1);
+        assert.equal(baselinesOf(b).length, 2, 'the two baselines the remote made');
       },
       { migrate: { legacyDone } },
     );
@@ -2979,8 +3484,8 @@ test('(g) the root hot.md is never turned into a baseline, and its backup is nam
 test('(g) a baseline this machine had already folded with done is created but is not a legacy head', () => {
   withCatchUp(({ b }) => {
     put(b, 'projects/p/hot.md', W1);
-    const virtual = loadSessionModel(b, 'p', { state: 'not-migrated' }).entries.find((e) =>
-      isBaselineId(e.closeId),
+    const virtual = loadSessionModel(b, 'p', { state: 'not-migrated' }).entries.find(
+      (e) => isBaselineId(e.closeId) && e.bodies[LEGACY_TRACK_ID] !== undefined,
     );
     putEntry(b, 'p', 'earlier-close-1', {
       tracks: [{ id: LEGACY_TRACK_ID, done: true, supersedes: [virtual.closeId] }],
@@ -3163,7 +3668,7 @@ const entryOf = (dir, rel) => parseSessionEntry(readRel(dir, rel)).entry;
 const countOf = (text, needle) => text.split(needle).length - 1;
 const migrate = (dir, opts = {}) => migrateVaultToSessionEntries(dir, opts);
 
-test('the move untracks the generated views, adds one baseline and both blocks, and keeps the rest as it was', () => {
+test('the move untracks the generated views, adds one baseline per old file and both blocks, and keeps the rest as it was', () => {
   withOldGit((dir) => {
     const before = commitCount(dir);
     const r = migrate(dir);
@@ -3174,13 +3679,15 @@ test('the move untracks the generated views, adds one baseline and both blocks, 
     assert.equal(migrationState(dir), 'migrated');
     assert.deepEqual(listTrackedGeneratedViews(dir, { source: 'head' }), []);
     assert.deepEqual(listTrackedGeneratedViews(dir), []);
-    assert.equal(r.baselines.length, 1, 'one project, one baseline');
-    assert.match(r.baselines[0], /^projects\/p\/sessions\/2026-09-25-baseline-[0-9a-f]{16}\.md$/);
+    assert.equal(r.baselines.length, 2, 'one project, one baseline per old file');
+    for (const rel of r.baselines) {
+      assert.match(rel, /^projects\/p\/sessions\/2026-09-25-baseline-[0-9a-f]{16}\.md$/);
+    }
     assert.deepEqual(
       changedBy(dir),
       [
         'A\t.gitattributes',
-        `A\t${r.baselines[0]}`,
+        ...r.baselines.map((rel) => `A\t${rel}`),
         'D\thot.md',
         'D\tprojects/p/hot.md',
         'D\tprojects/p/session-state.md',
@@ -3199,14 +3706,17 @@ test('the move untracks the generated views, adds one baseline and both blocks, 
   });
 });
 
-test('the baseline holds both old files whole: a fenced track heading, machine_note and tags survive', () => {
+test('the baselines hold both old files whole: a fenced track heading, machine_note and tags survive', () => {
   withOldGit((dir) => {
-    const [rel] = migrate(dir).baselines;
-    const entry = entryOf(dir, rel);
-    assert.equal(entry.summary, RICH_HOT);
-    assert.equal(entry.bodies[LEGACY_TRACK_ID], OLD_STATE_FILE);
-    assert.match(entry.bodies[LEGACY_TRACK_ID], /machine_note: keep me/);
-    assert.equal(entry.tracks[0].id, LEGACY_TRACK_ID);
+    const [hotRel, stateRel] = migrate(dir).baselines;
+    const hot = entryOf(dir, hotRel);
+    const state = entryOf(dir, stateRel);
+    assert.equal(hot.summary, RICH_HOT);
+    assert.deepEqual(hot.tracks, []);
+    assert.equal(state.bodies[LEGACY_TRACK_ID], OLD_STATE_FILE);
+    assert.match(state.bodies[LEGACY_TRACK_ID], /machine_note: keep me/);
+    assert.equal(state.tracks[0].id, LEGACY_TRACK_ID);
+    assert.equal(state.summary, '');
   });
 });
 
@@ -3338,7 +3848,9 @@ test('scope: index.md machine:devA beats a shared hot.md quietly; a scope only t
   withOldGit(
     (dir) => {
       const r = migrate(dir);
-      assert.equal(entryOf(dir, r.baselines[0]).visibilityScope, 'machine:devA');
+      for (const rel of r.baselines) {
+        assert.equal(entryOf(dir, rel).visibilityScope, 'machine:devA', rel);
+      }
       assert.equal(
         r.notices.some((n) => n.includes('범위를 이어받습니다')),
         false,
@@ -3350,7 +3862,9 @@ test('scope: index.md machine:devA beats a shared hot.md quietly; a scope only t
     (dir) => {
       const index = showHead(dir, 'projects/p/index.md');
       const r = migrate(dir);
-      assert.equal(entryOf(dir, r.baselines[0]).visibilityScope, 'machine:devA');
+      const [hot, state] = r.baselines.map((rel) => entryOf(dir, rel));
+      assert.equal(state.visibilityScope, 'machine:devA', 'the scope only the state file has');
+      assert.equal(hot.visibilityScope, 'shared', 'it does not hide the hot baseline');
       assert.equal(showHead(dir, 'projects/p/index.md'), index, 'index.md bytes are untouched');
       assert.ok(
         r.notices.some(
@@ -3368,7 +3882,13 @@ test('scope: index.md machine:devA beats a shared hot.md quietly; a scope only t
   withOldGit(
     (dir) => {
       const r = migrate(dir);
-      assert.equal(entryOf(dir, r.baselines[0]).visibilityScope, 'machine:');
+      const [hot, state] = r.baselines.map((rel) => entryOf(dir, rel));
+      assert.equal(
+        hot.visibilityScope,
+        'machine:',
+        'the hot file names another machine than index.md',
+      );
+      assert.equal(state.visibilityScope, 'machine:devB', 'the state file has no scope of its own');
       assert.ok(r.notices.some((n) => n.includes('machine:')));
     },
     {
@@ -3378,7 +3898,7 @@ test('scope: index.md machine:devA beats a shared hot.md quietly; a scope only t
   );
 });
 
-test('two clones that move on their own clocks and then pull each other agree: no conflict, one baseline', () => {
+test('two clones that move on their own clocks and then pull each other agree: no conflict, one baseline per file', () => {
   withOldClones(({ a, b }) => {
     migrate(a, { testHooks: { now: new Date('2026-10-01T09:00:00Z') } });
     migrate(b, { testHooks: { now: new Date('2026-10-01T09:01:00Z') } });
@@ -3387,16 +3907,16 @@ test('two clones that move on their own clocks and then pull each other agree: n
     const pulled = cgit(b, ['pull', '--no-rebase', '--no-edit']);
     assert.equal(pulled.status, 0, pulled.stderr);
     assert.equal(unmerged(b), '');
-    assert.equal(baselinesOf(b).length, 1);
+    assert.equal(baselinesOf(b).length, 2);
     cgitOk(b, ['push', '-q']);
     const back = cgit(a, ['pull', '--no-rebase', '--no-edit']);
     assert.equal(back.status, 0, back.stderr);
     assert.equal(unmerged(a), '');
-    assert.equal(baselinesOf(a).length, 1);
+    assert.equal(baselinesOf(a).length, 2);
   });
 });
 
-test('two clones that read different scopes make two baselines and no index.md conflict', () => {
+test('two clones that read different scopes keep each file its own scope and make no index.md conflict', () => {
   withOldClones(
     ({ a, b }) => {
       put(b, 'projects/p/hot.md', OLD_HOT_FILE.replace('machine:devA', 'machine:devB'));
@@ -3423,9 +3943,10 @@ test('two clones that read different scopes make two baselines and no index.md c
       assert.equal(back.status, 0, back.stderr);
       assert.equal(unmerged(a), '');
       const scopes = baselinesOf(a).map(
-        (n) => entryOf(a, `projects/p/sessions/${n}`).visibilityScope,
+        (n) => entryOf(a, `projects/p/sessions/${n}`).visibilityScope ?? 'shared',
       );
-      assert.deepEqual(scopes.sort(), ['machine:', 'machine:devA']);
+      // the hot baselines differ (one clone's hot.md names devB), the shared state baseline is one
+      assert.deepEqual(scopes.sort(), ['machine:devA', 'machine:devB', 'shared']);
       assert.equal(
         showHead(a, 'projects/p/index.md'),
         '---\ntitle: p\nvisibility_scope: shared\n---\n',
@@ -3446,7 +3967,7 @@ test('a project .hypoignore hides gets no baseline; its old files are kept local
       assert.equal(r.migrated, true, JSON.stringify(r));
       assert.deepEqual(
         r.baselines.map((b) => b.split('/')[1]),
-        ['p'],
+        ['p', 'p'],
       );
       assert.equal(existsSync(join(dir, 'projects/secret/sessions')), false);
       for (const f of ['hot.md', 'session-state.md']) {
@@ -3510,7 +4031,7 @@ test('a view staged as S and edited to W: both go to backups and out as addition
     );
     assert.equal(r.shared.length, 2);
     assert.deepEqual(r.shared.map((rel) => entryOf(dir, rel).summary).sort(), [S, W].sort());
-    assert.equal(baselinesOf(dir).length, 3);
+    assert.equal(baselinesOf(dir).length, 4, 'the move made two, the edits one each');
     assert.equal(cgitOk(dir, ['diff', '--cached', '--name-only']).trim(), '');
   });
 });
@@ -4714,7 +5235,7 @@ test('a .gitignore that holds the whole block, with user lines around it, still 
   );
 });
 
-test('the virtual baseline of a vault not moved yet is HEAD bytes, not the staged or working-tree ones, and its id is the migration id', () => {
+test('the virtual baseline of a vault not moved yet holds the working-tree bytes: a hand edit that is staged or not shows up', () => {
   withOldGit((dir) => {
     put(dir, 'projects/p/hot.md', RICH_HOT.replace('the old summary', 'STAGED summary'));
     cgitOk(dir, ['add', 'projects/p/hot.md']);
@@ -4722,15 +5243,181 @@ test('the virtual baseline of a vault not moved yet is HEAD bytes, not the stage
     const virtual = loadSessionModel(dir, 'p').entries.find((e) => isBaselineId(e.closeId));
     assert.ok(virtual, 'a virtual baseline');
     const text = JSON.stringify(virtual);
-    assert.ok(text.includes('the old summary'), 'HEAD text');
-    assert.equal(text.includes('STAGED'), false);
-    assert.equal(text.includes('WORKTREE'), false);
+    assert.ok(text.includes('WORKTREE summary'), 'the working-tree text');
+    assert.equal(text.includes('the old summary'), false, 'not HEAD');
+    assert.equal(text.includes('STAGED'), false, 'not the index');
+  });
+});
+
+test('the virtual baseline of a file the vault .gitignore keeps out of git is still there', () => {
+  withOldGit((dir) => {
+    // HEAD tracks neither old file of q: a user rule keeps them out, and they are on disk
+    put(dir, '.gitignore', '.cache/\nprojects/q/\n');
+    put(dir, 'projects/q/index.md', '---\ntitle: q\n---\n');
+    put(dir, 'projects/q/session-state.md', '## Next Up\nQ_STATE_BODY\n');
+    const model = loadSessionModel(dir, 'q');
+    const virtual = model.entries.find((e) => isBaselineId(e.closeId));
+    assert.ok(virtual, JSON.stringify(model));
+    assert.ok(JSON.stringify(virtual).includes('Q_STATE_BODY'));
+  });
+});
+
+test('the virtual baseline skips bytes the generator wrote, and an edit of them counts again', () => {
+  withOldGit((dir) => {
+    const written = '---\ngenerated: sessions\n---\nwritten by the generator\n';
+    put(dir, 'projects/p/hot.md', written);
+    put(dir, 'projects/p/session-state.md', '');
+    // committed, so the working tree and HEAD hold the same bytes and only ownership decides
+    commitIn(dir);
+    put(
+      dir,
+      '.cache/generated-views.json',
+      JSON.stringify({ views: { 'projects/p/hot.md': sha(written) } }),
+    );
+    assert.equal(
+      loadSessionModel(dir, 'p').entries.filter((e) => isBaselineId(e.closeId)).length,
+      0,
+      'the generator output is not old memory',
+    );
+    put(dir, 'projects/p/hot.md', `${written}typed by hand\n`);
+    commitIn(dir);
+    const [edited] = loadSessionModel(dir, 'p').entries.filter((e) => isBaselineId(e.closeId));
+    assert.ok(edited && JSON.stringify(edited).includes('typed by hand'), 'an edited view is read');
+  });
+});
+
+test('with a clean working tree the virtual baseline has the id the migration commit builds', () => {
+  withOldGit((dir) => {
+    const virtual = loadSessionModel(dir, 'p').entries.find(
+      (e) => isBaselineId(e.closeId) && e.summary !== '',
+    );
+    assert.ok(virtual, 'a virtual hot baseline');
+    const r = migrate(dir);
+    assert.equal(r.migrated, true, JSON.stringify(r));
+    const ids = r.baselines.map((rel) => entryOf(dir, rel).closeId);
+    assert.ok(ids.includes(virtual.closeId), 'the migration commit builds the same baseline id');
+  });
+});
+
+// An old file git does not track is not published and not claimed by the migration: whether it is
+// private local memory or an edited generated view cannot be told, and its scope may live in an
+// `index.md` that is untracked too. The writer backs it up and the notice says where.
+test('an untracked old file with an untracked machine-scoped index.md is in no commit and no shared view, and is backed up with a notice', () => {
+  withOldGit((dir) => {
+    put(
+      dir,
+      'projects/q/index.md',
+      '---\ntitle: q\nvisibility_scope: machine:secret-device\n---\n',
+    );
+    put(dir, 'projects/q/session-state.md', '## Next Up\nPRIVATE_LOCAL_MEMORY\n');
+    assert.equal(cgitOk(dir, ['ls-files', 'projects/q']).trim(), '', 'precondition: untracked');
     const r = migrate(dir);
     assert.equal(r.migrated, true, JSON.stringify(r));
     assert.equal(
-      entryOf(dir, r.baselines[0]).closeId,
-      virtual.closeId,
-      'the migration commit builds the same baseline id',
+      r.baselines.some((rel) => rel.startsWith('projects/q/')),
+      false,
+      JSON.stringify(r.baselines),
+    );
+    assert.equal(
+      git(dir, ['grep', '-q', 'PRIVATE_LOCAL_MEMORY', 'HEAD']).status,
+      1,
+      'in no commit',
+    );
+    assert.ok(
+      r.notices.some((n) => n.includes('projects/q/session-state.md')),
+      `the migration says the file stayed out: ${JSON.stringify(r.notices)}`,
+    );
+    const written = writeGeneratedViews(dir, WRITE);
+    const backup = written.backedUp.find((b) => b.relPath === 'projects/q/session-state.md');
+    assert.ok(backup, JSON.stringify(written.backedUp));
+    assert.match(readFileSync(backup.backupPath, 'utf-8'), /PRIVATE_LOCAL_MEMORY/);
+    const shared = [readRel(dir, 'hot.md'), readRel(dir, 'projects/q/hot.md')].join('\n');
+    assert.equal(shared.includes('PRIVATE_LOCAL_MEMORY'), false, 'in no shared view');
+    const notice = consumeRootHotHealthNotice(dir) ?? '';
+    assert.ok(notice.includes(relative(dir, backup.backupPath)), `names the backup: ${notice}`);
+    assert.match(notice, /notes\.md/, 'says how to bring the text back');
+  });
+});
+
+test('an edited generated view that git does not track, with an ownership record, is backed up and not claimed', () => {
+  withOldGit((dir) => {
+    const written = '---\ngenerated: sessions\n---\nwritten by the generator\n';
+    put(dir, 'projects/q/index.md', '---\ntitle: q\n---\n');
+    put(dir, 'projects/q/hot.md', `${written}typed by hand EDITED_VIEW\n`);
+    put(
+      dir,
+      '.cache/generated-views.json',
+      JSON.stringify({ views: { 'projects/q/hot.md': sha(written) } }),
+    );
+    const r = migrate(dir);
+    assert.equal(r.migrated, true, JSON.stringify(r));
+    assert.equal(
+      r.baselines.some((rel) => rel.startsWith('projects/q/')),
+      false,
+      'not a baseline',
+    );
+    assert.equal(git(dir, ['grep', '-q', 'EDITED_VIEW', 'HEAD']).status, 1, 'in no commit');
+    const claimed = readGeneratedViewsRecord(dir).views['projects/q/hot.md'];
+    assert.equal(claimed, sha(written), 'the record still holds the old hash: not claimed');
+    const out = writeGeneratedViews(dir, WRITE);
+    const backup = out.backedUp.find((b) => b.relPath === 'projects/q/hot.md');
+    assert.ok(backup, JSON.stringify(out.backedUp));
+    assert.match(readFileSync(backup.backupPath, 'utf-8'), /EDITED_VIEW/);
+  });
+});
+
+test('an old file that is not tracked, ignored by the vault or never added, is not published as a baseline by the move', () => {
+  withOldGit(
+    (dir) => {
+      put(dir, 'projects/q/index.md', '---\ntitle: q\n---\n');
+      put(dir, 'projects/q/session-state.md', '## Next Up\nQ_PRIVATE_STATE\n');
+      put(dir, 'projects/r/index.md', '---\ntitle: r\n---\n');
+      put(dir, 'projects/r/session-state.md', '## Next Up\nR_PLAIN_STATE\n');
+      const r = migrate(dir);
+      assert.equal(r.migrated, true, JSON.stringify(r));
+      const published = r.baselines.map((rel) => readRel(dir, rel)).join('\n');
+      // the contract changed: a file that was merely never added is no longer published either
+      assert.equal(published.includes('R_PLAIN_STATE'), false, 'the never added one is not');
+      assert.equal(published.includes('Q_PRIVATE_STATE'), false, 'the ignored one is not');
+      assert.equal(cgitOk(dir, ['ls-tree', '-r', '--name-only', 'HEAD', 'projects/q']).trim(), '');
+      // kept local: the writer backs it up and the notice says where
+      assert.ok(
+        r.notices.some((n) => n.includes('projects/q/session-state.md')),
+        JSON.stringify(r.notices),
+      );
+      const out = writeGeneratedViews(dir, WRITE);
+      const backup = out.backedUp.find((b) => b.relPath === 'projects/q/session-state.md');
+      assert.ok(backup, JSON.stringify(out.backedUp));
+      assert.match(readFileSync(backup.backupPath, 'utf-8'), /Q_PRIVATE_STATE/);
+      assert.ok(out.backedUp.some((b) => b.relPath === 'projects/r/session-state.md'));
+      assert.ok((consumeRootHotHealthNotice(dir) ?? '').includes(relative(dir, backup.backupPath)));
+    },
+    { '.gitignore': '.cache/\nprojects/q/session-state.md\n' },
+  );
+});
+
+test('a tracked view with the generator bytes gets no baseline in the migration commit', () => {
+  withOldGit((dir) => {
+    const written = '---\ngenerated: sessions\n---\nwritten by the generator\n';
+    put(dir, 'projects/p/hot.md', written);
+    commitIn(dir);
+    put(
+      dir,
+      '.cache/generated-views.json',
+      JSON.stringify({ views: { 'projects/p/hot.md': sha(written) } }),
+    );
+    const r = migrate(dir);
+    assert.equal(r.migrated, true, JSON.stringify(r));
+    const texts = r.baselines.map((rel) => readRel(dir, rel));
+    assert.equal(
+      texts.some((t) => t.includes('written by the generator')),
+      false,
+      'the generator output is not turned into a baseline',
+    );
+    assert.equal(
+      texts.some((t) => t.includes('old state body')),
+      true,
+      'the real old state file still is',
     );
   });
 });

@@ -35,6 +35,7 @@ import {
   withTmpHome,
 } from './helpers.mjs';
 import { PROVENANCE_FILENAME, EXPECTED_PKG_NAME } from '../scripts/lib/pkg-provenance.mjs';
+import { buildBaselineEntry } from '../hooks/session-entries.mjs';
 import {
   RECEIPT_SCHEMA_VERSION,
   CERT_CHECKPOINT,
@@ -3963,3 +3964,90 @@ test('registry has user and project rows on one path: drift reads the user row, 
 // build-failed comment in evaluateTarget).
 
 suite('doctor.mjs: feedback projection attributes hook-broken');
+
+// ── doctor.mjs: a baseline entry must still name its own content ──────────────
+//
+// git pairs a baseline with the old file it was cut from as a rename when it merges the migration
+// commit, so another machine's edit to the old file can land inside the baseline with no conflict.
+
+suite('doctor.mjs: session baselines');
+
+function writeBaseline(dir, kind, text, edit = (t) => t) {
+  const built = buildBaselineEntry({
+    kind,
+    text,
+    date: '2026-09-25',
+    visibilityScope: null,
+    project: 'demo',
+    legacyDone: false,
+  });
+  mkdirSync(join(dir, 'projects', 'demo', 'sessions'), { recursive: true });
+  const rel = join('projects', 'demo', 'sessions', built.fileName);
+  writeFileSync(join(dir, rel), edit(built.text));
+  return rel;
+}
+
+function runBaselineCheck(dir) {
+  const r = run('doctor.mjs', [`--hypo-dir=${dir}`, '--json']);
+  return JSON.parse(r.stdout).find((c) => c.label === 'Session baselines');
+}
+
+test('doctor-baselines: baselines that match their names pass, and the count is reported', () => {
+  withTmpDir((dir) => {
+    writeFileSync(join(dir, 'hypo-config.md'), '# config');
+    writeBaseline(dir, 'hot', 'old hot body\n');
+    writeBaseline(dir, 'state', '## Next Up\nold state body\n');
+    const check = runBaselineCheck(dir);
+    assert.ok(check, 'the check ran');
+    assert.equal(check.status, 'pass', check.detail);
+    assert.match(check.detail, /2 baseline entries/);
+  });
+});
+
+test('doctor-baselines: a baseline whose bytes were edited after it was named is a warn that names the file', () => {
+  withTmpDir((dir) => {
+    writeFileSync(join(dir, 'hypo-config.md'), '# config');
+    const good = writeBaseline(dir, 'hot', 'old hot body\n');
+    const bad = writeBaseline(dir, 'state', '## Next Up\nold state body\n', (t) =>
+      t.replace('old state body', 'old state body, edited on another machine'),
+    );
+    const check = runBaselineCheck(dir);
+    assert.ok(check, 'the check ran');
+    assert.equal(check.status, 'warn', check.detail);
+    assert.ok(check.detail.includes(bad), check.detail);
+    assert.ok(!check.detail.includes(good), 'the intact baseline is not named');
+    assert.match(check.detail, /1 baseline entry holds bytes that do not match the name/);
+  });
+});
+
+test('doctor-baselines: a vault with no baselines has no such check', () => {
+  withTmpDir((dir) => {
+    writeFileSync(join(dir, 'hypo-config.md'), '# config');
+    mkdirSync(join(dir, 'projects', 'demo', 'sessions'), { recursive: true });
+    assert.equal(runBaselineCheck(dir), undefined);
+  });
+});
+
+test('doctor-baselines: a baseline that cannot be parsed is a warn that names the file, not a pass, and the intact one is not named', () => {
+  withTmpDir((dir) => {
+    writeFileSync(join(dir, 'hypo-config.md'), '# config');
+    const good = writeBaseline(dir, 'hot', 'old hot body\n');
+    const broken = writeBaseline(
+      dir,
+      'state',
+      '## Next Up\nold state body\n',
+      () => 'not an entry\n',
+    );
+    const checks = JSON.parse(run('doctor.mjs', [`--hypo-dir=${dir}`, '--json']).stdout).filter(
+      (c) => c.label === 'Session baselines',
+    );
+    assert.deepEqual(
+      checks.map((c) => c.status),
+      ['warn'],
+      JSON.stringify(checks),
+    );
+    assert.ok(checks[0].detail.includes(broken), checks[0].detail);
+    assert.match(checks[0].detail, /cannot be parsed/);
+    assert.ok(!checks[0].detail.includes(good), 'the intact baseline is not named');
+  });
+});

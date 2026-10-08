@@ -2,8 +2,11 @@
 /**
  * hypo-session-start.mjs — SessionStart hook
  *
- * On session start:
- *   HIT  → cwd matches a project's working_dir → inject hot.md (2000 chars) + session-state.md (2000 chars)
+ * On session start, in this order: pull (and catch up to a migrated remote), finish a leftover
+ * pull archive, move a remote-less vault to session entries (or tell the user why not), write the
+ * root `hot.md`, then
+ *   HIT  → cwd matches a project's working_dir → inject that project's heads, built in memory
+ *          from its session entries (4000 chars), then write its two generated views
  *   MISS → inject global hot.md pointer only (no fan-out to all projects)
  */
 
@@ -16,7 +19,6 @@ import { spawnSync, spawn } from 'child_process';
 import {
   HYPO_DIR,
   buildOutput,
-  SESSION_STATE_NEXT_HEADINGS,
   formatGrowthMetrics,
   readSyncState,
   clearSyncState,
@@ -42,11 +44,24 @@ import {
   PKG_ROOT,
   withFileLock,
   vaultCommitLockTarget,
-  claimAndWriteRootHotProjection,
-  recordTouchedPaths,
   consumeRootHotHealthNotice,
-  rootHotBackupRecoveryNotice,
+  incomingChangesViewTracking,
+  migrationState,
+  projectHiddenByHypoignore,
+  resumePullArchive,
+  setAsideNotices,
+  upstreamIsMigrated,
+  vaultHasNoGit,
 } from './hypo-shared.mjs';
+import { buildInjection, entryVisible, isBaselineId, nextUpItems } from './session-entries.mjs';
+import {
+  MIGRATION_START_DEADLINE_MS,
+  fastForwardTo,
+  loadSessionModel,
+  migrateVaultToSessionEntries,
+  recordObservedHeads,
+  writeGeneratedViews,
+} from './session-views.mjs';
 import {
   defaultCachePath,
   detectChannel,
@@ -69,13 +84,7 @@ import {
   clearPkgRootNullNotified,
   UPGRADE_APPLY_EITHER,
 } from './version-check.mjs';
-import {
-  snapshotBase,
-  overwriteTargets,
-  beginObservedGeneration,
-  recordObserved,
-  hashContent,
-} from './base-store.mjs';
+import { snapshotBase, overwriteTargets, beginObservedGeneration } from './base-store.mjs';
 import { listProposalsChecked } from './proposal-store.mjs';
 
 // Privacy guard: refuse to read+inject .hypoignore-matched
@@ -106,32 +115,12 @@ function readIfNotIgnored(path, maxChars, patterns) {
   return { raw, shown: raw.slice(0, maxChars) };
 }
 
-// Scoped-out is not the same as absent. Both make readIfNotIgnored return null,
-// but telling the model "no snapshot yet / first session" when the snapshot merely
-// belongs to another machine is a lie it will act on. Returns false for an ignored
-// or missing file so only a real machine-scope hide reports true.
-// The caller may name the project and the fact, never the withheld body: a message
-// explaining the hide must not re-leak what it hid.
-function isScopedOut(path, patterns) {
+// The STALE marker of an old hot/state file's text (each baseline entry carries one file whole,
+// frontmatter included), or '' for no verify_by_date, an unparseable one, or an error: the derived summaries of
+// later entries carry no such field and pass through unchanged.
+function staleMarkerForText(text, today) {
   try {
-    if (!path || !existsSync(path)) return false;
-    if (patterns.length > 0 && isIgnored(path, HYPO_DIR, patterns)) return false;
-    return !scopeVisible(readVisibilityScope(readFileSync(path, 'utf-8')), currentDevice());
-  } catch {
-    return false;
-  }
-}
-
-// Compute the STALE marker for a hot/state file from its RAW content (readIfNotIgnored
-// already slices, which could truncate frontmatter). Honors the same .hypoignore
-// privacy guard, and returns '' for any miss (no path, ignored, absent, no
-// verify_by_date, or error) so derived summaries pass through unchanged.
-function staleMarkerForPath(path, patterns, today) {
-  try {
-    if (!path) return '';
-    if (patterns.length > 0 && isIgnored(path, HYPO_DIR, patterns)) return '';
-    if (!existsSync(path)) return '';
-    return staleMarkerFor(readFileSync(path, 'utf-8'), today);
+    return text ? staleMarkerFor(text, today) : '';
   } catch {
     return '';
   }
@@ -558,26 +547,8 @@ function buildClearRecoveryLine(source) {
   return (
     `[WIKI_AUTOCLOSE] 이전 세션(${prevId})이 /clear로 강제 종료됨.${trLine}${cwdLine}\n` +
     `  session-close가 미완료라면 지금 즉시 실행할 것 ` +
-    `(hot.md + session-state.md + log.md 최소 갱신).`
+    `(close payload로 원본 기록).`
   );
-}
-
-/**
- * Pull the wiki repo. Returns true only when the pull actually succeeded. On
- * success, also records the last-success timestamp (silently — no notice; the
- * existing failure notice below is unchanged) so doctor never reports "never
- * synced" right after a healthy startup pull, even when no auto-commit Stop
- * hook has run yet this session.
- */
-function gitPull(dir) {
-  if (!existsSync(join(dir, '.git'))) return false;
-  const r = spawnSync('git', ['-C', dir, 'pull', '--ff-only', '--quiet'], {
-    stdio: 'pipe',
-    timeout: 10000,
-  });
-  const ok = r.status === 0;
-  if (ok) recordSyncSuccess(dir, 'pull');
-  return ok;
 }
 
 /**
@@ -853,7 +824,6 @@ function foreignUncommittedNotice(hypoDir, ownProject) {
 
 const GLOBAL_HOT = join(HYPO_DIR, 'hot.md');
 const HOT_CHARS = 2000;
-const STATE_CHARS = 2000;
 
 function findProjectFiles(cwd) {
   if (!existsSync(PROJECTS_DIR)) return null;
@@ -877,32 +847,221 @@ function findProjectFiles(cwd) {
   };
 }
 
-function extractSection(content, heading) {
-  const headings = Array.isArray(heading) ? heading : [heading];
-  for (const h of headings) {
-    const re = new RegExp(`## ${h}\\r?\\n([\\s\\S]*?)(?=\\r?\\n## |$)`);
-    const m = content.match(re);
-    if (m) return m[1].trim();
-  }
-  return null;
+// Characters of project context the hook injects (the old pair of 2000-character files).
+const INJECTION_BUDGET = 4000;
+
+// `{state, date}` of the last session-entries notice shown: the same state on the same day is not
+// shown again (`.cache/session-entries-notice.json`, see `announceOncePerDay`).
+const NOTICE_REL = join('.cache', 'session-entries-notice.json');
+
+const REMOTE_NOT_MIGRATED_NOTICE =
+  '이 볼트는 아직 옛 세션 현황 형식입니다. 같은 볼트를 쓰는 모든 기계를 이 버전 이상으로 올린 뒤, ' +
+  '한 기계에서 `/hypo:upgrade --migrate-sessions`를 한 번 실행하세요. 그 전까지 이 기계의 close는 ' +
+  '원본만 쓰고, 파일로 보는 현황(`hot.md`, `session-state.md`)은 갱신되지 않습니다.';
+
+const OPTED_OUT_NOTICE =
+  '이 볼트는 세션 원본 형식을 끈 상태(롤백)입니다. 평면 파일은 롤백 지점 이후 구버전 기계의 쓰기까지 ' +
+  '포함합니다. 같은 내용이 원본과 평면 파일에서 두 번 보일 수 있습니다. 다시 켜려면 ' +
+  '`/hypo:upgrade --migrate-sessions`를 실행하세요.';
+
+const DEADLINE_NOTICE =
+  '이번 세션은 시간이 부족해 이행을 다음 세션으로 미뤘습니다. 그 세션은 이행 전 동작을 합니다.';
+
+// The clock of this run. A test sets HYPO_TEST_NOW (an ISO time) to fix the first reading and
+// HYPO_TEST_NOW_STEP_MS to move each later reading on by that much, which is how a spawned hook
+// is made to pass the migration start deadline or to see another calendar day. Unset, it is the
+// real clock. It only reads two environment variables and writes nothing.
+function makeClock() {
+  const start = Date.parse(process.env.HYPO_TEST_NOW ?? '');
+  if (Number.isNaN(start)) return () => Date.now();
+  const step = Number(process.env.HYPO_TEST_NOW_STEP_MS) || 0;
+  let reads = 0;
+  return () => start + step * reads++;
 }
 
-function printTerminalSummary(proj, hotContent, stateContent) {
-  const nextFromState = stateContent
-    ? extractSection(stateContent, SESSION_STATE_NEXT_HEADINGS)
-    : null;
-  const next = nextFromState ?? extractSection(hotContent ?? '', SESSION_STATE_NEXT_HEADINGS);
-  const prev = hotContent
-    ? (extractSection(hotContent, '직전 세션 \\([^)]+\\)') ??
-      extractSection(hotContent, '직전 세션.*') ??
-      extractSection(hotContent, 'Last Session.*'))
-    : null;
+function localDay(ms) {
+  const d = new Date(ms);
+  const pad = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+}
+
+// A record that cannot be read counts as "not shown yet": more notices, never fewer.
+function sessionNoticeDue(state, day) {
+  try {
+    const rec = JSON.parse(readFileSync(join(HYPO_DIR, NOTICE_REL), 'utf-8'));
+    return !(rec && rec.state === state && rec.date === day);
+  } catch {
+    return true;
+  }
+}
+
+function recordSessionNotice(state, day) {
+  try {
+    atomicWrite(join(HYPO_DIR, NOTICE_REL), JSON.stringify({ state, date: day }));
+  } catch {
+    // best-effort: a failed record only means the notice shows again
+  }
+}
+
+const vaultGit = (args) =>
+  spawnSync('git', ['-C', HYPO_DIR, ...args], { encoding: 'utf-8', timeout: 10000 });
+
+// A vault with any remote never moves itself: another machine may still run the old scheme. When
+// git cannot say, assume a remote.
+function vaultHasRemote() {
+  const r = vaultGit(['remote']);
+  return r.status !== 0 || (r.stdout || '').trim() !== '';
+}
+
+/**
+ * With the upstream fetched: when it is ahead of HEAD (HEAD is its ancestor) and taking it in
+ * changes how the generated views are tracked (a migration commit, a rollback commit, or the
+ * `.gitignore` block arriving), move HEAD there with `fastForwardTo`, which sets aside what would
+ * block the merge or be overwritten without a word and puts it back if the merge fails. A plain
+ * fast-forward is not enough for these commits: it deletes a clean view of a project `.hypoignore`
+ * hides with no copy, and a rollback commit overwrites an ignored local file. A diverged history
+ * is left to the Stop hook's pull. Returns whether it handled the range (moved or refused); after
+ * a refusal the caller must not fall back to a plain merge, which would do the unsafe thing.
+ * Records into `out`: `pullOk`, `notices`, `announced` (backup paths already named in a notice, so
+ * the archive resume does not name them twice).
+ */
+function catchUpToUpstream(out) {
+  const target = (
+    vaultGit(['rev-parse', '--verify', '--quiet', '@{u}^{commit}']).stdout || ''
+  ).trim();
+  const head = (
+    vaultGit(['rev-parse', '--verify', '--quiet', 'HEAD^{commit}']).stdout || ''
+  ).trim();
+  if (!target || !head || target === head) return false;
+  if (vaultGit(['merge-base', '--is-ancestor', 'HEAD', target]).status !== 0) return false;
+  // Enter when the range itself changes how views are tracked, or when the remote has moved and
+  // this vault has not: `upstreamIsMigrated` stays true for good once the remote moved, so on its
+  // own it would send every ordinary pull of a migrated vault through the catch-up and report a
+  // dirty file as a missed migration commit.
+  if (
+    !incomingChangesViewTracking(HYPO_DIR, target) &&
+    !(upstreamIsMigrated(HYPO_DIR) && migrationState(HYPO_DIR) !== 'migrated')
+  ) {
+    return false;
+  }
+  const moved = fastForwardTo(HYPO_DIR, target);
+  if (!moved.ok) {
+    out.notices.push(
+      `원격의 세션 현황 이행 커밋을 받지 못했습니다: ${moved.notice ?? moved.reason ?? 'unknown'}`,
+    );
+    return true;
+  }
+  out.pullOk = true;
+  recordSyncSuccess(HYPO_DIR, 'pull');
+  const { localOnly, unowned, cleared } = moved.pre;
+  out.announced.push(...[...localOnly, ...unowned, ...cleared].map((v) => v.backupPath));
+  out.notices.push(...setAsideNotices(HYPO_DIR, moved.pre));
+  return true;
+}
+
+/**
+ * `pull --ff-only` in two steps, so a migration or rollback range can be told apart before it
+ * lands: fetch, catch up when the range changes view tracking, else fast-forward to the upstream.
+ * When the fetch fails (no remote, offline) the pull is not tried: it would reach the same remote
+ * and fail the same way, after another timeout.
+ */
+function pullVault(out) {
+  if (vaultGit(['fetch', '--quiet']).status !== 0) {
+    out.pullOk = false;
+    return;
+  }
+  if (catchUpToUpstream(out)) return;
+  out.pullOk = vaultGit(['merge', '--ff-only', '--quiet', '@{u}']).status === 0;
+  if (out.pullOk) recordSyncSuccess(HYPO_DIR, 'pull');
+}
+
+/**
+ * Everything that moves the vault's history at session start, under the vault commit lock: the
+ * pull (with the catch-up to a migrated or rolled-back upstream), and the finish of a pull archive
+ * an earlier run left after its merge (independent of the migration state). Returns
+ * `{pullOk, notices}`. A lock that cannot be had leaves `pullOk` false, like a failed pull.
+ */
+function syncVault() {
+  const out = { pullOk: false, notices: [], announced: [] };
+  // The archive resume needs only a repository somewhere above the vault (a vault in a
+  // subdirectory of one has no `.git` of its own); the pull needs the vault's own `.git`. A vault
+  // that does not exist gets neither: the lock would create `.cache/` under a missing root.
+  if (!existsSync(HYPO_DIR) || vaultHasNoGit(HYPO_DIR)) return out;
+  const ownGit = existsSync(join(HYPO_DIR, '.git'));
+  try {
+    withFileLock(
+      vaultCommitLockTarget(HYPO_DIR),
+      () => {
+        try {
+          if (ownGit) pullVault(out);
+        } catch (err) {
+          out.notices.push(`원격 변경을 받는 중 실패했습니다: ${err?.message ?? err}`);
+        }
+        try {
+          out.notices.push(...resumePullArchive(HYPO_DIR, { announced: out.announced }).notices);
+        } catch (err) {
+          out.notices.push(`남은 보관 기록을 처리하지 못했습니다: ${err?.message ?? err}`);
+        }
+      },
+      { timeoutMs: Number(process.env.HYPO_VAULT_LOCK_TIMEOUT_MS) || 5000 },
+    );
+  } catch {
+    // lock timeout or a failure outside the steps above: pullOk keeps what it had
+  }
+  return out;
+}
+
+/**
+ * What one project's SessionStart injection is made of, built in memory from its session entries
+ * (before the migration the model holds a virtual baseline of the old files, so nothing here reads
+ * a generated view file). `{hidden: true}` for a project `.hypoignore` hides. Otherwise `{text,
+ * observed, markers, items, hasSnapshot, scopedOut}`: `hasSnapshot` is whether this machine can see any
+ * entry, `scopedOut` whether entries exist that only another machine can.
+ */
+function projectInjection(proj, state, patterns) {
+  if (projectHiddenByHypoignore(HYPO_DIR, proj, patterns)) return { hidden: true };
+  const device = currentDevice();
+  const model = loadSessionModel(HYPO_DIR, proj, { state, localOld: true });
+  const injection = buildInjection(model, INJECTION_BUDGET, { device });
+  const seen = model.entries.filter((e) => entryVisible(model, e, device));
+  // An entry file that cannot be read is not an absent one. Only the count is told: a hidden file's
+  // name is not for the model. With nothing else readable the project is not called a first session.
+  const unreadable = model.unreadable.length;
+  if (unreadable > 0 && seen.length === 0) return { unavailable: true };
+  const items = nextUpItems(model, { device });
+  // TODAY is UTC to match doctor.mjs. The old files' dates survive in the baseline entries: the
+  // summary of the hot baseline is the old `hot.md`, the frontmatter of the state baseline's
+  // `legacy` head the old `session-state.md`.
+  const today = new Date().toISOString().slice(0, 10);
+  const markers = [
+    seen
+      .filter((e) => isBaselineId(e.closeId))
+      .map((e) => staleMarkerForText(e.summary, today))
+      .find(Boolean),
+    items.map((i) => staleMarkerForText(i.legacyFrontmatter, today)).find(Boolean),
+  ].filter(Boolean);
+  const warning =
+    unreadable > 0
+      ? `[주의: 세션 원본 ${unreadable}개를 읽지 못해 아래 현황에 빠졌을 수 있습니다. 이 프로젝트를 첫 세션으로 단정하지 마세요. /hypo:doctor로 확인할 수 있습니다.]\n\n`
+      : '';
+  return {
+    text: warning + injection.text,
+    observed: injection.observed,
+    markers,
+    items,
+    hasSnapshot: seen.length > 0,
+    scopedOut: seen.length === 0 && model.entries.length > 0,
+  };
+}
+
+// The head titles and bodies come from the model, not from a re-parse of the rendered markdown (a
+// baseline's body can hold `##` lines of its own).
+function printTerminalSummary(proj, items) {
   const lines = ['', `\x1b[36m[Hypomnema]\x1b[0m project: \x1b[1m${proj}\x1b[0m`];
-  if (prev) lines.push(`  prev: ${prev.split('\n')[0].replace(/^\*\*|\*\*$/g, '')}`);
-  if (next) {
+  if (items.length) {
     lines.push('  next:');
-    next
-      .split('\n')
+    items
+      .flatMap((i) => [`${i.title} (${i.date})`, ...i.body.split('\n')])
       .slice(0, 20)
       .forEach((l) => lines.push(`    ${l}`));
   }
@@ -914,42 +1073,29 @@ let raw = '';
 process.stdin.setEncoding('utf-8');
 process.stdin.on('data', (chunk) => (raw += chunk));
 process.stdin.on('end', () => {
-  // Declared before the try so every emit branch — including the outer
-  // catch — carries the same `systemMessage` (the user-visible update/sibling
+  // Declared before the try so every emit branch, including the outer
+  // catch, carries the same `systemMessage` (the user-visible update/sibling
   // banner). Reassigned once below after the notices are computed.
   let outExtra = { continue: true, suppressOutput: true };
   try {
+    const clock = makeClock();
+    const startedAt = clock();
     let data = {};
     try {
       data = JSON.parse(raw);
     } catch {}
 
-    // BLOCKER fix: serialized against every other writer of this vault
-    // (hypo-auto-commit.mjs's stage+commit+sync, crystallize.mjs's apply, and
-    // writeRootHotProjection below) on the SAME lock. A fast-forward pull
-    // rewrites hot.md as surely as the projection writer does, so locking the
-    // writer alone would just move the unguarded overwrite onto this line.
-    // Not reentrant: this hold is released before the projection call below
-    // takes the same lock for itself, and nothing between them holds it.
-    //
-    // A lock timeout leaves pullOk false, which is the same state a failed
-    // pull produces: the sync-state notice stays unresolved for one more
-    // session rather than being cleared on a pull that never ran.
-    //
-    // The `.git` check is gitPull's own precondition, hoisted out so the lock
-    // is never taken for a call that cannot pull: withFileLock creates the
-    // lock's parent directory, which on an install with no vault would mint
-    // `.cache/` under a wiki root that does not exist.
-    let pullOk = false;
-    if (existsSync(join(HYPO_DIR, '.git'))) {
-      try {
-        pullOk = withFileLock(vaultCommitLockTarget(HYPO_DIR), () => gitPull(HYPO_DIR), {
-          timeoutMs: Number(process.env.HYPO_VAULT_LOCK_TIMEOUT_MS) || 5000,
-        });
-      } catch {
-        pullOk = false;
-      }
-    }
+    // Serialized against every other writer of this vault (hypo-auto-commit.mjs's
+    // stage-and-commit-and-sync, crystallize.mjs's apply, the generated-view writer) on the SAME
+    // lock: a fast-forward pull rewrites tracked files as surely as the view writer does. The lock
+    // is released before the writers below take it for themselves; it is not reentrant.
+    // A lock timeout leaves pullOk false, the state a failed pull produces: the sync-state notice
+    // stays unresolved for one more session rather than being cleared on a pull that never ran.
+    // The vault checks in syncVault are its own precondition: withFileLock creates the lock's parent
+    // directory, which on an install with no vault would mint `.cache/` under a wiki root that
+    // does not exist.
+    const sync = syncVault();
+    const pullOk = sync.pullOk;
     const syncLine = syncStateNotice(pullOk);
     const proposalLine = pendingProposalNotice();
     const growthLine = readLastGrowthLine();
@@ -970,11 +1116,11 @@ process.stdin.on('end', () => {
     // The update + stale-sibling + pkgRoot-drift/null banners must reach the
     // USER. On a SessionStart hook that exits 0, stderr is invisible in the
     // normal TUI (only shown on exit 2 / --verbose) and additionalContext is
-    // model-only — `systemMessage` is the documented user-visible channel.
+    // model-only: `systemMessage` is the documented user-visible channel.
     // Route those banners there. They ALSO stay in noticePrefix →
     // additionalContext below, so the model and the user start the session
-    // looking at the same state. (The other stderr notices —
-    // sync/growth/clear/suggest — are intentionally transcript/--verbose only
+    // looking at the same state. (The other stderr notices
+    // sync/growth/clear/suggest are intentionally transcript/--verbose only
     // and out of this banner's scope.)
     const userMessage = [updateLine, siblingLine, pkgDriftLine, pkgNullLine]
       .filter(Boolean)
@@ -1000,6 +1146,69 @@ process.stdin.on('end', () => {
     if (siblingLine) process.stderr.write(`\n\x1b[33m${siblingLine}\x1b[0m\n`);
     if (pkgDriftLine) process.stderr.write(`\n\x1b[33m${pkgDriftLine}\x1b[0m\n`);
     if (pkgNullLine) process.stderr.write(`\n\x1b[33m${pkgNullLine}\x1b[0m\n`);
+
+    // A notice the user must see (systemMessage) and the model should know (additionalContext).
+    const surface = (msg) => {
+      notices.push(msg);
+      noticePrefix = `${notices.join('\n\n')}\n\n`;
+      outExtra = {
+        ...outExtra,
+        systemMessage: [outExtra.systemMessage, msg].filter(Boolean).join('\n\n'),
+      };
+      process.stderr.write(`\n\x1b[33m${msg}\x1b[0m\n`);
+    };
+    for (const msg of sync.notices) surface(msg);
+
+    // The vault's move to session entries. A vault with a remote is never moved from here, however
+    // far along the others are; the one without a remote moves unless the hook already used up
+    // its start allowance. A notice about the state shows once per state and local day.
+    let state = existsSync(HYPO_DIR) ? migrationState(HYPO_DIR) : 'migrated';
+    const day = localDay(startedAt);
+    // The record is written after the foreign-change scan below, which would otherwise count the
+    // record file itself in a vault that does not ignore `.cache/`.
+    const shownKeys = [];
+    const announceOncePerDay = (key, text) => {
+      if (!sessionNoticeDue(key, day)) return;
+      surface(text);
+      shownKeys.push(key);
+    };
+    if (state === 'not-migrated') {
+      if (vaultHasRemote()) {
+        announceOncePerDay('not-migrated', REMOTE_NOT_MIGRATED_NOTICE);
+      } else if (clock() - startedAt > MIGRATION_START_DEADLINE_MS) {
+        announceOncePerDay('migration-deferred:deadline', DEADLINE_NOTICE);
+      } else {
+        // A throw from the move (a directory git or the filesystem will not let it read) must not
+        // take the injection and the notices after it down with it: it defers the move like any
+        // other reason, and the old files are injected as before.
+        let moved;
+        try {
+          moved = migrateVaultToSessionEntries(HYPO_DIR);
+        } catch (err) {
+          moved = {
+            deferred: 'error',
+            notices: [`이행을 다음 세션으로 미뤘습니다: ${err?.message ?? String(err)}`],
+          };
+        }
+        if (moved.deferred) {
+          // One record per reason, so a passing reason (a busy lock, the deadline) does not hide
+          // an actionable one the same day.
+          announceOncePerDay(`migration-deferred:${moved.deferred}`, moved.notices.join('\n'));
+        } else {
+          if (moved.commit) {
+            surface(
+              '이 볼트의 세션 현황을 세션별 원본(projects/*/sessions/)으로 옮겼습니다. ' +
+                '`hot.md`와 `session-state.md`는 이제 원본에서 만들어지는 파일이라 커밋되지 않습니다.',
+            );
+          }
+          for (const msg of moved.notices) surface(msg);
+        }
+        state = migrationState(HYPO_DIR);
+      }
+    } else if (state === 'opted-out') {
+      announceOncePerDay('opted-out', OPTED_OUT_NOTICE);
+    }
+
     const cwd = data.cwd || data.directory || process.cwd();
     const sessionId = data.session_id || 'default';
     const MARKER_FILE = sessionMarkerPath(sessionId);
@@ -1007,7 +1216,7 @@ process.stdin.on('end', () => {
 
     // ownProject = the cwd-matched project (or null on a MISS, per
     // foreignUncommittedNotice's docstring). Late-appended into `notices` /
-    // `noticePrefix`, same pattern the MISS branch's suggestLine uses below —
+    // `noticePrefix`, same pattern the MISS branch's suggestLine uses below:
     // both need `hit` first, which isn't resolved until this line.
     const foreignNotice = foreignUncommittedNotice(HYPO_DIR, hit ? hit.proj : null);
     if (foreignNotice) {
@@ -1016,228 +1225,40 @@ process.stdin.on('end', () => {
       process.stderr.write(`\n\x1b[33m${foreignNotice}\x1b[0m\n`);
     }
 
-    // Root hot.md projection. Must run AFTER gitPull (so it
-    // reflects the merged tree) and BEFORE snapshotBase below (so this
-    // session's base for 'hot.md' is the freshly generated bytes, not
-    // whatever was on disk before this write). Also deliberately AFTER
-    // foreignUncommittedNotice above: that check reads `git status` on the
-    // wiki tree, and this session's OWN regeneration of hot.md is not a
-    // foreign or unattributed change: running the write first would make the
-    // projection's own necessary write show up in that scan and misreport as
-    // one. resolveActiveProject, closeCandidateSlugs, and the HIT/MISS
-    // injection later in this hook all read hot.md, so the write still has to
-    // land before any of those.
-    // recordTouchedPaths here is the ONLY thing that gets this write into a
-    // scoped hypo-auto-commit at Stop. Without it: SessionStart writes fresh
-    // bytes, Stop's own rebuild sees disk already equals the projection
-    // (writeRootHotProjection's no-op branch) and records nothing touched, and
-    // hypo-auto-commit only ever commits its touched-paths set, so the write
-    // this hook just made would never be staged or committed by ANY path, and
-    // would sit as an unattributable dirty file (closeFileTargetsGlobal scopes
-    // hot.md as close-owned; classifyForeignOnlyDirty cannot demote it to
-    // foreign) blocking both the close gate and PreCompact. TODO(wave 3): this
-    // whole call disappears the moment hot.md comes out of overwriteTargets /
-    // the commit path, since a projection target no longer needs a commit.
-    //
-    // The touched-paths record is claimed BEFORE the write, not after: it is
-    // itself best-effort (a lock timeout can fail it), and recording it after
-    // the fact means a failure there leaves a real disk write with nothing in
-    // any session's touched-paths set, the exact orphan this comment already
-    // described, just moved from "Stop's rebuild is a no-op" to "the record
-    // call itself failed." Claiming it first and skipping the write on a
-    // failed claim means hot.md is never rewritten without something able to
-    // account for that rewrite at close time.
-    //
-    // The claim and the write share one hold of the vault lock
-    // (claimAndWriteRootHotProjection). Claimed first and locked second, a
-    // Stop for the same session_id could take the lock in between, retire
-    // the still-unwritten claim, and leave the write that followed with no
-    // claim at all.
+    for (const key of shownKeys) recordSessionNotice(key, day);
+
+    // A prior Stop's write of a generated view may have backed up bytes it did not write, or have
+    // failed invisibly (its own stdout is suppressed), and left a note for the next SessionStart.
+    // One-shot: consumed (and deleted) the moment it is read, so it surfaces exactly once.
+    const showHealthNotice = () => {
+      const health = consumeRootHotHealthNotice(HYPO_DIR);
+      if (health) surface(health);
+    };
+
+    // The root `hot.md` is written first, for every session: a fast-forward over a migration
+    // commit deletes it from the working tree, and the MISS injection below reads it. The current
+    // project's two views follow the injection (a slow or failed write must not block it); the
+    // other projects' views wait for the Stop hook.
     if (existsSync(HYPO_DIR)) {
-      // A missing session_id reads as "not claimed" here (claimProjectionWrite
-      // underneath), unlike every other best-effort accumulate call, or this
-      // write proceeds with nothing able to ever bring it into a commit.
-      let outcome;
-      let writeError = null;
       try {
-        // n1 fix: session_id goes along so this session's own digest lands in
-        // ITS OWN receipt, not just the shared global ownership record (see
-        // writeRootHotProjection's doc comment).
-        outcome = claimAndWriteRootHotProjection(HYPO_DIR, data.session_id);
+        writeGeneratedViews(HYPO_DIR, { projects: [], root: true });
       } catch (err) {
-        writeError = err;
+        surface(`세션 현황 파일 갱신에 실패했습니다: ${err?.message ?? String(err)}`);
       }
-      if (writeError) {
-        // BLOCKER fix: writeRootHotProjection now throws instead of
-        // silently treating an unreadable existing hot.md as absent. The
-        // claim this call added was already dropped inside the lock (see
-        // claimAndWriteRootHotProjection), so no stale 'hot.md' claim is
-        // left to sweep in whatever another session or a person writes next.
-        // catch-message-accuracy fix (r5-w1.md): the write can throw from
-        // several different steps (reading the existing file, writing the
-        // migration backup, updating .gitignore, or the final atomic write
-        // itself), not only a read failure: wording this as "읽을 수 없어"
-        // (could not read) misnamed a disk-full or backup-write failure as
-        // something it was not. What stays true regardless of which step
-        // failed is that the atomic write never ran, so the old file is
-        // untouched.
-        const err = writeError;
-        const msg = `루트 hot.md 갱신에 실패해 이전 파일을 그대로 두었습니다: ${err?.message ?? String(err)}`;
-        notices.push(msg);
-        noticePrefix = notices.length ? `${notices.join('\n\n')}\n\n` : '';
-        outExtra = {
-          ...outExtra,
-          systemMessage: [outExtra.systemMessage, msg].filter(Boolean).join('\n\n'),
-        };
-        process.stderr.write(`\n\x1b[33m${msg}\x1b[0m\n`);
-      } else if (outcome.claimFailed) {
-        const msg =
-          '루트 hot.md 갱신을 건너뛰었습니다: 이번 세션의 커밋 범위에 기록하지 못해 갱신 후 미커밋 파일로 남을 수 있었습니다.';
-        notices.push(msg);
-        noticePrefix = notices.length ? `${notices.join('\n\n')}\n\n` : '';
-        outExtra = {
-          ...outExtra,
-          systemMessage: [outExtra.systemMessage, msg].filter(Boolean).join('\n\n'),
-        };
-        process.stderr.write(`\n\x1b[33m${msg}\x1b[0m\n`);
-      } else {
-        const { result } = outcome;
-        if (result.lockTimeout) {
-          // BLOCKER fix, the other half: the projection writer holds the
-          // vault lock, so a vault busy with another session's commit can
-          // leave this session on the previous pointer table. Say so instead
-          // of starting the session on a stale table with no explanation.
-          // No claim to drop: it is taken inside the same lock, so a lock
-          // timeout means this run never claimed anything, and a resumed
-          // session_id's earlier, still-unresolved 'hot.md' claim is left
-          // exactly as it was.
-          const msg =
-            '루트 hot.md 를 갱신하지 못했습니다: 다른 세션이 이 저장소를 쓰는 중이라 잠금을 얻지 못했습니다. 이번 세션은 이전 포인터 표를 그대로 읽습니다 (다음 세션 시작이나 종료 때 다시 시도합니다).';
-          notices.push(msg);
-          noticePrefix = notices.length ? `${notices.join('\n\n')}\n\n` : '';
-          outExtra = {
-            ...outExtra,
-            systemMessage: [outExtra.systemMessage, msg].filter(Boolean).join('\n\n'),
-          };
-          process.stderr.write(`\n\x1b[33m${msg}\x1b[0m\n`);
-        } else if (result.scanError) {
-          const msg =
-            '루트 hot.md 갱신 실패: projects/ 디렉터리를 읽을 수 없어 이전 파일을 그대로 두었습니다.' +
-            ` 권한과 경로를 확인하고(\`ls -ld ${join(HYPO_DIR, 'projects')}\`), 고치면 다음 세션 시작이나 종료 때 자동으로 다시 시도합니다.`;
-          notices.push(msg);
-          noticePrefix = notices.length ? `${notices.join('\n\n')}\n\n` : '';
-          outExtra = {
-            ...outExtra,
-            systemMessage: [outExtra.systemMessage, msg].filter(Boolean).join('\n\n'),
-          };
-          process.stderr.write(`\n\x1b[33m${msg}\x1b[0m\n`);
-        } else if (result.warnings.length > 0) {
-          // major-1/3: a per-project read failure no longer disappears
-          // silently: it kept its row (blank date) in the table already
-          // written above, but the reason must still reach a human.
-          const msg =
-            `루트 hot.md 갱신 중 일부 프로젝트를 읽지 못했습니다:\n${result.warnings.join('\n')}\n` +
-            '해당 파일의 권한과 경로를 확인하면 다음 세션 시작이나 종료 때 자동으로 다시 읽습니다.';
-          notices.push(msg);
-          noticePrefix = notices.length ? `${notices.join('\n\n')}\n\n` : '';
-          outExtra = {
-            ...outExtra,
-            systemMessage: [outExtra.systemMessage, msg].filter(Boolean).join('\n\n'),
-          };
-          process.stderr.write(`\n\x1b[33m${msg}\x1b[0m\n`);
-        }
-        if (result.gitignoreUpdated) {
-          // Best-effort: the gitignore change itself already landed on
-          // disk (writeRootHotProjection would have thrown otherwise); a
-          // failure to also claim it only risks THIS one infra file
-          // showing up as an unattributed dirty file at close, not the
-          // backup it protects (which is gitignored either way).
-          const gClaimed = recordTouchedPaths(HYPO_DIR, data.session_id, ['.gitignore']);
-          if (!gClaimed) {
-            process.stderr.write(
-              '[hypo-session-start] .gitignore 갱신(백업 유출 방지 패턴)을 커밋 범위에 기록하지 못했습니다\n',
-            );
-          }
-        }
-        if (result.backedUp && result.backupPath) {
-          // MAJOR fix: the backup itself was never in question (it lands
-          // on disk and is gitignored either way), only whether a human
-          // ever learns it exists. Before this, `backedUp`/`backupPath`
-          // reached neither `notices` nor `systemMessage`: the backup file
-          // is gitignored, so it does not even show up in `git status`, and
-          // a person who had just hand-edited root hot.md would see their
-          // edit silently replaced with no trace of where it went. Naming
-          // only the file (basename), not its full path: the vault root is
-          // already implied by the session, and nothing else here leaks a
-          // full filesystem path into a notice. This branch should be rare
-          // once rootHot leaves the close payload/overwrite targets: with
-          // no scripted writer left that targets this file, a backup only
-          // happens when a person edits it by hand, so this notice does
-          // not become noise on every session.
-          // Naming the file is not a recovery path on its own: copying the
-          // backup back onto root hot.md just gets it replaced again on the
-          // next rebuild. rootHotBackupRecoveryNotice (hooks/hypo-shared.mjs)
-          // is the one sentence that says what actually recovers the
-          // content, shared with the Stop-hook rebuild and project-create so
-          // the three writers cannot drift into different wordings.
-          const msg = rootHotBackupRecoveryNotice(result.backupPath);
-          notices.push(msg);
-          noticePrefix = notices.length ? `${notices.join('\n\n')}\n\n` : '';
-          outExtra = {
-            ...outExtra,
-            systemMessage: [outExtra.systemMessage, msg].filter(Boolean).join('\n\n'),
-          };
-          process.stderr.write(`\n\x1b[33m${msg}\x1b[0m\n`);
-        }
-      }
+      showHealthNotice();
     }
 
-    // A prior Stop's rebuild may have failed invisibly (its own stdout is
-    // suppressed) and left a note for the next SessionStart to show. One-shot:
-    // consumed (and deleted) the moment it is read, so it surfaces exactly
-    // once instead of repeating on every future session.
-    const staleProjectionNotice = consumeRootHotHealthNotice(HYPO_DIR);
-    if (staleProjectionNotice) {
-      notices.push(staleProjectionNotice);
-      noticePrefix = notices.length ? `${notices.join('\n\n')}\n\n` : '';
-      outExtra = {
-        ...outExtra,
-        systemMessage: [outExtra.systemMessage, staleProjectionNotice].filter(Boolean).join('\n\n'),
-      };
-      process.stderr.write(`\n\x1b[33m${staleProjectionNotice}\x1b[0m\n`);
-    }
-
-    // Observed-base snapshot for the write=proposal gate. Deliberately AFTER gitPull: the base must
-    // describe the tree this session actually starts from, remote merges
-    // included, or the first close would raise a proposal against content the
-    // session never had a chance to conflict with. Once per session
-    // (existence-check inside snapshotBase), so resume and compact leave it
-    // alone. `data.session_id` is used raw rather than the 'default' fallback
-    // above. A session with no id has no base and closes down the legacy
-    // direct-write path.
-    //
-    // Only the root-only targets (hot.md, open-questions.md) are snapshotted
-    // HERE, unconditionally. They carry no .hypoignore/visibility gate of
-    // their own, so hashing them before any injection decision costs
-    // nothing a later read would have refused anyway. The current project's
-    // OWN two targets (hit.proj's hot.md / session-state.md) used to be
-    // snapshotted right here too, blind to whether the HIT branch below was
-    // about to actually show them (review r4-w4 major 3): that let a
-    // .hypoignore'd or machine-scoped-out project target mint a "clean" base
-    // from bytes this session was never shown a single line of, and for a
-    // LATE HIT (this session's cwd only resolves to a project on a later
-    // resume/compact, not its first SessionStart), that base came from
-    // whatever was on disk at that arbitrary later moment, with no relation
-    // to what injection actually revealed. Enrollment for those two moved
-    // down to right after the HIT branch's own reads decide that question
-    // (see the call there).
+    // Observed-base snapshot for the write=proposal gate. Deliberately AFTER the pull: the base
+    // must describe the tree this session actually starts from, remote merges included. Once per
+    // session (existence-check inside snapshotBase), so resume and compact leave it alone.
+    // `data.session_id` is used raw rather than the 'default' fallback above. A session with no id
+    // has no base and closes down the legacy direct-write path.
     if (data.session_id) {
       snapshotBase(HYPO_DIR, data.session_id, overwriteTargets(null));
-      // Bumps the observed generation on EVERY SessionStart (first run and
-      // resume/compact alike), before the injections below record into it. A
-      // resume that ends up injecting nothing (ignored, scoped out, absent)
-      // still bumps, which is what lets a stale observation from an earlier
-      // resume expire instead of staying licensed for the rest of the session.
+      // Bumps the observed generation on EVERY SessionStart (first run and resume/compact alike),
+      // before the injections below record into it. A resume that ends up injecting nothing still
+      // bumps, which is what lets a stale observation from an earlier resume expire instead of
+      // staying licensed for the rest of the session.
       beginObservedGeneration(HYPO_DIR, data.session_id);
     }
 
@@ -1250,190 +1271,77 @@ process.stdin.on('end', () => {
     const hitPrefix = vaultOrientation ? `${vaultOrientation}\n\n` : '';
 
     if (hit) {
-      // project hot/state only. root/global hot (below) is a derived pointer
-      // table with no per-page frontmatter, so it is never a STALE target and
-      // gets no marker logic. TODAY is UTC to match doctor.mjs (D1/D2). The
-      // marker is computed on raw content (staleMarkerForPath), then prepended
-      // onto the sliced display content; a no-op when there is no verify_by_date.
-      const TODAY = new Date().toISOString().slice(0, 10);
-      const hotRead = readIfNotIgnored(hit.hotPath, HOT_CHARS, ignorePatterns);
-      const stateRead = readIfNotIgnored(hit.statePath, STATE_CHARS, ignorePatterns);
-      // Enroll THIS project's two overwrite targets now, right next to the
-      // reads that just decided whether this session is actually about to be
-      // shown them (review r4-w4 major 3: see the top-of-hook snapshotBase
-      // call's comment for why this moved here instead of running blind
-      // before this decision existed). A target `readIfNotIgnored` refused
-      // (.hypoignore, machine-scoped-out) but that still exists on disk is
-      // left OUT of `relPaths` on purpose: `snapshotBase` would otherwise
-      // hash it anyway (it re-reads disk itself, not these `Read`s) and mint
-      // a base from bytes this session was never shown, so the key stays
-      // 'unknown' and this session's closes keep failing safe on it, same as
-      // before late enrollment existed. A target genuinely absent on disk
-      // (no file yet) is still safe to enroll as `null` (nothing was hidden
-      // from anyone, there is simply nothing there yet), so `existsSync`
-      // lets that case through even though `readIfNotIgnored` also returns
-      // null for it.
-      //
-      // `knownHashes` (review r5-w3 blocker 1): the root-only snapshotBase
-      // call above (line ~999) always creates base.json before this HIT
-      // branch runs, so this call would otherwise ALWAYS take snapshotBase's
-      // "enroll" branch and hash `hit.hotPath`/`hit.statePath` off disk again,
-      // a SEPARATE read from `hotRead`/`stateRead` above. A writer landing in
-      // that window mints a base from bytes this session was never shown, and
-      // a later close built from `hotRead.raw`/`stateRead.raw` reads
-      // disk-equals-base and overwrites that writer's change with no park.
-      // Passing the hash of the bytes `hotRead`/`stateRead` ALREADY read pins
-      // the base to what this session was actually shown, not to whatever a
-      // second, independent read happens to find.
-      if (data.session_id) {
-        // Test-only barrier, the other half of the enroll probe below. The
-        // dump alone catches a call that drops `knownHashes`, but not one
-        // that re-reads disk here and hashes that: with nothing changing the
-        // file, the re-read and the shown bytes agree. When
-        // HYPO_TEST_ENROLL_BARRIER is a non-empty string, the hook says so on
-        // stderr and waits until that path exists (10s at most), which gives
-        // a test the gap between the reads above and the hashing below to
-        // change the file in. It only waits and reads: it writes no file,
-        // inside the vault or out, for the reason the dump comment gives.
-        const barrier = process.env.HYPO_TEST_ENROLL_BARRIER;
-        if (typeof barrier === 'string' && barrier.length > 0) {
-          process.stderr.write('[hypo-test] enroll-barrier-ready\n');
-          const deadline = Date.now() + 10000;
-          while (!existsSync(barrier) && Date.now() < deadline) {
-            Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
-          }
-        }
-        const relPaths = [];
-        const knownHashes = {};
-        const hotRelPath = join('projects', hit.proj, 'hot.md');
-        const stateRelPath = join('projects', hit.proj, 'session-state.md');
-        if (hotRead) {
-          relPaths.push(hotRelPath);
-          knownHashes[hotRelPath] = hashContent(hotRead.raw);
-        } else if (!existsSync(hit.hotPath)) {
-          relPaths.push(hotRelPath);
-          knownHashes[hotRelPath] = null; // observed-absent, not unread
-        }
-        if (stateRead) {
-          relPaths.push(stateRelPath);
-          knownHashes[stateRelPath] = hashContent(stateRead.raw);
-        } else if (!existsSync(hit.statePath)) {
-          relPaths.push(stateRelPath);
-          knownHashes[stateRelPath] = null;
-        }
-        // Test-only wiring probe (review r5-w4 blocker 1,
-        // tests/proposal-base.test.mjs). It replaced a seam that wrote
-        // `process.env.HYPO_TEST_RACE_HOT_WRITE` straight into `hit.hotPath`
-        // to fake a concurrent writer: every file under hooks/ is copied into
-        // every install, that path is a real person's project hot.md, and the
-        // guard was `!== undefined`, so an empty value truncated the file to
-        // zero bytes. Nothing here writes inside the vault any more.
-        //
-        // What is left is the half the seam was actually needed for. Whether
-        // `snapshotBase` honors a hash it is told is a property of
-        // `snapshotBase`, and a direct unit test covers it; whether THIS call
-        // site hands it the hashes of the bytes it just showed is only
-        // observable here, and dropping the argument leaves every other
-        // real-hook test green (with no writer in the gap, a fresh disk read
-        // and the shown bytes agree). So when HYPO_TEST_ENROLL_DUMP names a
-        // path, the arguments this call actually passes are written there as
-        // JSON, and a test reads them back. `args`, not the local
-        // `knownHashes`: reading the local would report the map as passed even
-        // when the call below stopped passing it, which is precisely the
-        // regression this exists to catch. An argument list of three shows up
-        // as `argc: 3` with no `knownHashes` key at all.
-        //
-        // Best-effort, like every other cache write in these hooks: a bad
-        // dump path must not take down a SessionStart.
-        const enroll = (...args) => {
-          const dumpPath = process.env.HYPO_TEST_ENROLL_DUMP;
-          if (dumpPath) {
-            try {
-              writeFileSync(
-                dumpPath,
-                JSON.stringify({ argc: args.length, relPaths: args[2], knownHashes: args[3] }),
-              );
-            } catch {
-              // ignore: the probe is diagnostics, never a precondition
-            }
-          }
-          return snapshotBase(...args);
-        };
-        if (relPaths.length) enroll(HYPO_DIR, data.session_id, relPaths, knownHashes);
+      // The injection is final before the views are written, so a slow or failed write cannot
+      // change what the session is told.
+      let view;
+      try {
+        view = projectInjection(hit.proj, state, ignorePatterns);
+      } catch (err) {
+        // The model could not be loaded: say so and keep everything else of this start.
+        surface(
+          `세션 현황을 읽지 못해 이번 세션에는 주입하지 못했습니다: ${err?.message ?? String(err)}`,
+        );
+        view = { unavailable: true };
       }
-      let hotContent = hotRead ? hotRead.shown : null;
-      let stateContent = stateRead ? stateRead.shown : null;
-      const hotMarker = staleMarkerForPath(hit.hotPath, ignorePatterns, TODAY);
-      const stateMarker = staleMarkerForPath(hit.statePath, ignorePatterns, TODAY);
-      if (hotContent && hotMarker) hotContent = `${hotMarker}\n${hotContent}`;
-      if (stateContent && stateMarker) stateContent = `${stateMarker}\n${stateContent}`;
+      try {
+        writeGeneratedViews(HYPO_DIR, { projects: [hit.proj], root: false });
+      } catch (err) {
+        surface(`세션 현황 파일 갱신에 실패했습니다: ${err?.message ?? String(err)}`);
+      }
+      showHealthNotice();
 
-      if (hotContent || stateContent) {
-        printTerminalSummary(hit.proj, hotContent, stateContent);
+      if (!view.hidden && view.text) {
+        printTerminalSummary(hit.proj, view.items);
         writeFileSync(
           MARKER_FILE,
           JSON.stringify({
             proj: hit.proj,
             hotPath: hit.hotPath,
             statePath: hit.statePath,
-            hasSnapshot: true,
+            hasSnapshot: view.hasSnapshot,
             ts: Date.now(),
           }),
         );
-        const parts = [];
-        if (hotContent) parts.push(`[HOT]\n${hotContent}`);
-        if (stateContent) parts.push(`[SESSION STATE — 다음 작업]\n${stateContent}`);
+        const body = [...view.markers, view.text].join('\n\n');
         console.log(
           JSON.stringify(
             buildOutput(
               'SessionStart',
-              `${noticePrefix}${hitPrefix}[WIKI HOT CACHE: project=${sanitizeProjForPrompt(hit.proj)}]\n\n${parts.join('\n\n')}`,
+              `${noticePrefix}${hitPrefix}[WIKI HOT CACHE: project=${sanitizeProjForPrompt(hit.proj)}]\n\n${body}`,
               outExtra,
             ),
           ),
         );
-        // Observed-set record: this is the actual injection point, so this is
-        // where "this session was SHOWN these bytes" becomes true. Recorded
-        // AFTER the marker write and the console.log above (fail-open
-        // ordering): if this throws, the model has already been shown the
-        // bytes above but no observed-entry lands, so the guard just fails
-        // safe into a park later, rather than the reverse — an entry on disk
-        // claiming an observation the injection never actually emitted.
-        // Gated on `hotContent`/`stateContent` (the same predicate that put
-        // each into `parts` above), not on `hotRead`/`stateRead` alone: an
-        // empty-but-not-ignored file makes `hotRead` a truthy `{raw:'',
-        // shown:''}`, and recording against that would create an observed
-        // entry for bytes the model was never actually shown a line of.
-        // Hash `.raw` (the full file this call just read), never a fresh
-        // `readFileSync` here — that would credit a write landing between the
-        // read above and this line to an observation that never happened.
+        // Observed heads: this is the actual injection point, so this is where "this session was
+        // SHOWN these heads" becomes true. Recorded AFTER the marker write and the console.log
+        // above (fail-open ordering): if this throws, the model has already been shown the heads
+        // but nothing is recorded, so the next close just does not replace them, rather than the
+        // reverse: a record claiming an observation the injection never emitted.
         if (data.session_id) {
-          if (hotContent) {
-            recordObserved(
-              HYPO_DIR,
-              data.session_id,
-              join('projects', hit.proj, 'hot.md'),
-              hashContent(hotRead.raw),
-              hotRead.raw.length > HOT_CHARS,
-            );
-          }
-          if (stateContent) {
-            recordObserved(
-              HYPO_DIR,
-              data.session_id,
-              join('projects', hit.proj, 'session-state.md'),
-              hashContent(stateRead.raw),
-              stateRead.raw.length > STATE_CHARS,
-            );
+          try {
+            recordObservedHeads(HYPO_DIR, data.session_id, hit.proj, {
+              level: 'full',
+              heads: view.observed.heads,
+            });
+            recordObservedHeads(HYPO_DIR, data.session_id, hit.proj, {
+              level: 'pointer',
+              heads: view.observed.pointer,
+            });
+          } catch (err) {
+            process.stderr.write(`[hypo-session-start] observed heads: ${err?.message ?? err}\n`);
           }
         }
       } else {
         // A snapshot that exists but is scoped to another machine must not be
         // reported as "no snapshot yet": the model would treat a resumed project
         // as a first session. Say which it is, and say nothing of the contents.
-        const scopedOut =
-          isScopedOut(hit.hotPath, ignorePatterns) || isScopedOut(hit.statePath, ignorePatterns);
-        const reason = scopedOut ? 'snapshot scoped to another machine' : 'no snapshot yet';
+        const scopedOut = view.scopedOut === true;
+        const unavailable = view.unavailable === true;
+        const reason = unavailable
+          ? 'session state could not be read'
+          : scopedOut
+            ? 'snapshot scoped to another machine'
+            : 'no snapshot yet';
         process.stderr.write(
           `\n\x1b[36m[Hypomnema]\x1b[0m project: \x1b[1m${hit.proj}\x1b[0m (${reason})\n\n`,
         );
@@ -1445,7 +1353,14 @@ process.stdin.on('end', () => {
         // that already exists elsewhere.
         writeFileSync(
           MARKER_FILE,
-          JSON.stringify({ proj: hit.proj, hotPath: null, scopedOut, ts: Date.now() }),
+          JSON.stringify({
+            proj: hit.proj,
+            hotPath: null,
+            hasSnapshot: false,
+            scopedOut,
+            unavailable,
+            ts: Date.now(),
+          }),
         );
         console.log(
           JSON.stringify(
@@ -1485,7 +1400,7 @@ process.stdin.on('end', () => {
     const globalRead = readIfNotIgnored(GLOBAL_HOT, HOT_CHARS, ignorePatterns);
     const globalContent = globalRead ? globalRead.shown : null;
     if (!globalContent) {
-      // GLOBAL_HOT exists but is empty or .hypoignore'd — still surface any
+      // GLOBAL_HOT exists but is empty or .hypoignore'd: still surface any
       // pending notices (sync state, growth, AND the auto-project offer), which
       // would otherwise be silently dropped here.
       const notice = notices.join('\n\n');
@@ -1505,28 +1420,6 @@ process.stdin.on('end', () => {
         ),
       ),
     );
-    // Observed-set record: the MISS branch's root hot.md injection is the one
-    // place a project-less session observes anything at all. Recorded AFTER
-    // the console.log above. See the HIT branch's comment for why (fail-open
-    // ordering). Hashes `.raw`, not a fresh disk read, for the same reason
-    // given there.
-    //
-    // This call records nothing any more. overwriteTargets() stopped returning
-    // 'hot.md' when the root pointer table became a hook-generated projection,
-    // and recordObserved only writes for keys the base snapshot is tracking, so
-    // the guard rejects this one every time. It is kept here, rather than
-    // deleted, because this file is being rewritten in another lane at the same
-    // time and a deletion would widen that merge. Delete it when the two lanes
-    // land together.
-    if (data.session_id) {
-      recordObserved(
-        HYPO_DIR,
-        data.session_id,
-        'hot.md',
-        hashContent(globalRead.raw),
-        globalRead.raw.length > HOT_CHARS,
-      );
-    }
   } catch (err) {
     process.stderr.write(`[hypo-session-start] error: ${err?.message ?? String(err)}\n`);
     console.log(JSON.stringify(outExtra));

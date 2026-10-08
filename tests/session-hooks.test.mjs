@@ -2059,14 +2059,15 @@ test('derived project hot without verify_by_date gets no STALE marker', () => {
 test('root/global hot injection path carries no STALE marker logic', () => {
   // Global hot is a derived pointer table (hypo-hot-rebuild) with no per-page
   // frontmatter, so A3 deliberately leaves its injection path untouched. Pin
-  // that scope: staleMarkerForPath is only wired to the project hot/state block.
+  // that scope: staleMarkerForText is only wired to the project hot/state block.
   const src = readFileSync(join(HOOKS, 'hypo-session-start.mjs'), 'utf-8');
-  const markerCount = (src.match(/staleMarkerForPath\(/g) || []).length;
-  // one definition + two call sites (hotPath, statePath); nothing on global hot.
+  const markerCount = (src.match(/staleMarkerForText\(/g) || []).length;
+  // one definition + two call sites (the old hot and the old state, both read from the baseline
+  // entry); nothing on global hot.
   assert.equal(
     markerCount,
     3,
-    `staleMarkerForPath must be scoped to project hot/state, found ${markerCount} refs`,
+    `staleMarkerForText must be scoped to project hot/state, found ${markerCount} refs`,
   );
 });
 
@@ -5860,7 +5861,9 @@ test('own-project changes are excluded from the foreign count', () => {
 // it).
 test('root-level uncommitted changes (shared vault infra) count as unattributed, not silently dropped', () => {
   withTwoProjectWiki((dir, work) => {
-    writeFileSync(join(dir, 'hot.md'), '---\ntitle: Hot\nupdated: today\n---\n## edited\n');
+    // Root hot.md is a generated view of the session entries now, and the hook sets a hand-edited
+    // one aside; another root-level file stands for shared vault infra.
+    writeFileSync(join(dir, 'hypo-config.md'), '# config\nedited\n');
     const r = runSessionStartFor(dir, work, 'issue99-root');
     assert.equal(r.status, 0, `stderr: ${r.stderr}`);
     assert.ok(
@@ -7735,4 +7738,1155 @@ test("n1: rootHotProjectionIsCurrent is false for session A once session B's wri
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+// ── SessionStart and session entries: moving, catching up, injecting ─────────
+//
+// The names below are added next to the suites above rather than into their import lists, so a
+// second lane appending to this file does not touch the same lines.
+import { readdirSync, realpathSync } from 'node:fs';
+import {
+  GITIGNORE_BLOCK as SS_GITIGNORE_BLOCK,
+  entryFileName as ssEntryFileName,
+  parseSessionEntry as ssParse,
+  renderViews as ssRenderViews,
+} from '../hooks/session-entries.mjs';
+import { createHash as ssCreateHash } from 'node:crypto';
+import {
+  clearGeneratedPathsBlockingPull as ssClearGeneratedPaths,
+  migrationState as ssMigrationState,
+  SESSION_ENTRIES_OFF_MARKER as SS_OFF_MARKER,
+} from '../hooks/hypo-shared.mjs';
+import {
+  loadSessionModel as ssLoadModel,
+  migrateVaultToSessionEntries as ssMigrate,
+  writeGeneratedViews as ssWriteViews,
+} from '../hooks/session-views.mjs';
+
+const SS_OLD_HOT =
+  '---\ntitle: "hot: p"\ntype: reference\nupdated: 2026-09-20\n---\nold hot body\n';
+const SS_OLD_STATE =
+  '---\ntype: session-state\nupdated: 2026-09-25\n---\n## Next Up\nold state body\n';
+const SS_MIGRATION_SUBJECT = 'hypomnema: move session state into projects/*/sessions entries';
+
+// Every git child of these fixtures gets HOME in the session temp dir and no system config; the
+// identity comes from each clone's own config.
+const ssGit = (dir, args) =>
+  spawnSync('git', args, {
+    cwd: dir,
+    encoding: 'utf-8',
+    env: { ...process.env, HOME: SESSION_TMP_HOME, GIT_CONFIG_NOSYSTEM: '1' },
+  });
+function ssGitOk(dir, args) {
+  const r = ssGit(dir, args);
+  assert.equal(r.status, 0, `git ${args.join(' ')}: ${r.stderr}`);
+  return r.stdout;
+}
+const ssPut = (dir, rel, text) => {
+  mkdirSync(dirname(join(dir, rel)), { recursive: true });
+  writeFileSync(join(dir, rel), text);
+};
+const ssRead = (dir, rel) => readFileSync(join(dir, rel), 'utf-8');
+const ssHead = (dir) => ssGitOk(dir, ['rev-parse', 'HEAD']).trim();
+const ssCount = (dir) => Number(ssGitOk(dir, ['rev-list', '--count', 'HEAD']).trim());
+const ssMigrationCommits = (dir) =>
+  ssGitOk(dir, ['log', '--format=%s'])
+    .split('\n')
+    .filter((s) => s === SS_MIGRATION_SUBJECT).length;
+const ssIdentify = (dir) => {
+  ssGitOk(dir, ['config', 'user.email', 't@example.com']);
+  ssGitOk(dir, ['config', 'user.name', 't']);
+  ssGitOk(dir, ['config', 'commit.gpgsign', 'false']);
+};
+const ssCommitAll = (dir, message = 'x') => {
+  ssGitOk(dir, ['add', '-A']);
+  ssGitOk(dir, ['commit', '-q', '-m', message]);
+};
+
+/**
+ * A vault that has not moved to session entries: project `p` (working dir `work`) and project `q`
+ * with the old two files tracked. `opts.remote` adds a bare origin the vault is pushed to;
+ * `other()` clones it into a second machine. Calls `fn({root, dir, work, origin, other})`.
+ */
+function withStartVault(opts, fn) {
+  withTmpDir((root) => {
+    const dir = join(root, 'a');
+    const work = join(root, 'work');
+    mkdirSync(work, { recursive: true });
+    mkdirSync(dir, { recursive: true });
+    ssGitOk(dir, ['init', '-q', '-b', 'main']);
+    ssIdentify(dir);
+    const files = {
+      '.gitignore': '.cache/\n',
+      'hypo-config.md': '# config\n',
+      'hot.md': '---\ntitle: Hot\nupdated: 2026-09-01\n---\n# Hot\n',
+      'projects/p/index.md': `---\ntitle: p\ntype: project-index\nupdated: 2026-09-01\nworking_dir: "${realpathSync(work)}"\n---\n# p\n`,
+      'projects/p/hot.md': SS_OLD_HOT,
+      'projects/p/session-state.md': SS_OLD_STATE,
+      'projects/q/index.md': '---\ntitle: q\ntype: project-index\nupdated: 2026-09-01\n---\n# q\n',
+      'projects/q/hot.md': SS_OLD_HOT.replace('"hot: p"', '"hot: q"'),
+      'projects/q/session-state.md': SS_OLD_STATE,
+      ...opts.files,
+    };
+    for (const [rel, text] of Object.entries(files)) ssPut(dir, rel, text);
+    ssCommitAll(dir, 'seed');
+    const origin = join(root, 'origin.git');
+    if (opts.remote) {
+      ssGitOk(root, ['init', '-q', '--bare', '-b', 'main', origin]);
+      ssGitOk(dir, ['remote', 'add', 'origin', origin]);
+      ssGitOk(dir, ['push', '-q', '-u', 'origin', 'main']);
+    }
+    const other = () => {
+      const b = join(root, 'b');
+      ssGitOk(root, ['clone', '-q', origin, b]);
+      ssIdentify(b);
+      return b;
+    };
+    fn({ root, dir, work, origin, other });
+  });
+}
+
+// Run the real SessionStart hook; `env` may carry HYPO_TEST_NOW and the like.
+function ssStart(dir, cwd, { sessionId = 'sess-t12', env = {} } = {}) {
+  const r = spawnSync(process.execPath, [join(HOOKS, 'hypo-session-start.mjs')], {
+    input: JSON.stringify({ cwd, session_id: sessionId }),
+    encoding: 'utf-8',
+    env: {
+      ...process.env,
+      HOME: SESSION_TMP_HOME,
+      HYPO_DIR: dir,
+      HYPO_DEVICE: 'dev-t12',
+      GIT_CONFIG_NOSYSTEM: '1',
+      ...env,
+    },
+  });
+  assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+  const out = JSON.parse(r.stdout);
+  return {
+    r,
+    out,
+    sys: out.systemMessage ?? '',
+    ctx: out.hookSpecificOutput?.additionalContext ?? '',
+  };
+}
+
+// Another machine's work: an entry file for `project` with one track, written and committed.
+function ssPutEntry(dir, project, { date, sessionId, openedAt = 1, track, title, body }) {
+  const closeId = closeIdFor(sessionId, openedAt);
+  ssPut(
+    dir,
+    `projects/${project}/sessions/${ssEntryFileName(date, closeId)}`,
+    formatSessionEntry({
+      project,
+      closeId,
+      sessionId,
+      date,
+      tracks: [{ id: track, title, new: true }],
+      summary: `summary of ${closeId}`,
+      bodies: { [track]: body },
+    }),
+  );
+  return { closeId, fileName: ssEntryFileName(date, closeId) };
+}
+
+const SS_DAY_ONE = { HYPO_TEST_NOW: '2026-10-07T03:00:00Z' };
+const SS_DAY_TWO = { HYPO_TEST_NOW: '2026-10-08T03:00:00Z' };
+
+suite('hypo-session-start.mjs: a vault without a remote moves itself to session entries');
+
+test('(1)(11) the first SessionStart makes one migration commit and leaves the views on disk and out of git', () => {
+  withStartVault({}, ({ dir, work }) => {
+    const before = ssCount(dir);
+    const { sys } = ssStart(dir, work);
+    assert.equal(ssCount(dir), before + 1);
+    assert.equal(ssMigrationCommits(dir), 1);
+    assert.equal(ssMigrationState(dir), 'migrated');
+    assert.match(sys, /옮겼습니다/, `the move is told to the user: ${sys}`);
+    assert.doesNotMatch(
+      ssGitOk(dir, ['status', '--porcelain']),
+      /hot\.md|session-state\.md/,
+      'no generated path shows in git status',
+    );
+    // (11) the current project's view is on disk and is what the generator renders for the
+    // post-move model: written after the move, not before it.
+    const models = ['p', 'q'].map((slug) => ssLoadModel(dir, slug, { state: 'migrated' }));
+    const expected = ssRenderViews(models, { device: 'dev-t12', only: ['p'] }).projects.p
+      .sessionState;
+    assert.equal(ssRead(dir, 'projects/p/session-state.md'), expected);
+    assert.match(expected, /baseline-[0-9a-f]{16}/, 'it carries the baseline close id');
+  });
+});
+
+test('(3) a move that cannot take the lock still injects the old session-state body and leaves tracked files alone', () => {
+  withStartVault({}, ({ dir, work }) => {
+    const head = ssHead(dir);
+    const lock = `${vaultCommitLockTarget(dir)}.lock`;
+    mkdirSync(dirname(lock), { recursive: true });
+    writeFileSync(lock, String(process.pid));
+    const { sys, ctx } = ssStart(dir, work, { env: { HYPO_VAULT_LOCK_TIMEOUT_MS: '300' } });
+    rmSync(lock, { force: true });
+    assert.equal(ssHead(dir), head, 'no migration commit');
+    assert.equal(ssRead(dir, 'projects/p/session-state.md'), SS_OLD_STATE);
+    assert.equal(ssRead(dir, 'projects/p/hot.md'), SS_OLD_HOT);
+    assert.equal(ssGitOk(dir, ['status', '--porcelain']).trim(), '');
+    assert.match(
+      ctx,
+      /old state body/,
+      'the injection reads the baseline built from the old files',
+    );
+    assert.match(sys, /미뤘습니다/);
+  });
+});
+
+test('(7) an opted-out vault is not moved, and the rollback notice reaches the injection', () => {
+  withStartVault({}, ({ dir, work }) => {
+    ssPut(dir, SS_OFF_MARKER, 'rolled back\n');
+    ssCommitAll(dir, 'opt out');
+    const head = ssHead(dir);
+    const { ctx, sys } = ssStart(dir, work);
+    assert.equal(ssHead(dir), head);
+    assert.equal(ssMigrationCommits(dir), 0);
+    assert.match(ctx, /롤백 지점 이후 구버전 기계의 쓰기까지 포함/);
+    assert.match(sys, /롤백 지점 이후 구버전 기계의 쓰기까지 포함/);
+  });
+});
+
+test('(8) a SessionStart past the start deadline defers the move; inside it the move happens', () => {
+  withStartVault({}, ({ dir, work }) => {
+    const head = ssHead(dir);
+    const late = ssStart(dir, work, { env: { ...SS_DAY_ONE, HYPO_TEST_NOW_STEP_MS: '25000' } });
+    assert.equal(ssHead(dir), head, 'no migration commit past the deadline');
+    assert.match(late.sys, /다음 세션으로 미뤘습니다/);
+    assert.match(late.ctx, /old state body/);
+    const inTime = ssStart(dir, work, { env: { ...SS_DAY_ONE, HYPO_TEST_NOW_STEP_MS: '1000' } });
+    assert.equal(ssMigrationCommits(dir), 1, 'the same vault moves when time is left');
+    assert.match(inTime.sys, /옮겼습니다/);
+  });
+});
+
+test('(F2) a move that throws is deferred with a notice, and the start goes on to inject', () => {
+  if (process.getuid?.() === 0) return; // chmod 000 does not stop root
+  withStartVault({}, ({ dir, work }) => {
+    const sessions = join(dir, 'projects', 'p', 'sessions');
+    mkdirSync(sessions, { recursive: true });
+    chmodSync(sessions, 0o000);
+    try {
+      const head = ssHead(dir);
+      const { r, sys, ctx } = ssStart(dir, work, { env: SS_DAY_ONE });
+      assert.doesNotMatch(r.stderr, /\[hypo-session-start\] error:/, 'not the top-level catch');
+      assert.equal(ssHead(dir), head, 'no migration commit');
+      assert.match(
+        sys,
+        /이행을 다음 세션으로 미뤘습니다: .*EACCES/s,
+        'the deferral names the cause',
+      );
+      assert.match(ctx, /WIKI HOT CACHE: project=p/, 'the injection still has its header');
+    } finally {
+      chmodSync(sessions, 0o755);
+    }
+  });
+});
+
+const DEFERRED_BY_LOCK = /이행을 다음 세션으로 미뤘습니다: 다른 세션이 저장소 잠금/;
+test('(F8) a deferral that passes (the deadline) does not hide a different one (a busy lock) the same day, and a repeat of the same one stays quiet', () => {
+  withStartVault({}, ({ dir, work }) => {
+    const late = ssStart(dir, work, { env: { ...SS_DAY_ONE, HYPO_TEST_NOW_STEP_MS: '25000' } });
+    assert.match(late.sys, /시간이 부족해/, 'the deadline notice');
+    const lock = `${vaultCommitLockTarget(dir)}.lock`;
+    mkdirSync(dirname(lock), { recursive: true });
+    writeFileSync(lock, String(process.pid));
+    try {
+      const env = { ...SS_DAY_ONE, HYPO_VAULT_LOCK_TIMEOUT_MS: '300' };
+      const busy = ssStart(dir, work, { env });
+      assert.match(busy.sys, DEFERRED_BY_LOCK, 'the lock notice shows the same day');
+      const again = ssStart(dir, work, { env });
+      assert.doesNotMatch(
+        again.sys,
+        DEFERRED_BY_LOCK,
+        'the same reason on the same day is said once',
+      );
+    } finally {
+      rmSync(lock, { force: true });
+    }
+  });
+});
+
+test('(10) the terminal summary shows a baseline head whole, `## Notes` and the sentence after it included', () => {
+  const state =
+    '---\ntype: session-state\nupdated: 2026-09-25\n---\n## Next Up\nold state body\n## Notes\nNOTES_SENTENCE_T12\n';
+  withStartVault({ files: { 'projects/p/session-state.md': state } }, ({ dir, work }) => {
+    const { r } = ssStart(dir, work);
+    assert.match(r.stderr, /이행 전 기록/, `the head title: ${r.stderr}`);
+    assert.match(r.stderr, /NOTES_SENTENCE_T12/, `the sentence after ## Notes: ${r.stderr}`);
+  });
+});
+
+suite('hypo-session-start.mjs: a vault with a remote is never moved from a hook');
+
+test('(2)(2b) an old-format vault with a remote gets a daily notice in systemMessage and nothing else changes', () => {
+  withStartVault({ remote: true }, ({ dir, work }) => {
+    const head = ssHead(dir);
+    const first = ssStart(dir, work, { env: SS_DAY_ONE });
+    assert.equal(ssHead(dir), head, 'no new commit');
+    assert.match(
+      first.sys,
+      /아직 옛 세션 현황 형식/,
+      'in systemMessage, not only additionalContext',
+    );
+    assert.match(first.ctx, /old state body/, 'the old session-state body is injected');
+    assert.equal(ssRead(dir, 'projects/p/hot.md'), SS_OLD_HOT);
+    assert.equal(ssRead(dir, 'projects/p/session-state.md'), SS_OLD_STATE);
+    assert.equal(
+      ssGitOk(dir, ['status', '--porcelain']).trim(),
+      '',
+      'tracked files byte-unchanged',
+    );
+    // (2b) the same state on the same day is not said again; another day says it again
+    const again = ssStart(dir, work, { env: SS_DAY_ONE });
+    assert.doesNotMatch(again.sys, /아직 옛 세션 현황 형식/);
+    const nextDay = ssStart(dir, work, { env: SS_DAY_TWO });
+    assert.match(nextDay.sys, /아직 옛 세션 현황 형식/);
+    // a changed state is said at once, even on the same day
+    ssPut(dir, SS_OFF_MARKER, 'rolled back\n');
+    ssCommitAll(dir, 'opt out');
+    const optedOut = ssStart(dir, work, { env: SS_DAY_TWO });
+    assert.match(optedOut.sys, /롤백 지점 이후 구버전 기계의 쓰기까지 포함/);
+    assert.doesNotMatch(optedOut.sys, /아직 옛 세션 현황 형식/);
+  });
+});
+
+test('(2c) before the move, a new entry head points at its own file and only the baseline head points at session-state.md', () => {
+  withStartVault({ remote: true }, ({ dir, work }) => {
+    const one = ssPutEntry(dir, 'p', {
+      date: '2999-01-02',
+      sessionId: 's-one',
+      track: 'trk-one',
+      title: 'Track One',
+      body: 'X'.repeat(5000),
+    });
+    const two = ssPutEntry(dir, 'p', {
+      date: '2999-01-01',
+      sessionId: 's-two',
+      track: 'trk-two',
+      title: 'Track Two',
+      body: 'Y'.repeat(5000),
+    });
+    const { ctx } = ssStart(dir, work, { env: SS_DAY_ONE });
+    for (const e of [one, two]) {
+      const path = `projects/p/sessions/${e.fileName}`;
+      assert.ok(ctx.includes(path), `the injection names ${path}: ${ctx.slice(0, 1500)}`);
+      assert.ok(existsSync(join(dir, path)), `${path} is on disk`);
+    }
+    const stateLines = ctx.split('\n').filter((l) => l.includes('projects/p/session-state.md'));
+    assert.ok(stateLines.length > 0, 'the baseline head points at the old file');
+    for (const l of stateLines) assert.match(l, /baseline-/, `only a baseline head: ${l}`);
+  });
+});
+
+test('(F1) before the move, a hand edit of an old file reaches the injection from the working tree and the file stays as it is', () => {
+  withStartVault({ remote: true }, ({ dir, work }) => {
+    const edited = SS_OLD_STATE.replace('old state body', 'WORKTREE_EDIT_T12');
+    ssPut(dir, 'projects/p/session-state.md', edited);
+    const head = ssHead(dir);
+    const { ctx } = ssStart(dir, work, { env: SS_DAY_ONE });
+    assert.match(ctx, /WORKTREE_EDIT_T12/, 'the working-tree text is what the session is told');
+    assert.doesNotMatch(ctx, /old state body/, 'not the committed text');
+    assert.equal(ssRead(dir, 'projects/p/session-state.md'), edited, 'the edit is untouched');
+    assert.equal(ssHead(dir), head, 'no commit');
+  });
+});
+
+test('(F1b) before the move, an old file the vault .gitignore keeps out of git is injected, not reported as no snapshot yet', () => {
+  withStartVault({ remote: true }, ({ root, dir }) => {
+    ssPut(dir, '.gitignore', '.cache/\nprojects/z/\n');
+    ssCommitAll(dir, 'ignore z');
+    const workZ = join(root, 'work-z');
+    mkdirSync(workZ, { recursive: true });
+    ssPut(
+      dir,
+      'projects/z/index.md',
+      `---\ntitle: z\ntype: project-index\nupdated: 2026-09-01\nworking_dir: "${realpathSync(workZ)}"\n---\n# z\n`,
+    );
+    ssPut(
+      dir,
+      'projects/z/session-state.md',
+      SS_OLD_STATE.replace('old state body', 'Z_STATE_T12'),
+    );
+    assert.equal(ssGitOk(dir, ['ls-files', 'projects/z']).trim(), '', 'precondition: untracked');
+    const { ctx } = ssStart(dir, workZ, { env: SS_DAY_ONE, sessionId: 'sess-t12-z' });
+    assert.match(ctx, /Z_STATE_T12/, 'the file on disk is injected');
+    assert.doesNotMatch(ctx, /no snapshot yet/);
+  });
+});
+
+test('(F2) a session state that cannot be read keeps the rest of the start and says so, instead of dropping the whole injection', () => {
+  if (process.getuid?.() === 0) return; // chmod 000 does not stop root, so the fixture cannot fail
+  withStartVault({ remote: true }, ({ dir, work }) => {
+    const sessions = join(dir, 'projects', 'p', 'sessions');
+    mkdirSync(sessions, { recursive: true });
+    chmodSync(sessions, 0o000);
+    try {
+      const { r, sys, ctx } = ssStart(dir, work, { env: SS_DAY_ONE });
+      assert.doesNotMatch(r.stderr, /\[hypo-session-start\] error:/, 'not the top-level catch');
+      assert.match(sys, /세션 현황을 읽지 못해/, 'the user is told');
+      assert.match(ctx, /EACCES/, 'with the cause');
+      assert.match(ctx, /아직 옛 세션 현황 형식/, 'the notices before the injection are kept');
+      assert.match(ctx, /WIKI HOT CACHE: project=p, session state could not be read/);
+      assert.doesNotMatch(ctx, /no snapshot yet/, 'an unreadable state is not an absent one');
+      const marker = JSON.parse(readFileSync(sharedMod.sessionMarkerPath('sess-t12'), 'utf-8'));
+      assert.equal(marker.unavailable, true, 'first-prompt is told it was not a first session');
+      assert.equal(marker.hasSnapshot, false);
+    } finally {
+      chmodSync(sessions, 0o755);
+    }
+  });
+});
+
+test('(N1) a notes.md scoped to one machine is injected there and not on another machine', () => {
+  withStartVault({}, ({ dir, work }) => {
+    ssPut(
+      dir,
+      'projects/p/notes.md',
+      '---\nvisibility_scope: machine:dev-t12\n---\nNOTE_FOR_DEV_T12\n',
+    );
+    const owner = ssStart(dir, work, { env: { ...SS_DAY_ONE, HYPO_DEVICE: 'dev-t12' } });
+    assert.match(owner.ctx, /Project notes/);
+    assert.match(owner.ctx, /NOTE_FOR_DEV_T12/, 'the owning machine is told the note');
+    const other = ssStart(dir, work, { env: { ...SS_DAY_ONE, HYPO_DEVICE: 'dev-other' } });
+    assert.match(other.ctx, /WIKI HOT CACHE: project=p/, 'the rest of the injection is there');
+    assert.doesNotMatch(other.ctx, /NOTE_FOR_DEV_T12/, 'another machine is not');
+  });
+});
+
+test('(N2) a notes.md that .hypoignore matches is not injected, and the same note is when the rule is gone', () => {
+  withStartVault({}, ({ dir, work }) => {
+    ssPut(dir, 'projects/p/notes.md', 'NOTE_PLAIN_T12\n');
+    assert.match(ssStart(dir, work, { env: SS_DAY_ONE }).ctx, /NOTE_PLAIN_T12/);
+    ssPut(dir, '.hypoignore', 'projects/p/notes.md\n');
+    const hidden = ssStart(dir, work, { env: SS_DAY_ONE });
+    assert.match(hidden.ctx, /WIKI HOT CACHE: project=p/, 'the project itself is not hidden');
+    assert.doesNotMatch(hidden.ctx, /NOTE_PLAIN_T12/);
+  });
+});
+
+test('(U1) an entry that cannot be read is told as a count next to the entries that can, and the project is not a first session', () => {
+  withStartVault({}, ({ dir, work }) => {
+    ssPutEntry(dir, 'p', {
+      date: '2999-01-02',
+      sessionId: 's-good',
+      track: 'trk-good',
+      title: 'Good',
+      body: 'GOOD_ENTRY_BODY\n',
+    });
+    ssPut(
+      dir,
+      `projects/p/sessions/${ssEntryFileName('2999-01-03', 'bad-close')}`,
+      'not an entry\n',
+    );
+    const { ctx } = ssStart(dir, work, { env: SS_DAY_ONE });
+    assert.match(ctx, /GOOD_ENTRY_BODY/, 'the readable entry is injected');
+    assert.match(ctx, /세션 원본 1개를 읽지 못해/, 'the count is told');
+    assert.doesNotMatch(ctx, /bad-close/, 'not the file name');
+    assert.doesNotMatch(ctx, /no snapshot yet/);
+  });
+});
+
+test('(U2) when the only entry file cannot be read the project is unavailable, not "no snapshot yet"', () => {
+  withStartVault({}, ({ dir, work }) => {
+    ssGitOk(dir, ['rm', '-q', 'projects/p/hot.md', 'projects/p/session-state.md']);
+    ssCommitAll(dir, 'no old files');
+    ssPut(
+      dir,
+      `projects/p/sessions/${ssEntryFileName('2999-01-03', 'bad-close')}`,
+      'not an entry\n',
+    );
+    const { ctx } = ssStart(dir, work, { env: SS_DAY_ONE, sessionId: 'sess-t12-u2' });
+    assert.match(ctx, /WIKI HOT CACHE: project=p, session state could not be read/);
+    assert.doesNotMatch(ctx, /no snapshot yet/);
+    const marker = JSON.parse(readFileSync(sharedMod.sessionMarkerPath('sess-t12-u2'), 'utf-8'));
+    assert.equal(marker.unavailable, true, 'first-prompt is told it was not a first session');
+  });
+});
+
+test('(H1) a vault with no git: a project hidden by .hypoignore on the first start is moved on the start that sees it, and its old text is injected without a backup', () => {
+  withTmpDir((root) => {
+    const dir = join(root, 'vault');
+    const work = join(root, 'work');
+    mkdirSync(work, { recursive: true });
+    ssPut(dir, 'hypo-config.md', '# config\n');
+    ssPut(
+      dir,
+      'projects/p/index.md',
+      `---\ntitle: p\ntype: project-index\nupdated: 2026-09-01\nworking_dir: "${realpathSync(work)}"\n---\n# p\n`,
+    );
+    ssPut(dir, 'projects/p/hot.md', SS_OLD_HOT);
+    ssPut(dir, 'projects/p/session-state.md', SS_OLD_STATE);
+    ssPut(dir, '.hypoignore', 'projects/p/\n');
+    ssStart(dir, work, { env: SS_DAY_ONE });
+    assert.equal(ssRead(dir, 'projects/p/hot.md'), SS_OLD_HOT, 'hidden: not touched');
+    rmSync(join(dir, '.hypoignore'));
+    const { ctx } = ssStart(dir, work, { env: SS_DAY_TWO });
+    assert.match(ctx, /old state body/, 'the old state is in the injection');
+    assert.match(ctx, /old hot body/);
+    assert.equal(existsSync(join(dir, '.cache', 'backups')), false, 'no backup of those bytes');
+    const baselines = readdirSync(join(dir, 'projects', 'p', 'sessions')).filter((n) =>
+      n.includes('-baseline-'),
+    );
+    assert.equal(baselines.length, 2);
+  });
+});
+
+// An old file git does not track is not published and not claimed by the move, but the session that
+// starts right after it is still told its text (the file is on disk until the writer backs it up).
+function withUntrackedProject(index, fn) {
+  withStartVault({}, ({ root, dir }) => {
+    const workZ = join(root, 'work-z');
+    mkdirSync(workZ, { recursive: true });
+    ssPut(
+      dir,
+      'projects/z/index.md',
+      `---\ntitle: z\ntype: project-index\nupdated: 2026-09-01\nworking_dir: "${realpathSync(workZ)}"\n${index}---\n# z\n`,
+    );
+    ssPut(
+      dir,
+      'projects/z/session-state.md',
+      SS_OLD_STATE.replace('old state body', 'Z_UNTRACKED_STATE'),
+    );
+    assert.equal(ssGitOk(dir, ['ls-files', 'projects/z']).trim(), '', 'precondition: untracked');
+    fn({ dir, workZ });
+  });
+}
+
+function assertUntrackedNeverPublished(dir) {
+  assert.equal(ssMigrationState(dir), 'migrated', 'the start moved the vault');
+  assert.equal(ssGit(dir, ['grep', '-q', 'Z_UNTRACKED_STATE', 'HEAD']).status, 1, 'in no commit');
+  for (const view of ['hot.md', 'projects/z/hot.md', 'projects/z/session-state.md']) {
+    assert.doesNotMatch(ssRead(dir, view), /Z_UNTRACKED_STATE/, `${view} is no shared view of it`);
+  }
+  assert.match(
+    ssRead(dir, '.cache/backups/projects/z/session-state.md.pre-projection-backup.md'),
+    /Z_UNTRACKED_STATE/,
+    'a backup holds the bytes',
+  );
+}
+
+test('(L1) the start that moves the vault still injects an untracked old file, publishes it nowhere, backs it up and says where', () => {
+  withUntrackedProject('', ({ dir, workZ }) => {
+    const { ctx, sys } = ssStart(dir, workZ, { env: SS_DAY_ONE, sessionId: 'sess-t12-l1' });
+    assert.match(ctx, /Z_UNTRACKED_STATE/, 'this session is told the text');
+    assertUntrackedNeverPublished(dir);
+    assert.match(
+      sys,
+      /\.cache\/backups\/projects\/z\/session-state\.md/,
+      'the notice names the backup',
+    );
+    assert.match(sys, /notes\.md/, 'and how to bring the text back');
+  });
+});
+
+test('(L2) an untracked old file whose untracked index.md scopes it to another machine is not injected here, and is in no commit or view', () => {
+  withUntrackedProject('visibility_scope: machine:dev-other\n', ({ dir, workZ }) => {
+    const { ctx } = ssStart(dir, workZ, { env: SS_DAY_ONE, sessionId: 'sess-t12-l2' });
+    assert.doesNotMatch(
+      ctx,
+      /Z_UNTRACKED_STATE/,
+      "the other machine's memory is not this session's",
+    );
+    assertUntrackedNeverPublished(dir);
+  });
+});
+
+test('(L3) an untracked old file scoped to another machine stays out of this machine even when the local index.md says entry_scope: shared, and is injected on the machine it names', () => {
+  const startOn = (device, assertCtx) =>
+    withUntrackedProject('entry_scope: shared\n', ({ dir, workZ }) => {
+      ssPut(
+        dir,
+        'projects/z/session-state.md',
+        SS_OLD_STATE.replace(
+          'type: session-state',
+          'type: session-state\nvisibility_scope: machine:other-device',
+        ).replace('old state body', 'Z_UNTRACKED_STATE'),
+      );
+      const { ctx } = ssStart(dir, workZ, {
+        env: { ...SS_DAY_ONE, HYPO_DEVICE: device },
+        sessionId: `sess-t12-l3-${device}`,
+      });
+      assert.match(ctx, /WIKI HOT CACHE: project=z/, 'the rest of the injection is there');
+      assertCtx(ctx);
+    });
+  startOn('this-device', (ctx) =>
+    assert.doesNotMatch(ctx, /Z_UNTRACKED_STATE/, 'its own machine scope still applies'),
+  );
+  startOn('other-device', (ctx) =>
+    assert.match(ctx, /Z_UNTRACKED_STATE/, 'the machine it names is told the text'),
+  );
+});
+
+test('(9b) a clone that takes a migration commit with a fast-forward has the root hot.md and a MISS injection of it', () => {
+  withStartVault({ remote: true }, ({ dir, work, other }) => {
+    const b = other();
+    assert.equal(ssMigrate(b).migrated, true);
+    ssGitOk(b, ['push', '-q', 'origin', 'main']);
+    const unrelated = join(dirname(work), 'unrelated');
+    mkdirSync(unrelated, { recursive: true });
+    const { ctx } = ssStart(dir, unrelated);
+    assert.equal(ssMigrationState(dir), 'migrated', 'the fast-forward brought the move');
+    assert.ok(existsSync(join(dir, 'hot.md')), 'the root hot.md is on disk when the hook ends');
+    assert.match(ssRead(dir, 'hot.md'), /\[\[projects\/p\/hot\]\]/);
+    assert.match(ctx, /WIKI HOT CACHE: global/);
+    assert.match(ctx, /\| p \|/, 'the MISS injection carries the root table');
+  });
+});
+
+suite('hypo-session-start.mjs: injection from session entries and observed heads');
+
+test('(5) a head that fits goes in whole and a head that does not goes in as a pointer, and each is recorded as such', () => {
+  withStartVault({}, ({ dir, work }) => {
+    const one = ssPutEntry(dir, 'p', {
+      date: '2999-01-02',
+      sessionId: 's-one',
+      track: 'trk-one',
+      title: 'Track One',
+      body: 'BODY_ONE_MARK\n'.repeat(100),
+    });
+    const two = ssPutEntry(dir, 'p', {
+      date: '2999-01-01',
+      sessionId: 's-two',
+      track: 'trk-two',
+      title: 'Track Two',
+      body: 'BODY_TWO_MARK\n'.repeat(500),
+    });
+    const { ctx } = ssStart(dir, work, { sessionId: 'sess-t12-heads' });
+    assert.match(ctx, /BODY_ONE_MARK/, 'the first head is whole');
+    assert.doesNotMatch(ctx, /BODY_TWO_MARK/, 'the second is a pointer line, not a body');
+    assert.match(
+      ctx,
+      new RegExp(
+        `Track Two \\(trk-two\\) · 2999-01-01 · ${two.closeId}: 이 트랙을 이어 작업하면 먼저 projects/p/session-state.md`,
+      ),
+      'once the vault has moved, the generated view is where a head is read',
+    );
+    const observed = JSON.parse(ssRead(dir, '.cache/sessions/sess-t12-heads/observed-heads.json'))
+      .projects.p;
+    assert.deepEqual(observed.full['trk-one'], [one.closeId], 'the whole head is recorded full');
+    assert.deepEqual(
+      observed.pointer['trk-two'],
+      [two.closeId],
+      'the pointer head is recorded pointer',
+    );
+    assert.equal(observed.full['trk-two'], undefined, 'and not as full');
+    assert.equal(observed.pointer['trk-one'], undefined, 'nor the first as a pointer');
+  });
+});
+
+test('(6) the marker says there is no snapshot for a project that has views but no entries, and that there is one with an entry', () => {
+  withTmpDir((root) => {
+    const dir = join(root, 'vault');
+    const work = join(root, 'work');
+    mkdirSync(work, { recursive: true });
+    ssPut(
+      dir,
+      'projects/p/index.md',
+      `---\ntitle: p\ntype: project-index\nupdated: 2026-09-01\nworking_dir: "${realpathSync(work)}"\n---\n# p\n`,
+    );
+    // Real generator output carries `generated: sessions`; a flat file without it is an old file,
+    // which a vault with no git moves into a baseline entry (see the suite at the end).
+    const generatedView = '---\ngenerated: sessions\n---\n# generated view only\n';
+    ssPut(dir, 'projects/p/hot.md', generatedView);
+    ssPut(dir, 'projects/p/session-state.md', generatedView);
+    const bare = ssStart(dir, work, { sessionId: 'sess-t12-nosnap' });
+    assert.ok(bare.out, 'the hook ran on a vault with no git');
+    const marker = JSON.parse(readFileSync(markerPath('sess-t12-nosnap'), 'utf-8'));
+    assert.equal(marker.hasSnapshot, false);
+    rmSync(markerPath('sess-t12-nosnap'), { force: true });
+    ssPutEntry(dir, 'p', {
+      date: '2026-10-01',
+      sessionId: 's-one',
+      track: 'trk-one',
+      title: 'Track One',
+      body: 'a body\n',
+    });
+    ssStart(dir, work, { sessionId: 'sess-t12-snap' });
+    const withEntry = JSON.parse(readFileSync(markerPath('sess-t12-snap'), 'utf-8'));
+    assert.equal(withEntry.hasSnapshot, true);
+    rmSync(markerPath('sess-t12-snap'), { force: true });
+  });
+});
+
+test('(9) a SessionStart in p writes p and the root from the pulled entries and leaves the views of q alone', () => {
+  withStartVault({ remote: true }, ({ dir, work, other }) => {
+    assert.equal(ssMigrate(dir).migrated, true);
+    ssGitOk(dir, ['push', '-q', 'origin', 'main']);
+    ssWriteViews(dir, { device: 'dev-t12' });
+    const qBefore = ssRead(dir, 'projects/q/session-state.md');
+    const b = other();
+    ssPutEntry(b, 'p', {
+      date: '2026-10-05',
+      sessionId: 's-p',
+      track: 'trk-p',
+      title: 'Track P',
+      body: 'BODY_P_T12\n',
+    });
+    ssPutEntry(b, 'q', {
+      date: '2026-10-06',
+      sessionId: 's-q',
+      track: 'trk-q',
+      title: 'Track Q',
+      body: 'BODY_Q_T12\n',
+    });
+    ssCommitAll(b, 'entries from another machine');
+    ssGitOk(b, ['push', '-q', 'origin', 'main']);
+    const { ctx } = ssStart(dir, work);
+    assert.match(ssRead(dir, 'projects/p/session-state.md'), /BODY_P_T12/);
+    assert.match(ctx, /BODY_P_T12/);
+    const root = ssRead(dir, 'hot.md');
+    assert.match(root, /\| p \| 2026-10-05 \|/);
+    assert.match(root, /\| q \| 2026-10-06 \|/);
+    assert.equal(
+      ssRead(dir, 'projects/q/session-state.md'),
+      qBefore,
+      "q's view waits for the Stop hook",
+    );
+  });
+});
+
+test('the injection comes from the entries even when a flat view on disk says something else', () => {
+  withTmpDir((root) => {
+    const dir = join(root, 'vault');
+    const work = join(root, 'work');
+    mkdirSync(work, { recursive: true });
+    ssPut(
+      dir,
+      'projects/p/index.md',
+      `---\ntitle: p\ntype: project-index\nupdated: 2026-09-01\nworking_dir: "${realpathSync(work)}"\n---\n# p\n`,
+    );
+    // A stale generated view (it carries the generator's marker), not an old file: a vault with no
+    // git moves an old file into a baseline entry, and that is injected.
+    ssPut(
+      dir,
+      'projects/p/session-state.md',
+      '---\ngenerated: sessions\n---\n# a stale flat view\nSTALE_FLAT_T12\n',
+    );
+    ssPutEntry(dir, 'p', {
+      date: '2026-10-01',
+      sessionId: 's-one',
+      track: 'trk-one',
+      title: 'Track One',
+      body: 'ENTRY_BODY_T12\n',
+    });
+    const { ctx } = ssStart(dir, work);
+    assert.match(ctx, /ENTRY_BODY_T12/);
+    assert.doesNotMatch(ctx, /STALE_FLAT_T12/);
+  });
+});
+
+suite('hypo-session-start.mjs: catching up to a migration commit another machine pushed');
+
+// `dir` is behind: another clone migrated and pushed, and `dir` has not fetched yet.
+function withBehindVault(fn) {
+  withStartVault({ remote: true }, ({ dir, work, origin, other }) => {
+    const b = other();
+    assert.equal(ssMigrate(b).migrated, true);
+    ssGitOk(b, ['push', '-q', 'origin', 'main']);
+    fn({ dir, work, origin, b, migrationSha: ssHead(b) });
+  });
+}
+const ssBackups = (dir, rel) => {
+  const base = join(dir, '.cache', 'backups', dirname(rel));
+  const stem = rel.split('/').at(-1);
+  try {
+    return readdirSync(base)
+      .filter((n) => n.startsWith(`${stem}.pre-`))
+      .map((n) => readFileSync(join(base, n), 'utf-8'));
+  } catch {
+    return [];
+  }
+};
+const ssContains = (dir, sha) =>
+  ssGit(dir, ['merge-base', '--is-ancestor', sha, 'HEAD']).status === 0;
+
+test('(4) an uncommitted edit of a view is backed up and the fast-forward still lands, with no migration commit of its own', () => {
+  withBehindVault(({ dir, work, migrationSha }) => {
+    ssPut(dir, 'projects/p/hot.md', 'LOCAL_EDIT_T12\n');
+    const { sys } = ssStart(dir, work);
+    assert.ok(ssContains(dir, migrationSha), 'HEAD holds the remote migration commit');
+    assert.equal(ssMigrationState(dir), 'migrated');
+    assert.equal(ssMigrationCommits(dir), 1, 'only the remote machine moved the vault');
+    assert.ok(
+      ssBackups(dir, 'projects/p/hot.md').includes('LOCAL_EDIT_T12\n'),
+      'the edit is backed up',
+    );
+    assert.doesNotMatch(sys, /받지 못했습니다/);
+  });
+});
+
+test('(4b) an uncommitted pure-addition line of .gitignore survives the fast-forward next to the block, once each', () => {
+  withBehindVault(({ dir, work, migrationSha }) => {
+    ssPut(dir, '.gitignore', '.cache/\nlocal-only/\n');
+    ssStart(dir, work);
+    assert.ok(ssContains(dir, migrationSha));
+    const lines = ssRead(dir, '.gitignore').split('\n');
+    assert.equal(
+      lines.filter((l) => l === SS_GITIGNORE_BLOCK.split('\n')[0]).length,
+      1,
+      'the block',
+    );
+    assert.equal(lines.filter((l) => l === 'local-only/').length, 1, 'the local line');
+    assert.match(ssGitOk(dir, ['diff', '--name-only']), /\.gitignore/, 'still uncommitted');
+    assert.equal(ssGitOk(dir, ['ls-files', '-u']).trim(), '');
+  });
+});
+
+test('(4c) a local .gitignore negation stops the fast-forward and says so, with HEAD and the file untouched', () => {
+  withBehindVault(({ dir, work, migrationSha }) => {
+    ssPut(dir, '.gitignore', '.cache/\n!keep.md\n');
+    const head = ssHead(dir);
+    const { sys } = ssStart(dir, work);
+    assert.equal(ssHead(dir), head);
+    assert.equal(ssContains(dir, migrationSha), false);
+    assert.equal(ssRead(dir, '.gitignore'), '.cache/\n!keep.md\n');
+    assert.match(sys, /이행 커밋을 받지 못했습니다/);
+  });
+});
+
+test('(4d) a view another session staged is backed up byte for byte, unstaged, and the fast-forward lands', () => {
+  withBehindVault(({ dir, work, migrationSha }) => {
+    ssPut(dir, 'projects/p/hot.md', 'STAGED_BYTES_T12\n');
+    ssGitOk(dir, ['add', 'projects/p/hot.md']);
+    ssPut(dir, 'projects/p/hot.md', 'WORKTREE_BYTES_T12\n');
+    ssStart(dir, work);
+    assert.ok(ssContains(dir, migrationSha));
+    const saved = ssBackups(dir, 'projects/p/hot.md');
+    assert.ok(saved.includes('STAGED_BYTES_T12\n'), 'the stage bytes are kept');
+    assert.ok(saved.includes('WORKTREE_BYTES_T12\n'), 'and the working tree bytes');
+    assert.equal(ssGitOk(dir, ['diff', '--cached', '--name-only']).trim(), '');
+    assert.equal(ssMigrationCommits(dir), 1);
+  });
+});
+
+test('(4e) an edit that differs from the remote baseline becomes an additional baseline commit and reaches the remote', () => {
+  withBehindVault(({ dir, work, origin, migrationSha }) => {
+    ssPut(dir, 'projects/p/hot.md', 'LOCAL_ONLY_MEMORY_T12\n');
+    ssStart(dir, work);
+    assert.ok(ssContains(dir, migrationSha));
+    assert.equal(ssGitOk(dir, ['rev-list', '--count', `${migrationSha}..HEAD`]).trim(), '1');
+    assert.match(
+      ssGitOk(dir, ['show', '--name-only', '--format=', 'HEAD']),
+      /projects\/p\/sessions\/.*baseline-[0-9a-f]{16}\.md/,
+    );
+    ssGitOk(dir, ['push', '-q', 'origin', 'main']);
+    assert.equal(
+      ssGitOk(origin, ['rev-parse', 'main']).trim(),
+      ssHead(dir),
+      'shared at the next sync',
+    );
+  });
+});
+
+test('(4f) a stop between the fast-forward and the share is finished by the next SessionStart, once', () => {
+  withBehindVault(({ dir, work, migrationSha }) => {
+    ssGitOk(dir, ['fetch', '-q']);
+    ssPut(dir, 'projects/p/hot.md', 'LOCAL_EDIT_T12\n');
+    // the earlier run, up to the point where it stopped: set aside, then merged, nothing shared
+    const pre = ssClearGeneratedPaths(dir, '@{u}');
+    assert.equal(pre.ok, true, JSON.stringify(pre));
+    ssGitOk(dir, ['merge', '-q', '--ff-only', '@{u}']);
+    assert.ok(existsSync(join(dir, '.cache', 'pull-archive.json')), 'the record is left behind');
+    const before = ssCount(dir);
+    ssStart(dir, work);
+    assert.equal(ssCount(dir), before + 1, 'one additional baseline commit');
+    assert.equal(existsSync(join(dir, '.cache', 'pull-archive.json')), false, 'the record is gone');
+    assert.ok(ssContains(dir, migrationSha));
+    const again = ssCount(dir);
+    ssStart(dir, work);
+    assert.equal(ssCount(dir), again, 'a second SessionStart makes no commit');
+  });
+});
+
+test('(4g) a rollback commit over an ignored local file backs the file up instead of overwriting it, and says so', () => {
+  withStartVault({ remote: true }, ({ dir, work, other }) => {
+    const b = other();
+    assert.equal(ssMigrate(b).migrated, true);
+    ssGitOk(b, ['push', '-q', 'origin', 'main']);
+    ssGitOk(dir, ['pull', '-q', '--ff-only']);
+    assert.equal(ssMigrationState(dir), 'migrated', 'this machine is on the migrated side');
+    ssPut(dir, 'projects/p/hot.md', 'LOCAL_IGNORED_HOT\n');
+    // the rollback commit: the block is gone and the view is tracked again
+    ssPut(b, '.gitignore', '.cache/\n');
+    ssPut(b, 'projects/p/hot.md', 'ROLLED_BACK_HOT\n');
+    ssGitOk(b, ['add', '-f', '.gitignore', 'projects/p/hot.md']);
+    ssGitOk(b, ['commit', '-q', '-m', 'rollback']);
+    ssGitOk(b, ['push', '-q', 'origin', 'main']);
+    const { sys } = ssStart(dir, work);
+    assert.equal(ssHead(dir), ssHead(b), 'the rollback commit was taken in');
+    assert.equal(ssRead(dir, 'projects/p/hot.md'), 'ROLLED_BACK_HOT\n');
+    assert.ok(
+      ssBackups(dir, 'projects/p/hot.md').includes('LOCAL_IGNORED_HOT\n'),
+      'the ignored local bytes are kept',
+    );
+    assert.match(sys, /projects\/p\/hot\.md/, 'and the user is told where they went');
+  });
+});
+
+test('(4h) a migration commit takes the clean old files of a hidden project away only after a local copy is kept', () => {
+  withBehindVault(({ dir, work, migrationSha }) => {
+    ssPut(dir, '.hypoignore', 'projects/p/\n');
+    ssStart(dir, work);
+    assert.ok(ssContains(dir, migrationSha), 'the migration commit was taken in');
+    assert.ok(ssBackups(dir, 'projects/p/hot.md').includes(SS_OLD_HOT), 'hot.md is kept locally');
+    assert.ok(
+      ssBackups(dir, 'projects/p/session-state.md').includes(SS_OLD_STATE),
+      'session-state.md is kept locally',
+    );
+  });
+});
+
+test('(F6) after the vault is migrated, an ordinary pull blocked by a dirty file is not reported as a missed migration commit', () => {
+  withStartVault({ remote: true, files: { 'pages/x.md': 'x one\n' } }, ({ dir, work, other }) => {
+    const b = other();
+    assert.equal(ssMigrate(b).migrated, true);
+    ssGitOk(b, ['push', '-q', 'origin', 'main']);
+    ssStart(dir, work, { env: SS_DAY_ONE }); // takes the migration commit
+    assert.equal(ssMigrationState(dir), 'migrated');
+    // another machine edits a page, and this one has an uncommitted edit of the same page
+    ssPut(b, 'pages/x.md', 'x remote\n');
+    ssCommitAll(b, 'edit x');
+    ssGitOk(b, ['push', '-q', 'origin', 'main']);
+    ssPut(dir, 'pages/x.md', 'x local\n');
+    const head = ssHead(dir);
+    const { sys, ctx } = ssStart(dir, work, { env: SS_DAY_TWO });
+    assert.equal(ssHead(dir), head, 'the blocked pull moved nothing');
+    assert.equal(ssRead(dir, 'pages/x.md'), 'x local\n');
+    assert.doesNotMatch(sys, /이행 커밋을 받지 못했습니다/, 'no migration commit is in that range');
+    assert.doesNotMatch(ctx, /이행 커밋을 받지 못했습니다/);
+  });
+});
+
+test('(F9) a fetch that fails ends the pull there: no second network call is made', () => {
+  withStartVault({ remote: true }, ({ root, dir, work }) => {
+    ssGitOk(dir, ['remote', 'set-url', 'origin', join(root, 'nowhere.git')]);
+    const trace = join(root, 'git-trace.txt');
+    ssStart(dir, work, { env: { ...SS_DAY_ONE, GIT_TRACE: trace } });
+    const calls = readFileSync(trace, 'utf-8');
+    assert.match(calls, /built-in: git fetch/, 'the fetch was tried');
+    assert.doesNotMatch(calls, /built-in: git pull/, 'and the pull was not');
+  });
+});
+
+test('(F10) a vault inside another repository still finishes a pull archive left after its merge', () => {
+  withTmpDir((root) => {
+    const top = join(root, 'top');
+    const dir = join(top, 'wiki');
+    const work = join(root, 'work');
+    mkdirSync(work, { recursive: true });
+    mkdirSync(dir, { recursive: true });
+    ssGitOk(top, ['init', '-q', '-b', 'main']);
+    ssIdentify(top);
+    ssPut(dir, 'hypo-config.md', '# config\n');
+    ssPut(
+      dir,
+      'projects/p/index.md',
+      `---\ntitle: p\ntype: project-index\nupdated: 2026-09-01\nworking_dir: "${realpathSync(work)}"\n---\n# p\n`,
+    );
+    ssPut(dir, SS_OFF_MARKER, 'rolled back\n'); // keeps the hook from moving this vault
+    ssCommitAll(top, 'seed');
+    const record = join(dir, '.cache', 'pull-archive.json');
+    ssPut(
+      dir,
+      '.cache/pull-archive.json',
+      JSON.stringify({
+        v: 2,
+        stage: 'merged',
+        targetSha: ssHead(top),
+        gitignoreLines: [],
+        views: [],
+      }),
+    );
+    assert.equal(
+      existsSync(join(dir, '.git')),
+      false,
+      'precondition: the vault has no .git of its own',
+    );
+    ssStart(dir, work, { env: SS_DAY_ONE });
+    assert.equal(existsSync(record), false, 'the archive record was finished and removed');
+  });
+});
+
+// ── a vault that is not a git repository ─────────────────────────────────────
+
+suite(
+  'hypo-session-start.mjs: a vault that is not a git repository moves its old files into baseline entries',
+);
+
+// A vault with no `.git` anywhere above it: project `p` (working dir `work`) with the old two files.
+// There is no root `hot.md`: one that the generator did not write is backed up, which is not what
+// these tests look at.
+function withGitlessVault(opts, fn) {
+  withTmpDir((root) => {
+    const dir = join(root, 'vault');
+    const work = join(root, 'work');
+    mkdirSync(work, { recursive: true });
+    const files = {
+      'hypo-config.md': '# config\n',
+      'projects/p/index.md': `---\ntitle: p\ntype: project-index\nupdated: 2026-09-01\nworking_dir: "${realpathSync(work)}"\n---\n# p\n`,
+      'projects/p/hot.md': SS_OLD_HOT,
+      'projects/p/session-state.md': SS_OLD_STATE,
+      ...opts.files,
+    };
+    for (const [rel, text] of Object.entries(files)) ssPut(dir, rel, text);
+    assert.equal(ssMigrationState(dir), 'migrated', 'precondition: no git, so nothing is tracked');
+    fn({ dir, work });
+  });
+}
+
+const ssBaselineFiles = (dir, slug = 'p') =>
+  readdirSync(join(dir, 'projects', slug, 'sessions'))
+    .filter((n) => /-baseline-[0-9a-f]{16}\.md$/.test(n))
+    .sort();
+const ssHasBackups = (dir) => existsSync(join(dir, '.cache', 'backups'));
+const ssGitlessSnapshot = (dir) =>
+  JSON.stringify(
+    [
+      ...ssBaselineFiles(dir).map((n) => [n, ssRead(dir, `projects/p/sessions/${n}`)]),
+      ...['hot.md', 'projects/p/hot.md', 'projects/p/session-state.md'].map((rel) => [
+        rel,
+        ssRead(dir, rel),
+      ]),
+      ['record', ssRead(dir, '.cache/generated-views.json')],
+    ],
+    null,
+    1,
+  );
+
+test('(n1) the first SessionStart moves the old files into two baseline entries, injects them and backs nothing up', () => {
+  withGitlessVault({}, ({ dir, work }) => {
+    const { ctx } = ssStart(dir, work);
+    const names = ssBaselineFiles(dir);
+    assert.equal(names.length, 2, `one baseline entry per old file: ${names}`);
+    const entries = names.map((n) => ssParse(ssRead(dir, `projects/p/sessions/${n}`)));
+    for (const e of entries) assert.equal(e.ok, true);
+    const hot = entries.find((e) => e.entry.summary !== '').entry;
+    const state = entries.find((e) => e.entry.summary === '').entry;
+    assert.equal(hot.summary, SS_OLD_HOT, 'the old hot.md, whole');
+    assert.equal(state.bodies.legacy, SS_OLD_STATE, 'the old session-state.md, whole');
+    assert.match(ctx, /old state body/, 'the old state body is injected as in a git vault');
+    assert.match(ctx, /old hot body/, 'and the old hot summary');
+    // views are the generator's output now, and nothing was set aside as foreign bytes
+    assert.match(ssRead(dir, 'projects/p/session-state.md'), /generated: sessions/);
+    assert.match(ssRead(dir, 'projects/p/session-state.md'), /old state body/);
+    assert.match(ssRead(dir, 'projects/p/hot.md'), /generated: sessions/);
+    assert.match(ssRead(dir, 'projects/p/hot.md'), /old hot body/);
+    assert.equal(ssHasBackups(dir), false, 'nothing was backed up as unowned bytes');
+    assert.doesNotMatch(ctx, /pre-projection-backup/);
+    const record = JSON.parse(ssRead(dir, '.cache/generated-views.json')).views;
+    assert.equal(
+      record['projects/p/hot.md'],
+      ssCreateHash('sha256').update(ssRead(dir, 'projects/p/hot.md'), 'utf-8').digest('hex'),
+    );
+    assert.match(ctx, /옮겼습니다/, 'the move is told in the injection');
+  });
+});
+
+test('(n2) a second SessionStart changes nothing: same entries, same views, same record', () => {
+  withGitlessVault({}, ({ dir, work }) => {
+    ssStart(dir, work);
+    const first = ssGitlessSnapshot(dir);
+    const { ctx } = ssStart(dir, work);
+    assert.equal(ssGitlessSnapshot(dir), first);
+    assert.equal(ssBaselineFiles(dir).length, 2);
+    assert.match(ctx, /old state body/, 'and the injection still carries the old state');
+    assert.equal(ssHasBackups(dir), false);
+  });
+});
+
+test('(n3) an edit to a generated view after the move is backed up, not made a third baseline', () => {
+  withGitlessVault({}, ({ dir, work }) => {
+    ssStart(dir, work);
+    ssPut(dir, 'projects/p/hot.md', 'typed over the view\n');
+    ssStart(dir, work);
+    assert.equal(ssBaselineFiles(dir).length, 2, 'no new baseline for a post-move edit');
+    assert.ok(ssHasBackups(dir), 'the foreign bytes were backed up');
+    assert.match(ssRead(dir, 'projects/p/hot.md'), /generated: sessions/);
+  });
+});
+
+test('(n4) each old file keeps its own scope: a machine-scoped state file hides only the state entry elsewhere', () => {
+  const scopedState = SS_OLD_STATE.replace(
+    'updated:',
+    'visibility_scope: machine:dev-elsewhere\nupdated:',
+  );
+  withGitlessVault({ files: { 'projects/p/session-state.md': scopedState } }, ({ dir, work }) => {
+    const { ctx } = ssStart(dir, work, { env: { HYPO_DEVICE: 'dev-t12' } });
+    assert.doesNotMatch(ctx, /old state body/, 'the scoped state stays off this machine');
+    assert.match(ctx, /old hot body/, 'the unscoped hot summary is still shown');
+    const scopes = ssBaselineFiles(dir).map(
+      (n) => ssParse(ssRead(dir, `projects/p/sessions/${n}`)).entry.visibilityScope,
+    );
+    assert.deepEqual(scopes.sort(), ['machine:dev-elsewhere', null].sort());
+    assert.doesNotMatch(ssRead(dir, 'projects/p/session-state.md'), /old state body/);
+  });
+});
+
+// The three tests below carry the contracts of the root-projection SessionStart tests that the
+// session-entries generator retired (a held lock, a failed write, a backed-up edit), in the shape
+// the generator has: no touched-paths claim, the notice rides the one health-notice file.
+test('(n5) a view edit that was backed up is named in systemMessage with its backup path and where the text should go', () => {
+  withGitlessVault({}, ({ dir, work }) => {
+    ssStart(dir, work);
+    ssPut(dir, 'projects/p/hot.md', 'typed over the view\n');
+    const { sys } = ssStart(dir, work);
+    assert.ok(ssHasBackups(dir), 'fixture: the edit was backed up');
+    assert.match(sys, /\.cache\/backups\//, `the backup path is named: ${sys}`);
+    assert.match(sys, /projects\/p\/hot\.md/, `the view it came from is named: ${sys}`);
+    assert.match(sys, /notes\.md/, `and so is where the text should go: ${sys}`);
+    assert.match(
+      ssRead(dir, 'projects/p/hot.md'),
+      /generated: sessions/,
+      'the view is regenerated',
+    );
+    assert.equal(ssStart(dir, work).sys, '', 'the notice is shown once');
+  });
+});
+
+test('(n6) a vault lock held by another session leaves the views as they were, says so in systemMessage, and the next start catches up', () => {
+  withGitlessVault({}, ({ dir, work }) => {
+    ssStart(dir, work);
+    const viewBefore = ssRead(dir, 'projects/p/session-state.md');
+    ssPutEntry(dir, 'p', {
+      date: '2026-10-07',
+      sessionId: 'other-session',
+      track: 'main',
+      title: 'Later work',
+      body: 'a body the held lock must not render yet',
+    });
+    const lockPath = `${vaultCommitLockTarget(dir)}.lock`;
+    mkdirSync(dirname(lockPath), { recursive: true });
+    writeFileSync(lockPath, String(process.pid));
+    try {
+      const { sys } = ssStart(dir, work, { env: { HYPO_VAULT_LOCK_TIMEOUT_MS: '200' } });
+      assert.match(sys, /이번에는 갱신하지 않았습니다/, `the skipped refresh is reported: ${sys}`);
+      assert.equal(ssRead(dir, 'projects/p/session-state.md'), viewBefore, 'view bytes unchanged');
+    } finally {
+      rmSync(lockPath, { force: true });
+    }
+    const { sys: later } = ssStart(dir, work);
+    assert.doesNotMatch(later, /이번에는 갱신하지 않았습니다/, 'the notice is shown once');
+    assert.match(
+      ssRead(dir, 'projects/p/session-state.md'),
+      /a body the held lock must not render yet/,
+      'with the lock free the same start renders the new entry',
+    );
+  });
+});
+
+test('(n7) a view that cannot be written is reported in systemMessage and the injection still goes out', () => {
+  withGitlessVault({}, ({ dir, work }) => {
+    ssStart(dir, work);
+    // EISDIR on read: a directory where the generated file should be
+    rmSync(join(dir, 'projects', 'p', 'hot.md'));
+    mkdirSync(join(dir, 'projects', 'p', 'hot.md'));
+    const { sys, ctx } = ssStart(dir, work);
+    assert.match(sys, /세션 현황 파일 갱신에 실패했습니다/, `the failure is reported: ${sys}`);
+    assert.match(ctx, /old state body/, 'the injection is built from the entries regardless');
+  });
 });
