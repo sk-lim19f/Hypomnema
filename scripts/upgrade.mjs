@@ -18,6 +18,9 @@
  *                       hook drift/apply, settings.json registration, the
  *                       wiki-*.mjs → hypo-*.mjs rename migration, and
  *                       the user-extensions companion sync (E4).
+ *   --migrate-sessions  Move a vault that has a git remote to session entries (see
+ *                       migrateSessionsCommand). Runs instead of the drift check, and
+ *                       pushes the migration commit.
  *   --json              Output results as JSON
  *   --allow-downgrade   Override the guard that refuses to overwrite a NEWER
  *                       active install with an older package
@@ -37,6 +40,7 @@ import {
   unlinkSync,
   chmodSync,
 } from 'fs';
+import { spawnSync } from 'child_process';
 import { join, isAbsolute } from 'path';
 import { homedir } from 'os';
 import { fileURLToPath } from 'url';
@@ -67,6 +71,28 @@ import {
 } from './lib/git-hooks-dir.mjs';
 import { classifyInstall, downgradeGuardMessage } from '../hooks/version-check.mjs';
 import { atomicWrite } from '../hooks/atomic-write.mjs';
+import {
+  GITATTRIBUTES_BLOCK,
+  GITIGNORE_BLOCK,
+  missingBlockLines,
+} from '../hooks/session-entries.mjs';
+import {
+  listTrackedGeneratedViews,
+  migrationState,
+  pullRemote,
+  pushRemote,
+  resolvePushTarget,
+  revPathArg,
+  upstreamIsMigrated,
+  vaultCommitLockTarget,
+  withFileLock,
+} from '../hooks/hypo-shared.mjs';
+import {
+  afterFastForward,
+  buildCommitInTempIndex,
+  fastForwardTo,
+  migrateVaultToSessionEntries,
+} from '../hooks/session-views.mjs';
 
 const HOME = homedir();
 const SCRIPT_DIR = fileURLToPath(new URL('.', import.meta.url));
@@ -108,6 +134,7 @@ function parseArgs(argv) {
     codex: false,
     allowDowngrade: false,
     allowDualInstall: false,
+    migrateSessions: false,
   };
   for (const arg of argv.slice(2)) {
     if (arg.startsWith('--hypo-dir=')) args.hypoDir = expandHome(arg.slice(11));
@@ -118,6 +145,7 @@ function parseArgs(argv) {
     else if (arg === '--json') args.json = true;
     else if (arg === '--allow-downgrade') args.allowDowngrade = true;
     else if (arg === '--allow-dual-install') args.allowDualInstall = true;
+    else if (arg === '--migrate-sessions') args.migrateSessions = true;
   }
   if (!args.hypoDir) args.hypoDir = resolveHypoRoot();
   return args;
@@ -1128,9 +1156,210 @@ function writePluginModeMetadata() {
 // the other pkgJsonPath-taking helpers already there) also makes the writer's
 // TOCTOU refusal directly unit-testable without spawning the whole script.
 
+// ── --migrate-sessions ───────────────────────────────────────────────────────
+
+// Earlier byte-exact editions of the two blocks the migration commit adds. A vault moved with one of
+// them keeps migrating nothing further (`migrationState` reads a block that lacks a pattern line of
+// the current edition as `incomplete-block`), so the command swaps a known old edition for the
+// current one. Add the outgoing edition here whenever `GITIGNORE_BLOCK` or `GITATTRIBUTES_BLOCK`
+// changes. An edition that is not listed (a hand edit) is left alone and the move reports it.
+const PREVIOUS_GITIGNORE_BLOCKS = [
+  `# Hypomnema: session views generated from projects/*/sessions/ (not committed)
+/hot.md
+/projects/*/hot.md
+/projects/*/session-state.md
+/hot.md.pre-projection-backup*.md
+/hot.md.pre-projection-backup*.tmp
+/projects/*/*.pre-projection-backup*.md
+/projects/*/*.pre-projection-backup*.tmp
+/projects/*/sessions/*.tmp
+`,
+];
+const PREVIOUS_GITATTRIBUTES_BLOCKS = [
+  `# Hypomnema: session-log shards are append-only, keep both sides on a merge
+projects/*/session-log/*.md merge=union
+`,
+];
+
+/** `[{relPath, text}]`: HEAD's `.gitignore` / `.gitattributes` with a known old block swapped for the current one. */
+function staleBlockWrites(hypoDir) {
+  const writes = [];
+  for (const [relPath, current, previous] of [
+    ['.gitignore', GITIGNORE_BLOCK, PREVIOUS_GITIGNORE_BLOCKS],
+    ['.gitattributes', GITATTRIBUTES_BLOCK, PREVIOUS_GITATTRIBUTES_BLOCKS],
+  ]) {
+    const shown = spawnSync('git', ['-C', hypoDir, 'show', revPathArg('HEAD', relPath)], {
+      encoding: 'utf-8',
+    });
+    if (shown.status !== 0 || !missingBlockLines(shown.stdout, current)?.length) continue;
+    const text = shown.stdout.endsWith('\n') ? shown.stdout : `${shown.stdout}\n`;
+    const old = previous.find((b) => text.includes(b));
+    if (!old) continue;
+    const next = text.replace(old, () => current);
+    if (missingBlockLines(next, current)?.length === 0) writes.push({ relPath, text: next });
+  }
+  return writes;
+}
+
+/**
+ * `upgrade --migrate-sessions`: the way a vault with a git remote moves to session entries (the
+ * session-start hook only moves a vault without one). Run it once, on one machine, after every
+ * machine that uses the vault has the new version. It fetches, then:
+ *   - a remote that is already migrated is taken in (fast-forward, or `pullRemote` when the
+ *     histories diverged) and this machine does not migrate on its own;
+ *   - any other remote history is merged first (`pullRemote`), so the migration commit is built on
+ *     the newest HEAD and the push is a fast-forward;
+ *   - `migrateVaultToSessionEntries(…, {reenable: true})`, then pull and push.
+ * A step that cannot go on prints why and returns 1. Running it again after a failed push does
+ * nothing new and pushes. A vault whose `.gitignore` or `.gitattributes` holds an older edition of
+ * the block is brought to the current edition first. Returns the exit code.
+ */
+function migrateSessionsCommand(hypoDir) {
+  const say = (m) => console.log(m);
+  const fail = (m) => {
+    console.error(`✗ ${m}`);
+    return 1;
+  };
+  const git = (...a) =>
+    spawnSync('git', ['-C', hypoDir, ...a], { encoding: 'utf-8', timeout: 60000 });
+  if (git('rev-parse', '--is-inside-work-tree').status !== 0) {
+    say(`${hypoDir} is not a git work tree: no tracked session views to move.`);
+    return 0;
+  }
+  const locked = (fn) => {
+    try {
+      return withFileLock(vaultCommitLockTarget(hypoDir), fn, {
+        timeoutMs: Number(process.env.HYPO_VAULT_LOCK_TIMEOUT_MS) || 5000,
+      });
+    } catch (err) {
+      if (err?.code !== 'ELOCKTIMEOUT') throw err;
+      return { stop: 'another session holds the vault lock; run the command again in a moment' };
+    }
+  };
+  const stopOf = (p) =>
+    `taking in the remote ${p.deferred ? `was deferred (${p.deferred})` : p.conflict ? 'stopped on a merge conflict' : 'failed'}`;
+  const ffTo = (sha) => {
+    const applied = fastForwardTo(hypoDir, sha);
+    if (!applied.ok) {
+      return {
+        stop: applied.notice ?? applied.deferred ?? applied.reason ?? 'fast-forward failed',
+      };
+    }
+    return { notices: afterFastForward(hypoDir, applied.pre).notices };
+  };
+
+  // A migrated upstream keeps the generated views untracked. When HEAD tracks some (an old machine's
+  // unpushed work merged in), `migrationState` reads not-migrated and rendering stays off, and a
+  // push would hand that state to every machine. Stop before anything is pushed.
+  const trackedViewsBlock = () => {
+    let tracked;
+    try {
+      tracked = listTrackedGeneratedViews(hypoDir, { source: 'head' });
+    } catch (err) {
+      return `could not list the tracked session views (${err?.message ?? err})`;
+    }
+    if (!tracked.length || !upstreamIsMigrated(hypoDir)) return null;
+    const list = tracked.map((p) => `'${p}'`).join(' ');
+    return (
+      `The remote is already migrated, but this branch tracks generated session views: ${tracked.join(', ')}. ` +
+      'A push would leave session views switched off for every machine. Nothing was pushed. ' +
+      `Repair: git rm --cached -- ${list}, record that as a commit, then run this command again (the files stay on disk and are ignored).`
+    );
+  };
+
+  const prepared = locked(() => {
+    const notices = [];
+    const hasRemote = git('remote').stdout.trim() !== '';
+    if (hasRemote && git('fetch', '-q').status !== 0) {
+      return { stop: 'git fetch failed; not migrating on a base that may be behind the remote' };
+    }
+    const hasUpstream = git('rev-parse', '--verify', '-q', '@{u}').status === 0;
+    const isAncestor = (a, b) => git('merge-base', '--is-ancestor', a, b).status === 0;
+    if (hasUpstream && !isAncestor('@{u}', 'HEAD')) {
+      if (upstreamIsMigrated(hypoDir) && isAncestor('HEAD', '@{u}')) {
+        const moved = ffTo(git('rev-parse', '@{u}').stdout.trim());
+        if (moved.stop) return moved;
+        notices.push(...moved.notices);
+      } else {
+        const pulled = pullRemote(hypoDir, { leaveNotices: false });
+        notices.push(...pulled.notices);
+        if (pulled.deferred || pulled.conflict || !pulled.pulled) {
+          return { stop: stopOf(pulled), notices };
+        }
+      }
+    }
+    const writes = staleBlockWrites(hypoDir);
+    if (writes.length) {
+      const built = buildCommitInTempIndex(hypoDir, {
+        message: 'hypomnema: bring the session views ignore rules up to date',
+        writes,
+      });
+      if (!built.ok) return { stop: `could not build the block update: ${built.reason}`, notices };
+      const moved = ffTo(built.sha);
+      if (moved.stop) return { ...moved, notices };
+      notices.push(
+        ...moved.notices,
+        `Updated ${writes.map((w) => w.relPath).join(' and ')} to the current block.`,
+      );
+    }
+    return { notices, hasUpstream, remoteMigrated: hasUpstream && upstreamIsMigrated(hypoDir) };
+  });
+  for (const n of prepared.notices ?? []) say(n);
+  if (prepared.stop) return fail(prepared.stop);
+
+  if (prepared.remoteMigrated) {
+    const blocked = trackedViewsBlock();
+    if (blocked) return fail(blocked);
+    if (migrationState(hypoDir) === 'incomplete-block') {
+      return fail(
+        'The session views block in .gitignore lacks some of its lines (a hand edit or a bad merge), so session views stay off. Restore the whole block, commit it, and run this command again.',
+      );
+    }
+    say(
+      'Another machine already moved this vault. Took in its commit; this machine did not migrate.',
+    );
+  } else if (migrationState(hypoDir) === 'migrated') {
+    say('This vault is already on session entries. Nothing to migrate.');
+  } else {
+    const r = migrateVaultToSessionEntries(hypoDir, { reenable: true });
+    for (const n of r.notices) say(n);
+    if (!r.migrated)
+      return fail(`migration did not run (${r.deferred ?? r.skipped}); see the notice above`);
+    say(
+      `Migrated: commit ${r.commit.slice(0, 8)}, ${r.baselines.length} baseline entr${r.baselines.length === 1 ? 'y' : 'ies'}, ${r.shared.length} additional baseline(s) from local old files.`,
+    );
+  }
+
+  if (!prepared.hasUpstream) {
+    say('No upstream branch, so nothing was pushed.');
+  } else {
+    // `syncRemote` split in two: the pull must run under the vault lock, the push must not.
+    const pulled = locked(() => pullRemote(hypoDir, { leaveNotices: false }));
+    if (pulled.stop) return fail(pulled.stop);
+    for (const n of pulled.notices) say(n);
+    if (pulled.conflict || pulled.deferred) return fail(stopOf(pulled));
+    const blocked = trackedViewsBlock();
+    if (blocked) return fail(blocked);
+    if (!pushRemote(hypoDir, resolvePushTarget(hypoDir)).pushed) {
+      return fail(
+        'push failed (see `hypomnema doctor`). Run this command again once the remote accepts pushes: it adds no new commit.',
+      );
+    }
+    say('Pushed.');
+  }
+  say(
+    'A machine that skipped the upgrade loses the session view in its injection, can stall sync on a local commit that edits a generated file, and (plugin installs) is not refreshed on its own.',
+  );
+  say(
+    'While machines catch up, a plain `git pull` or Obsidian Git can hit conflicts that Hypomnema sync resolves.',
+  );
+  return 0;
+}
+
 // ── main ─────────────────────────────────────────────────────────────────────
 
 const args = parseArgs(process.argv);
+if (args.migrateSessions) process.exit(migrateSessionsCommand(args.hypoDir));
 
 // Target paths. Claude is always checked; codex is checked only when --codex is set
 // so users without codex installed see no false drift.

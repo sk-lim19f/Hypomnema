@@ -61,6 +61,7 @@ import {
   SESSION_ENTRIES_OFF_MARKER,
   undoClearedPaths,
   unignoredCachePaths,
+  unignoredPaths,
   vaultCommitLockTarget,
   vaultGitPrefix,
   vaultHasNoGit,
@@ -354,6 +355,7 @@ const emptyResult = (over) => ({
   written: [],
   unchanged: [],
   backedUp: [],
+  stageableViews: [],
   ...over,
 });
 
@@ -533,7 +535,8 @@ export function moveLegacyFilesToEntriesUnlocked(hypoDir, own) {
  * `{notMigrated, lockTimeout, written[], unchanged[], backedUp[{relPath, backupPath}]}`; when the
  * vault is not `migrated` nothing is written and `notMigrated` is true (`incomplete-block` also adds
  * `missingBlockLines[]` and leaves a health notice; a `.cache/` that git would not ignore adds
- * `unignoredCache[]` and leaves one too). A project that
+ * `unignoredCache[]` and leaves one too). A view path git would not ignore (a later `!` rule) is not
+ * written and listed in `stageableViews[]`, with a notice naming it. A project that
  * `.hypoignore` hides (see `projectHiddenByHypoignore`) is neither read nor written and has no
  * root row. Any backup leaves a health notice for the next SessionStart, written right after the
  * backup (see `writeOneView`).
@@ -565,13 +568,31 @@ export function writeGeneratedViewsUnlocked(hypoDir, opts = {}) {
   );
   const models = all.map((p) => loadSessionModel(hypoDir, p, { state, testHooks }));
   const views = renderViews(models, { device, only });
-  const targets = only.flatMap((slug) => [
+  const allTargets = only.flatMap((slug) => [
     [`projects/${slug}/hot.md`, views.projects[slug].hot],
     [`projects/${slug}/session-state.md`, views.projects[slug].sessionState],
   ]);
-  if (root) targets.push(['hot.md', views.root]);
+  if (root) allTargets.push(['hot.md', views.root]);
+  // The block's lines being present does not make a view ignored: a later `!` rule can let one
+  // through, and `git add -A` would stage what the generator writes. Judge each path by the
+  // effective rules and write none that git would stage.
+  const stageable = new Set(
+    unignoredPaths(
+      hypoDir,
+      allTargets.map(([relPath]) => relPath),
+    ),
+  );
+  const targets = allTargets.filter(([relPath]) => !stageable.has(relPath));
+  const notes = [];
+  if (stageable.size) {
+    notes.push(
+      `세션 현황 파일: ${[...stageable].join(', ')}를 .gitignore가 무시하지 않아(뒤쪽의 \`!\` 규칙일 수 있습니다) ` +
+        '쓰지 않았습니다. 그대로 쓰면 git add -A가 생성 파일을 스테이징합니다. ' +
+        '그 규칙을 지우거나 해당 경로를 무시하는 줄을 .gitignore 끝에 추가하면 다음 갱신부터 씁니다.',
+    );
+  }
 
-  const result = emptyResult({ state });
+  const result = emptyResult({ state, stageableViews: [...stageable] });
   let failure = null;
   try {
     for (const [relPath, content] of targets) {
@@ -587,6 +608,7 @@ export function writeGeneratedViewsUnlocked(hypoDir, opts = {}) {
       failure ??= err;
     }
   }
+  if (notes.length) writeRootHotHealthNotice(hypoDir, notes.join('\n'));
   if (failure) throw failure;
   return result;
 }
@@ -818,6 +840,23 @@ export function fastForwardTo(hypoDir, sha, { testHooks } = {}) {
   return { ok: true, pre };
 }
 
+/**
+ * What every landed `fastForwardTo` leaves to do, for the migration and for `upgrade
+ * --migrate-sessions`: tell what was set aside, then share what this machine held only in its
+ * working tree or index (the old files differ from HEAD) as additional baselines; the pull record
+ * is dropped once those are committed. `pre` is the `pre` of the `fastForwardTo` result. Returns
+ * `{notices, created}` (the entries made, relative to the vault). A caller holds the vault lock.
+ */
+export function afterFastForward(hypoDir, pre) {
+  const setAside = setAsideNotices(hypoDir, pre);
+  markPullArchiveMerged(hypoDir);
+  const { localOnly, unowned, cleared } = pre;
+  const resumed = resumePullArchive(hypoDir, {
+    announced: [...localOnly, ...unowned, ...cleared].map((v) => v.backupPath),
+  });
+  return { notices: [...setAside, ...resumed.notices], created: resumed.created };
+}
+
 const migrationResult = (over) => ({
   migrated: false,
   commit: null,
@@ -879,6 +918,24 @@ export function migrateVaultToSessionEntriesUnlocked(hypoDir, opts = {}) {
     tracked = listTrackedGeneratedViews(hypoDir, { source: 'head' });
   } catch (err) {
     return deferredMigration('head-unreadable', err?.message);
+  }
+  // The move lists the views to remove from HEAD. A view that is staged but not in HEAD (a new
+  // project whose old files were added by hand) would stay in the index, tracked, after the move.
+  // Nothing is written before the person unstages or commits them.
+  let indexed;
+  try {
+    indexed = listTrackedGeneratedViews(hypoDir, { source: 'index' });
+  } catch (err) {
+    return deferredMigration('index-unreadable', err?.message);
+  }
+  const inHead = new Set(tracked);
+  const stagedOnly = indexed.filter((rel) => !inHead.has(rel));
+  if (stagedOnly.length) {
+    return deferredMigration(
+      'staged-views',
+      `커밋되지 않고 스테이징만 된 세션 현황 파일이 있어 아무것도 쓰지 않았습니다 (${stagedOnly.join(', ')}). ` +
+        'git restore --staged로 스테이징을 풀거나 먼저 커밋한 뒤 다시 시도합니다',
+    );
   }
   const notices = [];
   const patterns = loadHypoIgnore(hypoDir);
@@ -995,20 +1052,13 @@ export function migrateVaultToSessionEntriesUnlocked(hypoDir, opts = {}) {
     const reason = applied.deferred ?? applied.reason ?? 'ff-failed';
     return deferredMigration(reason, applied.notice ?? reason);
   }
-  notices.push(...setAsideNotices(hypoDir, applied.pre));
-  // What this machine held only in its working tree or index (the old files differ from HEAD) goes
-  // out as additional baselines; the record is dropped once those are committed.
-  markPullArchiveMerged(hypoDir);
-  const { localOnly, unowned, cleared } = applied.pre;
-  const resumed = resumePullArchive(hypoDir, {
-    announced: [...localOnly, ...unowned, ...cleared].map((v) => v.backupPath),
-  });
+  const after = afterFastForward(hypoDir, applied.pre);
   return migrationResult({
     migrated: true,
     commit: commit.sha,
     baselines,
-    shared: resumed.created,
-    notices: [...notices, ...resumed.notices],
+    shared: after.created,
+    notices: [...notices, ...after.notices],
   });
 }
 

@@ -509,10 +509,13 @@ function addedLines(base, lines) {
 
 /**
  * Merge two `.gitignore` edits of one base when both only appended lines. `{ok: true, merged}`
- * (theirs' bytes, then the lines only `ours` added, each once) or `{ok: false, reason}`. It
- * refuses a removed, reordered or middle-inserted base line on either side, and a `!` line added
- * on EITHER side: a negation depends on where it sits among the other patterns, and appending
- * reorders them.
+ * (theirs' bytes, then the lines `ours` added, in order) or `{ok: false, reason}`. It refuses a
+ * removed, reordered or middle-inserted base line on either side, and a `!` line added on EITHER
+ * side: a negation depends on where it sits among the other patterns, and appending reorders them.
+ * A line `ours` appended counts as already there only when theirs ALSO appended it: a repeat of a
+ * base line is kept, because appended after a base `!` rule it re-ignores what that rule let
+ * through. Every added line is a plain pattern placed after the whole base, so their order among
+ * themselves changes nothing and an identical pair collapses to one.
  */
 export function mergeAdditiveGitignore(base, ours, theirs) {
   const baseLines = splitLines(base);
@@ -524,7 +527,7 @@ export function mergeAdditiveGitignore(base, ours, theirs) {
   if ([...oursAdded, ...theirsAdded].some((l) => l.trimStart().startsWith('!'))) {
     return { ok: false, reason: 'negation-added' };
   }
-  const seen = new Set(theirsLines);
+  const seen = new Set(theirsAdded);
   const extra = [];
   for (const line of oursAdded) {
     if (seen.has(line)) continue;

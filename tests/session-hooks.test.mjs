@@ -8278,3 +8278,1095 @@ test('(n7) a view that cannot be written is reported in systemMessage and the in
     assert.match(ctx, /old state body/, 'the injection is built from the entries regardless');
   });
 });
+
+// ── sync conflict resolution in pullRemote (view modify/delete, additive .gitignore) ────────────
+//
+// Two real clones of one bare origin. `a` and `b` start at the old state (the three generated views
+// tracked). A "migrated" commit is built by hand: views removed, the ignore block added, one
+// baseline entry per old file. The production code under test runs in this process, so the git identity and
+// config come from a throwaway global config that is set around each body and restored.
+import { createHash } from 'node:crypto';
+import {
+  pullRemote,
+  finishOwnedMerge,
+  clearGeneratedPathsBlockingPull,
+} from '../hooks/hypo-shared.mjs';
+import { buildLegacyBaselines } from '../hooks/session-entries.mjs';
+
+const SYNC_CONFIG = () => {
+  const path = join(SESSION_TMP_HOME, 'gitconfig-sync-resolve');
+  writeFileSync(
+    path,
+    '[user]\n\tname = t\n\temail = t@example.com\n[init]\n\tdefaultBranch = main\n[commit]\n\tgpgsign = false\n',
+  );
+  return path;
+};
+
+function sgit(dir, args) {
+  return spawnSync('git', args, {
+    cwd: dir,
+    encoding: 'utf-8',
+    env: {
+      ...process.env,
+      HOME: SESSION_TMP_HOME,
+      GIT_CONFIG_GLOBAL: SYNC_CONFIG(),
+      GIT_CONFIG_NOSYSTEM: '1',
+    },
+  });
+}
+
+const sgitOk = (dir, args) => {
+  const r = sgit(dir, args);
+  assert.equal(r.status, 0, `git ${args.join(' ')}: ${r.stderr}`);
+  return r.stdout;
+};
+
+function inSyncEnv(fn) {
+  const saved = {
+    GIT_CONFIG_GLOBAL: process.env.GIT_CONFIG_GLOBAL,
+    GIT_CONFIG_NOSYSTEM: process.env.GIT_CONFIG_NOSYSTEM,
+  };
+  process.env.GIT_CONFIG_GLOBAL = SYNC_CONFIG();
+  process.env.GIT_CONFIG_NOSYSTEM = '1';
+  try {
+    return fn();
+  } finally {
+    for (const [k, v] of Object.entries(saved)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+  }
+}
+
+const SY_HOT = `---
+title: "hot: p"
+type: reference
+updated: 2026-09-20
+visibility_scope: machine:devA
+---
+old hot body
+`;
+const SY_STATE = `---
+type: session-state
+updated: 2026-09-25
+---
+## Next Up
+old state body
+`;
+const SY_W1 = SY_HOT.replace('old hot body', 'local edit one');
+const SY_W2 = SY_HOT.replace('old hot body', 'local edit two');
+const SY_VIEWS = ['hot.md', 'projects/p/hot.md', 'projects/p/session-state.md'];
+const SY_SEED = {
+  '.gitignore': '.cache/\nbase-1\nbase-2\n',
+  'hot.md': 'root hot\n',
+  'projects/p/index.md': '---\ntitle: p\n---\n',
+  'projects/p/hot.md': SY_HOT,
+  'projects/p/session-state.md': SY_STATE,
+  'pages/x.md': 'x\n',
+  'pages/y.md': 'y\n',
+};
+
+function syPut(dir, rel, text) {
+  mkdirSync(dirname(join(dir, rel)), { recursive: true });
+  writeFileSync(join(dir, rel), text);
+}
+const syRead = (dir, rel) => readFileSync(join(dir, rel), 'utf-8');
+// The merge records live in the git directory (a plain clone: `.git/`), never in the vault tree.
+const syOwnedPath = (dir) => join(dir, '.git', 'hypo-merge-owned.json');
+const syIntentPath = (dir) => join(dir, '.git', 'hypo-merge-intent.json');
+const syCommit = (dir, msg = 'x') => {
+  sgitOk(dir, ['add', '-A']);
+  sgitOk(dir, ['commit', '-q', '-m', msg]);
+};
+const syHead = (dir) => sgitOk(dir, ['rev-parse', 'HEAD']).trim();
+const syUnmerged = (dir) => sgitOk(dir, ['ls-files', '-u']).trim();
+const syMergeHead = (dir) => sgit(dir, ['rev-parse', '-q', '--verify', 'MERGE_HEAD']).status === 0;
+const syParents = (dir, rev) =>
+  sgitOk(dir, ['rev-list', '--parents', '-n1', rev]).trim().split(' ').length - 1;
+const syBaselines = (dir, rev = 'HEAD') =>
+  sgitOk(dir, ['ls-tree', '--name-only', '-r', rev, '--', 'projects/p/sessions/'])
+    .split('\n')
+    .filter((n) => /-baseline-[0-9a-f]{16}\.md$/.test(n));
+// The files an ordinary Stop commit would carry: what HEAD changed.
+const syChangedBy = (dir, rev = 'HEAD') =>
+  sgitOk(dir, ['show', '--name-only', '--format=', rev]).split('\n').filter(Boolean);
+const syBackupTexts = (dir, rel = 'projects/p/hot.md') => {
+  const names = (() => {
+    try {
+      return readdirSync(join(dir, '.cache', 'backups', dirname(rel)));
+    } catch {
+      return [];
+    }
+  })();
+  return names
+    .filter((n) => n.startsWith(`${basename(rel)}.pre-`))
+    .map((n) => readFileSync(join(dir, '.cache', 'backups', dirname(rel), n), 'utf-8'));
+};
+
+// Origin seeded with the old state, `a` and `b` cloned from it. `extra` seeds more files.
+function withSyncClones(fn, extra = {}) {
+  inSyncEnv(() =>
+    withTmpDir((root) => {
+      const origin = join(root, 'origin.git');
+      const a = join(root, 'a');
+      const b = join(root, 'b');
+      sgitOk(root, ['init', '-q', '--bare', origin]);
+      sgitOk(root, ['clone', '-q', origin, a]);
+      for (const [rel, text] of Object.entries({ ...SY_SEED, ...extra })) syPut(a, rel, text);
+      syCommit(a);
+      sgitOk(a, ['push', '-q', '-u', 'origin', 'main']);
+      sgitOk(root, ['clone', '-q', origin, b]);
+      fn({ a, b, root, origin });
+    }),
+  );
+}
+
+// What a migration commit does to a clone: the three views leave the tree, the block is added, and
+// one baseline entry per old file is built from `hot` and `state`. Committed, not pushed.
+function syMigrate(dir, hot = SY_HOT, state = SY_STATE) {
+  sgitOk(dir, ['rm', '-q', ...SY_VIEWS]);
+  syPut(dir, '.gitignore', `${syRead(dir, '.gitignore')}${GITIGNORE_BLOCK}`);
+  // One entry per old file (hot first); the project scope narrows both to this machine.
+  for (const baseline of buildLegacyBaselines({
+    hotText: hot,
+    stateText: state,
+    date: '2026-09-25',
+    project: 'p',
+    scopes: { index: 'machine:devA', hot: null, state: null },
+    legacyDone: false,
+  })) {
+    syPut(dir, `projects/p/sessions/${baseline.fileName}`, baseline.text);
+  }
+  syCommit(dir, 'migrate');
+}
+
+const syEditAndPush = (dir, rel, text) => {
+  syPut(dir, rel, text);
+  syCommit(dir, `edit ${rel}`);
+  sgitOk(dir, ['push', '-q']);
+};
+
+// `a` is the old-version machine that edited `projects/p/hot.md` and pushed first; `b` migrated
+// locally (not pushed) and is the one that syncs.
+function withIncomingEdit(fn, { hot = SY_HOT } = {}) {
+  withSyncClones(({ a, b, ...rest }) => {
+    syEditAndPush(a, 'projects/p/hot.md', SY_W1);
+    syMigrate(b, hot);
+    fn({ a, b, ...rest });
+  });
+}
+
+// `a` migrated and pushed first; `b` is the old-version machine whose unpushed commit edited the view.
+function withOurEdit(fn, { hot = SY_HOT } = {}) {
+  withSyncClones(({ a, b, ...rest }) => {
+    syMigrate(a, hot);
+    sgitOk(a, ['push', '-q']);
+    syPut(b, 'projects/p/hot.md', SY_W1);
+    syCommit(b, 'edit view');
+    sgitOk(b, ['fetch', '-q']); // so `@{u}` names the migrated tree
+    fn({ a, b, ...rest });
+  });
+}
+
+suite('sync conflict resolution: view modify/delete');
+
+test('modify/delete, incoming side modified: the pull lands, the incoming bytes are backed up, untracked and shared as one baseline', () => {
+  withIncomingEdit(({ b }) => {
+    const before = syBaselines(b).length;
+    assert.equal(before, 2, 'the local migration baselines, one per old file');
+    const res = pullRemote(b);
+    assert.equal(res.pulled, true, JSON.stringify(res));
+    assert.equal(res.conflict, false);
+    assert.equal(syUnmerged(b), '');
+    assert.equal(syMergeHead(b), false);
+    assert.deepEqual(syBackupTexts(b), [SY_W1], 'the incoming content is the backup');
+    assert.equal(sgitOk(b, ['ls-files', '--', 'projects/p/hot.md']).trim(), '', 'untracked');
+    assert.equal(syParents(b, 'HEAD~1'), 2, 'HEAD~1 is the merge commit');
+    const added = syChangedBy(b).filter((n) => /-baseline-/.test(n));
+    assert.equal(
+      added.length,
+      1,
+      `one additional baseline in the commit after the merge: ${added}`,
+    );
+    assert.match(syRead(b, added[0]), /local edit one/);
+    assert.equal(syBaselines(b).length, before + 1);
+    assert.equal(existsSync(syOwnedPath(b)), false);
+    assert.equal(existsSync(join(b, '.cache', 'pull-archive.json')), false);
+  });
+});
+
+test('modify/delete, our side modified: the same result, with our bytes in the backup', () => {
+  withOurEdit(({ b }) => {
+    const before = syBaselines(b, '@{u}').length;
+    assert.equal(before, 2, 'the migration baselines, one per old file');
+    const res = pullRemote(b);
+    assert.equal(res.pulled, true, JSON.stringify(res));
+    assert.equal(syUnmerged(b), '');
+    assert.equal(syMergeHead(b), false);
+    assert.deepEqual(syBackupTexts(b), [SY_W1], 'our content is the backup');
+    assert.equal(sgitOk(b, ['ls-files', '--', 'projects/p/hot.md']).trim(), '', 'untracked');
+    const added = syChangedBy(b).filter((n) => /-baseline-/.test(n));
+    assert.equal(added.length, 1, `one additional baseline: ${added}`);
+    assert.match(syRead(b, added[0]), /local edit one/);
+    assert.equal(syBaselines(b).length, before + 1);
+  });
+});
+
+test('modify/delete, bytes equal to the remote baseline body: no new original, incoming side', () => {
+  withIncomingEdit(
+    ({ b }) => {
+      const before = syBaselines(b).length;
+      const res = pullRemote(b);
+      assert.equal(res.pulled, true, JSON.stringify(res));
+      assert.equal(syUnmerged(b), '');
+      assert.deepEqual(syBackupTexts(b), [SY_W1], 'the backup is made either way');
+      assert.equal(syBaselines(b).length, before, 'no additional baseline');
+      assert.equal(syParents(b, 'HEAD'), 2, 'HEAD is the merge commit, no commit after it');
+    },
+    { hot: SY_W1 },
+  );
+});
+
+test('modify/delete, bytes equal to the remote baseline body: no new original, our side', () => {
+  withOurEdit(
+    ({ b }) => {
+      const before = syBaselines(b, '@{u}').length;
+      const res = pullRemote(b);
+      assert.equal(res.pulled, true, JSON.stringify(res));
+      assert.equal(syUnmerged(b), '');
+      assert.deepEqual(syBackupTexts(b), [SY_W1]);
+      assert.equal(syBaselines(b).length, before, 'no additional baseline');
+      assert.equal(syParents(b, 'HEAD'), 2);
+    },
+    { hot: SY_W1 },
+  );
+});
+
+test('modify/delete on pages/x.md is not a view path: the merge is aborted and conflict is reported', () => {
+  withSyncClones(({ a, b }) => {
+    syEditAndPush(a, 'pages/x.md', 'x edited upstream\n');
+    sgitOk(b, ['rm', '-q', 'pages/x.md']);
+    syCommit(b, 'delete x');
+    const head = syHead(b);
+    const res = pullRemote(b);
+    assert.equal(res.pulled, false);
+    assert.equal(res.conflict, true, JSON.stringify(res));
+    assert.equal(syMergeHead(b), false, 'aborted');
+    assert.equal(syUnmerged(b), '');
+    assert.equal(syHead(b), head);
+    assert.equal(existsSync(syOwnedPath(b)), false);
+  });
+});
+
+test('modify/delete interrupted after the index change: the next pullRemote finishes the merge it owns', () => {
+  withIncomingEdit(({ b }) => {
+    const first = pullRemote(b, {
+      testHooks: {
+        afterResolveBeforeCommit: () => {
+          throw new Error('killed');
+        },
+      },
+    });
+    assert.equal(first.pulled, false);
+    assert.equal(syMergeHead(b), true, 'the merge is left open');
+    assert.equal(existsSync(syOwnedPath(b)), true);
+    const second = pullRemote(b);
+    assert.equal(second.pulled, true, JSON.stringify(second));
+    assert.equal(syMergeHead(b), false);
+    assert.equal(syParents(b, 'HEAD~1'), 2, 'the merge commit');
+    assert.equal(syUnmerged(b), '');
+    assert.deepEqual(syBackupTexts(b), [SY_W1]);
+    assert.equal(syChangedBy(b).filter((n) => /-baseline-/.test(n)).length, 1);
+    assert.equal(existsSync(syOwnedPath(b)), false);
+  });
+});
+
+test('modify/delete: a merge a person opened is left alone (no record, or a record naming another MERGE_HEAD)', () => {
+  withSyncClones(({ a, b }) => {
+    syEditAndPush(a, 'pages/y.md', 'y upstream\n');
+    syPut(b, 'pages/x.md', 'x local\n');
+    syCommit(b, 'local');
+    sgitOk(b, ['fetch', '-q']);
+    sgitOk(b, ['merge', '--no-commit', '--no-ff', '@{u}']);
+    assert.equal(syMergeHead(b), true);
+    const mergeHead = sgitOk(b, ['rev-parse', 'MERGE_HEAD']).trim();
+    const index = sgitOk(b, ['ls-files', '-s']);
+    const y = syRead(b, 'pages/y.md');
+    const noRecord = pullRemote(b);
+    assert.equal(noRecord.pulled, false);
+    assert.equal(noRecord.deferred, 'external', JSON.stringify(noRecord));
+    assert.ok(
+      noRecord.notices.some((n) => n.includes('진행 중인 merge가 있어')),
+      String(noRecord.notices),
+    );
+    assert.equal(sgitOk(b, ['rev-parse', 'MERGE_HEAD']).trim(), mergeHead);
+    assert.equal(sgitOk(b, ['ls-files', '-s']), index);
+    assert.equal(syRead(b, 'pages/y.md'), y);
+    // A record that names some other merge: with the same digest and nothing to verify, only the
+    // MERGE_HEAD comparison stands between this merge and a commit.
+    const digest = createHash('sha256').update(index, 'utf-8').digest('hex');
+    writeFileSync(
+      syOwnedPath(b),
+      JSON.stringify({ v: 1, mergeHead: 'f'.repeat(40), indexDigest: digest, resolvedPaths: [] }),
+    );
+    const otherRecord = pullRemote(b);
+    assert.equal(otherRecord.pulled, false);
+    assert.equal(otherRecord.deferred, 'external', JSON.stringify(otherRecord));
+    assert.equal(sgitOk(b, ['rev-parse', 'MERGE_HEAD']).trim(), mergeHead);
+    assert.equal(sgitOk(b, ['ls-files', '-s']), index);
+  });
+});
+
+test('modify/delete interrupted, then the recorded backup is deleted: the merge is not finished', () => {
+  withIncomingEdit(({ b }) => {
+    pullRemote(b, {
+      testHooks: {
+        afterResolveBeforeCommit: () => {
+          throw new Error('killed');
+        },
+      },
+    });
+    const head = syHead(b);
+    const owned = JSON.parse(readFileSync(syOwnedPath(b), 'utf-8'));
+    const [{ backupPath }] = owned.resolvedPaths.filter((r) => r.kind === 'modify-delete');
+    rmSync(backupPath, { force: true });
+    const res = pullRemote(b);
+    assert.equal(res.pulled, false);
+    assert.equal(res.deferred, 'stuck', JSON.stringify(res));
+    assert.ok(
+      res.notices.some((n) => n.includes('백업')),
+      String(res.notices),
+    );
+    assert.equal(syMergeHead(b), true);
+    assert.equal(syHead(b), head, 'no merge commit was made');
+  });
+});
+
+test('modify/delete interrupted, then another path is staged: the merge is not finished until that stage is gone', () => {
+  withIncomingEdit(({ b }) => {
+    pullRemote(b, {
+      testHooks: {
+        afterResolveBeforeCommit: () => {
+          throw new Error('killed');
+        },
+      },
+    });
+    const head = syHead(b);
+    syPut(b, 'pages/y.md', 'y staged by another session\n');
+    sgitOk(b, ['add', 'pages/y.md']);
+    const res = pullRemote(b);
+    assert.equal(res.pulled, false);
+    assert.equal(res.deferred, 'stuck', JSON.stringify(res));
+    assert.ok(
+      res.notices.some((n) => n.includes('스테이징된 변경')),
+      String(res.notices),
+    );
+    assert.equal(syMergeHead(b), true, 'MERGE_HEAD stays');
+    assert.equal(syHead(b), head);
+    assert.ok(sgitOk(b, ['diff', '--cached', '--name-only']).includes('pages/y.md'));
+    // The pair: with the stage gone the same re-entry finishes the merge.
+    sgitOk(b, ['reset', '-q', 'pages/y.md']);
+    const again = pullRemote(b);
+    assert.equal(again.pulled, true, JSON.stringify(again));
+    assert.equal(syMergeHead(b), false);
+    assert.equal(syParents(b, 'HEAD~1'), 2);
+    assert.ok(!syChangedBy(b, 'HEAD~1').includes('pages/y.md'));
+  });
+});
+
+test('modify/delete: finishOwnedMerge on a vault with no merge open is a no-op and drops a stale record', () => {
+  withSyncClones(({ b }) => {
+    assert.deepEqual(finishOwnedMerge(b), { state: 'none', notices: [] });
+    writeFileSync(
+      syOwnedPath(b),
+      JSON.stringify({ v: 1, mergeHead: 'a'.repeat(40), indexDigest: null, resolvedPaths: [] }),
+    );
+    assert.equal(finishOwnedMerge(b).state, 'none');
+    assert.equal(existsSync(syOwnedPath(b)), false);
+  });
+});
+
+// ── realistic sizes: the baseline entry holds the views' bytes, so rename detection can pair them ──
+
+const syLines = (n, tag) =>
+  Array.from({ length: n }, (_, i) => `- item ${i} ${tag} lorem ipsum dolor sit amet`).join('\n');
+// About 3KB: more than half of the baseline entry (frontmatter + the small other view + this).
+const SY_BIG_STATE = `---
+type: session-state
+updated: 2026-09-25
+---
+## Next Up
+${syLines(40, 'old')}
+## Notes
+${syLines(10, 'note')}
+`;
+const SY_BIG_HOT = SY_HOT.replace('old hot body\n', `## Now\n${syLines(50, 'old')}\n`);
+const SY_STATE_PATH = 'projects/p/session-state.md';
+const SY_HOT_PATH = 'projects/p/hot.md';
+// `larger` names the view that holds most of the baseline's bytes; the other one stays small.
+const SY_REALISTIC = {
+  state: {
+    path: SY_STATE_PATH,
+    text: SY_BIG_STATE,
+    hot: SY_HOT,
+    state: SY_BIG_STATE,
+    marker: 'type: session-state',
+  },
+  hot: {
+    path: SY_HOT_PATH,
+    text: SY_BIG_HOT,
+    hot: SY_BIG_HOT,
+    state: SY_STATE,
+    marker: 'type: reference',
+  },
+};
+const SY_EDIT_SHAPES = [
+  ['mid-line edit', (t) => t.replace('- item 3 old', '- item 3 CHANGED by the old machine')],
+  ['tail append', (t) => `${t}- appended by the old machine\n`],
+];
+
+// `direction` 'incoming': `a` (old version) edited the view and pushed, `b` migrated locally.
+// 'ours': `a` migrated and pushed, `b` holds the unpushed edit. `fn` gets the baseline path, its
+// blob before the sync, and the edited bytes.
+function withRealisticSizes(larger, direction, edit, fn) {
+  const fx = SY_REALISTIC[larger];
+  withSyncClones(
+    ({ a, b }) => {
+      const edited = edit(fx.text);
+      let rev = 'HEAD';
+      if (direction === 'incoming') {
+        syEditAndPush(a, fx.path, edited);
+        syMigrate(b, fx.hot, fx.state);
+      } else {
+        syMigrate(a, fx.hot, fx.state);
+        sgitOk(a, ['push', '-q']);
+        syPut(b, fx.path, edited);
+        syCommit(b, 'edit view');
+        sgitOk(b, ['fetch', '-q']);
+        rev = '@{u}';
+      }
+      // Each old file is its own baseline entry: take the one that holds the larger view.
+      const holding = syBaselines(b, rev).filter((n) =>
+        sgitOk(b, ['show', `${rev}:${n}`]).includes(fx.marker),
+      );
+      assert.equal(holding.length, 1, `one baseline holds the ${larger} view: ${holding}`);
+      const baseline = holding[0];
+      const blob = sgitOk(b, ['rev-parse', `${rev}:${baseline}`]).trim();
+      assert.ok(
+        Buffer.byteLength(fx.text) * 2 > Buffer.byteLength(sgitOk(b, ['cat-file', '-p', blob])),
+        `the ${larger} view is at least half of the baseline, so a rename can pair them`,
+      );
+      fn({ b, baseline, blob, edited, path: fx.path });
+    },
+    { [fx.path]: fx.text },
+  );
+}
+
+for (const larger of ['state', 'hot']) {
+  for (const direction of ['incoming', 'ours']) {
+    for (const [shape, edit] of SY_EDIT_SHAPES) {
+      test(`modify/delete at realistic sizes, ${larger} larger, ${direction} side, ${shape}: the view conflict is settled and the shared baseline entry is untouched`, () => {
+        withRealisticSizes(larger, direction, edit, ({ b, baseline, blob, edited, path }) => {
+          const res = pullRemote(b);
+          assert.equal(res.pulled, true, JSON.stringify(res));
+          assert.equal(res.conflict, false, JSON.stringify(res));
+          assert.equal(syUnmerged(b), '');
+          assert.equal(syMergeHead(b), false);
+          assert.equal(
+            sgitOk(b, ['rev-parse', `HEAD:${baseline}`]).trim(),
+            blob,
+            'the content-named baseline entry is the blob the migration made',
+          );
+          assert.deepEqual(syBackupTexts(b, path), [edited], 'the backup holds the edit');
+          assert.equal(sgitOk(b, ['ls-files', '--', path]).trim(), '', 'untracked');
+          assert.equal(existsSync(syIntentPath(b)), false);
+          assert.equal(existsSync(syOwnedPath(b)), false);
+        });
+      });
+    }
+  }
+}
+
+test('merge intent: a kill right after the merge left MERGE_HEAD, before any record, is taken back by the next pullRemote, which completes the sync', () => {
+  withIncomingEdit(({ b }) => {
+    const first = pullRemote(b, {
+      testHooks: {
+        afterMergeStarted: () => {
+          throw new Error('killed');
+        },
+      },
+    });
+    assert.equal(first.pulled, false);
+    assert.equal(syMergeHead(b), true, 'the merge is left open');
+    assert.equal(existsSync(syIntentPath(b)), true, 'the intent is kept');
+    assert.equal(existsSync(syOwnedPath(b)), false, 'no resolution record');
+    const second = pullRemote(b);
+    assert.equal(second.pulled, true, JSON.stringify(second));
+    assert.ok(
+      second.notices.some((n) => n.includes('끊긴 동기화가 남긴 merge')),
+      String(second.notices),
+    );
+    assert.equal(syMergeHead(b), false);
+    assert.equal(syUnmerged(b), '');
+    assert.equal(syParents(b, 'HEAD~1'), 2, 'the merge commit');
+    assert.deepEqual(syBackupTexts(b), [SY_W1]);
+    assert.equal(existsSync(syIntentPath(b)), false);
+  });
+});
+
+test('merge intent: a merge a person opened stays alone when an intent names another target or another HEAD', () => {
+  withSyncClones(({ a, b }) => {
+    syEditAndPush(a, 'pages/y.md', 'y upstream\n');
+    syPut(b, 'pages/x.md', 'x local\n');
+    syCommit(b, 'local');
+    sgitOk(b, ['fetch', '-q']);
+    sgitOk(b, ['merge', '--no-commit', '--no-ff', '@{u}']);
+    const mergeHead = sgitOk(b, ['rev-parse', 'MERGE_HEAD']).trim();
+    const head = syHead(b);
+    const index = sgitOk(b, ['ls-files', '-s']);
+    const intents = [
+      ['another target', { v: 1, phase: 'pull', head, target: 'f'.repeat(40) }],
+      ['another HEAD', { v: 1, phase: 'pull', head: 'e'.repeat(40), target: mergeHead }],
+    ];
+    for (const [label, intent] of intents) {
+      writeFileSync(syIntentPath(b), JSON.stringify(intent));
+      const res = pullRemote(b);
+      assert.equal(res.pulled, false, label);
+      assert.equal(res.deferred, 'external', `${label}: ${JSON.stringify(res)}`);
+      assert.equal(sgitOk(b, ['rev-parse', 'MERGE_HEAD']).trim(), mergeHead, label);
+      assert.equal(sgitOk(b, ['ls-files', '-s']), index, label);
+    }
+  });
+});
+
+// The fingerprint `pullRemote` records when the merge command returns with a merge open.
+const syFingerprint = (dir, unmerged = []) => ({
+  index: createHash('sha256')
+    .update(sgitOk(dir, ['ls-files', '-s']), 'utf-8')
+    .digest('hex'),
+  files: Object.fromEntries(
+    unmerged.map((rel) => [
+      rel,
+      createHash('sha256')
+        .update(readFileSync(join(dir, rel)))
+        .digest('hex'),
+    ]),
+  ),
+});
+
+test('merge intent: the pair of the kill test, the intent and a matching fingerprint are what make the open merge ours', () => {
+  withSyncClones(({ a, b }) => {
+    syEditAndPush(a, 'pages/y.md', 'y upstream\n');
+    syPut(b, 'pages/x.md', 'x local\n');
+    syCommit(b, 'local');
+    sgitOk(b, ['fetch', '-q']);
+    const head = syHead(b);
+    const target = sgitOk(b, ['rev-parse', '@{u}']).trim();
+    sgitOk(b, ['merge', '--no-commit', '--no-ff', '@{u}']);
+    const intent = { v: 1, phase: 'pull', head, target };
+    // The intent alone only names the merge: nothing says nobody touched it since, so it stays.
+    writeFileSync(syIntentPath(b), JSON.stringify(intent));
+    const bare = pullRemote(b);
+    assert.equal(bare.pulled, false);
+    assert.equal(bare.deferred, 'external', JSON.stringify(bare));
+    assert.ok(
+      bare.notices.some((n) => n.includes('상태 기록이 없어')),
+      String(bare.notices),
+    );
+    assert.equal(syMergeHead(b), true, 'the merge stays for a person');
+    writeFileSync(syIntentPath(b), JSON.stringify({ ...intent, fingerprint: syFingerprint(b) }));
+    const res = pullRemote(b);
+    assert.equal(res.pulled, true, JSON.stringify(res));
+    assert.equal(syMergeHead(b), false);
+    assert.equal(syRead(b, 'pages/y.md'), 'y upstream\n');
+    assert.equal(syRead(b, 'pages/x.md'), 'x local\n');
+  });
+});
+
+// `a` and `b` both edit pages/x.md: a content conflict Hypomnema cannot settle itself.
+function withContentConflict(fn, extra = {}) {
+  withSyncClones(({ a, b, ...rest }) => {
+    syEditAndPush(a, 'pages/x.md', 'x upstream\n');
+    syPut(b, 'pages/x.md', 'x local\n');
+    syCommit(b, 'local x');
+    fn({ a, b, ...rest });
+  }, extra);
+}
+
+const killAfterMerge = {
+  afterMergeStarted: () => {
+    throw new Error('killed');
+  },
+};
+
+for (const [how, touch] of [
+  [
+    'staged',
+    (b) => {
+      syPut(b, 'pages/x.md', 'human resolved\n');
+      sgitOk(b, ['add', 'pages/x.md']);
+    },
+  ],
+  ['edited in the working tree, not staged', (b) => syPut(b, 'pages/x.md', 'human resolved\n')],
+]) {
+  test(`merge intent: a resolution a person ${how} after the interruption is left alone`, () => {
+    withContentConflict(({ b }) => {
+      const first = pullRemote(b, { testHooks: killAfterMerge });
+      assert.equal(first.pulled, false);
+      assert.equal(syMergeHead(b), true, 'the merge is left open');
+      assert.ok(JSON.parse(readFileSync(syIntentPath(b), 'utf-8')).fingerprint, 'fingerprint kept');
+      touch(b);
+      const index = sgitOk(b, ['ls-files', '-s']);
+      const mergeHead = sgitOk(b, ['rev-parse', 'MERGE_HEAD']).trim();
+      const second = pullRemote(b);
+      assert.equal(second.pulled, false);
+      assert.equal(second.deferred, 'external', JSON.stringify(second));
+      assert.ok(
+        second.notices.some((n) => n.includes('사람이 해소한 내용')),
+        String(second.notices),
+      );
+      assert.equal(syMergeHead(b), true, 'the merge is still open');
+      assert.equal(sgitOk(b, ['rev-parse', 'MERGE_HEAD']).trim(), mergeHead);
+      assert.equal(syRead(b, 'pages/x.md'), 'human resolved\n', 'the resolution bytes stay');
+      assert.equal(sgitOk(b, ['ls-files', '-s']), index, 'the index is unchanged');
+    });
+  });
+}
+
+test('merge intent: the pair of the staged resolution, an untouched interrupted conflict is taken back and retried', () => {
+  withContentConflict(({ b }) => {
+    pullRemote(b, { testHooks: killAfterMerge });
+    assert.equal(syMergeHead(b), true);
+    const second = pullRemote(b);
+    assert.ok(
+      second.notices.some((n) => n.includes('끊긴 동기화가 남긴 merge를 취소')),
+      String(second.notices),
+    );
+    // The retry hits the same content conflict and aborts it in the same run, as any conflict.
+    assert.equal(second.conflict, true, JSON.stringify(second));
+    assert.equal(second.deferred, undefined);
+    assert.equal(syMergeHead(b), false);
+    assert.equal(syRead(b, 'pages/x.md'), 'x local\n');
+  });
+});
+
+test('merge intent: a vault whose .gitignore leaves .cache/ out still recovers an interrupted conflict', () => {
+  withContentConflict(
+    ({ b }) => {
+      pullRemote(b, { testHooks: killAfterMerge });
+      assert.equal(syMergeHead(b), true, 'the merge is left open');
+      assert.equal(existsSync(syIntentPath(b)), true, 'the intent is in the git directory');
+      assert.equal(existsSync(join(b, '.cache', 'merge-intent.json')), false);
+      const second = pullRemote(b);
+      assert.notEqual(second.deferred, 'external', JSON.stringify(second));
+      assert.ok(
+        second.notices.some((n) => n.includes('끊긴 동기화가 남긴 merge를 취소')),
+        String(second.notices),
+      );
+      assert.equal(syMergeHead(b), false, 'the interrupted merge was taken back');
+      assert.equal(
+        sgitOk(b, ['status', '--porcelain', '--', 'pages']).trim(),
+        '',
+        'pages are clean',
+      );
+    },
+    { '.gitignore': 'base-1\nbase-2\n' },
+  );
+});
+
+test('merge intent: a linked worktree keeps its records in its own git directory and recovers from them', () => {
+  withContentConflict(({ b, root }) => {
+    const wt = join(root, 'linked');
+    sgitOk(b, ['worktree', 'add', '-q', '--track', '-b', 'linked', wt, 'origin/main']);
+    syPut(wt, 'pages/x.md', 'x linked\n');
+    syCommit(wt, 'linked x');
+    pullRemote(wt, { testHooks: killAfterMerge });
+    assert.equal(syMergeHead(wt), true, 'the merge is left open in the linked worktree');
+    const own = join(
+      sgitOk(wt, ['rev-parse', '--absolute-git-dir']).trim(),
+      'hypo-merge-intent.json',
+    );
+    assert.ok(own.includes(join('.git', 'worktrees')), own);
+    assert.equal(existsSync(own), true, 'the intent is under the worktree git directory');
+    assert.equal(
+      existsSync(join(b, '.git', 'hypo-merge-intent.json')),
+      false,
+      'not the shared one',
+    );
+    const second = pullRemote(wt);
+    assert.ok(
+      second.notices.some((n) => n.includes('끊긴 동기화가 남긴 merge를 취소')),
+      String(second.notices),
+    );
+    assert.equal(syMergeHead(wt), false);
+  });
+});
+
+test('interrupted resolution with no index record: stuck, and the notice says the resolution was interrupted (not that something was staged meanwhile)', () => {
+  withIncomingEdit(({ b }) => {
+    pullRemote(b, {
+      testHooks: {
+        afterResolveBeforeCommit: () => {
+          throw new Error('killed');
+        },
+      },
+    });
+    const recPath = syOwnedPath(b);
+    const rec = JSON.parse(readFileSync(recPath, 'utf-8'));
+    writeFileSync(recPath, JSON.stringify({ ...rec, indexDigest: null }));
+    const res = pullRemote(b);
+    assert.equal(res.deferred, 'stuck', JSON.stringify(res));
+    const notice = res.notices.join('\n');
+    assert.match(notice, /끊겨 인덱스 기록이 없습니다/);
+    assert.equal(notice.includes('스테이징된 변경'), false, notice);
+    assert.equal(syMergeHead(b), true, 'MERGE_HEAD stays');
+  });
+});
+
+test('a vault hook that rejects the merge commit: the stuck notice carries the hook output, and the merge is finished once the hook passes', () => {
+  withIncomingEdit(({ b }) => {
+    pullRemote(b, {
+      testHooks: {
+        afterResolveBeforeCommit: () => {
+          throw new Error('killed');
+        },
+      },
+    });
+    const hook = join(b, '.git', 'hooks', 'pre-commit');
+    writeFileSync(hook, '#!/bin/sh\necho "REJECTED-BY-VAULT-HOOK: frontmatter" >&2\nexit 1\n');
+    chmodSync(hook, 0o755);
+    const res = pullRemote(b);
+    assert.equal(res.deferred, 'stuck', JSON.stringify(res));
+    assert.ok(
+      res.notices.some((n) => n.includes('REJECTED-BY-VAULT-HOOK: frontmatter')),
+      String(res.notices),
+    );
+    assert.equal(syMergeHead(b), true, 'MERGE_HEAD stays');
+    // The pair: the same vault with a hook that passes finishes the merge.
+    rmSync(hook);
+    const again = pullRemote(b);
+    assert.equal(again.pulled, true, JSON.stringify(again));
+    assert.equal(syMergeHead(b), false);
+  });
+});
+
+test('sync notices: a line left by an earlier sync is kept and not added twice, and leaveNotices: false leaves none', () => {
+  const noticeFile = (b) => join(b, '.cache', 'root-hot-projection-notice.json');
+  withSyncClones(({ a, b }) => {
+    syEditAndPush(a, 'pages/y.md', 'y upstream\n');
+    syPut(b, 'pages/x.md', 'x local\n');
+    syCommit(b, 'local');
+    sgitOk(b, ['fetch', '-q']);
+    sgitOk(b, ['merge', '--no-commit', '--no-ff', '@{u}']); // a merge a person opened: a notice every sync
+    writeRootHotHealthNotice(b, 'earlier notice');
+    const silent = pullRemote(b, { leaveNotices: false });
+    assert.equal(silent.deferred, 'external');
+    assert.ok(silent.notices.length > 0, 'the notices are still returned');
+    assert.equal(JSON.parse(readFileSync(noticeFile(b), 'utf-8')).message, 'earlier notice');
+    pullRemote(b);
+    pullRemote(b);
+    const lines = JSON.parse(readFileSync(noticeFile(b), 'utf-8')).message.split('\n');
+    assert.equal(lines[0], 'earlier notice');
+    assert.equal(lines.length, new Set(lines).size, `no line twice: ${lines.join(' | ')}`);
+    assert.equal(lines.filter((l) => l.includes('진행 중인 merge가 있어')).length, 1);
+  });
+});
+
+suite('sync conflict resolution: gitignore union');
+
+// `a` and `b` both change `.gitignore` (base: `.cache/`, `base-1`, `base-2`) next to each other, so
+// git reports a content conflict with three stages. `a` pushes first; `b` syncs.
+function gitignoreConflict(aText, bText, fn) {
+  withSyncClones(({ a, b }) => {
+    syEditAndPush(a, '.gitignore', aText);
+    syPut(b, '.gitignore', bText);
+    syCommit(b, 'b ignore');
+    fn({ a, b });
+  });
+}
+const BASE_IGNORE = '.cache/\nbase-1\nbase-2\n';
+
+function assertAborted(b, head, ours) {
+  const res = pullRemote(b);
+  assert.equal(res.pulled, false);
+  assert.equal(res.conflict, true, JSON.stringify(res));
+  assert.equal(syMergeHead(b), false);
+  assert.equal(syUnmerged(b), '');
+  assert.equal(syHead(b), head);
+  assert.equal(syRead(b, '.gitignore'), ours, 'ours is untouched');
+}
+
+test('gitignore union: both sides added different lines, the conflict is resolved and each line is there once', () => {
+  gitignoreConflict(`${BASE_IGNORE}a-line\n`, `${BASE_IGNORE}b-line\n`, ({ b }) => {
+    const res = pullRemote(b);
+    assert.equal(res.pulled, true, JSON.stringify(res));
+    assert.equal(res.conflict, false);
+    assert.equal(syUnmerged(b), '');
+    assert.equal(syMergeHead(b), false);
+    assert.equal(syParents(b, 'HEAD'), 2);
+    const lines = sgitOk(b, ['show', 'HEAD:.gitignore']).split('\n');
+    assert.equal(lines.filter((l) => l === 'a-line').length, 1);
+    assert.equal(lines.filter((l) => l === 'b-line').length, 1);
+    assert.equal(syRead(b, '.gitignore'), sgitOk(b, ['show', 'HEAD:.gitignore']));
+  });
+});
+
+test('gitignore union: one side deleted a base line, the merge is aborted', () => {
+  gitignoreConflict('.cache/\nbase-1\n', `${BASE_IGNORE}b-line\n`, ({ b }) => {
+    assertAborted(b, syHead(b), `${BASE_IGNORE}b-line\n`);
+  });
+});
+
+test('gitignore union: the incoming side added a negation, the merge is aborted', () => {
+  gitignoreConflict(`${BASE_IGNORE}!keep.md\n`, `${BASE_IGNORE}b-line\n`, ({ b }) => {
+    assertAborted(b, syHead(b), `${BASE_IGNORE}b-line\n`);
+  });
+});
+
+test('gitignore union: our side added !keep.md and theirs added *.md, the merge is aborted', () => {
+  gitignoreConflict(`${BASE_IGNORE}*.md\n`, `${BASE_IGNORE}!keep.md\n`, ({ b }) => {
+    assertAborted(b, syHead(b), `${BASE_IGNORE}!keep.md\n`);
+  });
+});
+
+test('gitignore union: a rule ours appended again after a base negation survives the merge, so the private file stays ignored', () => {
+  withSyncClones(
+    ({ a, b }) => {
+      syEditAndPush(a, '.gitignore', '.cache/\n*.md\n!secret.md\na-line\n');
+      syPut(b, '.gitignore', '.cache/\n*.md\n!secret.md\n*.md\n');
+      syCommit(b, 'b re-ignores');
+      syPut(b, 'secret.md', 'private\n');
+      assert.equal(sgit(b, ['check-ignore', '-q', 'secret.md']).status, 0, 'ignored before');
+      const res = pullRemote(b);
+      assert.equal(res.pulled, true, JSON.stringify(res));
+      assert.equal(syMergeHead(b), false);
+      const merged = sgitOk(b, ['show', 'HEAD:.gitignore']);
+      assert.equal(merged, '.cache/\n*.md\n!secret.md\na-line\n*.md\n');
+      assert.equal(sgit(b, ['check-ignore', '-q', 'secret.md']).status, 0, 'still ignored');
+      sgitOk(b, ['add', '-A']);
+      assert.equal(sgitOk(b, ['diff', '--cached', '--name-only']).trim(), '', 'nothing staged');
+    },
+    { '.gitignore': '.cache/\n*.md\n!secret.md\n' },
+  );
+});
+
+suite('sync conflict resolution: diverged catch-up');
+
+// `a` migrates and pushes. `b` has a local, unpushed commit (so the history diverges) and the
+// edits `dirty` makes to its working tree.
+function divergedCatchUp(dirty, fn, extra = {}) {
+  withSyncClones(({ a, b, ...rest }) => {
+    syMigrate(a);
+    sgitOk(a, ['push', '-q']);
+    syPut(b, 'pages/local.md', 'local commit\n');
+    syCommit(b, 'local');
+    dirty(b);
+    fn({ a, b, ...rest });
+  }, extra);
+}
+
+test('diverged catch-up (W2): an unpushed commit and an uncommitted view edit still receive the migration', () => {
+  divergedCatchUp(
+    (b) => syPut(b, 'projects/p/hot.md', SY_W1),
+    ({ b }) => {
+      const res = pullRemote(b);
+      assert.equal(res.pulled, true, JSON.stringify(res));
+      assert.equal(res.conflict, false);
+      assert.equal(syUnmerged(b), '');
+      assert.deepEqual(syBackupTexts(b), [SY_W1]);
+      assert.equal(syParents(b, 'HEAD~1'), 2, 'the merge commit');
+      const added = syChangedBy(b).filter((n) => /-baseline-/.test(n));
+      assert.equal(added.length, 1, `one additional baseline commit: ${added}`);
+      assert.match(syRead(b, added[0]), /local edit one/);
+      assert.equal(existsSync(join(b, '.cache', 'pull-archive.json')), false);
+    },
+  );
+});
+
+test('diverged catch-up (W3): a staged view edit is backed up as its stage bytes and the stage is gone', () => {
+  divergedCatchUp(
+    (b) => {
+      syPut(b, 'projects/p/hot.md', SY_W1);
+      sgitOk(b, ['add', 'projects/p/hot.md']);
+    },
+    ({ b }) => {
+      const res = pullRemote(b);
+      assert.equal(res.pulled, true, JSON.stringify(res));
+      assert.equal(syUnmerged(b), '');
+      assert.deepEqual(syBackupTexts(b), [SY_W1]);
+      assert.equal(sgitOk(b, ['diff', '--cached', '--name-only']).trim(), '');
+    },
+  );
+});
+
+test('diverged catch-up: a pull that fails on another conflict puts the view bytes back as they were', () => {
+  const states = [
+    ['unstaged edit', (b) => syPut(b, 'projects/p/hot.md', SY_W1)],
+    [
+      'staged edit, then a later working-tree edit',
+      (b) => {
+        syPut(b, 'projects/p/hot.md', SY_W1);
+        sgitOk(b, ['add', 'projects/p/hot.md']);
+        syPut(b, 'projects/p/hot.md', SY_W2);
+      },
+    ],
+  ];
+  for (const [label, dirty] of states) {
+    withSyncClones(({ a, b }) => {
+      // The migration commit also edits pages/x.md, which b deleted: a conflict that is not ours to settle.
+      syMigrate(a);
+      syPut(a, 'pages/x.md', 'x edited upstream\n');
+      syCommit(a, 'edit x');
+      sgitOk(a, ['push', '-q']);
+      sgitOk(b, ['rm', '-q', 'pages/x.md']);
+      syCommit(b, 'delete x');
+      dirty(b);
+      const snap = () => ({
+        head: syHead(b),
+        status: sgitOk(b, ['status', '--porcelain']),
+        diff: sgitOk(b, ['diff']),
+        cached: sgitOk(b, ['diff', '--cached']),
+        hot: syRead(b, 'projects/p/hot.md'),
+      });
+      const before = snap();
+      const res = pullRemote(b);
+      assert.equal(res.pulled, false, label);
+      assert.equal(res.conflict, true, `${label}: ${JSON.stringify(res)}`);
+      assert.deepEqual(
+        snap(),
+        before,
+        `${label}: worktree, git diff and git diff --cached as before`,
+      );
+      assert.equal(existsSync(join(b, '.cache', 'pull-archive.json')), false, label);
+    });
+  }
+});
+
+test('diverged catch-up: a pull that fails without a conflict also puts the view bytes back', () => {
+  divergedCatchUp(
+    (b) => syPut(b, 'projects/p/hot.md', SY_W1),
+    ({ b }) => {
+      // The merge fails with nothing unmerged (a vault hook rejects the merge commit): what the
+      // clearing step moved has to come back. The fetch happens once, before the clearing step, so a
+      // remote that goes away afterwards no longer reaches the merge; a rejected merge does.
+      const hook = join(b, '.git', 'hooks', 'pre-merge-commit');
+      writeFileSync(hook, '#!/bin/sh\necho rejected by the vault hook >&2\nexit 1\n');
+      chmodSync(hook, 0o755);
+      const head = syHead(b);
+      const res = pullRemote(b);
+      assert.equal(res.pulled, false, JSON.stringify(res));
+      assert.equal(res.conflict, false, JSON.stringify(res));
+      assert.equal(syHead(b), head);
+      assert.equal(syMergeHead(b), false);
+      assert.equal(syUnmerged(b), '');
+      assert.equal(syRead(b, 'projects/p/hot.md'), SY_W1, 'the edit is back in the working tree');
+      assert.equal(existsSync(join(b, '.cache', 'pull-archive.json')), false);
+    },
+  );
+});
+
+test('behind machine with a local view edit (no local commit) receives the migration through pullRemote', () => {
+  withSyncClones(({ a, b }) => {
+    syMigrate(a);
+    sgitOk(a, ['push', '-q']);
+    syPut(b, 'projects/p/hot.md', SY_W1);
+    const res = pullRemote(b);
+    assert.equal(res.pulled, true, JSON.stringify(res));
+    assert.equal(syUnmerged(b), '');
+    assert.deepEqual(syBackupTexts(b), [SY_W1]);
+    // The two remote baselines (hot and state) plus one for the hot.md this machine set aside:
+    // only the kinds a machine archived are shared, so the untouched state view adds none.
+    assert.equal(syBaselines(b).length, 3, 'the remote baselines and the additional hot one');
+    assert.equal(sgitOk(b, ['ls-files', '--', 'projects/p/hot.md']).trim(), '');
+  });
+});
+
+test('diverged catch-up: a merge that landed before its archive was shared is picked up by the next pullRemote, even when the pull fails', () => {
+  withSyncClones(({ a, b, root }) => {
+    syMigrate(a);
+    sgitOk(a, ['push', '-q']);
+    syPut(b, 'projects/p/hot.md', SY_W1);
+    sgitOk(b, ['fetch', '-q']);
+    // The state a run killed between the merge and the share leaves: the record is written and
+    // the merge has landed, nothing is shared.
+    assert.equal(clearGeneratedPathsBlockingPull(b, '@{u}').ok, true);
+    sgitOk(b, ['merge', '--ff-only', '@{u}']);
+    const archive = join(b, '.cache', 'pull-archive.json');
+    assert.equal(existsSync(archive), true);
+    assert.equal(syBaselines(b).length, 2, 'only the migration baselines, nothing shared yet');
+    // A pull that cannot fetch must still share what the landed merge set aside.
+    sgitOk(b, ['remote', 'set-url', 'origin', join(root, 'gone.git')]);
+    const res = pullRemote(b);
+    assert.equal(res.pulled, false, 'the pull itself failed');
+    assert.equal(syBaselines(b).length, 3, JSON.stringify(res));
+    assert.equal(existsSync(archive), false);
+  });
+});
+
+test('diverged catch-up: a vault whose .gitignore leaves .cache/ out still receives the migration when there is nothing to set aside', () => {
+  withSyncClones(
+    ({ a, b }) => {
+      syMigrate(a);
+      sgitOk(a, ['push', '-q']);
+      // The generator's record vouches for the root hot.md, so no backup is needed for it.
+      syPut(
+        b,
+        '.cache/generated-views.json',
+        JSON.stringify({
+          views: { 'hot.md': createHash('sha256').update('root hot\n').digest('hex') },
+        }),
+      );
+      sgitOk(b, ['fetch', '-q']);
+      const cleared = clearGeneratedPathsBlockingPull(b, '@{u}');
+      assert.equal(cleared.ok, true, JSON.stringify(cleared));
+      assert.deepEqual(
+        [cleared.backups, cleared.archived, cleared.localOnly, cleared.unowned, cleared.cleared],
+        [[], [], [], [], []],
+      );
+      assert.equal(existsSync(join(b, '.cache', 'backups')), false, 'nothing was written');
+      const res = pullRemote(b);
+      assert.equal(res.pulled, true, JSON.stringify(res));
+      assert.equal(res.deferred, undefined);
+      assert.equal(migrationState(b), 'migrated');
+      assert.equal(sgitOk(b, ['ls-files', '--', 'projects/p/hot.md']).trim(), '', 'untracked');
+      assert.equal(existsSync(syIntentPath(b)), false);
+    },
+    { '.gitignore': 'base-1\nbase-2\n' },
+  );
+});
+
+test('fetch once per sync, and a failed fetch is recorded as the pull failure with no merge', () => {
+  withSyncClones(({ a, b, root }) => {
+    syEditAndPush(a, 'pages/y.md', 'y upstream\n');
+    syPut(b, 'pages/x.md', 'x local\n');
+    syCommit(b, 'local');
+    // Every fetch from origin runs through this wrapper, which counts it.
+    const count = join(root, 'fetch-count');
+    const wrapper = join(root, 'upload-pack.sh');
+    writeFileSync(wrapper, `#!/bin/sh\necho x >> '${count}'\nexec git upload-pack "$@"\n`);
+    chmodSync(wrapper, 0o755);
+    sgitOk(b, ['config', 'remote.origin.uploadpack', wrapper]);
+    const res = pullRemote(b);
+    assert.equal(res.pulled, true, JSON.stringify(res));
+    assert.equal(syRead(b, 'pages/y.md'), 'y upstream\n');
+    assert.equal(readFileSync(count, 'utf-8').trim().split('\n').length, 1, 'one fetch');
+    // The pair: a remote that cannot be fetched stops the sync before any merge.
+    syEditAndPush(a, 'pages/y.md', 'y upstream again\n');
+    sgitOk(b, ['remote', 'set-url', 'origin', join(root, 'gone.git')]);
+    const head = syHead(b);
+    const failed = pullRemote(b);
+    assert.equal(failed.pulled, false, JSON.stringify(failed));
+    assert.equal(failed.conflict, false);
+    assert.equal(syHead(b), head);
+    assert.equal(syMergeHead(b), false);
+    const entries = readFileSync(join(b, '.cache', 'sync-state.json'), 'utf-8')
+      .split('\n')
+      .filter(Boolean)
+      .map((l) => JSON.parse(l));
+    assert.deepEqual(
+      entries.map((e) => e.op),
+      ['pull'],
+      'the fetch failure is the pull failure',
+    );
+  });
+});
