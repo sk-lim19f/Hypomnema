@@ -698,19 +698,19 @@ export function scopeVisible(scopeValue, device) {
 }
 
 /**
- * Whether `device` may see one session entry of `model`. Both the entry's own `visibility_scope`
- * and the project's `entry_scope` (`model.entryScope`, when a string) must admit the device, so a
- * wide `entry_scope` never exposes an entry scoped to another machine and a narrow one hides the
- * entries that are otherwise shared. The one place the two scopes are combined.
+ * Whether `device` may see one session entry of `model`. A string `model.entryScope` (the
+ * project's `entry_scope`) replaces every entry's own `visibility_scope`: it is the human-written
+ * key that reopens entries a machine scope closed. Without one, the entry's own scope decides.
+ * The one place the two scopes meet.
  */
 export function entryVisible(model, entry, device) {
-  if (typeof model.entryScope === 'string' && !scopeVisible(model.entryScope, device)) return false;
+  if (typeof model.entryScope === 'string') return scopeVisible(model.entryScope, device);
   return scopeVisible(entry.visibilityScope, device);
 }
 
 // Everything the renderers and the injection share: the entries this machine may see (a hidden
 // entry is treated as absent, so it cannot replace a visible one), newest first, and the active
-// and finished tracks. Visibility is `entryVisible`: the entry's own scope and `entry_scope` both.
+// and finished tracks. Visibility is `entryVisible`: `entry_scope` when set, else the entry's own scope.
 function projectView(model, device) {
   const entries = sortEntries(model.entries.filter((e) => entryVisible(model, e, device)));
   const tracks = trackHeads(entries);

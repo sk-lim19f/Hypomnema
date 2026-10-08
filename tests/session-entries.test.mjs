@@ -1098,11 +1098,15 @@ test('hypo-shared re-exports the one scopeVisible, and the machine filter answer
   }
 });
 
-test('an entry is visible only when both its own scope and entryScope admit the device', () => {
+test('entryScope, when a string, replaces every entry own scope; without it the entry own scope decides', () => {
   const own = [E('c1', { visibilityScope: 'machine:devB' }), E('c2')];
-  // a wide entry_scope does not expose an entry scoped to another machine
+  // no entry_scope: the entry's own scope decides
+  const plain = M(own);
+  assert.deepEqual(ids(nextUpItems(plain, { device: 'devA' })), ['c2']);
+  assert.deepEqual(ids(nextUpItems(plain, { device: 'devB' })), ['c1', 'c2']);
+  // an explicit entry_scope: shared reopens an entry scoped to another machine
   const open = M(own, { entryScope: 'shared' });
-  assert.deepEqual(ids(nextUpItems(open, { device: 'devA' })), ['c2']);
+  assert.deepEqual(ids(nextUpItems(open, { device: 'devA' })), ['c1', 'c2']);
   assert.deepEqual(ids(nextUpItems(open, { device: 'devB' })), ['c1', 'c2']);
   // a narrow entry_scope hides entries whose own scope is shared
   const closed = M(own, { entryScope: 'machine:devB' });
@@ -1110,7 +1114,8 @@ test('an entry is visible only when both its own scope and entryScope admit the 
   assert.deepEqual(ids(nextUpItems(closed, { device: 'devB' })), ['c1', 'c2']);
   assert.equal(entryVisible(closed, E('c3'), 'devA'), false);
   assert.equal(entryVisible(closed, E('c3'), 'devB'), true);
-  assert.equal(entryVisible(open, own[0], 'devA'), false);
+  assert.equal(entryVisible(open, own[0], 'devA'), true, 'the override reopens it');
+  assert.equal(entryVisible(plain, own[0], 'devA'), false, 'without it the own scope closes it');
 });
 
 test('isSessionProjectDir wants index.md or sessions/ and refuses _template', () => {
@@ -2034,7 +2039,7 @@ test('in a vault with no git, each old file keeps its own scope and the moved by
   });
 });
 
-test('in a vault with no git, entry_scope never widens an old file scoped to another machine, and a narrow one hides shared ones', () => {
+test('in a vault with no git, entry_scope replaces the scope of an old file, and without it the old file scope decides', () => {
   withTmpDir((dir) => {
     gitlessLegacyVault(dir, {
       'projects/p/session-state.md': OLD_STATE_FILE.replace(
@@ -2045,10 +2050,17 @@ test('in a vault with no git, entry_scope never widens an old file scoped to ano
     writeGeneratedViews(dir, WRITE);
     const sees = (device) => renderViews([loadSessionModel(dir, 'p')], { device }).projects.p;
     // the hot baseline is machine:devA, the state baseline is shared
+    assert.match(sees('devA').hot, /old hot body/);
+    assert.doesNotMatch(
+      sees('devB').hot,
+      /old hot body/,
+      'without entry_scope its own scope decides',
+    );
+    assert.match(sees('devB').sessionState, /old state body/, 'the shared one stays visible');
     put(dir, 'projects/p/index.md', '---\ntitle: p\nentry_scope: shared\n---\n');
     assert.match(sees('devA').hot, /old hot body/);
-    assert.doesNotMatch(sees('devB').hot, /old hot body/, 'a wide entry_scope does not widen it');
-    assert.match(sees('devB').sessionState, /old state body/, 'the shared one stays visible');
+    assert.match(sees('devB').hot, /old hot body/, 'an explicit entry_scope: shared reopens it');
+    assert.match(sees('devB').sessionState, /old state body/);
     put(dir, 'projects/p/index.md', '---\ntitle: p\nentry_scope: machine:devA\n---\n');
     assert.match(sees('devA').hot, /old hot body/);
     assert.match(sees('devA').sessionState, /old state body/);
@@ -3667,6 +3679,113 @@ test('shareLegacyBytes skips an element whose backup is gone or changed, and say
     assert.deepEqual(shared.skipped, ['projects/p/hot.md']);
     assert.equal(shared.notices.length, 1);
     assert.equal(commitCount(b), before);
+  });
+});
+
+const STATE_LOCAL = OLD_STATE_FILE.replace('old state body', 'local state');
+const scopeOfEntry = (dir, rel) => parseSessionEntry(readRel(dir, rel)).entry.visibilityScope;
+
+test('shareLegacyBytes: an uncommitted index.md scope can narrow the baseline but never widen it', () => {
+  // HEAD's index.md scopes the project to devA; the working tree says shared
+  withCatchUp(
+    ({ b }) => {
+      put(b, 'projects/p/session-state.md', STATE_LOCAL);
+      const pre = catchUpAndMerge(b);
+      put(b, 'projects/p/index.md', '---\ntitle: p\nvisibility_scope: shared\n---\n');
+      const shared = shareLegacyBytes(b, pre.archived);
+      assert.equal(shared.created.length, 1, JSON.stringify(shared));
+      assert.equal(scopeOfEntry(b, shared.created[0]), 'machine:devA', 'HEAD scope holds');
+      assert.equal(pathInHead(b, shared.created[0]), true);
+    },
+    { seed: { 'projects/p/index.md': '---\ntitle: p\nvisibility_scope: machine:devA\n---\n' } },
+  );
+  // HEAD's index.md has no scope; the working tree narrows it
+  withCatchUp(({ b }) => {
+    put(b, 'projects/p/session-state.md', STATE_LOCAL);
+    const pre = catchUpAndMerge(b);
+    put(b, 'projects/p/index.md', '---\ntitle: p\nvisibility_scope: machine:devB\n---\n');
+    const shared = shareLegacyBytes(b, pre.archived);
+    assert.equal(shared.created.length, 1, JSON.stringify(shared));
+    assert.equal(scopeOfEntry(b, shared.created[0]), 'machine:devB', 'the narrowing applies');
+  });
+});
+
+test('shareLegacyBytes: the same old text under a different scope is another baseline, and under the same scope is not', () => {
+  withCatchUp(({ b }) => {
+    put(b, 'projects/p/session-state.md', STATE_LOCAL);
+    const pre = catchUpAndMerge(b);
+    const withScope = (scope) =>
+      put(b, 'projects/p/index.md', `---\ntitle: p\nvisibility_scope: ${scope}\n---\n`);
+    withScope('machine:devA');
+    const first = shareLegacyBytes(b, pre.archived);
+    assert.equal(first.created.length, 1, JSON.stringify(first));
+    assert.equal(scopeOfEntry(b, first.created[0]), 'machine:devA');
+    withScope('machine:devB');
+    const second = shareLegacyBytes(b, pre.archived);
+    assert.equal(second.created.length, 1, 'a different scope is a different baseline');
+    assert.notEqual(second.created[0], first.created[0]);
+    assert.equal(scopeOfEntry(b, second.created[0]), 'machine:devB');
+    assert.equal(pathInHead(b, second.created[0]), true);
+    const third = shareLegacyBytes(b, pre.archived);
+    assert.deepEqual(third.created, [], 'the same text and scope is shared once');
+  });
+});
+
+test('shareLegacyBytes returns the members it could not share: a changed backup and a conflicting destination', () => {
+  withCatchUp(({ b }) => {
+    put(b, 'projects/p/session-state.md', STATE_LOCAL);
+    const pre = catchUpAndMerge(b);
+    const [view] = pre.archived;
+    const original = readFileSync(view.backupPath, 'utf-8');
+    writeFileSync(view.backupPath, 'changed by hand\n');
+    const changed = shareLegacyBytes(b, pre.archived);
+    assert.deepEqual(changed.unresolved, [view], 'the changed backup is unresolved');
+    writeFileSync(view.backupPath, original);
+    // publish it once, take it out of HEAD, then leave a different file at its path
+    const made = shareLegacyBytes(b, pre.archived);
+    assert.equal(made.created.length, 1, JSON.stringify(made));
+    assert.deepEqual(made.unresolved, []);
+    cgitOk(b, ['rm', '-q', '-f', made.created[0]]);
+    cgitOk(b, ['commit', '-q', '-m', 'drop']);
+    put(b, made.created[0], 'someone else wrote this\n');
+    const clash = shareLegacyBytes(b, pre.archived);
+    assert.deepEqual(clash.created, []);
+    assert.deepEqual(clash.unresolved, [view], 'the clash is unresolved');
+  });
+});
+
+test('resumePullArchive keeps the record with only the unresolved members when a backup changed, and reports it again until it is shared', () => {
+  withCatchUp(({ b }) => {
+    put(b, 'projects/p/hot.md', W1);
+    const pre = catchUpAndMerge(b);
+    const [view] = pre.archived;
+    const original = readFileSync(view.backupPath, 'utf-8');
+    writeFileSync(view.backupPath, 'changed by hand\n');
+    const record = () => JSON.parse(readRel(b, '.cache/pull-archive.json'));
+    const first = resumePullArchive(b);
+    assert.equal(first.resumed, true);
+    assert.deepEqual(first.created, []);
+    assert.equal(existsSync(join(b, '.cache', 'pull-archive.json')), true, 'the record survives');
+    assert.deepEqual(
+      record().views.map((v) => v.relPath),
+      ['projects/p/hot.md'],
+    );
+    assert.ok(
+      first.notices.some((n) => n.includes('projects/p/hot.md') && n.includes('다시 시도')),
+      first.notices.join('\n'),
+    );
+    const second = resumePullArchive(b);
+    assert.equal(second.resumed, true, 'the next resume picks it up again');
+    assert.ok(
+      second.notices.some((n) => n.includes('백업')),
+      second.notices.join('\n'),
+    );
+    assert.equal(existsSync(join(b, '.cache', 'pull-archive.json')), true);
+    // the backup is whole again: the next resume shares it and removes the record
+    writeFileSync(view.backupPath, original);
+    const third = resumePullArchive(b);
+    assert.equal(third.created.length, 1, JSON.stringify(third));
+    assert.equal(existsSync(join(b, '.cache', 'pull-archive.json')), false);
   });
 });
 
