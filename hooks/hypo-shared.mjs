@@ -2039,22 +2039,30 @@ function gitOut(hypoDir, args) {
 export function unignoredCachePaths(hypoDir) {
   // `.cache/` itself, plus a backup path as deep as the ones `backUpGeneratedPath` writes, so a
   // rule that names a few files (or one directory level) does not pass for ignoring the tree.
-  const probes = [
+  return unignoredPaths(hypoDir, [
     '.cache/',
     '.cache/backups/projects/probe/hot.md.pre-projection-backup.md',
     '.cache/pull-archive.json',
     '.cache/generated-views.json',
-  ];
+  ]);
+}
+
+/**
+ * The paths of `paths` (relative to the vault) that git would NOT ignore, judged by the effective
+ * rules in one `git check-ignore --stdin -z` call. A tracked path counts as not ignored. When git
+ * cannot answer, inside a repository every path counts as not ignored (that is not proof of an
+ * ignore rule); outside one there is nothing to stage and the answer is `[]`.
+ */
+export function unignoredPaths(hypoDir, paths) {
+  if (!paths.length) return [];
   const r = vaultGit(hypoDir, ['check-ignore', '--stdin', '-z'], {
-    input: probes.map((p) => `${p}\0`).join(''),
+    input: paths.map((p) => `${p}\0`).join(''),
   });
   if (r.status !== 0 && r.status !== 1) {
-    // git could not answer. Inside a repository that is not proof of an ignore rule, so defer;
-    // outside one there is nothing to stage.
-    return vaultGit(hypoDir, ['rev-parse', '--is-inside-work-tree']).status === 0 ? probes : [];
+    return vaultGit(hypoDir, ['rev-parse', '--is-inside-work-tree']).status === 0 ? paths : [];
   }
   const ignored = new Set(String(r.stdout).split('\0'));
-  return probes.filter((p) => !ignored.has(p));
+  return paths.filter((p) => !ignored.has(p));
 }
 
 /** The notice that goes with a deferral because `unignoredCachePaths` was not empty. */
@@ -2151,6 +2159,20 @@ export function upstreamIsMigrated(hypoDir) {
  * counts as touching, because the clearing step then reports the failure itself.
  */
 export function incomingChangesViewTracking(hypoDir, targetRev) {
+  return viewTrackingChangedSince(hypoDir, targetRev, targetRev);
+}
+
+/**
+ * The same question for our side: whether the commits HEAD holds beyond its merge-base with
+ * `targetRev` add or remove tracking of a generated view path (a migration made on this machine and
+ * not pushed yet). `pullRemote` asks both sides before it merges.
+ */
+export function outgoingChangesViewTracking(hypoDir, targetRev) {
+  return viewTrackingChangedSince(hypoDir, targetRev, 'HEAD');
+}
+
+// `side` is the revision whose changes since the merge-base of HEAD and `targetRev` are judged.
+function viewTrackingChangedSince(hypoDir, targetRev, side) {
   const base = gitOut(hypoDir, ['merge-base', 'HEAD', targetRev])?.trim();
   if (!base) return true;
   const diff = gitOut(hypoDir, [
@@ -2160,7 +2182,7 @@ export function incomingChangesViewTracking(hypoDir, targetRev) {
     '-z',
     '--relative',
     base,
-    targetRev,
+    side,
   ]);
   if (diff === null) return true;
   const tokens = diff.split('\0').filter(Boolean);
@@ -2277,13 +2299,17 @@ export function setAsideNotices(
 /**
  * Append the lines of `lines` that the working-tree `.gitignore` does not have, at the end (the
  * file stays uncommitted). Lines are compared without a trailing `\r`, so a CRLF file does not get
- * the same line again. Returns the lines it added.
+ * the same line again. A line only counts as present when it sits at or after the last `!` line:
+ * ignore rules are order sensitive, so a pattern that appears above a later negation does not
+ * apply any more, and appending it again is what puts it back in force. Returns the lines it added.
  */
 export function restoreGitignoreLines(hypoDir, lines) {
   const path = join(hypoDir, '.gitignore');
   const current = readTextOrNull(path) ?? '';
   const bare = (l) => l.replace(/\r$/, '');
-  const have = new Set(current.split('\n').map(bare));
+  const all = current.split('\n').map(bare);
+  const lastNegation = all.findLastIndex((l) => l.trimStart().startsWith('!'));
+  const have = new Set(all.slice(Math.max(lastNegation, 0)));
   const missing = [...new Set(lines)].filter((l) => !have.has(bare(l)));
   if (!missing.length) return [];
   const lead = current === '' || current.endsWith('\n') ? '' : '\n';
@@ -2346,6 +2372,19 @@ export function markPullArchiveMerged(hypoDir) {
  * working-tree path is restored). `testHooks.beforeBackupWrite` goes to the backups.
  */
 export function clearGeneratedPathsBlockingPull(hypoDir, targetRev, opts = {}) {
+  try {
+    return clearBlockingPaths(hypoDir, targetRev, opts);
+  } catch (err) {
+    if (err?.message === CACHE_NOT_IGNORED && err.result) return err.result;
+    throw err;
+  }
+}
+
+// Thrown by `clearBlockingPaths` (carrying its stop result) at the first write under `.cache/` when
+// no ignore rule covers it, so a vault with nothing to set aside never meets the check.
+const CACHE_NOT_IGNORED = 'cache-not-ignored';
+
+function clearBlockingPaths(hypoDir, targetRev, opts) {
   const { testHooks } = opts;
   // What has been moved so far. Every stop reports all of it, so the caller can undo it.
   const backups = [];
@@ -2399,15 +2438,25 @@ export function clearGeneratedPathsBlockingPull(hypoDir, targetRev, opts = {}) {
   const head = headSha.trim();
 
   // 1b. Backups and the archive go under `.cache/`: no byte is moved while a `git add -A` would
-  // stage them. Nothing was written yet except the restore of step 1.
-  const unignored = unignoredCachePaths(hypoDir);
-  if (unignored.length) {
-    return stop({
-      deferred: 'cache-not-ignored',
-      reason: 'cache-not-ignored',
-      notice: cacheNotIgnoredNotice(unignored),
+  // stage them. The check runs just before the first of those writes (`cacheGate`), so a vault
+  // with nothing to set aside is not held back by it. Nothing was written yet except the restore
+  // of step 1.
+  let cacheChecked = false;
+  const cacheGate = () => {
+    if (cacheChecked) return;
+    const unignored = unignoredCachePaths(hypoDir);
+    if (!unignored.length) {
+      cacheChecked = true;
+      return;
+    }
+    throw Object.assign(new Error(CACHE_NOT_IGNORED), {
+      result: stop({
+        deferred: 'cache-not-ignored',
+        reason: 'cache-not-ignored',
+        notice: cacheNotIgnoredNotice(unignored),
+      }),
     });
-  }
+  };
 
   // 2. What `target` brings in.
   const base = gitOut(hypoDir, ['merge-base', 'HEAD', target])?.trim();
@@ -2471,6 +2520,7 @@ export function clearGeneratedPathsBlockingPull(hypoDir, targetRev, opts = {}) {
   // The number of this run among those that fed the record; see the record's comment.
   const run = Math.max(0, ...(prior?.views ?? []).map((v) => v.run ?? 0)) + 1;
   const backUp = (relPath, kind, text) => {
+    cacheGate();
     const backupPath = backUpGeneratedPath(hypoDir, join(hypoDir, relPath), text, testHooks);
     backups.push(backupPath);
     return { relPath, kind, backupPath };
@@ -2496,6 +2546,7 @@ export function clearGeneratedPathsBlockingPull(hypoDir, targetRev, opts = {}) {
         readRootHotProjectionOwnership(hypoDir).lastHash,
       ];
       if (!vouched.includes(sha)) {
+        cacheGate();
         const backupPath = backUpGeneratedPath(hypoDir, join(hypoDir, 'hot.md'), text, testHooks);
         unowned.push({ relPath: 'hot.md', kind: 'worktree', backupPath });
       }
@@ -2557,6 +2608,7 @@ export function clearGeneratedPathsBlockingPull(hypoDir, targetRev, opts = {}) {
     (list) => list.length,
   );
   if (prior || anySetAside) {
+    cacheGate();
     try {
       writePullArchive(hypoDir, {
         v: 2,
@@ -4865,71 +4917,687 @@ export function appendSyncFailure(hypoDir, op, error) {
 const syncGit = (hypoDir, ...args) =>
   spawnSync('git', ['-C', hypoDir, ...args], { encoding: 'utf-8', timeout: 30000 });
 
+// ── resolving a sync conflict (pullRemote) ───────────────────────────────────
+// A pull that stops on a conflict Hypomnema can settle without a person is finished here: a
+// generated view path with a modify/delete conflict (an old install changed a view the migration
+// untracked) and a `.gitignore` both sides only added lines to. Everything else is aborted as
+// before. The caller holds the vault commit lock (the lock is not reentrant, so nothing here takes it).
+
+// The two merge records live under the git directory, never in the vault tree. A vault whose
+// `.gitignore` lacks `.cache/` would otherwise get no record at all, and a merge a killed run left
+// open would stay unrecognized for good. Git never stages anything under its own directory.
+// `--absolute-git-dir` is this worktree's own directory (`.git/worktrees/<name>` in a linked
+// worktree, where `MERGE_HEAD` lives too); `--git-path` would send a name git does not know to the
+// directory every worktree shares, and two worktrees would overwrite each other's record.
+const MERGE_OWNED_FILE = 'hypo-merge-owned.json';
+const MERGE_INTENT_FILE = 'hypo-merge-intent.json';
+
+/** Absolute path of `name` under the vault's git directory, or `null` when git cannot say. */
+function gitDirFile(hypoDir, name) {
+  const r = vaultGit(hypoDir, ['rev-parse', '--absolute-git-dir']);
+  const dir = r.status === 0 ? r.stdout.replace(/\r?\n$/, '') : '';
+  return dir ? join(dir, name) : null;
+}
+
+function readGitDirJson(hypoDir, name) {
+  try {
+    return JSON.parse(readFileSync(gitDirFile(hypoDir, name), 'utf-8'));
+  } catch {
+    return null;
+  }
+}
+
+function writeGitDirJson(hypoDir, name, rec, pretty = false) {
+  const path = gitDirFile(hypoDir, name);
+  if (!path) throw new Error('git directory unknown');
+  atomicWrite(path, `${JSON.stringify(rec, null, pretty ? 2 : 0)}\n`, { durable: true });
+}
+
+function removeGitDirFile(hypoDir, name) {
+  try {
+    const path = gitDirFile(hypoDir, name);
+    if (path) rmSync(path, { force: true });
+  } catch {
+    // best-effort: a leftover record only counts while a `MERGE_HEAD` it names is open
+  }
+}
+
+// `hypo-merge-owned.json`: {v: 1, mergeHead, indexDigest, resolvedPaths: [{relPath, kind:
+// 'modify-delete'|'gitignore', backupPath?, backupSha256?, mergedSha256?}]}. Written before the
+// first resolving git command, and again with `indexDigest` (sha256 of `git ls-files -s`) once the
+// resolution is applied, so a merge left open by a killed run can be told from one a person started.
+function readMergeOwned(hypoDir) {
+  const rec = readGitDirJson(hypoDir, MERGE_OWNED_FILE);
+  const ok =
+    rec?.v === 1 &&
+    typeof rec.mergeHead === 'string' &&
+    Array.isArray(rec.resolvedPaths) &&
+    (rec.indexDigest === null || typeof rec.indexDigest === 'string');
+  return ok ? rec : null;
+}
+
+const writeMergeOwned = (hypoDir, rec) => writeGitDirJson(hypoDir, MERGE_OWNED_FILE, rec, true);
+const clearMergeOwned = (hypoDir) => removeGitDirFile(hypoDir, MERGE_OWNED_FILE);
+
+// `hypo-merge-intent.json`: {v: 1, phase: 'pull', head, target, fingerprint?}. Written (durably) just
+// before the merge command runs, which is whenever HEAD is behind the upstream (git may
+// fast-forward), so a `MERGE_HEAD` a killed run left with no resolution record can be told from one
+// a person opened: it names the HEAD and the upstream commit this run was about to merge.
+// `fingerprint` ({index, files}) is added right after the merge command returned with a merge
+// open: the sha256 of `git ls-files -s` and of each unmerged worktree file at that moment. The
+// intent alone only proves which merge started; the fingerprint is what proves nobody has touched
+// it since (a person's staged resolution changes it). It is deleted once no `MERGE_HEAD` is left.
+function readMergeIntent(hypoDir) {
+  const rec = readGitDirJson(hypoDir, MERGE_INTENT_FILE);
+  const ok =
+    rec?.v === 1 &&
+    rec.phase === 'pull' &&
+    typeof rec.head === 'string' &&
+    typeof rec.target === 'string';
+  return ok ? rec : null;
+}
+
+const clearMergeIntent = (hypoDir) => removeGitDirFile(hypoDir, MERGE_INTENT_FILE);
+
+const mergeIntentExists = (hypoDir) => {
+  const path = gitDirFile(hypoDir, MERGE_INTENT_FILE);
+  return path !== null && existsSync(path);
+};
+
+function fileSha256OrNull(path) {
+  try {
+    return createHash('sha256').update(readFileSync(path)).digest('hex');
+  } catch {
+    return null;
+  }
+}
+
 /**
- * The tree-mutating half of a sync: `git pull --no-rebase`, plus the abort
- * that keeps the working tree from being left half-merged.
+ * `{index, files: {relPath: sha256|null}}` for the merge now open: the index digest and the worktree
+ * bytes of every unmerged path. `null` when git cannot give the index digest.
+ */
+function mergeFingerprint(hypoDir, unmergedPaths) {
+  const index = indexDigestOf(hypoDir);
+  if (index === null) return null;
+  const files = {};
+  for (const relPath of [...unmergedPaths].sort()) {
+    files[relPath] = fileSha256OrNull(join(hypoDir, relPath));
+  }
+  return { index, files };
+}
+
+const sameFingerprint = (a, b) =>
+  a !== null &&
+  b !== null &&
+  typeof a === 'object' &&
+  typeof b === 'object' &&
+  a.index === b.index &&
+  JSON.stringify(a.files) === JSON.stringify(b.files);
+
+/** Record the post-merge fingerprint in the intent (a kill before this leaves the merge to a person). */
+function recordMergeFingerprint(hypoDir, unmergedPaths) {
+  try {
+    const intent = readMergeIntent(hypoDir);
+    const fingerprint = intent && mergeFingerprint(hypoDir, unmergedPaths);
+    if (intent && fingerprint) {
+      writeGitDirJson(hypoDir, MERGE_INTENT_FILE, { ...intent, fingerprint });
+    }
+  } catch {
+    // no fingerprint: the merge is then left to a person
+  }
+}
+
+/** `{state: 'present', sha}`, `{state: 'absent'}` or `{state: 'error'}` for `MERGE_HEAD`. */
+function mergeHeadState(hypoDir) {
+  const r = vaultGit(hypoDir, ['rev-parse', '-q', '--verify', 'MERGE_HEAD']);
+  if (r.status === 0) return { state: 'present', sha: r.stdout.trim() };
+  return { state: r.status === 1 ? 'absent' : 'error' };
+}
+
+function indexDigestOf(hypoDir) {
+  const r = vaultGit(hypoDir, ['ls-files', '-s']);
+  return r.status === 0 ? sha256Hex(r.stdout) : null;
+}
+
+/** `Map<path, Set<stage>>` of the unmerged index entries, or `null` when git cannot answer. */
+function unmergedEntries(hypoDir) {
+  const r = vaultGit(hypoDir, ['ls-files', '-u', '-z']);
+  if (r.status !== 0) return null;
+  const byPath = new Map();
+  for (const rec of r.stdout.split('\0').filter(Boolean)) {
+    const m = /^\d+ [0-9a-f]+ ([123])\t([\s\S]*)$/.exec(rec);
+    if (!m) return null;
+    byPath.set(m[2], (byPath.get(m[2]) ?? new Set()).add(Number(m[1])));
+  }
+  return byPath;
+}
+
+/**
+ * Settle the open conflict when every unmerged path is one of the two kinds Hypomnema resolves:
+ * (a) a generated view path that one side modified and the other deleted (stages 1+2 or 1+3), or
+ * (b) `.gitignore` with all three stages where `mergeAdditiveGitignore(:1, :2, :3)` is `ok`.
+ * (a) backs the modified side's stage up (whichever side it is), lists it in the pull archive for
+ * `shareLegacyBytes`, and removes the path from the index; (b) writes and stages the merged bytes.
+ * The merge commit is not made here (`finishOwnedMerge` does it). Returns `{ok, notices, rollback}`;
+ * `ok: false` means nothing was resolved and the records it wrote are taken back (the backups stay),
+ * so the caller aborts the merge as it always did. `rollback` takes the records back after a later
+ * failure. `testHooks.beforeBackupWrite` goes to the backups.
+ */
+function resolveSyncConflict(hypoDir, byPath, { testHooks } = {}) {
+  const plan = [];
+  for (const [relPath, stages] of byPath) {
+    const key = [...stages].sort().join('');
+    if (isGeneratedViewPath(relPath) && (key === '12' || key === '13')) {
+      plan.push({ kind: 'modify-delete', relPath, stage: key === '12' ? 2 : 3 });
+    } else if (relPath === '.gitignore' && key === '123') {
+      const [base, ours, theirs] = [1, 2, 3].map((n) => gitShowText(hypoDir, `:${n}`, relPath));
+      if ([base, ours, theirs].includes(null)) return { ok: false, notices: [] };
+      const merged = mergeAdditiveGitignore(base, ours, theirs);
+      if (!merged.ok) return { ok: false, notices: [] };
+      plan.push({ kind: 'gitignore', relPath, merged: merged.merged });
+    } else {
+      return { ok: false, notices: [] };
+    }
+  }
+  if (!plan.length) return { ok: false, notices: [] };
+  // The backups and the pull archive go under `.cache/`: write none of them while `git add -A` would stage them.
+  const unignored = unignoredCachePaths(hypoDir);
+  if (unignored.length) return { ok: false, notices: [cacheNotIgnoredNotice(unignored)] };
+  const merge = mergeHeadState(hypoDir);
+  const head = gitOut(hypoDir, ['rev-parse', '--verify', '--quiet', 'HEAD'])?.trim();
+  if (merge.state !== 'present' || !head) return { ok: false, notices: [] };
+
+  const archivePath = join(hypoDir, PULL_ARCHIVE_REL);
+  let priorRaw = null;
+  try {
+    priorRaw = readTextOrNull(archivePath);
+  } catch {
+    return { ok: false, notices: [] };
+  }
+  const rollback = () => {
+    clearMergeOwned(hypoDir);
+    try {
+      if (priorRaw === null) rmSync(archivePath, { force: true });
+      else atomicWrite(archivePath, priorRaw);
+    } catch {
+      // the record then still names backups that exist: the next catch-up carries it
+    }
+  };
+  try {
+    const prior = readPullArchive(hypoDir);
+    // One state of the machine per run: these versions are committed ones, not the dirty files of an
+    // earlier clearing run, so they pair up among themselves.
+    const run = Math.max(0, ...(prior?.views ?? []).map((v) => v.run ?? 0)) + 1;
+    const views = [];
+    const resolvedPaths = [];
+    for (const item of plan) {
+      if (item.kind === 'gitignore') {
+        resolvedPaths.push({
+          relPath: item.relPath,
+          kind: 'gitignore',
+          mergedSha256: sha256Hex(item.merged),
+        });
+        continue;
+      }
+      const bytes = gitShowText(hypoDir, `:${item.stage}`, item.relPath);
+      if (bytes === null) throw new Error(`stage ${item.stage} of ${item.relPath} is unreadable`);
+      const backupPath = backUpGeneratedPath(
+        hypoDir,
+        join(hypoDir, item.relPath),
+        bytes,
+        testHooks,
+      );
+      const sha256 = sha256Hex(bytes);
+      // Stage 2 is ours: the other side (theirs) deleted, so its tree has nothing and the companion
+      // file comes from our pre-merge HEAD. Stage 3 is theirs: the companion comes from MERGE_HEAD.
+      // Both are commit ids, because the name `MERGE_HEAD` is gone once the merge commit exists.
+      const companionRev = item.stage === 2 ? head : merge.sha;
+      views.push({
+        relPath: item.relPath,
+        kind: 'worktree',
+        backupPath,
+        sha256,
+        companionRev,
+        run,
+      });
+      resolvedPaths.push({
+        relPath: item.relPath,
+        kind: 'modify-delete',
+        backupPath,
+        backupSha256: sha256,
+      });
+    }
+    if (views.length) {
+      writePullArchive(hypoDir, {
+        v: 2,
+        stage: 'archived',
+        targetSha: merge.sha,
+        gitignoreLines: prior?.gitignoreLines ?? [],
+        views: mergeViews(prior?.views ?? [], views),
+        localOnly: prior?.localOnly ?? [],
+        unowned: prior?.unowned ?? [],
+        cleared: prior?.cleared ?? [],
+        gitignoreSaved: prior?.gitignoreSaved ?? [],
+      });
+    }
+    const owned = { v: 1, mergeHead: merge.sha, indexDigest: null, resolvedPaths };
+    writeMergeOwned(hypoDir, owned);
+
+    const removals = plan.filter((p) => p.kind === 'modify-delete').map((p) => p.relPath);
+    if (
+      removals.length &&
+      vaultGit(hypoDir, ['rm', '--cached', '-q', '--', ...literalSpecs(removals)]).status !== 0
+    ) {
+      throw new Error('git rm --cached failed');
+    }
+    for (const item of plan.filter((p) => p.kind === 'gitignore')) {
+      atomicWrite(join(hypoDir, item.relPath), item.merged);
+      if (vaultGit(hypoDir, ['add', '--', ...literalSpecs([item.relPath])]).status !== 0) {
+        throw new Error('git add .gitignore failed');
+      }
+    }
+    if (unmergedEntries(hypoDir)?.size !== 0) throw new Error('unmerged paths remain');
+    const indexDigest = indexDigestOf(hypoDir);
+    if (indexDigest === null) throw new Error('index digest unreadable');
+    writeMergeOwned(hypoDir, { ...owned, indexDigest });
+  } catch {
+    rollback();
+    return { ok: false, notices: [] };
+  }
+  return { ok: true, notices: [], rollback };
+}
+
+/**
+ * Finish a merge Hypomnema started and a killed run left open: `MERGE_HEAD` exists and
+ * the owned record (`hypo-merge-owned.json` in the git directory) names it. Called first in `pullRemote`. Returns `{state, notices}`:
+ *   - `'none'`: no merge is open (a leftover owned record is deleted). Carry on with the sync.
+ *   - `'finished'`: the merge commit was made, the archived bytes were shared (`resumePullArchive`)
+ *     and the owned record was deleted.
+ *   - `'external'`: a merge is open that this code did not start (no record, or one that names
+ *     another `MERGE_HEAD`: a person, `git pull`, Obsidian Git). Nothing is touched.
+ *   - `'stuck'`: it is ours but is not safe to finish, and nothing is touched: the index has
+ *     entries the resolution did not stage (`indexDigest` differs), an unmerged path remains, a
+ *     recorded backup is gone or changed, the merged `.gitignore` is not what was recorded, a view
+ *     is still in the index, or the commit failed.
+ * The index digest check is what keeps `git commit --no-edit` from sweeping a path another session
+ * staged in between into the merge commit.
+ */
+export function finishOwnedMerge(hypoDir) {
+  const owned = readMergeOwned(hypoDir);
+  const merge = mergeHeadState(hypoDir);
+  if (merge.state === 'error') {
+    return {
+      state: 'external',
+      notices: ['git이 진행 중인 merge 여부를 답하지 못해 동기화를 건너뛰었습니다.'],
+    };
+  }
+  if (merge.state === 'absent') {
+    if (owned) clearMergeOwned(hypoDir);
+    clearMergeIntent(hypoDir);
+    return { state: 'none', notices: [] };
+  }
+  if (!owned || owned.mergeHead !== merge.sha) {
+    // A pull of ours that was killed after the merge started and before any resolution record: the
+    // intent names this very HEAD and `MERGE_HEAD`, and its fingerprint says the merge is still as
+    // the merge command left it. Only then is it taken back, as the old code did. A merge that
+    // differs from the fingerprint holds somebody's work (a staged resolution), so it stays.
+    // ponytail: a person who merges the same upstream commit by hand at the same HEAD while a
+    // stale intent exists would not match the fingerprint either; a kill between the merge command
+    // and the fingerprint write leaves an untouched merge to a person, who gets the notice below.
+    const intent = readMergeIntent(hypoDir);
+    const head = gitOut(hypoDir, ['rev-parse', '--verify', '--quiet', 'HEAD'])?.trim();
+    if (intent && intent.target === merge.sha && intent.head === head) {
+      const unmerged = unmergedEntries(hypoDir);
+      const untouched =
+        unmerged !== null &&
+        sameFingerprint(intent.fingerprint ?? null, mergeFingerprint(hypoDir, unmerged.keys()));
+      if (!untouched) {
+        return {
+          state: 'external',
+          notices: [
+            intent.fingerprint
+              ? '끊긴 동기화가 남긴 merge에 사람이 해소한 내용이나 스테이징한 변경이 있어 그대로 두고 동기화를 건너뛰었습니다. git status를 보고 git merge --continue나 git merge --abort로 먼저 끝내세요.'
+              : '끊긴 동기화가 남긴 것으로 보이는 merge가 있지만 그 시점의 상태 기록이 없어 사람의 해소가 섞였는지 알 수 없습니다. 그대로 두고 동기화를 건너뛰었으니 git status를 보고 git merge --continue나 git merge --abort로 먼저 끝내세요.',
+          ],
+        };
+      }
+      const abort = vaultGit(hypoDir, ['merge', '--abort']);
+      if (abort.status === 0 && unmergedEntries(hypoDir)?.size === 0) {
+        clearMergeOwned(hypoDir);
+        clearMergeIntent(hypoDir);
+        return {
+          state: 'none',
+          notices: ['끊긴 동기화가 남긴 merge를 취소하고 동기화를 다시 시도합니다.'],
+        };
+      }
+      return {
+        state: 'stuck',
+        notices: [
+          '끊긴 동기화가 남긴 merge를 취소하지 못했습니다. git status를 보고 git merge --abort로 끝내세요.',
+        ],
+      };
+    }
+    return {
+      state: 'external',
+      notices: [
+        '진행 중인 merge가 있어 동기화를 건너뛰었습니다. git status를 보고 git merge --continue나 git merge --abort로 먼저 끝내세요.',
+      ],
+    };
+  }
+  const stuck = (why) => ({
+    state: 'stuck',
+    notices: [
+      `Hypomnema가 시작한 merge를 끝내지 못했습니다: ${why}. git status를 보고 git merge --continue나 git merge --abort로 끝내세요.`,
+    ],
+  });
+  const unmerged = unmergedEntries(hypoDir);
+  if (unmerged === null) return stuck('git ls-files -u가 실패했습니다');
+  if (unmerged.size)
+    return stuck(`해소되지 않은 경로가 남았습니다 (${[...unmerged.keys()].join(', ')})`);
+  for (const r of owned.resolvedPaths) {
+    if (r.kind === 'modify-delete') {
+      let bytes = null;
+      try {
+        bytes = readFileSync(r.backupPath, 'utf-8');
+      } catch {
+        // missing: reported below
+      }
+      if (bytes === null || sha256Hex(bytes) !== r.backupSha256) {
+        return stuck(`${r.relPath}의 백업(${r.backupPath})이 없거나 달라졌습니다`);
+      }
+      const tracked = vaultGit(hypoDir, ['ls-files', '--', ...literalSpecs([r.relPath])]);
+      if (tracked.status !== 0 || tracked.stdout.trim()) {
+        return stuck(`${r.relPath}가 아직 인덱스에 있습니다`);
+      }
+    } else if (r.kind === 'gitignore') {
+      const staged = gitShowText(hypoDir, ':0', r.relPath);
+      if (staged === null || sha256Hex(staged) !== r.mergedSha256) {
+        return stuck(`${r.relPath}의 인덱스 내용이 기록한 합친 결과와 다릅니다`);
+      }
+    } else {
+      return stuck(`알 수 없는 기록 종류입니다 (${r.kind})`);
+    }
+  }
+  // Killed between the first record and the second: the resolution may be half applied, and there
+  // is no digest to compare the index with.
+  if (owned.indexDigest === null) {
+    return stuck(
+      '해소를 하던 중 끊겨 인덱스 기록이 없습니다(아직 커밋된 것이 없어 git merge --abort는 안전합니다)',
+    );
+  }
+  if (indexDigestOf(hypoDir) !== owned.indexDigest) {
+    return {
+      state: 'stuck',
+      notices: [
+        '끝나지 않은 동기화가 있고 그 사이 스테이징된 변경이 있어 자동으로 이어 가지 않았습니다. git status를 보고 git merge --continue나 git merge --abort로 끝내세요.',
+      ],
+    };
+  }
+  const commit = vaultGit(hypoDir, ['commit', '--no-edit', '-q']);
+  if (commit.status !== 0) {
+    // The whole stderr: a vault pre-commit hook that rejects the merge says why there.
+    const why = String(commit.stderr)
+      .trim()
+      .replace(/\s*\n\s*/g, ' / ')
+      .slice(0, 600);
+    return stuck(`git commit 실패: ${why}`);
+  }
+  const resumed = resumePullArchive(hypoDir);
+  clearMergeOwned(hypoDir);
+  clearMergeIntent(hypoDir);
+  const backups = owned.resolvedPaths
+    .filter((r) => r.kind === 'modify-delete')
+    .map((r) => backupPathForNotice(r.backupPath));
+  const summary =
+    `동기화 충돌을 자동으로 해소했습니다: ${owned.resolvedPaths.map((r) => r.relPath).join(', ')}.` +
+    (backups.length ? ` 수정된 쪽 내용은 ${backups.join(', ')}에 보관했습니다.` : '') +
+    (resumed.created.length ? ` 추가 기준선: ${resumed.created.join(', ')}.` : '');
+  return { state: 'finished', notices: [summary, ...resumed.notices] };
+}
+
+// Append `notices` to the health notice the next SessionStart shows (the one-slot file
+// `writeRootHotHealthNotice` owns), keeping what an earlier writer left there. Read and write sit
+// under the file lock `writeRootHotHealthNotice` and the reader take, and a line already in the
+// message is not added again, so a notice that repeats on every sync does not pile up.
+function leaveSyncNotice(hypoDir, notices) {
+  const lines = notices.flatMap((n) => n.split('\n')).filter(Boolean);
+  if (!lines.length) return;
+  const path = join(hypoDir, '.cache', ROOT_HOT_HEALTH_NOTICE_FILENAME);
+  try {
+    withFileLock(path, () => {
+      let earlier = '';
+      try {
+        const message = JSON.parse(readFileSync(path, 'utf-8')).message;
+        if (typeof message === 'string') earlier = message;
+      } catch {
+        // none, or unreadable: nothing to keep
+      }
+      const have = new Set(earlier.split('\n'));
+      const fresh = [...new Set(lines)].filter((l) => !have.has(l));
+      if (!fresh.length) return;
+      atomicWrite(
+        path,
+        JSON.stringify({ message: [earlier, ...fresh].filter(Boolean).join('\n'), ts: Date.now() }),
+      );
+    });
+  } catch {
+    // best-effort, like every notice write: a hook must not fail Stop over it
+  }
+}
+
+/**
+ * The tree-mutating half of a sync: `git fetch` and `git merge @{u}` (a pull made of its two
+ * halves, so the fetch runs once), plus the abort that keeps the working tree from being left
+ * half-merged.
  *
  * Split out of syncRemote (review r5-w4 major 2) so a caller can hold the
  * vault commit lock across this and NOT across the push. This half has to
  * stay inside the lock: it rewrites files another session could be reading,
  * staging, or committing at the same moment. See hypo-auto-commit.mjs for the
- * other side of that split.
+ * other side of that split. A caller must hold that lock (it is not reentrant,
+ * and the baseline commit this makes runs inside it).
  *
- * Failure policy (v1.4 "sync hardening"), unchanged by the split:
+ * Order of work:
+ *   1. `finishOwnedMerge`: a merge Hypomnema left open is finished first; a merge somebody else
+ *      left open stops this sync (notice only, `deferred: 'external'`).
+ *   2. `resumePullArchive`: archived bytes whose merge already landed are shared.
+ *   3. `git fetch` (one failure is recorded as the 'pull' failure and the sync stops there, with no
+ *      merge). When the incoming range changes generated view tracking (a migration or a
+ *      rollback commit) or the upstream is migrated, and HEAD does not hold `@{u}`,
+ *      `clearGeneratedPathsBlockingPull` sets aside what would block the merge. A deferral
+ *      (`.gitignore` not a pure addition, `.cache/` not ignored, a concurrent change) skips the
+ *      pull: notice only. Any other stop is taken back and the pull runs, so git reports its own
+ *      failure. A pull that then fails takes the cleared bytes back (`undoClearedPaths`).
+ *   4. `git merge --no-edit @{u}`, and the conflict policy below. When either side adds or
+ *      removes generated view tracking across the merge (`incomingChangesViewTracking`,
+ *      `outgoingChangesViewTracking`), the merge runs with `-X rename-threshold=100%`: otherwise
+ *      git pairs the view the migration deleted with the baseline entry that holds its bytes, and an
+ *      old machine's edit of that view lands as a content merge on the shared baseline file (a
+ *      conflict on a `sessions/` path, or a silent change of a content-named file) instead of a
+ *      modify/delete conflict on the view. When HEAD does not hold `@{u}`, the merge is announced
+ *      first by `hypo-merge-intent.json` in the git directory, which lets a later run take back a merge a killed run
+ *      left open before it had any resolution record (`finishOwnedMerge`). After a merge that
+ *      landed, `resumePullArchive` shares what was set aside. The flag applies to the whole merge,
+ *      so during the one-time migration merge a page that one side renamed and edited while the
+ *      other side edited it ends as modify/delete, and the sync aborts for a manual merge. The
+ *      merge is `git merge`, which ignores `pull.ff` (it honors `merge.ff`), unlike the old
+ *      `git pull --no-rebase`.
+ *
+ * Failure policy (v1.4 "sync hardening"):
  *   - clean fast-forward / conflict-free merge → `{pulled: true}`, caller pushes.
- *   - MERGE CONFLICT (`git pull --no-rebase` leaves unmerged paths): abort the
- *     merge so the tree returns to the just-committed local state ("ours"),
- *     record op='conflict', and report `{conflict: true}` so the caller does
+ *   - MERGE CONFLICT (`git merge` leaves unmerged paths): when every unmerged path is a
+ *     generated view with a modify/delete conflict, or a `.gitignore` both sides only added lines
+ *     to, resolve it and finish the merge (`resolveSyncConflict`, `finishOwnedMerge`) →
+ *     `{pulled: true}`. Otherwise abort the merge so the tree returns to the just-committed local
+ *     state ("ours"), record op='conflict', and report `{conflict: true}` so the caller does
  *     NOT push (a diverged branch cannot fast-forward, so the push would only
  *     add a noisy second failure). No data is lost: ours stays committed
  *     locally, "theirs" stays on the remote, and the divergence is surfaced by
- *     session-start + doctor until the user merges manually. Inline
- *     auto-resolution (preserving the losing version as a `.conflict-*`
- *     sibling) is deferred.
+ *     session-start + doctor until the user merges manually.
  *   - non-conflict pull failure (network/auth: no unmerged paths) → record
  *     op='pull' and report `{pulled: false, conflict: false}`; the caller still
  *     pushes, since a transient pull blip should not block an otherwise
  *     pushable commit.
  *
+ * `notices` (always an array) are also left for the next SessionStart. `deferred` is set only when
+ * this sync skipped the pull on purpose; `leaveNotices: false` leaves them to a caller that
+ * shows them itself. `testHooks`: `afterMergeStarted` (runs right after the merge command
+ * returns), `afterResolveBeforeCommit` (runs after a conflict is resolved, before its merge
+ * commit), and what `clearGeneratedPathsBlockingPull` and
+ * `backUpGeneratedPath` take.
+ *
  * Best-effort: never throws. A sync failure must not break the Stop hook. A
  * throw is reported as `{pulled: false, conflict: false}`, which lets the
- * caller attempt the push, exactly as the combined function did.
+ * caller attempt the push, exactly as the combined function did. A throw
+ * never aborts an open merge (a killed run leaves the same state).
  *
  * @param {string} hypoDir
- * @returns {{pulled: boolean, conflict: boolean}}
+ * @param {{testHooks?: object, leaveNotices?: boolean}} [opts]
+ * @returns {{pulled: boolean, conflict: boolean, notices: string[], deferred?: string}}
  */
-export function pullRemote(hypoDir) {
+export function pullRemote(hypoDir, { testHooks, leaveNotices = true } = {}) {
   const git = (...args) => syncGit(hypoDir, ...args);
+  const notices = [];
+  const done = (result) => {
+    // The intent only matters while a merge it announced is open.
+    if (mergeIntentExists(hypoDir) && mergeHeadState(hypoDir).state === 'absent') {
+      clearMergeIntent(hypoDir);
+    }
+    if (leaveNotices) leaveSyncNotice(hypoDir, notices);
+    return { ...result, notices };
+  };
+  // A deferral skips the pull on purpose; it is recorded like a failed pull so doctor shows it.
+  const defer = (why, note) => {
+    if (note) appendSyncFailure(hypoDir, 'pull', note);
+    return done({ pulled: false, conflict: false, deferred: why });
+  };
+  // What the clearing step moved. A pull that does not land takes it back.
+  let pre = null;
+  const takeBack = () => {
+    const moved = pre
+      ? pre.archived.length +
+        pre.localOnly.length +
+        pre.unowned.length +
+        pre.cleared.length +
+        pre.gitignoreSaved.length
+      : 0;
+    if (moved > 0) notices.push(...undoClearedPaths(hypoDir, pre).notices);
+    pre = null;
+  };
   try {
-    const pull = git('pull', '--no-rebase', '-q');
-    if (pull.status === 0) {
+    const owned = finishOwnedMerge(hypoDir);
+    notices.push(...owned.notices);
+    if (owned.state === 'finished') {
       recordSyncSuccess(hypoDir, 'pull');
-      return { pulled: true, conflict: false };
+      return done({ pulled: true, conflict: false });
+    }
+    if (owned.state !== 'none') return defer(owned.state, owned.notices[0]);
+    notices.push(...resumePullArchive(hypoDir).notices);
+
+    const fetch = git('fetch', '-q');
+    if (fetch.status !== 0) {
+      appendSyncFailure(hypoDir, 'pull', fetch.stderr || fetch.stdout);
+      return done({ pulled: false, conflict: false });
+    }
+    const behind =
+      git('rev-parse', '--verify', '-q', '@{u}').status === 0 &&
+      git('merge-base', '--is-ancestor', '@{u}', 'HEAD').status !== 0;
+    const incomingMoves = behind && incomingChangesViewTracking(hypoDir, '@{u}');
+    const canCatchUp = behind && (upstreamIsMigrated(hypoDir) || incomingMoves);
+    // A side that adds or removes view tracking needs exact renames only (see the docblock).
+    const exactRenames = behind && (incomingMoves || outgoingChangesViewTracking(hypoDir, '@{u}'));
+    if (canCatchUp) {
+      pre = clearGeneratedPathsBlockingPull(hypoDir, '@{u}', { testHooks });
+      if (!pre.ok) {
+        const { deferred, notice } = pre;
+        takeBack();
+        if (deferred) {
+          if (notice) notices.push(notice);
+          return defer(deferred, notice);
+        }
+        // Any other stop (another file is dirty, a revision git cannot read): pull anyway and let
+        // git report its own failure.
+      } else if (pre.backups.length) {
+        const where = [...new Set(pre.backups.map(backupPathForNotice))].join(', ');
+        notices.push(`이행 커밋을 받으려고 이 기계의 옛 세션 현황 변경을 ${where}에 보관했습니다.`);
+      }
+    }
+
+    if (behind) {
+      const head = gitOut(hypoDir, ['rev-parse', '--verify', '--quiet', 'HEAD'])?.trim();
+      const target = gitOut(hypoDir, ['rev-parse', '--verify', '--quiet', '@{u}'])?.trim();
+      if (head && target) {
+        try {
+          writeGitDirJson(hypoDir, MERGE_INTENT_FILE, { v: 1, phase: 'pull', head, target });
+        } catch {
+          // no intent: a merge left open by a kill is then left to a person
+        }
+      }
+    }
+    const pull = git(
+      'merge',
+      '-q',
+      '--no-edit',
+      ...(exactRenames ? ['-X', 'rename-threshold=100%'] : []),
+      '@{u}',
+    );
+    if (pull.status !== 0 && mergeHeadState(hypoDir).state === 'present') {
+      recordMergeFingerprint(hypoDir, unmergedEntries(hypoDir)?.keys() ?? []);
+    }
+    testHooks?.afterMergeStarted?.();
+    if (pull.status === 0) {
+      notices.push(...resumePullArchive(hypoDir).notices);
+      recordSyncSuccess(hypoDir, 'pull');
+      return done({ pulled: true, conflict: false });
     }
     // A merge conflict leaves unmerged index entries; a network/auth failure
     // leaves none. Only the former must be aborted to keep the tree clean.
-    const unmerged = git('ls-files', '-u');
-    const hasConflict = unmerged.status === 0 && (unmerged.stdout || '').trim().length > 0;
-    if (hasConflict) {
+    const unmerged = unmergedEntries(hypoDir);
+    if (unmerged !== null && unmerged.size > 0) {
+      const resolved = resolveSyncConflict(hypoDir, unmerged, { testHooks });
+      notices.push(...resolved.notices);
+      if (resolved.ok) {
+        testHooks?.afterResolveBeforeCommit?.();
+        const finished = finishOwnedMerge(hypoDir);
+        if (finished.state === 'finished') {
+          notices.push(...finished.notices);
+          recordSyncSuccess(hypoDir, 'pull');
+          return done({ pulled: true, conflict: false });
+        }
+        // Our own resolution could not be committed: abort like any other conflict.
+        resolved.rollback();
+      }
       // Abort to return the tree to the just-committed local state. Verify the
       // abort actually cleaned up: if it fails (filesystem/concurrent-mutation
       // edge), the tree may still be half-merged, so record that distinctly
-      // ('conflict-unresolved') rather than masking it as a clean abort.
+      // ('conflict-unresolved') rather than masking it as a clean abort. Only a
+      // clean abort lets the cleared bytes go back: into a half-merged tree they
+      // stay in their backups, and the archive record names them.
       const abort = git('merge', '--abort');
-      const stillUnmerged = git('ls-files', '-u');
-      const aborted = abort.status === 0 && (stillUnmerged.stdout || '').trim().length === 0;
+      const aborted = abort.status === 0 && unmergedEntries(hypoDir)?.size === 0;
+      if (aborted) takeBack();
       appendSyncFailure(
         hypoDir,
         aborted ? 'conflict' : 'conflict-unresolved',
         pull.stderr || pull.stdout,
       );
-      return { pulled: false, conflict: true };
+      return done({ pulled: false, conflict: true });
+    }
+    // No merge was open when this run began (`finishOwnedMerge` said so), so a `MERGE_HEAD` now is
+    // this merge stopped before its commit (a `pre-merge-commit` hook that rejects): take it back,
+    // or the next sync would find it and wait for a person.
+    const stopped = mergeHeadState(hypoDir).state === 'present';
+    if (
+      !stopped ||
+      (git('merge', '--abort').status === 0 && unmergedEntries(hypoDir)?.size === 0)
+    ) {
+      takeBack();
     }
     appendSyncFailure(hypoDir, 'pull', pull.stderr || pull.stdout);
-    return { pulled: false, conflict: false };
+    return done({ pulled: false, conflict: false });
   } catch {
     // best-effort: never break the Stop hook
-    return { pulled: false, conflict: false };
+    return done({ pulled: false, conflict: false });
   }
 }
 
@@ -5061,13 +5729,15 @@ export function pushRemote(hypoDir, target) {
 }
 
 /**
- * Pull + push the wiki against its remote, guaranteeing the working tree is
- * never left half-merged.
+ * Pull + push the wiki against its remote. A conflict is aborted in the same run, so the working
+ * tree normally is not left half-merged. A run killed mid-merge, or an abort git cannot complete
+ * (`conflict-unresolved`), leaves a merge open; the next `pullRemote` takes it back or reports it
+ * (`finishOwnedMerge`).
  *
- * The two halves in their original order, for every caller that does not hold
- * the vault commit lock and so has no reason to care where the boundary is.
- * hypo-auto-commit.mjs does hold it and calls pullRemote/pushRemote itself;
- * see there. The ordering guarantee lives here as well as there: a conflicting
+ * The two halves in their original order, for a caller that holds the vault
+ * commit lock around the whole thing (`pullRemote` needs it, and the push then
+ * runs inside it too). hypo-auto-commit.mjs holds it for the pull only and
+ * calls pullRemote/pushRemote itself; see there. The ordering guarantee lives here as well as there: a conflicting
  * pull returns before the push, so a diverged branch is never pushed from.
  *
  * Best-effort: never throws. A sync failure must not break the Stop hook.

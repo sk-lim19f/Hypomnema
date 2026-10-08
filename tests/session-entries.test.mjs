@@ -814,6 +814,25 @@ test('mergeAdditiveGitignore refuses a line inserted in the middle on either sid
   assert.equal(mergeAdditiveGitignore(BASE, `${BASE}/mid\n`, `${BASE}/t\n`).ok, true);
 });
 
+test('mergeAdditiveGitignore keeps a line ours appended again after a base negation, so the last rule still wins', () => {
+  const base = '*.md\n!secret.md\n';
+  // Ours repeats `*.md` at the tail (re-ignoring secret.md); theirs added another pattern.
+  assert.deepEqual(mergeAdditiveGitignore(base, `${base}*.md\n`, `${base}/t\n`), {
+    ok: true,
+    merged: `${base}/t\n*.md\n`,
+  });
+  // Theirs changed nothing: the repeat still lands after the negation.
+  assert.deepEqual(mergeAdditiveGitignore(base, `${base}*.md\n`, base), {
+    ok: true,
+    merged: `${base}*.md\n`,
+  });
+  // The pair: both sides appended the same repeat, so one copy is enough.
+  assert.deepEqual(mergeAdditiveGitignore(base, `${base}*.md\n`, `${base}*.md\n`), {
+    ok: true,
+    merged: `${base}*.md\n`,
+  });
+});
+
 test('mergeAdditiveGitignore refuses a negation added by theirs', () => {
   const r = mergeAdditiveGitignore(BASE, `${BASE}/o\n`, `${BASE}!keep.md\n`);
   assert.equal(r.ok, false);
@@ -2406,6 +2425,18 @@ test('restoreGitignoreLines compares lines without a trailing CR, so a CRLF .git
     assert.equal(readRel(dir, '.gitignore'), '.cache/\r\nlocal-only/\r\n', 'nothing was added');
     assert.deepEqual(restoreGitignoreLines(dir, ['.cache/', 'new/']), ['new/']);
     assert.equal(readRel(dir, '.gitignore'), '.cache/\r\nlocal-only/\r\nnew/\n');
+  });
+});
+
+test('restoreGitignoreLines appends a line that only appears above a later negation, and a second call adds nothing', () => {
+  withTmpDir((dir) => {
+    put(dir, '.gitignore', '*.md\n!secret.md\n');
+    assert.deepEqual(restoreGitignoreLines(dir, ['*.md']), ['*.md']);
+    assert.equal(readRel(dir, '.gitignore'), '*.md\n!secret.md\n*.md\n', 'the rule is back last');
+    assert.deepEqual(restoreGitignoreLines(dir, ['*.md']), [], 'now it is in force: no repeat');
+    // The pair: a line that already sits after the last negation is not added again.
+    put(dir, '.gitignore', '!secret.md\n*.md\n');
+    assert.deepEqual(restoreGitignoreLines(dir, ['*.md']), []);
   });
 });
 
@@ -4682,6 +4713,68 @@ test('the writer leaves .cache/ alone while a later rule un-ignores it, and says
     );
     assert.equal(readRel(dir, 'projects/p/hot.md'), 'hand written\n');
     assert.match(consumeRootHotHealthNotice(dir) ?? '', /\/\.cache\//);
+  });
+});
+
+test('the writer skips a view that a later rule un-ignores, writes the others, and names it in a notice', () => {
+  withOldGit((dir) => {
+    assert.equal(migrate(dir).migrated, true, 'precondition: the vault is migrated');
+    const ignore = showHead(dir, '.gitignore');
+    put(dir, '.gitignore', `${ignore}!/projects/p/hot.md\n`);
+    commitIn(dir);
+    assert.equal(migrationState(dir), 'migrated', 'precondition: the block lines are all there');
+    consumeRootHotHealthNotice(dir);
+    putEntry(dir, 'p', 'c-late', { date: '2026-10-02' });
+    for (const rel of ['hot.md', VIEW, 'projects/p/session-state.md']) {
+      if (existsSync(join(dir, rel))) unlinkSync(join(dir, rel));
+    }
+    const r = writeGeneratedViews(dir, WRITE);
+    assert.deepEqual(r.stageableViews, [VIEW], JSON.stringify(r));
+    assert.equal(existsSync(join(dir, VIEW)), false, 'the stageable view was not written');
+    assert.deepEqual(r.written.sort(), ['hot.md', 'projects/p/session-state.md']);
+    cgitOk(dir, ['add', '-A']);
+    assert.deepEqual(
+      cgitOk(dir, ['diff', '--cached', '--name-only'])
+        .split('\n')
+        .filter((n) => n && !n.includes('/sessions/')),
+      [],
+      'no generated view is staged (the new entry is)',
+    );
+    const notice = consumeRootHotHealthNotice(dir) ?? '';
+    assert.ok(notice.includes(VIEW) && notice.includes('.gitignore'), notice);
+    // The pair: with the rule gone the same render writes it.
+    put(dir, '.gitignore', ignore);
+    commitIn(dir);
+    const again = writeGeneratedViews(dir, WRITE);
+    assert.deepEqual(again.stageableViews, []);
+    assert.deepEqual(again.written, [VIEW]);
+    assert.equal(existsSync(join(dir, VIEW)), true);
+  });
+});
+
+test('a generated view staged by hand but not in HEAD stops the move before it writes anything, and the move goes on once it is committed', () => {
+  withOldGit((dir) => {
+    put(dir, 'projects/p2/hot.md', RICH_HOT);
+    cgitOk(dir, ['add', 'projects/p2/hot.md']);
+    const before = commitCount(dir);
+    const head = cgitOk(dir, ['rev-parse', 'HEAD']);
+    const r = migrate(dir);
+    assert.equal(r.migrated, false);
+    assert.equal(r.deferred, 'staged-views', JSON.stringify(r));
+    assert.ok(r.notices.join('\n').includes('projects/p2/hot.md'), r.notices.join('\n'));
+    assert.equal(commitCount(dir), before, 'no commit was created');
+    assert.equal(cgitOk(dir, ['rev-parse', 'HEAD']), head);
+    assert.ok(cgitOk(dir, ['ls-files']).includes('projects/p2/hot.md'), 'the stage is untouched');
+    assert.equal(migrationState(dir), 'not-migrated');
+    // The pair: once the stage is committed, HEAD lists it and the move removes it with the rest.
+    commitIn(dir);
+    const again = migrate(dir);
+    assert.equal(again.migrated, true, JSON.stringify(again));
+    assert.deepEqual(
+      listTrackedGeneratedViews(dir, { source: 'index' }),
+      [],
+      'no generated view is tracked after the move',
+    );
   });
 });
 
