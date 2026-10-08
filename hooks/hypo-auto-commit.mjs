@@ -2,9 +2,11 @@
 /**
  * hypo-auto-commit.mjs: Stop chain stage 3 (spawned by hypo-stop.mjs)
  *
- * At session end: stage this session's touched paths, commit if any, then
- * pull+push to sync remote. A pull that moves HEAD is followed by a regeneration
- * of the (untracked) session views, inside the same lock.
+ * At session end: finish a merge this tool left open, stage this session's touched paths, commit
+ * if any, then pull+push to sync remote. A pull that moves HEAD is followed by a regeneration
+ * of the (untracked) session views, inside the same lock. The push is withheld when the pull did
+ * not land (conflict, deferral, failure) and when the tree tracks generated views under a
+ * migrated upstream.
  *
  * Scoped, not whole-tree: this no longer sweeps the entire working tree. The
  * scope is this session's accumulated touched-paths set (hypo-auto-stage.mjs
@@ -37,6 +39,9 @@ import {
   resolvePushTarget,
   commitWikiChanges,
   commitTouchedPaths,
+  finishOwnedMerge,
+  listTrackedGeneratedViews,
+  upstreamIsMigrated,
   vaultCommitLockTarget,
   withFileLock,
   writeRootHotHealthNotice,
@@ -48,6 +53,12 @@ function hasRemote() {
   return (r.stdout || '').trim().length > 0;
 }
 
+const isGitRepo = () =>
+  spawnSync('git', ['-C', HYPO_DIR, 'rev-parse', '--is-inside-work-tree'], {
+    encoding: 'utf-8',
+    timeout: 30000,
+  }).status === 0;
+
 const headSha = () => {
   const r = spawnSync('git', ['-C', HYPO_DIR, 'rev-parse', '--verify', '-q', 'HEAD'], {
     encoding: 'utf-8',
@@ -55,6 +66,43 @@ const headSha = () => {
   });
   return r.status === 0 ? (r.stdout || '').trim() : null;
 };
+
+// A pull that moved HEAD (or a merge finished here) may have brought session entries other
+// machines closed, so the views are rendered again from what is on disk now. The vault lock is
+// held by the caller (it is not reentrant), hence the unlocked writer. The views are not tracked,
+// so this adds nothing to a commit or push.
+function renderViewsIfHeadMoved(before) {
+  if (headSha() === before) return;
+  try {
+    writeGeneratedViewsUnlocked(HYPO_DIR);
+  } catch (err) {
+    writeRootHotHealthNotice(
+      HYPO_DIR,
+      `세션 현황 파일을 pull 뒤에 다시 만들지 못했습니다: ${err?.message ?? String(err)}`,
+    );
+  }
+}
+
+// Under a migrated upstream the generated views stay untracked. An old-version machine can push a
+// commit that tracks them again; once a pull has merged it in, a push would hand that state to
+// every machine and switch the session views off for them. Returns the reason to withhold the
+// push, or null. Fails closed: when git cannot list the tracked paths the push is withheld too.
+function trackedViewsUnderMigratedUpstream() {
+  if (!upstreamIsMigrated(HYPO_DIR)) return null;
+  let tracked;
+  try {
+    tracked = listTrackedGeneratedViews(HYPO_DIR, { source: 'head' });
+  } catch (err) {
+    return `세션 현황 파일의 추적 여부를 확인하지 못해 push하지 않았습니다 (${err?.message ?? err}).`;
+  }
+  if (!tracked.length) return null;
+  const list = tracked.map((p) => `'${p}'`).join(' ');
+  return (
+    `원격은 이미 세션 항목 방식으로 옮겨졌는데 이 브랜치가 생성 파일을 추적합니다: ${tracked.join(', ')}. ` +
+    '이대로 push하면 모든 기계에서 세션 현황이 꺼지므로 push하지 않았습니다. ' +
+    `git -C ${HYPO_DIR} rm --cached -- ${list} 를 커밋한 뒤 다시 시도하세요 (파일은 디스크에 남고 무시됩니다).`
+  );
+}
 
 // Overridable so a test can force a fast lock-timeout instead of waiting out
 // the real default (mirrors crystallize.mjs's HYPO_APPEND_LOCK_TIMEOUT_MS).
@@ -114,6 +162,19 @@ try {
   withFileLock(
     vaultCommitLockTarget(HYPO_DIR),
     () => {
+      const startHead = headSha();
+      // A merge this tool started and a killed run left open is finished before anything is
+      // committed: a commit on top of it would either fail (a partial commit during a merge) or
+      // sweep the half-resolved index into the merge commit. One that is not ours, or not safe to
+      // finish, stops this Stop (commit and sync): the touched paths stay for the next one, and
+      // the notice says what to do.
+      if (isGitRepo()) {
+        const merge = finishOwnedMerge(HYPO_DIR);
+        if (merge.notices.length) writeRootHotHealthNotice(HYPO_DIR, merge.notices.join('\n'));
+        if (merge.state === 'external' || merge.state === 'stuck') return;
+        renderViewsIfHeadMoved(startHead);
+      }
+
       // Peek this session's scope, run the scoped commit, and — only on
       // success — clear exactly what committed, ALL under one hold of the
       // per-session lock. See commitTouchedPaths's docstring for why a
@@ -147,23 +208,19 @@ try {
         // (plus whatever the pull brought down) and nothing a sibling added
         // after the unlock.
         //
-        // A pull that moved HEAD may have brought session entries other machines
-        // closed, so the views are rendered again from what is on disk now. The
-        // lock is held here (it is not reentrant), hence the unlocked writer.
-        // The views are not tracked, so this adds nothing to the commit or push.
+        // A pull that moved HEAD may have brought session entries other machines closed.
         const before = headSha();
         const pulled = pullRemote(HYPO_DIR);
-        if (headSha() !== before) {
-          try {
-            writeGeneratedViewsUnlocked(HYPO_DIR);
-          } catch (err) {
-            writeRootHotHealthNotice(
-              HYPO_DIR,
-              `세션 현황 파일을 pull 뒤에 다시 만들지 못했습니다: ${err?.message ?? String(err)}`,
-            );
-          }
+        renderViewsIfHeadMoved(before);
+        // The push follows only a pull that landed. After a conflict, a deferral or a failed
+        // pull, pullRemote has already recorded the cause as the last sync-state entry, and a
+        // push attempt would add a second failure on top of it (a rejected push) that
+        // SessionStart would show instead of the conflict guidance.
+        if (pulled.pulled) {
+          const blocked = trackedViewsUnderMigratedUpstream();
+          if (blocked) writeRootHotHealthNotice(HYPO_DIR, blocked);
+          else pushTarget = resolvePushTarget(HYPO_DIR);
         }
-        if (!pulled.conflict) pushTarget = resolvePushTarget(HYPO_DIR);
       }
     },
     { timeoutMs: VAULT_LOCK_TIMEOUT_MS },
@@ -178,7 +235,7 @@ try {
 }
 
 // Outside the lock on purpose: see the note above the try block. Guarded by a
-// target resolved only after a successful commit and a non-conflicting pull,
+// target resolved only after a successful commit and a pull that landed,
 // so the set of cases that push is exactly the set that pushed before this
 // split, and what each one sends is fixed before the lock goes.
 if (pushTarget) pushRemote(HYPO_DIR, pushTarget);

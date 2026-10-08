@@ -4318,6 +4318,48 @@ export function classifySyncOp(op) {
 }
 
 /**
+ * The short text a sync failure record keeps from git's stderr. The first non-empty line is not
+ * enough: a refused merge says "would be overwritten by merge" and lists the paths on the lines
+ * after it, and a refused push opens with `To <url>`, with the rejection two lines further down.
+ * Both are kept here (the blocking paths, `non-fast-forward`), capped so a record stays one line.
+ *
+ * @param {unknown} error raw stderr/stdout
+ * @returns {string}
+ */
+export function summarizeSyncError(error) {
+  const lines = String(error || '')
+    .split('\n')
+    .map((l) => l.trim())
+    .filter(Boolean);
+  const first = (lines[0] || 'unknown error').slice(0, 200);
+  const blocked = lines.findIndex((l) => /would be overwritten by (merge|checkout)/i.test(l));
+  if (blocked >= 0) {
+    const paths = [];
+    for (const l of lines.slice(blocked + 1)) {
+      if (/^(please|aborting|error:|hint:)/i.test(l)) break;
+      paths.push(l);
+    }
+    if (paths.length) {
+      const shown = paths.slice(0, 5).join(', ');
+      const more = paths.length > 5 ? ` (+${paths.length - 5} more)` : '';
+      return `${lines[blocked].slice(0, 120)} ${shown}${more}`.slice(0, 400);
+    }
+    return lines[blocked].slice(0, 200);
+  }
+  const rejected = lines.find((l) =>
+    /\[(remote )?rejected\]|non-fast-forward|fetch first/i.test(l),
+  );
+  if (rejected) {
+    const behind = /non-fast-forward|fetch first/i.test(rejected);
+    return `push rejected${behind ? ' as non-fast-forward (the remote moved)' : ''}: ${rejected}`.slice(
+      0,
+      300,
+    );
+  }
+  return first;
+}
+
+/**
  * Append a sync failure entry. Best-effort — never throws, since a failed
  * failure-log must not break the Stop hook that calls it.
  *
@@ -4326,21 +4368,16 @@ export function classifySyncOp(op) {
  *   merge conflict was detected and aborted (the tree was left clean at the
  *   local commit); 'conflict-unresolved' = the abort itself failed and the tree
  *   may still be half-merged (rare). See syncRemote.
- * @param {string} error  raw stderr/stdout; first non-empty line is kept
+ * @param {string} error  raw stderr/stdout; kept as `summarizeSyncError` shortens it
  */
 export function appendSyncFailure(hypoDir, op, error) {
   try {
     const cacheDir = join(hypoDir, '.cache');
     if (!existsSync(cacheDir)) mkdirSync(cacheDir, { recursive: true });
-    const firstLine =
-      String(error || '')
-        .split('\n')
-        .map((l) => l.trim())
-        .find(Boolean) || 'unknown error';
     const entry = {
       timestamp: new Date().toISOString(),
       op,
-      error: firstLine.slice(0, 200),
+      error: summarizeSyncError(error),
       host: hostname(),
     };
     appendFileSync(syncStatePath(hypoDir), JSON.stringify(entry) + '\n');
@@ -4870,9 +4907,9 @@ function leaveSyncNotice(hypoDir, notices) {
  *     locally, "theirs" stays on the remote, and the divergence is surfaced by
  *     session-start + doctor until the user merges manually.
  *   - non-conflict pull failure (network/auth: no unmerged paths) → record
- *     op='pull' and report `{pulled: false, conflict: false}`; the caller still
- *     pushes, since a transient pull blip should not block an otherwise
- *     pushable commit.
+ *     op='pull' and report `{pulled: false, conflict: false}`. The caller does not push either:
+ *     a push after a failed or deferred pull only adds a second failure that hides the cause
+ *     (the last record is what the next SessionStart shows).
  *
  * `notices` (always an array) are also left for the next SessionStart. `deferred` is set only when
  * this sync skipped the pull on purpose; `leaveNotices: false` leaves them to a caller that
@@ -4882,8 +4919,7 @@ function leaveSyncNotice(hypoDir, notices) {
  * `backUpGeneratedPath` take.
  *
  * Best-effort: never throws. A sync failure must not break the Stop hook. A
- * throw is reported as `{pulled: false, conflict: false}`, which lets the
- * caller attempt the push, exactly as the combined function did. A throw
+ * throw is recorded as a pull failure and reported as `{pulled: false, conflict: false}`. A throw
  * never aborts an open merge (a killed run leaves the same state).
  *
  * @param {string} hypoDir
@@ -4901,9 +4937,10 @@ export function pullRemote(hypoDir, { testHooks, leaveNotices = true } = {}) {
     if (leaveNotices) leaveSyncNotice(hypoDir, notices);
     return { ...result, notices };
   };
-  // A deferral skips the pull on purpose; it is recorded like a failed pull so doctor shows it.
+  // A deferral skips the pull on purpose; it is recorded like a failed pull so doctor shows it, and
+  // so the last record names the cause even when the deferral came without a notice.
   const defer = (why, note) => {
-    if (note) appendSyncFailure(hypoDir, 'pull', note);
+    appendSyncFailure(hypoDir, 'pull', note || `pull deferred: ${why}`);
     return done({ pulled: false, conflict: false, deferred: why });
   };
   // What the clearing step moved. A pull that does not land takes it back.
@@ -5030,8 +5067,10 @@ export function pullRemote(hypoDir, { testHooks, leaveNotices = true } = {}) {
     }
     appendSyncFailure(hypoDir, 'pull', pull.stderr || pull.stdout);
     return done({ pulled: false, conflict: false });
-  } catch {
-    // best-effort: never break the Stop hook
+  } catch (err) {
+    // best-effort: never break the Stop hook. The record keeps a caller that does not push after a
+    // failed pull from going quiet.
+    appendSyncFailure(hypoDir, 'pull', `pull stopped: ${err?.message ?? String(err)}`);
     return done({ pulled: false, conflict: false });
   }
 }
@@ -5127,8 +5166,8 @@ export function resolvePushTarget(hypoDir, oid) {
  *     real means either pushing from a scratch clone or taking the lock back
  *     across the network, both bigger than this fix.
  *
- * Callers must not call this after a pullRemote that reported `conflict`:
- * pushing from a diverged branch only records a second, redundant failure.
+ * Callers must not call this after a pullRemote that did not report `pulled` (a conflict, a
+ * deferral or a failure): pushing then only records a second failure over the real cause.
  *
  * Best-effort: never throws.
  *
@@ -5183,6 +5222,7 @@ export function pushRemote(hypoDir, target) {
 export function syncRemote(hypoDir) {
   const { pulled, conflict } = pullRemote(hypoDir);
   if (conflict) return { pulled: false, pushed: false, conflict: true };
+  if (!pulled) return { pulled: false, pushed: false, conflict: false };
   // Resolved here rather than left to the push: the target is what makes the
   // push unambiguous, and a caller of this combined form has no other place to
   // decide it. HEAD right after the pull, which is what a bare `git push` would

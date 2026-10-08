@@ -30,7 +30,12 @@ import { isHypomnemaPluginEnabled } from '../scripts/lib/plugin-detect.mjs';
 import { wikiPreCommitContent } from '../scripts/lib/git-hooks-dir.mjs';
 import { writeDualSkipProvenance } from '../scripts/lib/pkg-json.mjs';
 import { PROVENANCE_FILENAME } from '../scripts/lib/pkg-provenance.mjs';
-import { GITATTRIBUTES_BLOCK, GITIGNORE_BLOCK } from '../hooks/session-entries.mjs';
+import {
+  GITATTRIBUTES_BLOCK,
+  GITIGNORE_BLOCK,
+  PREVIOUS_GITATTRIBUTES_BLOCKS,
+  PREVIOUS_GITIGNORE_BLOCKS,
+} from '../hooks/session-entries.mjs';
 import { migrationState } from '../hooks/hypo-shared.mjs';
 import { test, suite } from './harness.mjs';
 import {
@@ -3183,7 +3188,7 @@ test('migrate-sessions: a remote whose block lost a line is not called migrated,
 
 test('migrate-sessions: the two blocks are pinned, so an edit of either cannot skip PREVIOUS_*_BLOCKS', () => {
   // `staleBlockWrites` swaps an old edition for the current one only when the old edition is listed
-  // in PREVIOUS_GITIGNORE_BLOCKS / PREVIOUS_GITATTRIBUTES_BLOCKS (scripts/upgrade.mjs), a list kept by
+  // in PREVIOUS_GITIGNORE_BLOCKS / PREVIOUS_GITATTRIBUTES_BLOCKS (hooks/session-entries.mjs), a list kept by
   // hand. A vault migrated with an unlisted edition is never repaired.
   const sha = (text) => createHash('sha256').update(text).digest('hex');
   const pinned = [
@@ -3202,7 +3207,53 @@ test('migrate-sessions: the two blocks are pinned, so an edit of either cannot s
     assert.equal(
       sha(block),
       expected,
-      `${name} changed. Add the outgoing edition (its exact bytes) to PREVIOUS_${name}S in scripts/upgrade.mjs, then update the pinned sha256 in this test to ${sha(block)}.`,
+      `${name} changed. Add the outgoing edition (its exact bytes) to PREVIOUS_${name}S in hooks/session-entries.mjs, then update the pinned sha256 in this test to ${sha(block)}.`,
+    );
+  }
+});
+
+test('migrate-sessions: every edition of the two blocks that ever shipped is current or listed in PREVIOUS_*_BLOCKS', () => {
+  // The pin above fails when a block changes, but a person can satisfy it by updating the hash alone.
+  // This one compares the lists: `editions` is every edition that shipped, oldest first, ending with
+  // the current one. Changing a block means appending its new hash here, and then every earlier
+  // edition has to sit in PREVIOUS_*_BLOCKS, or `staleBlockWrites` never repairs a vault that was
+  // moved with it.
+  const sha = (text) => createHash('sha256').update(text).digest('hex');
+  const lists = [
+    [
+      'GITIGNORE_BLOCK',
+      GITIGNORE_BLOCK,
+      PREVIOUS_GITIGNORE_BLOCKS,
+      [
+        'd61dc88b20eb0f5fd0ebaf680f00614d40ea67b2072d14156558733dd6b9eea2',
+        'ebf4c3cb1c15c6a08c932a5317fe6b9b6e55c8f7b933e8fb9d131515922a166f',
+      ],
+    ],
+    [
+      'GITATTRIBUTES_BLOCK',
+      GITATTRIBUTES_BLOCK,
+      PREVIOUS_GITATTRIBUTES_BLOCKS,
+      [
+        'b215a98b587951d684fa739649b9b57c2a43b90e66317bb1dd3c5f57268c4544',
+        '5924078f8b9e575df7f2a6efef63769eae5eb0a8bc86008a9c54eefd0636d0bf',
+      ],
+    ],
+  ];
+  for (const [name, current, previous, editions] of lists) {
+    assert.equal(
+      editions.at(-1),
+      sha(current),
+      `${name} changed: append ${sha(current)} to this test's editions and put the outgoing edition in PREVIOUS_${name}S`,
+    );
+    assert.deepEqual(
+      previous.map(sha).sort(),
+      editions.slice(0, -1).sort(),
+      `PREVIOUS_${name}S must hold exactly the earlier editions, byte for byte`,
+    );
+    assert.equal(
+      previous.map(sha).includes(sha(current)),
+      false,
+      `${name} is not its own previous`,
     );
   }
 });

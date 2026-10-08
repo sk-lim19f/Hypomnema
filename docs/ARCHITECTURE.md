@@ -132,10 +132,10 @@ Hooks run automatically at Claude Code lifecycle events. They are deployed to `~
 | `hypo-lookup` | BM25 search over the wiki on every prompt. **HIT** → inject top-3 page snippets (≤2000 chars each; a page whose `verify_by_date` is overdue gets a `[STALE verify_by_date=…]` marker prepended). **MISS** → emit closest-slug signal that prompts Claude to research + `/hypo:ingest` |
 | `hypo-compact-guard` | Detect `/compact` or `/clear` typed in chat and, if session close is incomplete, tell Claude so. It never blocks `/compact` |
 | `hypo-personal-check` | PreCompact detection: lint blockers, uncommitted changes, missing session-log entries surface as a `systemMessage`; `/compact` is never blocked here |
-| `hypo-auto-stage` | After Write/Edit on a wiki path, run `git add` (skips paths matching `.hypoignore`) |
+| `hypo-auto-stage` | After Write/Edit on a wiki path, run `git add` (skips paths matching `.hypoignore`, and every path while a merge is open) |
 | `hypo-hot-rebuild` | At session stop, regenerate the root `hot.md` projection (the same generator `hypo-session-start` also calls); emit growth metrics + cache for next SessionStart. A scan failure (not just an empty `projects/`) skips the write and leaves a health notice for the next `SessionStart` to surface |
 | `hypo-session-record` | At session stop, append `{session_id, transcript_path, recorded_at, cwd, device}` to `.cache/sessions/index.jsonl` (primary source for the observability audit) |
-| `hypo-auto-commit` | At session stop, filter changed paths through `.hypoignore`, commit non-ignored changes, `git pull --no-rebase` + `git push` (silent fail on missing remote) |
+| `hypo-auto-commit` | At session stop, filter changed paths through `.hypoignore`, finish a merge Hypomnema left open, commit non-ignored changes, `git pull --no-rebase` + `git push` (silent fail on missing remote; the push is skipped after a pull that did not land, and when the tree tracks generated views under a migrated upstream) |
 | `hypo-cwd-change` | When working directory changes, re-resolve the active project and build a notice carrying its `hot.md`. The hook reference documents `watchPaths` and `systemMessage` as `CwdChanged`'s output fields and says only that "it shows the `systemMessage` as a brief terminal notification" and "the message doesn't reach the SDK message stream"; it does not say whether `systemMessage` reaches the model on this event either way. As of Claude Code 2.1.276 (checked 2026-09-18) and reconfirmed on 2.1.283, tracing the installed binary shows the only consumer of that `systemMessage` is the terminal notification queue, a low-priority toast that a same-keyed message replaces and that disappears after five seconds, with no branch that forwards it to the model; outside the interactive REPL the injecting function is null. No live-session observation of this path exists either way. Until the documentation says otherwise, this event is treated as not reaching the model |
 | `hypo-file-watch` | Build a `systemMessage` notice for a changed wiki file, over the same field as `hypo-cwd-change` whose reach to the model the reference leaves undocumented; as of Claude Code 2.1.276 (checked 2026-09-18) and reconfirmed on 2.1.283 it is likewise treated as not reaching the model, for the same shared-consumer reason (see the `hypo-cwd-change` row). On a stock install the event still has no registered trigger: its matcher key is omitted (not blank), which the reference says matches every watched file while adding nothing to the watch list, and nothing in this package returns `watchPaths` to seed that list. The watch list is session-global, not scoped to this plugin, so another hook or plugin that does seed it would make this matcher-less group fire on every watched file; the hook still returns immediately for any path that does not start with `HYPO_DIR` (a string-prefix check, not a symlink-resolving one). That check only screens the path string: a symlink living inside the wiki still starts with `HYPO_DIR` and passes it, and the hook's `readFileSync` follows the link, so such a symlink can still surface content from wherever it points. The event also fires regardless of who changed the file, so it is not an external-edit signal |
 
@@ -329,16 +329,17 @@ Before overwriting content it does not recognize as its own, the projection back
 a numbered variant, `-2.md`, `-3.md`, ...). These
 backups are never cleaned up automatically. Delete the ones you no longer need by hand.
 
-The write itself goes through `writeRootHotProjection` in `hooks/hypo-shared.mjs`, which holds
+The write itself goes through `writeGeneratedViews` in `hooks/session-views.mjs`, which holds
 the vault commit lock (`vaultCommitLockTarget`, the same lock `hypo-auto-commit.mjs` and
-`crystallize.mjs`'s apply take around stage and commit) across the whole projection write: the
-first read of `hot.md`, the ownership check, the backup, and the replacing rename. `hypo-session-start.mjs`'s
-own `git pull` takes and releases the same lock before calling into the projection, so the two
-never overlap; they still serialize against each other and against a concurrent `auto-commit` or
-`crystallize` apply. The lock is not reentrant: nothing inside the projection's write path may
-take it a second time, and a caller that already holds it has to call the unlocked form instead.
-When the lock cannot be acquired within its timeout, the write is skipped rather than blocked on
-indefinitely, and the caller is told the pointer table was left as-is.
+`crystallize.mjs`'s apply take around stage and commit) across the whole write: the read of each
+view, the ownership check, the backup, and the replacing rename. `hypo-session-start.mjs`'s own
+`git pull` takes and releases the same lock before it renders, so the two never overlap; they
+still serialize against each other and against a concurrent `auto-commit` or `crystallize` apply.
+The lock is not reentrant: nothing inside the write path may take it a second time, and a caller
+that already holds it (`hypo-auto-commit.mjs` after its pull) calls `writeGeneratedViewsUnlocked`
+instead. When the lock cannot be acquired within its timeout, the write is skipped rather than
+blocked on indefinitely, the result carries `lockTimeout: true`, and a health notice is left for
+the next SessionStart.
 
 ---
 

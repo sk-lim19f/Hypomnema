@@ -9370,3 +9370,223 @@ test('fetch once per sync, and a failed fetch is recorded as the pull failure wi
     );
   });
 });
+
+suite('Stop sync: owned merges, a pull that did not land, a migrated upstream');
+
+// The Stop hook over two real clones. `runStop` inherits the throwaway git config `inSyncEnv` sets.
+const syStop = (dir, sid) => runStop('hypo-auto-commit.mjs', dir, { session_id: sid });
+const syTouch = (dir, sid, rel, text = 'note\n') => {
+  syPut(dir, rel, text);
+  recordTouchedPaths(dir, sid, rel);
+};
+const syOpsOf = (dir) => readSyncEntries(dir).map((e) => e.op);
+const syRemoteHead = (origin) => sgitOk(origin, ['rev-parse', 'main']).trim();
+const syHealthNotice = (dir) => {
+  const p = join(dir, '.cache', 'root-hot-projection-notice.json');
+  return existsSync(p) ? JSON.parse(readFileSync(p, 'utf-8')).message : '';
+};
+// A merge a person opened (no owned record) in `b`, with a local commit so it is a real merge.
+function syOpenPersonMerge(a, b) {
+  syEditAndPush(a, 'pages/y.md', 'y upstream\n');
+  syPut(b, 'pages/x.md', 'x local\n');
+  syCommit(b, 'local');
+  sgitOk(b, ['fetch', '-q']);
+  sgitOk(b, ['merge', '--no-commit', '--no-ff', '@{u}']);
+  assert.equal(syMergeHead(b), true);
+}
+
+test('Stop finishes a merge this tool left open before it commits, and then pushes', () => {
+  withIncomingEdit(({ b, origin }) => {
+    pullRemote(b, {
+      testHooks: {
+        afterResolveBeforeCommit: () => {
+          throw new Error('killed');
+        },
+      },
+    });
+    assert.equal(syMergeHead(b), true, 'precondition: the merge is left open');
+    assert.equal(existsSync(syOwnedPath(b)), true, 'precondition: and it is ours');
+    syTouch(b, 'sess-owned', 'pages/note.md');
+    const r = syStop(b, 'sess-owned');
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    assert.equal(syMergeHead(b), false, 'the open merge was finished');
+    assert.equal(existsSync(syOwnedPath(b)), false);
+    assert.equal(sgitOk(b, ['rev-list', '--merges', '--count', 'HEAD']).trim(), '1', 'one merge');
+    assert.match(sgitOk(b, ['ls-tree', 'HEAD', 'pages/note.md']), /pages\/note\.md/, 'committed');
+    assert.equal(syRemoteHead(origin), syHead(b), 'and pushed');
+  });
+});
+
+test('Stop leaves a merge a person opened alone: nothing committed, nothing pushed, the notice says why', () => {
+  withSyncClones(({ a, b, origin }) => {
+    syOpenPersonMerge(a, b);
+    const remote = syRemoteHead(origin);
+    const head = syHead(b);
+    syTouch(b, 'sess-person', 'pages/note.md');
+    const r = syStop(b, 'sess-person');
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    assert.equal(syMergeHead(b), true, 'their merge is still open');
+    assert.equal(syHead(b), head, 'no commit on top of it');
+    assert.equal(sgitOk(b, ['ls-tree', 'HEAD', 'pages/note.md']).trim(), '');
+    assert.equal(syRemoteHead(origin), remote, 'nothing pushed');
+    assert.match(syHealthNotice(b), /진행 중인 merge가 있어/);
+    assert.deepEqual(
+      JSON.parse(readFileSync(touchedPathsPath(b, 'sess-person'), 'utf-8')),
+      ['pages/note.md'],
+      'the touched path stays for the next Stop',
+    );
+  });
+});
+
+const syAutoStage = (dir, sid, rel) =>
+  spawnSync(process.execPath, [join(HOOKS, 'hypo-auto-stage.mjs')], {
+    input: JSON.stringify({
+      session_id: sid,
+      tool_name: 'Write',
+      tool_input: { file_path: join(dir, rel), content: 'z\n' },
+    }),
+    encoding: 'utf-8',
+    env: { ...process.env, HOME: SESSION_TMP_HOME, HYPO_DIR: dir },
+  });
+
+test('auto-stage does not run git add while a merge is open, and still records the path', () => {
+  withSyncClones(({ a, b }) => {
+    syOpenPersonMerge(a, b);
+    syPut(b, 'pages/z.md', 'z\n');
+    const r = syAutoStage(b, 'sess-stage', 'pages/z.md');
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    assert.equal(sgitOk(b, ['ls-files', '--', 'pages/z.md']).trim(), '', 'not staged');
+    assert.deepEqual(
+      JSON.parse(readFileSync(touchedPathsPath(b, 'sess-stage'), 'utf-8')),
+      ['pages/z.md'],
+      'Stop will commit it once the merge is done',
+    );
+    // The pair: with the merge gone, the same write is staged.
+    sgitOk(b, ['merge', '--abort']);
+    assert.equal(syMergeHead(b), false);
+    const again = syAutoStage(b, 'sess-stage', 'pages/z.md');
+    assert.equal(again.status, 0, `stderr: ${again.stderr}`);
+    assert.equal(sgitOk(b, ['ls-files', '--', 'pages/z.md']).trim(), 'pages/z.md', 'staged');
+  });
+});
+
+test('Stop does not push after a conflicting pull: the last sync record is the conflict and SessionStart shows its guidance', () => {
+  withSyncClones(({ a, b, origin }) => {
+    syEditAndPush(a, 'pages/y.md', 'y from a\n');
+    const remote = syRemoteHead(origin);
+    syTouch(b, 'sess-conflict', 'pages/y.md', 'y from b\n');
+    const r = syStop(b, 'sess-conflict');
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    assert.match(sgitOk(b, ['log', '-1', '--format=%s', '--', 'pages/y.md']), /\S/, 'committed');
+    assert.equal(syMergeHead(b), false, 'the conflicting merge was aborted');
+    assert.deepEqual(syOpsOf(b), ['conflict'], 'no push was attempted after it');
+    assert.equal(syRemoteHead(origin), remote);
+    const start = runStart(b);
+    const ctx = injectedContext(JSON.parse(start.stdout)) || '';
+    assert.match(ctx, /remote diverged/, ctx);
+    assert.doesNotMatch(ctx, /last sync failed: push/, ctx);
+  });
+});
+
+test('Stop does not push after a deferred pull: the last record names the deferral, not a rejected push', () => {
+  withSyncClones(({ a, b, origin }) => {
+    syMigrate(a);
+    sgitOk(a, ['push', '-q']);
+    const remote = syRemoteHead(origin);
+    // The catch-up defers on a .gitignore that is not a pure addition.
+    syPut(b, '.gitignore', '.cache/\n!keep.md\n');
+    syTouch(b, 'sess-deferred', 'pages/note.md');
+    const r = syStop(b, 'sess-deferred');
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    assert.match(sgitOk(b, ['ls-tree', 'HEAD', 'pages/note.md']), /pages\/note\.md/, 'committed');
+    const entries = readSyncEntries(b);
+    assert.deepEqual(
+      entries.map((e) => e.op),
+      ['pull'],
+      JSON.stringify(entries),
+    );
+    assert.match(entries[0].error, /\.gitignore/, 'the record names the deferral');
+    assert.equal(syRemoteHead(origin), remote, 'nothing pushed');
+  });
+});
+
+test('Stop does not push after a failed pull: only the pull failure is recorded', () => {
+  withSyncClones(({ b, root }) => {
+    sgitOk(b, ['remote', 'set-url', 'origin', join(root, 'gone.git')]);
+    syTouch(b, 'sess-failed', 'pages/note.md');
+    const r = syStop(b, 'sess-failed');
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    assert.match(sgitOk(b, ['ls-tree', 'HEAD', 'pages/note.md']), /pages\/note\.md/, 'committed');
+    assert.deepEqual(syOpsOf(b), ['pull'], 'the pull failure, and no push on top of it');
+  });
+});
+
+test('a pull failure record names the paths that blocked the merge', () => {
+  withSyncClones(({ a, b }) => {
+    syEditAndPush(a, 'pages/new.md', 'from a\n');
+    syPut(b, 'pages/new.md', 'untracked here\n');
+    const res = pullRemote(b);
+    assert.equal(res.pulled, false, JSON.stringify(res));
+    const entries = readSyncEntries(b);
+    assert.equal(entries.at(-1).op, 'pull');
+    assert.match(entries.at(-1).error, /would be overwritten by merge/);
+    assert.match(entries.at(-1).error, /pages\/new\.md/, 'the blocking path is in the record');
+  });
+});
+
+test('a push failure record says non-fast-forward, not just the "To <url>" line', () => {
+  withSyncClones(({ a, b }) => {
+    syEditAndPush(a, 'pages/y.md', 'y upstream\n');
+    syPut(b, 'pages/x.md', 'x local\n');
+    syCommit(b, 'local');
+    const res = pushRemote(b, resolvePushTarget(b));
+    assert.equal(res.pushed, false);
+    const last = readSyncEntries(b).at(-1);
+    assert.equal(last.op, 'push');
+    assert.match(last.error, /non-fast-forward/, last.error);
+    assert.doesNotMatch(last.error, /^To /, last.error);
+  });
+});
+
+test('under a migrated upstream, Stop withholds a push of a tree that tracks generated views, and says so', () => {
+  withSyncClones(({ a, b, origin }) => {
+    syMigrate(a);
+    // An old-version machine pushed on top: the view is tracked again (force-added past the ignore).
+    syPut(a, 'projects/p/hot.md', SY_W1);
+    sgitOk(a, ['add', '-f', 'projects/p/hot.md']);
+    sgitOk(a, ['commit', '-q', '-m', 'old machine re-tracks the view']);
+    sgitOk(a, ['push', '-q']);
+    const remote = syRemoteHead(origin);
+    syTouch(b, 'sess-tracked', 'pages/note.md');
+    const r = syStop(b, 'sess-tracked');
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    assert.equal(
+      sgit(b, ['merge-base', '--is-ancestor', remote, 'HEAD']).status,
+      0,
+      'the pull landed: HEAD holds the remote tip',
+    );
+    assert.match(sgitOk(b, ['ls-tree', 'HEAD', 'pages/note.md']), /pages\/note\.md/, 'committed');
+    assert.match(sgitOk(b, ['ls-tree', '-r', '--name-only', 'HEAD']), /projects\/p\/hot\.md/);
+    assert.equal(syRemoteHead(origin), remote, 'nothing pushed');
+    const notice = syHealthNotice(b);
+    assert.match(notice, /projects\/p\/hot\.md/, notice);
+    assert.match(notice, /push하지 않았습니다/, notice);
+    assert.equal(existsSync(join(b, '.cache', 'sync-state.json')), false, 'not a sync failure');
+  });
+});
+
+test('under a migrated upstream, Stop pushes a tree that tracks no generated view', () => {
+  withSyncClones(({ a, b, origin }) => {
+    syMigrate(a);
+    sgitOk(a, ['push', '-q']);
+    syTouch(b, 'sess-untracked', 'pages/note.md');
+    const r = syStop(b, 'sess-untracked');
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    assert.equal(syRemoteHead(origin), syHead(b), 'pushed');
+    assert.doesNotMatch(
+      sgitOk(b, ['ls-tree', '-r', '--name-only', 'HEAD']),
+      /projects\/p\/hot\.md/,
+    );
+    assert.doesNotMatch(syHealthNotice(b), /push하지 않았습니다/);
+  });
+});

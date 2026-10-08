@@ -63,6 +63,15 @@ if (filePath.startsWith(HYPO_DIR + '/') || filePath === HYPO_DIR) {
         vaultCommitLockTarget(HYPO_DIR),
         () => {
           const rel = relative(HYPO_DIR, filePath);
+          // A merge in progress (open conflict, or a resolution waiting for its commit): staging
+          // now would change that resolution. The path is still in the session's touched set
+          // below, so Stop commits it once the merge is done.
+          if (
+            spawnSync('git', ['-C', HYPO_DIR, 'rev-parse', '-q', '--verify', 'MERGE_HEAD'], {
+              stdio: 'ignore',
+            }).status === 0
+          )
+            return;
           // A version a person already staged for this path must reach the commit intact, so that
           // it can be backed up there: `git add` would put the tool's bytes over it first. The
           // path is left unstaged (it is still in the session's touched set below, so Stop commits

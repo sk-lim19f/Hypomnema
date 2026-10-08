@@ -74,6 +74,8 @@ import { atomicWrite } from '../hooks/atomic-write.mjs';
 import {
   GITATTRIBUTES_BLOCK,
   GITIGNORE_BLOCK,
+  PREVIOUS_GITATTRIBUTES_BLOCKS,
+  PREVIOUS_GITIGNORE_BLOCKS,
   missingBlockLines,
 } from '../hooks/session-entries.mjs';
 import {
@@ -1157,29 +1159,6 @@ function writePluginModeMetadata() {
 // TOCTOU refusal directly unit-testable without spawning the whole script.
 
 // ── --migrate-sessions ───────────────────────────────────────────────────────
-
-// Earlier byte-exact editions of the two blocks the migration commit adds. A vault moved with one of
-// them keeps migrating nothing further (`migrationState` reads a block that lacks a pattern line of
-// the current edition as `incomplete-block`), so the command swaps a known old edition for the
-// current one. Add the outgoing edition here whenever `GITIGNORE_BLOCK` or `GITATTRIBUTES_BLOCK`
-// changes. An edition that is not listed (a hand edit) is left alone and the move reports it.
-const PREVIOUS_GITIGNORE_BLOCKS = [
-  `# Hypomnema: session views generated from projects/*/sessions/ (not committed)
-/hot.md
-/projects/*/hot.md
-/projects/*/session-state.md
-/hot.md.pre-projection-backup*.md
-/hot.md.pre-projection-backup*.tmp
-/projects/*/*.pre-projection-backup*.md
-/projects/*/*.pre-projection-backup*.tmp
-/projects/*/sessions/*.tmp
-`,
-];
-const PREVIOUS_GITATTRIBUTES_BLOCKS = [
-  `# Hypomnema: session-log shards are append-only, keep both sides on a merge
-projects/*/session-log/*.md merge=union
-`,
-];
 
 /** `[{relPath, text}]`: HEAD's `.gitignore` / `.gitattributes` with a known old block swapped for the current one. */
 function staleBlockWrites(hypoDir) {

@@ -3502,7 +3502,7 @@ function withBaseProject(fn) {
   });
 }
 
-test('first SessionStart snapshots all three overwrite targets, and not the root pointer table', () => {
+test('first SessionStart snapshots only open-questions: project views and the root pointer table are not overwrite targets', () => {
   withBaseProject((dir, work) => {
     const r = runHook(
       'hypo-session-start.mjs',
@@ -3511,14 +3511,18 @@ test('first SessionStart snapshots all three overwrite targets, and not the root
     );
     assert.equal(r.status, 0, `stderr: ${r.stderr}`);
     const parsed = JSON.parse(readFileSync(bsBasePath(dir, 'ss-1'), 'utf-8'));
-    assert.deepEqual(Object.keys(parsed.targets).sort(), [
-      join('pages', 'open-questions.md'),
-      join('projects', 'p1', 'hot.md'),
-      join('projects', 'p1', 'session-state.md'),
-    ]);
-    assert.equal(parsed.targets[join('projects', 'p1', 'hot.md')], bsHashContent('# p1 hot\n'));
-    // The hooks regenerate the root pointer table, so a base for it would make
-    // their own write look foreign and park a file nobody edited.
+    assert.deepEqual(Object.keys(parsed.targets), [join('pages', 'open-questions.md')]);
+    assert.equal(parsed.targets[OQ_REL], bsHashContent('# open questions\n'));
+    // A close no longer writes projects/<p>/hot.md or session-state.md (the hook renders them from
+    // session entries), so a base for them would make the hook's own render look foreign.
+    for (const view of ['hot.md', 'session-state.md']) {
+      assert.equal(
+        readBaseEntry(dir, 'ss-1', join('projects', 'p1', view)).state,
+        'unknown',
+        `SessionStart must not enroll the project view ${view}`,
+      );
+    }
+    // The hooks regenerate the root pointer table too, for the same reason.
     assert.ok(
       !Object.prototype.hasOwnProperty.call(parsed.targets, 'hot.md'),
       'SessionStart must not snapshot the root pointer table',
@@ -3588,16 +3592,14 @@ test('SessionStart outside any project still snapshots the global target', () =>
   });
 });
 
-// ── review r4-w4 major 3: late enrollment must not run blind to injection ───
-// snapshotBase's late-enrollment branch hashes whatever `hypo-session-start.mjs`
-// names it. Before this fix, the hook named the current project's two targets
-// BEFORE deciding whether it was about to show them: a .hypoignore'd or
-// machine-scoped-out target still minted a "clean" base from bytes this
-// session never saw. The two tests below exercise the real hook end to end,
-// not `snapshotBase` directly, because the bug lived entirely in the CALLER's
-// sequencing.
+// ── a later SessionStart (resume in a project) never enrolls project views ──
+// Before the session-entries change the hook late-enrolled the current project's hot.md and
+// session-state.md once a session turned out to run inside a project. A close no longer
+// overwrites those files, so the enrollment is gone. These two tests exercise the real hook
+// end to end because the sequencing lived in the CALLER: a MISS first start followed by a HIT
+// resume must still leave the project views unenrolled, whether or not they are visible.
 
-test('a MISS-then-HIT late enrollment via the real hook records the CURRENT visible disk content', () => {
+test('a MISS-then-HIT resume through the real hook leaves the project views unenrolled and open-questions untouched', () => {
   withBaseProject((dir, work) => {
     const outside = mkdtempSync(join(tmpdir(), 'hypo-base-nowhere-'));
     try {
@@ -3607,11 +3609,8 @@ test('a MISS-then-HIT late enrollment via the real hook records the CURRENT visi
         { HYPO_DIR: dir },
       );
       assert.equal(r.status, 0, `first (MISS) stderr: ${r.stderr}`);
-      assert.equal(
-        readBaseEntry(dir, 'ss-late', join('projects', 'p1', 'hot.md')).state,
-        'unknown',
-        'a MISS never names a project target, not even as unknown-tracked',
-      );
+      const oqBefore = readBaseEntry(dir, 'ss-late', OQ_REL);
+      assert.equal(oqBefore.state, 'hash', 'open-questions enrolls on the first start');
 
       r = runHook(
         'hypo-session-start.mjs',
@@ -3619,18 +3618,21 @@ test('a MISS-then-HIT late enrollment via the real hook records the CURRENT visi
         { HYPO_DIR: dir },
       );
       assert.equal(r.status, 0, `second (HIT) stderr: ${r.stderr}`);
-      assert.equal(
-        readBaseEntry(dir, 'ss-late', join('projects', 'p1', 'hot.md')).hash,
-        bsHashContent('# p1 hot\n'),
-        'late enrollment through the real hook still records the visible disk content',
-      );
+      for (const view of ['hot.md', 'session-state.md']) {
+        assert.equal(
+          readBaseEntry(dir, 'ss-late', join('projects', 'p1', view)).state,
+          'unknown',
+          `a HIT resume must not late-enroll ${view}`,
+        );
+      }
+      assert.deepEqual(readBaseEntry(dir, 'ss-late', OQ_REL), oqBefore, 'resume keeps the base');
     } finally {
       rmSync(outside, { recursive: true, force: true });
     }
   });
 });
 
-test('late enrollment never mints a base for a target this session was never actually shown', () => {
+test('a project view hidden by .hypoignore stays unenrolled on a HIT resume, and so does its visible sibling', () => {
   withBaseProject((dir, work) => {
     const outside = mkdtempSync(join(tmpdir(), 'hypo-base-nowhere-'));
     try {
@@ -3641,8 +3643,6 @@ test('late enrollment never mints a base for a target this session was never act
       );
       assert.equal(r.status, 0, `first (MISS) stderr: ${r.stderr}`);
 
-      // Hide p1's hot.md from injection before the HIT resume that would
-      // otherwise late-enroll it.
       writeFileSync(join(dir, '.hypoignore'), `${join('projects', 'p1', 'hot.md')}\n`);
 
       r = runHook(
@@ -3654,125 +3654,25 @@ test('late enrollment never mints a base for a target this session was never act
       assert.equal(
         readBaseEntry(dir, 'ss-hidden', join('projects', 'p1', 'hot.md')).state,
         'unknown',
-        'a target this session was never actually shown must stay unenrolled, not read as a clean base',
+        'a target this session was never shown must stay unenrolled',
       );
-      // The sibling target (session-state.md) is not named by the ignore
-      // pattern above, so it must still enroll normally.
       assert.equal(
         readBaseEntry(dir, 'ss-hidden', join('projects', 'p1', 'session-state.md')).state,
-        'hash',
-        'an unrelated, visible target must still enroll',
+        'unknown',
+        'the visible sibling is not an overwrite target either, so it is not enrolled',
       );
+      assert.equal(readBaseEntry(dir, 'ss-hidden', OQ_REL).state, 'hash');
     } finally {
       rmSync(outside, { recursive: true, force: true });
     }
   });
 });
 
-// ── major: the real hook's knownHashes wiring, not just snapshotBase itself ─
-// The unit test below (review r5-w3 blocker 1) pins snapshotBase's own
-// contract: told a hash, it must use that hash, never a fresh disk read. But
-// every real-hook test above only ever reads and enrolls within one
-// synchronous hook invocation, with nothing writing to disk in between, so
-// hypo-session-start.mjs dropping the `knownHashes` argument entirely (and
-// falling back to snapshotBase's own fresh-disk-read behavior) would leave
-// every one of them green: with no writer landing in the gap, a fresh read
-// and the shown bytes are the same bytes either way.
-//
-// The two halves are measured separately, and on purpose. The window itself
-// (bytes landing between the read and the enroll) is the unit test below,
-// which can arrange that ordering exactly. The WIRING (does the hook hand
-// those hashes over at all) is this test, through HYPO_TEST_ENROLL_DUMP:
-// hypo-session-start.mjs writes the argument list it actually passed to the
-// named path, and the hook's own read of hot.md is the only source the hash
-// below can have come from. The earlier version of this test forced a fake
-// concurrent writer through a seam that wrote to the project's real hot.md,
-// which is a production hook truncating a user's file whenever an env var
-// happened to be set (review r5-w4 blocker 1). The dump path is outside the
-// vault and no vault file is written either way.
-//
-// Final cross-review finding: the dump alone catches a call that drops the
-// fourth argument, but not one that re-reads disk just before the enroll and
-// hashes that. Nothing changed the file, so the re-read and the shown bytes
-// were both A. HYPO_TEST_ENROLL_BARRIER holds the hook between its reads and
-// the enroll; this test changes hot.md to B there and then lets it go. The
-// barrier only waits for a path to exist, so the hook still writes nothing.
-// Disabling the check: in hypo-session-start.mjs, hash
-// `readFileSync(hit.hotPath, 'utf-8')` instead of `hotRead.raw` for
-// knownHashes. The dump and the base both come out as B.
-await testAsync(
-  'the real hook hands snapshotBase the hashes of the bytes it showed, even when the file changes before the enroll (review r5-w4 blocker 1, real hook wiring)',
-  async () => {
-    const dir = mkdtempSync(join(tmpdir(), 'hypo-base-proj-'));
-    const work = mkdtempSync(join(tmpdir(), 'hypo-base-work-'));
-    const probeDir = mkdtempSync(join(tmpdir(), 'hypo-enroll-dump-'));
-    const dumpPath = join(probeDir, 'enroll.json');
-    const goPath = join(probeDir, 'go');
-    try {
-      // Same tree withBaseProject builds; inlined because that helper takes a
-      // synchronous callback and this test has to await the hook.
-      mkdirSync(join(dir, 'pages'), { recursive: true });
-      mkdirSync(join(dir, 'projects', 'p1'), { recursive: true });
-      writeFileSync(join(dir, 'hypo-config.md'), '# config\n');
-      writeFileSync(join(dir, 'hot.md'), '# root hot\n');
-      writeFileSync(join(dir, 'pages', 'open-questions.md'), '# open questions\n');
-      writeFileSync(join(dir, 'projects', 'p1', 'hot.md'), '# p1 hot\n');
-      writeFileSync(join(dir, 'projects', 'p1', 'session-state.md'), '# p1 state\n');
-      writeFileSync(
-        join(dir, 'projects', 'p1', 'index.md'),
-        `---\ntitle: p1\ntype: project-index\nupdated: 2026-07-08\nworking_dir: "${work}"\n---\n# P1\n`,
-      );
-      const shownA = '# p1 hot\n';
-      const laterB = '# p1 hot\n\nB: written after the hook read the file\n';
-      const hotPath = join(dir, 'projects', 'p1', 'hot.md');
-      const child = spawn(process.execPath, [join(HOOKS, 'hypo-session-start.mjs')], {
-        env: {
-          ...process.env,
-          HOME: SESSION_TMP_HOME,
-          HYPO_DIR: dir,
-          HYPO_TEST_ENROLL_DUMP: dumpPath,
-          HYPO_TEST_ENROLL_BARRIER: goPath,
-        },
-      });
-      let stderr = '';
-      let reachedBarrier = false;
-      const exited = new Promise((resolve) => child.on('close', resolve));
-      child.stdout.resume();
-      child.stderr.on('data', (c) => {
-        stderr += c;
-        if (!reachedBarrier && stderr.includes('[hypo-test] enroll-barrier-ready')) {
-          reachedBarrier = true;
-          writeFileSync(hotPath, laterB);
-          writeFileSync(goPath, '');
-        }
-      });
-      child.stdin.end(JSON.stringify({ cwd: work, session_id: 'ss-wiring' }));
-      const status = await exited;
-      assert.equal(status, 0, `stderr: ${stderr}`);
-      assert.ok(reachedBarrier, `the hook never reached the enroll barrier: ${stderr}`);
-      assert.equal(readFileSync(hotPath, 'utf-8'), laterB, 'precondition: disk moved on to B');
-      const rel = join('projects', 'p1', 'hot.md');
-      assert.equal(
-        readBaseEntry(dir, 'ss-wiring', rel).hash,
-        bsHashContent(shownA),
-        'the base must record the bytes this session was shown (A), not the later B',
-      );
-      const dump = JSON.parse(readFileSync(dumpPath, 'utf-8'));
-      assert.equal(
-        dump.argc,
-        4,
-        `the hook must pass knownHashes as the fourth argument, got argc=${dump.argc}: ${JSON.stringify(dump)}`,
-      );
-      assert.equal(
-        dump.knownHashes?.[rel],
-        bsHashContent(shownA),
-        'the hash handed over must be of the bytes this session was shown, not a later read',
-      );
-    } finally {
-      for (const d of [dir, work, probeDir]) rmSync(d, { recursive: true, force: true });
-    }
-  },
-);
+// The real-hook knownHashes wiring test (HYPO_TEST_ENROLL_DUMP / HYPO_TEST_ENROLL_BARRIER) is gone
+// with the hook behavior it pinned: SessionStart now passes snapshotBase only the global target
+// and never hands it hashes of project views. The snapshotBase contract itself stays pinned by the
+// unit test below, and the injected-bytes guarantee for observed heads by the source scan near the
+// end of this suite.
 
 // ── review r5-w3 blocker 1: late enrollment must record the SHOWN bytes ─────
 // snapshotBase's enroll branch used to hash `join(hypoDir, rel)` fresh off disk
@@ -4871,6 +4771,9 @@ test('AC8: readBaseEntry reads an observed-bearing base.json the same as before 
       { HYPO_DIR: dir },
     );
     assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    // SessionStart no longer injects open-questions, so the observation is recorded the way an
+    // injection would, with the hash of the bytes shown.
+    recordObserved(dir, 'ac8-sess', t4Rel, bsHashContent(readFileSync(join(dir, t4Rel), 'utf-8')));
     const parsed = JSON.parse(readFileSync(bsBasePath(dir, 'ac8-sess'), 'utf-8'));
     assert.ok(
       parsed.observed && typeof parsed.observed === 'object',
@@ -5079,44 +4982,41 @@ test('a truncated injection is stored but never licenses a close-time write (end
 // The gate is only as good as the promise that nothing automated reaches it. Scan
 // EXECUTABLE code, not prose: a doc comment naming the command is documentation, a
 // call is a bypass.
-test('recordObserved is only ever handed injected bytes, never a fresh disk read', () => {
-  // The observed set licenses a close to overwrite bytes this session was SHOWN.
-  // That guarantee lives entirely in WHICH bytes get hashed at the call site:
-  // `hashContent(read.raw)`, where `read` is the same object the injection
-  // printed. Swapping it for `hashContent(readFileSync(path))` re-reads disk
-  // and would credit a write that landed between the read and this line as an
-  // observation that never happened — silently widening the license to bytes
-  // nobody saw.
-  //
-  // Behavioural tests cannot reach that window: it is inside a single hook
-  // process, between two adjacent statements, with no seam a fixture can drive.
-  // A mutation that made the swap left all 141 proposal-base tests green
-  // (measured 2026-09-03), which is exactly the gap this scan closes. Read
-  // the source, strip comments so a doc example cannot trip it, and pin the
-  // ARGUMENT SHAPE.
+test('SessionStart records observed heads only from the injected view, never a fresh disk read', () => {
+  // The observed set licenses a close to replace heads this session was SHOWN. That guarantee
+  // lives in WHICH heads get recorded at the call site: `view.observed.*`, the same object the
+  // injection printed. Swapping it for a fresh model load would credit a head that landed between
+  // the injection and this line as an observation that never happened. No fixture can drive that
+  // window (it is inside one hook process, between adjacent statements), so this scan pins the
+  // argument shape. Comments are stripped so a doc example cannot trip it.
   const src = readFileSync(join(REPO, 'hooks', 'hypo-session-start.mjs'), 'utf-8')
     .replace(/\/\*[\s\S]*?\*\//g, '')
     .replace(/^\s*\/\/.*$/gm, '');
 
-  // Every recordObserved(...) call, with its full argument list (the calls are
-  // multi-line, so `[\s\S]` and a lazy quantifier up to the closing paren).
-  const calls = [...src.matchAll(/recordObserved\(([\s\S]*?)\);/g)].map((m) => m[1]);
+  // The per-file hash recorder is not called by the hook any more: no project view is an
+  // overwrite target, and open-questions is never injected.
   assert.equal(
-    calls.length,
-    3,
-    `expected the 3 known recordObserved call sites (HIT hot, HIT session-state, MISS root hot); found ${calls.length} — a new one must be checked by hand and added here`,
+    /\brecordObserved\(/.test(src),
+    false,
+    'hypo-session-start.mjs must not call recordObserved: only recordObservedHeads with the injected view',
   );
 
+  const calls = [...src.matchAll(/recordObservedHeads\(([\s\S]*?)\);/g)].map((m) => m[1]);
+  assert.equal(
+    calls.length,
+    2,
+    `expected the 2 known recordObservedHeads call sites (full, pointer); found ${calls.length}: a new one must be checked by hand and added here`,
+  );
   for (const args of calls) {
     assert.match(
       args,
-      /hashContent\(\s*\w+\.raw\s*\)/,
-      `recordObserved must hash the injected bytes (\`hashContent(<read>.raw)\`); got: ${args.replace(/\s+/g, ' ').trim()}`,
+      /heads:\s*view\.observed\.(heads|pointer)\b/,
+      `recordObservedHeads must record the injected view's heads; got: ${args.replace(/\s+/g, ' ').trim()}`,
     );
     assert.equal(
-      /readFileSync|readIfNotIgnored|hashFile/.test(args),
+      /readFileSync|loadSessionModel|readIfNotIgnored|hashFile/.test(args),
       false,
-      `recordObserved must not re-read the file at the call site; got: ${args.replace(/\s+/g, ' ').trim()}`,
+      `recordObservedHeads must not re-read at the call site; got: ${args.replace(/\s+/g, ' ').trim()}`,
     );
   }
 });
