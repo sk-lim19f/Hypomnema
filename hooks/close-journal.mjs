@@ -220,6 +220,32 @@ export function recordHandoffReceipt(hypoDir, closeSessionId, relPath, hash) {
 }
 
 /**
+ * Drop this session's record for `relPath`, but only while it still holds `hash`: the close
+ * restored that path after its commit did not land, so the record no longer describes
+ * bytes on disk, and left in place it would let identical bytes added later pass as this
+ * close's own uncommitted work. Other paths' records stay (the entry file and index.md of
+ * a failed close are still restaged by the retry). A record that moved to another hash is
+ * someone else's and stays.
+ * @returns {boolean} false when the journal could not be rewritten (no record counts as removed)
+ */
+export function removeJournalEntry(hypoDir, sessionId, relPath, hash) {
+  if (!sessionId) return true;
+  const path = closeJournalPath(hypoDir, sessionId);
+  if (path === null || !existsSync(path)) return true;
+  try {
+    withFileLock(path, () => {
+      const paths = readJournalAt(path);
+      if (paths[relPath] !== hash) return;
+      delete paths[relPath];
+      atomicWrite(path, JSON.stringify({ v: 1, sessionId: String(sessionId), paths }, null, 2));
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Clear this session's journal once its close has actually committed. A
  * journal entry that outlives a successful commit would keep offering to
  * restage bytes for a path this SAME session might legitimately touch again
