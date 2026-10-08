@@ -2988,6 +2988,36 @@ test('(c2) a staged .gitignore that is not a pure addition defers and leaves HEA
   });
 });
 
+// A pure addition, so the old rule set it aside: the lines went back to the work tree only and the
+// saved bytes were deleted, which left the stage empty. Disabling: in `clearBlockingPaths`
+// (hooks/hypo-shared.mjs) change `if (staged.has('.gitignore') && blocked.includes('.gitignore')) {`
+// to `if (false) {`. The deferral, stage and backup assertions go red.
+test('(c3) a .gitignore with one line staged and another unstaged defers, with the stage, the tree and the backups untouched', () => {
+  withCatchUp(({ b }) => {
+    put(b, 'projects/p/hot.md', W1);
+    put(b, '.gitignore', '.cache/\nstaged-line/\n');
+    cgitOk(b, ['add', '.gitignore']);
+    put(b, '.gitignore', '.cache/\nstaged-line/\nunstaged-line/\n');
+    const head = headOf(b);
+    const r = clear(b);
+    assert.equal(r.ok, false, JSON.stringify(r));
+    assert.equal(r.deferred, 'gitignore');
+    assert.equal(r.reason, 'gitignore-staged');
+    assert.ok(r.notice.includes('.gitignore'));
+    assert.equal(headOf(b), head);
+    assert.equal(
+      cgitOk(b, ['show', ':.gitignore']),
+      '.cache/\nstaged-line/\n',
+      'the stage is intact',
+    );
+    assert.equal(readRel(b, '.gitignore'), '.cache/\nstaged-line/\nunstaged-line/\n');
+    assert.equal(readRel(b, 'projects/p/hot.md'), W1, 'nothing is archived');
+    assert.equal(backupsIn(b, 'projects/p/hot.md').length, 0);
+    assert.equal(existsSync(join(b, '.cache', 'pull-archive.json')), false, 'no record');
+    assert.equal(existsSync(join(b, '.cache', 'backups')), false, 'and no backup');
+  });
+});
+
 test('(d) a working-tree .gitignore with a negation line defers and touches nothing', () => {
   withCatchUp(({ b }) => {
     put(b, 'projects/p/hot.md', W1);
@@ -5156,62 +5186,79 @@ test('two archived versions of one path both become baselines, and both are anno
 
 const STAGED_GITIGNORE = '.cache/\nstaged-only/\n';
 const WORK_GITIGNORE = '.cache/\r\n\r\nwork-only/\r\n\r\n';
+const HEAD_GITIGNORE = '.cache/\n';
 
-// `.gitignore` staged as STAGED_GITIGNORE, then rewritten in the working tree (CRLF, blank lines,
-// without the staged line); and a local commit, so the later `merge --ff-only` cannot succeed.
-function gitignoreTwoVersions(b) {
-  put(b, '.gitignore', STAGED_GITIGNORE);
-  cgitOk(b, ['add', '.gitignore']);
+// `.gitignore` rewritten in the working tree only (CRLF, blank lines), nothing staged; and a local
+// commit, so the later `merge --ff-only` cannot succeed.
+function gitignoreWorkOnly(b) {
   put(b, '.gitignore', WORK_GITIGNORE);
   put(b, 'pages/local.md', 'local\n');
   cgitOk(b, ['add', 'pages/local.md']);
   cgitOk(b, ['commit', '-q', '-m', 'local', '--', 'pages/local.md']);
-  assert.equal(cgitOk(b, ['show', ':.gitignore']), STAGED_GITIGNORE, 'precondition: staged blob');
+  assert.equal(cgitOk(b, ['diff', '--cached', '--name-only']).trim(), '', 'precondition: no stage');
   assert.equal(readRel(b, '.gitignore'), WORK_GITIGNORE, 'precondition: working tree');
 }
 const indexBlob = (b) => cgitOk(b, ['show', ':.gitignore']);
 
-test('a failed move puts the staged .gitignore blob and the working-tree bytes back exactly', () => {
+test('a failed move puts the working-tree .gitignore bytes back exactly', () => {
   withCatchUp(({ b }) => {
-    gitignoreTwoVersions(b);
+    gitignoreWorkOnly(b);
     const pre = clear(b);
     assert.equal(pre.ok, true, JSON.stringify(pre));
-    assert.deepEqual(pre.gitignoreSaved.map((v) => v.kind).sort(), ['stage', 'worktree']);
-    assert.equal(
-      readRel(b, '.gitignore'),
-      '.cache/\n',
-      'precondition: the clearing step restored HEAD',
+    assert.deepEqual(
+      pre.gitignoreSaved.map((v) => v.kind),
+      ['worktree'],
     );
     assert.equal(
-      cgitOk(b, ['diff', '--cached', '--name-only']).trim(),
-      '',
-      'and released the stage',
+      readRel(b, '.gitignore'),
+      HEAD_GITIGNORE,
+      'precondition: the clearing step restored HEAD',
     );
     assert.notEqual(ffTo(b), 0, 'precondition: the merge cannot fast-forward');
     const undone = undoClearedPaths(b, pre);
     assert.deepEqual(undone, { ok: true, notices: [] });
     assert.ok(readFileSync(join(b, '.gitignore')).equals(Buffer.from(WORK_GITIGNORE)));
-    assert.equal(indexBlob(b), STAGED_GITIGNORE);
+    assert.equal(indexBlob(b), HEAD_GITIGNORE, 'nothing got staged');
     assert.equal(existsSync(join(b, '.cache/pull-archive.json')), false);
     for (const { backupPath } of pre.gitignoreSaved) assert.equal(existsSync(backupPath), false);
   });
 });
 
-test('fastForwardTo leaves a staged-only .gitignore line staged and the CRLF working tree as it was when the merge fails', () => {
+test('fastForwardTo leaves the CRLF working-tree .gitignore as it was when the merge fails', () => {
   withCatchUp(({ b }) => {
-    gitignoreTwoVersions(b);
+    gitignoreWorkOnly(b);
     const r = fastForwardTo(b, '@{u}');
     assert.equal(r.ok, false);
     assert.match(r.reason, /^fast-forward-failed/);
-    assert.equal(r.pre.gitignoreSaved.length, 2, 'precondition: the clearing step moved it');
+    assert.equal(r.pre.gitignoreSaved.length, 1, 'precondition: the clearing step moved it');
     assert.ok(readFileSync(join(b, '.gitignore')).equals(Buffer.from(WORK_GITIGNORE)));
-    assert.equal(indexBlob(b), STAGED_GITIGNORE);
+    assert.equal(indexBlob(b), HEAD_GITIGNORE, 'nothing got staged');
+  });
+});
+
+// The staged-only line that the test above used to carry through the failed move: a staged
+// .gitignore is no longer set aside at all.
+test('fastForwardTo defers on a staged-only .gitignore line and leaves the stage, the tree and the backups alone', () => {
+  withCatchUp(({ b }) => {
+    put(b, '.gitignore', STAGED_GITIGNORE);
+    cgitOk(b, ['add', '.gitignore']);
+    put(b, '.gitignore', WORK_GITIGNORE);
+    const head = headOf(b);
+    const r = fastForwardTo(b, '@{u}');
+    assert.equal(r.ok, false);
+    assert.equal(r.deferred, 'gitignore');
+    assert.equal(r.reason, 'gitignore-staged');
+    assert.equal(headOf(b), head);
+    assert.equal(indexBlob(b), STAGED_GITIGNORE, 'the stage is intact');
+    assert.ok(readFileSync(join(b, '.gitignore')).equals(Buffer.from(WORK_GITIGNORE)));
+    assert.equal(existsSync(join(b, '.cache', 'backups')), false, 'no backup');
+    assert.equal(existsSync(join(b, '.cache/pull-archive.json')), false, 'no record');
   });
 });
 
 test('a .gitignore written after the clearing step is not overwritten by the undo, and its backup is kept', () => {
   withCatchUp(({ b }) => {
-    gitignoreTwoVersions(b);
+    gitignoreWorkOnly(b);
     const pre = clear(b);
     assert.equal(pre.ok, true, JSON.stringify(pre));
     put(b, '.gitignore', 'written by someone else\n');
@@ -5228,17 +5275,17 @@ test('a .gitignore written after the clearing step is not overwritten by the und
 
 test('a run that stopped after the .gitignore was released is recovered with its exact bytes', () => {
   withCatchUp(({ b }) => {
-    gitignoreTwoVersions(b);
+    gitignoreWorkOnly(b);
     const pre = clear(b);
     assert.equal(pre.ok, true, JSON.stringify(pre));
     const record = JSON.parse(readRel(b, '.cache/pull-archive.json'));
-    assert.equal(record.gitignoreSaved.length, 2, 'precondition: the record holds the saved bytes');
+    assert.equal(record.gitignoreSaved.length, 1, 'precondition: the record holds the saved bytes');
     // the next run starts from the released state; its own snapshot is the exact bytes again
     const again = clear(b);
     assert.equal(again.ok, true, JSON.stringify(again));
     assert.deepEqual(
-      again.gitignoreSaved.map((v) => readFileSync(v.backupPath, 'utf-8')).sort(),
-      [STAGED_GITIGNORE, WORK_GITIGNORE].sort(),
+      again.gitignoreSaved.map((v) => readFileSync(v.backupPath, 'utf-8')),
+      [WORK_GITIGNORE],
     );
   });
 });
