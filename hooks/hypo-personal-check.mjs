@@ -153,7 +153,7 @@ process.stdin.on('end', () => {
   // fs errors and no further.
   let feedbackHealed = '';
   // Notices the --write itself reports: a hand line it kept, and its write-time
-  // warnings. Its JSON report is the only place those exist (the record entry behind a
+  // warnings (or, with no drift, the pending ones a --check shows). Its JSON report is the only place those exist (the record entry behind a
   // kept line is dropped by that same write), so they are turned into notice lines
   // below. A report that is missing or malformed yields none.
   const healNotices = [];
@@ -167,6 +167,9 @@ process.stdin.on('end', () => {
             '--write',
             '--no-input',
             '--json',
+            // this hook shows the report's warnings below, so notices an older hook run
+            // left pending can be reported (and cleared) here
+            '--ack-notices',
             `--hypo-dir=${HYPO_DIR}`,
             `--claude-home=${join(homedir(), '.claude')}`,
           ],
@@ -206,6 +209,36 @@ process.stdin.on('end', () => {
         /* fail open: no report, no extra notices */
       }
       feedbackHealed = `[WIKI CHECK] feedback projection re-synced (${gate.driftTargets.join(', ')}); MEMORY.md body may be unchanged — drift was in the managed block / side-files.`;
+    }
+  } else if (PKG_ROOT) {
+    // No drift to repair, but an older hook's --write may have repaired it and left a kept-line
+    // notice pending (that run's output was thrown away). --check --ack-notices reports pending
+    // notices and removes them on exit 0, so they reach a reader here. Only those notices are
+    // shown: --check's other warnings (a skipped MEMORY projection) are not new information
+    // on every compact. Fail open: any fault means no extra notice.
+    try {
+      const c = spawnSync(
+        process.execPath,
+        [
+          join(PKG_ROOT, 'scripts', 'feedback-sync.mjs'),
+          '--check',
+          '--no-input',
+          '--json',
+          '--ack-notices',
+          `--hypo-dir=${HYPO_DIR}`,
+          `--claude-home=${join(homedir(), '.claude')}`,
+        ],
+        { encoding: 'utf-8', timeout: 30000 },
+      );
+      if (!c.error && c.status === 0) {
+        const report = JSON.parse(c.stdout || '');
+        for (const m of Array.isArray(report.warnings) ? report.warnings : []) {
+          if (typeof m === 'string' && /kept the hand-written line in /.test(m))
+            healNotices.push(`[WIKI CHECK] feedback-sync notice: ${m}`);
+        }
+      }
+    } catch {
+      /* fail open */
     }
   }
 
@@ -331,7 +364,11 @@ process.stdin.on('end', () => {
     console.log(
       JSON.stringify({
         continue: true,
-        systemMessage: `[WIKI CHECK] gate bypassed via HYPO_SKIP_GATE=1 (incomplete: ${skipped}).`,
+        // noticeText carries the kept-line notices the no-drift call above already took off the
+        // pending file: dropping it here would clear them without anyone seeing them
+        systemMessage:
+          `[WIKI CHECK] gate bypassed via HYPO_SKIP_GATE=1 (incomplete: ${skipped}).` +
+          (noticeText ? `\n${noticeText}` : ''),
       }),
     );
     return;
