@@ -1180,7 +1180,7 @@ process.stdin.on('end', () => {
           // is the one sentence that says what actually recovers the
           // content, shared with the Stop-hook rebuild and project-create so
           // the three writers cannot drift into different wordings.
-          const msg = rootHotBackupRecoveryNotice(result.backupPath);
+          const msg = rootHotBackupRecoveryNotice('hot.md', result.backupPath);
           notices.push(msg);
           noticePrefix = notices.length ? `${notices.join('\n\n')}\n\n` : '';
           outExtra = {

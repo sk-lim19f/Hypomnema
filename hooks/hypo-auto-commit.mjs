@@ -3,7 +3,8 @@
  * hypo-auto-commit.mjs: Stop chain stage 3 (spawned by hypo-stop.mjs)
  *
  * At session end: stage this session's touched paths, commit if any, then
- * pull+push to sync remote.
+ * pull+push to sync remote. A pull that moves HEAD is followed by a regeneration
+ * of the (untracked) session views, inside the same lock.
  *
  * Scoped, not whole-tree: this no longer sweeps the entire working tree. The
  * scope is this session's accumulated touched-paths set (hypo-auto-stage.mjs
@@ -38,14 +39,22 @@ import {
   commitTouchedPaths,
   vaultCommitLockTarget,
   withFileLock,
-  rootHotProjectionIsCurrent,
   writeRootHotHealthNotice,
 } from './hypo-shared.mjs';
+import { writeGeneratedViewsUnlocked } from './session-views.mjs';
 
 function hasRemote() {
   const r = spawnSync('git', ['-C', HYPO_DIR, 'remote'], { encoding: 'utf-8', timeout: 30000 });
   return (r.stdout || '').trim().length > 0;
 }
+
+const headSha = () => {
+  const r = spawnSync('git', ['-C', HYPO_DIR, 'rev-parse', '--verify', '-q', 'HEAD'], {
+    encoding: 'utf-8',
+    timeout: 30000,
+  });
+  return r.status === 0 ? (r.stdout || '').trim() : null;
+};
 
 // Overridable so a test can force a fast lock-timeout instead of waiting out
 // the real default (mirrors crystallize.mjs's HYPO_APPEND_LOCK_TIMEOUT_MS).
@@ -86,8 +95,8 @@ const sessionId = input.session_id || input.sessionId || null;
 // the commit. `git push` changes nothing locally, and it is a network round
 // trip with a 30s spawn timeout: holding the vault lock across it let one
 // session's Stop own the vault for up to a minute, while a sibling
-// SessionStart needs that same lock TWICE (its own `git pull` and the root
-// hot.md projection write) at 5s each, out of a 30s hook budget. The pushable
+// SessionStart needs that same lock TWICE (its own `git pull` and the
+// generated view write) at 5s each, out of a 30s hook budget. The pushable
 // decision is made inside the lock and acted on after it is released.
 //
 // "The push changes nothing locally" was the whole justification for that
@@ -109,35 +118,15 @@ try {
       // success — clear exactly what committed, ALL under one hold of the
       // per-session lock. See commitTouchedPaths's docstring for why a
       // commit failure or a same-path race can't lose anything under this.
-      const result = commitTouchedPaths(HYPO_DIR, sessionId, (paths) => {
-        // BLOCKER fix (r5-w1.md): 'hot.md' being IN this session's
-        // touched-paths set only ever proves this session once intended to
-        // write it, never that the bytes on disk right now are what it
-        // actually wrote: a scan error at SessionStart, a lock-timeout on
-        // the post-write record, or a claim simply outliving a later
-        // mid-session edit can all leave the claim standing over content
-        // this session never produced. Re-verify at this last possible
-        // moment, right before staging, instead of trying to revoke the
-        // claim on every branch that can go wrong upstream: a mismatch means
-        // whatever is on disk did not come from this session's own write, so
-        // it is dropped from THIS commit rather than swept in. It is not
-        // lost: the next SessionStart/Stop that manages a successful scan
-        // backs it up through the same ownership check before overwriting.
-        // n1 fix: sessionId, not just HYPO_DIR, since a sibling session's write
-        // updates the global ownership hash too, so this session's own
-        // receipt must independently confirm it produced the current bytes.
-        const scoped = rootHotProjectionIsCurrent(HYPO_DIR, sessionId)
-          ? paths
-          : paths.filter((p) => p !== 'hot.md');
-        if (scoped.length !== paths.length) {
-          writeRootHotHealthNotice(
-            HYPO_DIR,
-            '루트 hot.md이 이번 세션이 실제로 쓴 내용과 달라 이번 커밋에서 제외했습니다. 다음 세션 시작/종료 시 다시 확인됩니다.',
-          );
-        }
-        return commitWikiChanges(HYPO_DIR, scoped);
-      });
+      const result = commitTouchedPaths(HYPO_DIR, sessionId, (paths) =>
+        commitWikiChanges(HYPO_DIR, paths),
+      );
       if (!result.committed) return;
+      // The commit landed but its paths' index entries did not all move to the new HEAD. Stop's
+      // own output is suppressed, so the next SessionStart is where the person reads the fix.
+      if (typeof result.indexWarning === 'string') {
+        writeRootHotHealthNotice(HYPO_DIR, result.indexWarning);
+      }
 
       if (hasRemote()) {
         // pull/push failures must not stop the session, but they can no longer be
@@ -157,7 +146,24 @@ try {
         // HEAD here is still under the lock, so it is this session's commit
         // (plus whatever the pull brought down) and nothing a sibling added
         // after the unlock.
-        if (!pullRemote(HYPO_DIR).conflict) pushTarget = resolvePushTarget(HYPO_DIR);
+        //
+        // A pull that moved HEAD may have brought session entries other machines
+        // closed, so the views are rendered again from what is on disk now. The
+        // lock is held here (it is not reentrant), hence the unlocked writer.
+        // The views are not tracked, so this adds nothing to the commit or push.
+        const before = headSha();
+        const pulled = pullRemote(HYPO_DIR);
+        if (headSha() !== before) {
+          try {
+            writeGeneratedViewsUnlocked(HYPO_DIR);
+          } catch (err) {
+            writeRootHotHealthNotice(
+              HYPO_DIR,
+              `세션 현황 파일을 pull 뒤에 다시 만들지 못했습니다: ${err?.message ?? String(err)}`,
+            );
+          }
+        }
+        if (!pulled.conflict) pushTarget = resolvePushTarget(HYPO_DIR);
       }
     },
     { timeoutMs: VAULT_LOCK_TIMEOUT_MS },

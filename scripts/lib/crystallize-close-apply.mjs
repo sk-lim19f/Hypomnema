@@ -1962,6 +1962,18 @@ function failEntry(args, stage, error) {
 // another project than the one this close already published in (or recorded the
 // intent to) is refused with `entry-project-mismatch` before any write: taking the
 // recorded path would put this project's summary into the first project's file.
+function listProjectsOrFail(args) {
+  try {
+    return listSessionProjects(args.hypoDir);
+  } catch (err) {
+    return failEntry(
+      args,
+      'projects-unreadable',
+      `cannot list ${join(args.hypoDir, 'projects')} (${err?.message || err}); nothing was written.`,
+    );
+  }
+}
+
 function entryPathFor(args, project, closeId, date, pin) {
   const found = entryPathOfClose(args.hypoDir, project, closeId);
   const pinned = pin.pending?.closeId === closeId ? pin.pending.entryRelPath : null;
@@ -1969,7 +1981,7 @@ function entryPathFor(args, project, closeId, date, pin) {
     const elsewhere =
       pinned && !pinned.split('\\').join('/').startsWith(`projects/${project}/sessions/`)
         ? pinned
-        : listSessionProjects(args.hypoDir)
+        : listProjectsOrFail(args)
             .filter((p) => p !== project)
             .map((p) => entryPathOfClose(args.hypoDir, p, closeId))
             .find(Boolean);
@@ -4830,7 +4842,15 @@ function sessionProbeStatus(hypoDir, sessionId) {
     hypoDir,
     sessionId,
   });
-  for (const project of listSessionProjects(hypoDir)) {
+  let projects;
+  try {
+    projects = listSessionProjects(hypoDir);
+  } catch {
+    // A probe that cannot look reads as "not complete": the full apply path that follows reports
+    // the unreadable directory itself.
+    return { ok: false };
+  }
+  for (const project of projects) {
     const closeId = sessionProofCloseId(hypoDir, sessionId, {
       closeOpen: gate.ok,
       resolvedAtIndex: gate.resolvedAtIndex,

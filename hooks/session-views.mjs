@@ -13,7 +13,7 @@
 import { createHash, randomBytes } from 'node:crypto';
 import { readFileSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, relative } from 'node:path';
+import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { atomicWrite } from './atomic-write.mjs';
 import { isValidSessionId } from './proposal-store.mjs';
@@ -52,6 +52,7 @@ import {
   readRootHotProjectionOwnership,
   readVisibilityScope,
   resumePullArchive,
+  rootHotBackupRecoveryNotice,
   setAsideNotices,
   revPathArg,
   SESSION_ENTRIES_OFF_MARKER,
@@ -258,7 +259,10 @@ function readOwnership(hypoDir) {
 // backed up first, and the file is read again right before the replacing write so a save landing
 // in between is backed up as well. The ownership record takes the new hash before the replacing
 // write, so a process that dies after the write finds its own bytes vouched for (the other order
-// would back them up as foreign on the next run).
+// would back them up as foreign on the next run). Each backup is announced in the health notice
+// right after it is written and before its source is replaced: a later view that fails would
+// otherwise leave a hand edit saved in `.cache/backups/` that no notice ever names, because the next
+// run finds the generator's bytes in place. A notice that cannot be written stops the replacement.
 function writeOneView(hypoDir, relPath, content, own, testHooks, result) {
   const abs = join(hypoDir, relPath);
   const sha = sha256(content);
@@ -277,17 +281,20 @@ function writeOneView(hypoDir, relPath, content, own, testHooks, result) {
     return;
   }
   const backups = [];
-  if (current !== null && !ours(current))
-    backups.push(backUpGeneratedPath(hypoDir, abs, current, testHooks));
+  const backUp = (text) => {
+    const backupPath = backUpGeneratedPath(hypoDir, abs, text, testHooks);
+    if (!writeRootHotHealthNotice(hypoDir, rootHotBackupRecoveryNotice(relPath, backupPath)))
+      throw new Error(`the notice for the backup of ${relPath} could not be written`);
+    backups.push(backupPath);
+  };
+  if (current !== null && !ours(current)) backUp(current);
   testHooks?.beforeFinalWrite?.(abs);
   const latest = read();
   if (latest === content) {
     claim();
     result.unchanged.push(relPath);
   } else {
-    if (latest !== current && latest !== null && !ours(latest)) {
-      backups.push(backUpGeneratedPath(hypoDir, abs, latest, testHooks));
-    }
+    if (latest !== current && latest !== null && !ours(latest)) backUp(latest);
     if (own.views[relPath] !== sha) {
       own.views[relPath] = sha;
       writeGeneratedViewsRecord(hypoDir, own.views);
@@ -310,7 +317,8 @@ const emptyResult = (over) => ({
 // A migrated vault whose `.gitignore` block lost a line is not rendered into: the views would sit
 // outside the ignore patterns and a `git add -A` tool would stage them. Stopping silently is not
 // acceptable, so the next SessionStart gets a notice naming the lines. A plain not-migrated vault
-// stays silent. The notice file holds one message, so repeated renders do not pile notices up.
+// stays silent. Each line of a message is kept once in the notice file, so repeated renders do not
+// pile notices up.
 function skipIncompleteBlock(hypoDir, state) {
   const missing =
     missingBlockLines(showText(hypoDir, 'HEAD', '.gitignore') ?? '', GITIGNORE_BLOCK) ?? [];
@@ -340,7 +348,8 @@ function skipUnignoredCache(hypoDir, state, unignored) {
  * `missingBlockLines[]` and leaves a health notice; a `.cache/` that git would not ignore adds
  * `unignoredCache[]` and leaves one too). A project that
  * `.hypoignore` hides (see `projectHiddenByHypoignore`) is neither read nor written and has no
- * root row. Any backup leaves a health notice for the next SessionStart.
+ * root row. Any backup leaves a health notice for the next SessionStart, written right after the
+ * backup (see `writeOneView`).
  */
 export function writeGeneratedViewsUnlocked(hypoDir, opts = {}) {
   const { root = true, device = currentDevice(), testHooks } = opts;
@@ -381,19 +390,6 @@ export function writeGeneratedViewsUnlocked(hypoDir, opts = {}) {
     }
   }
   if (failure) throw failure;
-  if (result.backedUp.length) {
-    writeRootHotHealthNotice(
-      hypoDir,
-      result.backedUp
-        .map(
-          (b) =>
-            `생성 파일 ${b.relPath}에 생성기가 쓰지 않은 내용이 있어 ${relative(hypoDir, b.backupPath)}에 보관했습니다. ` +
-            '구버전 Hypomnema(같은 기계의 다른 설치일 수 있습니다)나 사람이 쓴 내용으로 보입니다. 자동으로 합치지 않았습니다. ' +
-            '남길 내용은 다음 close의 요약이나 projects/<p>/notes.md로 옮기세요.',
-        )
-        .join('\n'),
-    );
-  }
   return result;
 }
 
@@ -695,7 +691,13 @@ export function migrateVaultToSessionEntriesUnlocked(hypoDir, opts = {}) {
   // keep every close out of git once the views stop being tracked: the move waits for that rule.
   // Every project that is not hidden by `.hypoignore` is probed in one call, so the answer does not
   // depend on which project sorts first, and the notice names all of them.
-  const probed = [...new Set([...slugs, ...listSessionProjects(hypoDir)])]
+  let listed;
+  try {
+    listed = listSessionProjects(hypoDir);
+  } catch (err) {
+    return deferredMigration('projects-unreadable', err?.message);
+  }
+  const probed = [...new Set([...slugs, ...listed])]
     .filter((slug) => !projectHiddenByHypoignore(hypoDir, slug, patterns))
     .sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
   if (probed.length) {

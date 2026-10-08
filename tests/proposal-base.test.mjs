@@ -77,7 +77,6 @@ import {
   recordJournalEntry,
   clearJournal,
 } from '../hooks/close-journal.mjs';
-import { renderRootHotProjection } from '../hooks/hypo-shared.mjs';
 import { test, testAsync, suite } from './harness.mjs';
 import {
   HOME,

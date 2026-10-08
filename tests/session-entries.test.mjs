@@ -58,7 +58,6 @@ import {
 import {
   clearGeneratedPathsBlockingPull,
   consumeRootHotHealthNotice,
-  formatRootHotProjection,
   frontmatterScalar,
   isIgnored as isIgnoredHooks,
   legacyBaselineDate,
@@ -1142,7 +1141,7 @@ test('the generator never reads the date: two mocked days give the same bytes, u
   assert.match(first.root, /\nupdated: 2026-10-01\n/);
 });
 
-test('the root table is what formatRootHotProjection writes for the rows, and resolveActiveProject reads it', () => {
+test('the root table lists the rows in sortRootRows order in the shape resolveActiveProject reads', () => {
   const models = [
     M([E('c1', { date: '2026-10-01' })], { project: 'p' }),
     M([E('c2', { date: '2026-10-03' })], { project: 'q' }),
@@ -1159,7 +1158,13 @@ test('the root table is what formatRootHotProjection writes for the rows, and re
       .split('\n')
       .filter((l) => l.startsWith('| '))
       .join('\n');
-  assert.equal(tableOf(root), tableOf(formatRootHotProjection(rows)));
+  assert.equal(
+    tableOf(root),
+    [
+      '| Project | Last Session | Hot Cache |',
+      ...rows.map((r) => `| ${r.slug} | ${r.date} | [[projects/${r.slug}/hot]] |`),
+    ].join('\n'),
+  );
   withTmpDir((dir) => {
     writeFileSync(join(dir, 'hot.md'), root);
     assert.equal(resolveActiveProject(dir), 'q');
@@ -1451,6 +1456,26 @@ test('listSessionProjects leaves out _template and empty directories and keeps s
   });
 });
 
+// Disabling the defense: in `listSessionProjects` (hooks/hypo-shared.mjs) make the catch return
+// `[]` for every error (delete the `throw err`). The EACCES assertion goes red.
+test('listSessionProjects: no projects/ is no projects, but a projects/ it cannot read throws', () => {
+  withTmpDir((dir) => {
+    assert.deepEqual(listSessionProjects(dir), [], 'ENOENT');
+    writeFileSync(join(dir, 'projects'), 'a file, not a directory\n');
+    assert.deepEqual(listSessionProjects(dir), [], 'ENOTDIR');
+  });
+  if (process.getuid?.() === 0) return; // root reads a mode 000 directory
+  withTmpDir((dir) => {
+    put(dir, 'projects/p/index.md', 'x');
+    chmodSync(join(dir, 'projects'), 0o000);
+    try {
+      assert.throws(() => listSessionProjects(dir), { code: 'EACCES' });
+    } finally {
+      chmodSync(join(dir, 'projects'), 0o755);
+    }
+  });
+});
+
 test('listSessionEntries skips a file deleted between the listing and the read, and reports the rest', () => {
   withTmpDir((dir) => {
     putEntry(dir, 'p', 'keep');
@@ -1720,6 +1745,43 @@ test('bytes the writer did not write are backed up before they are replaced, and
   });
 });
 
+// Disabling the defense: in `writeOneView` (hooks/session-views.mjs) wrap the first
+// `backUpGeneratedPath(...)` call in `try { ... } catch {}`. The view is then overwritten with no
+// copy of the bytes, and the first assertion goes red.
+test('a backup that cannot be written stops the write: the unowned bytes stay in place and no record claims them', () => {
+  withTmpDir((dir) => {
+    seedProjects(dir);
+    put(dir, VIEW, 'hand written\n');
+    assert.throws(
+      () =>
+        writeGeneratedViews(dir, {
+          ...WRITE,
+          testHooks: {
+            beforeBackupWrite: () => {
+              throw new Error('backup disk full');
+            },
+          },
+        }),
+      /backup disk full/,
+    );
+    assert.equal(readRel(dir, VIEW), 'hand written\n', 'the view was not overwritten');
+    assert.equal(existsSync(join(dir, BACKUP_DIR, `${VIEW}.pre-projection-backup.md`)), false);
+    const record = existsSync(join(dir, '.cache/generated-views.json'))
+      ? JSON.parse(readRel(dir, '.cache/generated-views.json')).views
+      : {};
+    assert.equal(
+      record[VIEW],
+      undefined,
+      'the record does not vouch for bytes the writer never wrote',
+    );
+    // The retry with a working backup converges: one backup, then the replacement.
+    const r = writeGeneratedViews(dir, WRITE);
+    assert.equal(r.backedUp.length, 1, JSON.stringify(r.backedUp));
+    assert.equal(readRel(dir, `${BACKUP_DIR}/${VIEW}.pre-projection-backup.md`), 'hand written\n');
+    assert.match(readRel(dir, VIEW), /generated: sessions/);
+  });
+});
+
 test('an owned file is replaced without a backup when its entries change', () => {
   withTmpDir((dir) => {
     seedProjects(dir);
@@ -1808,6 +1870,49 @@ test('the old root projection hash seeds ownership of the root hot.md once', () 
       r.backedUp.map((b) => b.relPath),
       ['hot.md'],
     );
+  });
+});
+
+// Disabling: in `writeOneView` (hooks/session-views.mjs) remove the `writeRootHotHealthNotice`
+// condition in `backUp` (`if (false && !writeRootHotHealthNotice(...))`) and the notice is never
+// written for the first view, because the batch fails before any aggregate. The notice assertion
+// goes red: the first view's hand edit is backed up and replaced, then the second view fails.
+test('a hand edit backed up before a later view fails is named in the notice anyway', () => {
+  withTmpDir((dir) => {
+    seedProjects(dir);
+    put(dir, VIEW, 'hand written\n');
+    assert.throws(
+      () =>
+        writeGeneratedViews(dir, {
+          ...WRITE,
+          testHooks: {
+            beforeFinalWrite: (abs) => {
+              if (abs.endsWith('projects/p/session-state.md')) throw new Error('disk full');
+            },
+          },
+        }),
+      /disk full/,
+    );
+    assert.equal(readRel(dir, `${BACKUP_DIR}/${VIEW}.pre-projection-backup.md`), 'hand written\n');
+    assert.match(readRel(dir, VIEW), /generated: sessions/, 'the first view was replaced');
+    const notice = consumeRootHotHealthNotice(dir);
+    assert.ok(notice?.includes(VIEW) && notice.includes('pre-projection-backup'), notice);
+  });
+});
+
+// Disabling: in `writeOneView` delete the `throw new Error(...)` line after the notice write in
+// `backUp`. The view is then replaced with no notice, and the throws and bytes assertions go red.
+test('a backup whose notice cannot be written stops the replacement of its view', () => {
+  withTmpDir((dir) => {
+    seedProjects(dir);
+    put(dir, VIEW, 'hand written\n');
+    mkdirSync(join(dir, '.cache', 'root-hot-projection-notice.json'), { recursive: true });
+    assert.throws(
+      () => writeGeneratedViews(dir, WRITE),
+      /notice for the backup of projects\/p\/hot\.md/,
+    );
+    assert.equal(readRel(dir, VIEW), 'hand written\n', 'the hand edit is still in place');
+    assert.equal(readRel(dir, `${BACKUP_DIR}/${VIEW}.pre-projection-backup.md`), 'hand written\n');
   });
 });
 
@@ -2740,17 +2845,20 @@ test('a .gitignore that names only the three probe files is not an ignored .cach
 
 test('(a) the notices of the generator and of the root hot.md name the backup under .cache/backups', () => {
   withTmpDir((dir) => {
-    assert.match(
-      rootHotBackupRecoveryNotice(join(dir, '.cache/backups/hot.md.pre-projection-backup.md')),
-      /\.cache\/backups\/hot\.md\.pre-projection-backup\.md/,
+    // The head of the sentence names the view itself; the backup path later in it contains the
+    // same words, so a match anywhere in the sentence would not tell the two apart.
+    const rootSentence = rootHotBackupRecoveryNotice(
+      'hot.md',
+      join(dir, '.cache/backups/hot.md.pre-projection-backup.md'),
     );
+    assert.ok(rootSentence.startsWith('생성 파일 hot.md에 '), rootSentence);
+    assert.match(rootSentence, /\.cache\/backups\/hot\.md\.pre-projection-backup\.md/);
     seedProjects(dir);
     put(dir, VIEW, 'hand written\n');
     writeGeneratedViews(dir, WRITE);
-    assert.match(
-      consumeRootHotHealthNotice(dir) ?? '',
-      /\.cache\/backups\/projects\/p\/hot\.md\.pre-projection-backup\.md/,
-    );
+    const notice = consumeRootHotHealthNotice(dir) ?? '';
+    assert.ok(notice.startsWith(`생성 파일 ${VIEW}에 `), notice);
+    assert.match(notice, /\.cache\/backups\/projects\/p\/hot\.md\.pre-projection-backup\.md/);
   });
 });
 
@@ -2970,7 +3078,11 @@ test('(g) the root hot.md is never turned into a baseline, and its backup is nam
     const backupPath = pre.archived[0].backupPath;
     assert.equal(readFileSync(backupPath, 'utf-8'), 'root edited\n');
     assert.ok(
-      shared.notices.some((n) => n === rootHotBackupRecoveryNotice(backupPath)),
+      shared.notices.some(
+        (n) =>
+          n.startsWith('생성 파일 hot.md에 ') &&
+          n === rootHotBackupRecoveryNotice('hot.md', backupPath),
+      ),
       JSON.stringify(shared.notices),
     );
   });

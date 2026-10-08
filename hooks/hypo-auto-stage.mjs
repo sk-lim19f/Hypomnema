@@ -11,6 +11,11 @@ import {
   HYPO_DIR,
   loadHypoIgnore,
   isIgnored,
+  indexAndHeadBlobs,
+  isAutoStagedBlob,
+  isStagedDeletion,
+  readAutoStagedRecord,
+  recordAutoStagedBlob,
   recordTouchedPaths,
   vaultCommitLockTarget,
   withFileLock,
@@ -56,7 +61,31 @@ if (filePath.startsWith(HYPO_DIR + '/') || filePath === HYPO_DIR) {
     try {
       withFileLock(
         vaultCommitLockTarget(HYPO_DIR),
-        () => spawnSync('git', ['-C', HYPO_DIR, 'add', filePath], { stdio: 'ignore' }),
+        () => {
+          const rel = relative(HYPO_DIR, filePath);
+          // A version a person already staged for this path must reach the commit intact, so that
+          // it can be backed up there: `git add` would put the tool's bytes over it first. The
+          // path is left unstaged (it is still in the session's touched set below, so Stop commits
+          // it). A staged deletion (`git rm`) is skipped the same way: `git add` would turn it into a
+          // modification. With no answer from git about the index, skip too: Stop stages it either
+          // way.
+          const before = indexAndHeadBlobs(HYPO_DIR, rel);
+          if (
+            !before ||
+            isStagedDeletion(before.head, before.indexed) ||
+            (before.index &&
+              before.index !== before.head &&
+              !isAutoStagedBlob(readAutoStagedRecord(HYPO_DIR), rel, before.index, before.head))
+          )
+            return;
+          const add = spawnSync('git', ['-C', HYPO_DIR, 'add', filePath], { stdio: 'ignore' });
+          if (add.status !== 0) return;
+          // Record the blob this hook staged (and the HEAD blob it sat on), so the commit can tell
+          // it from one a person staged later and does not back up Claude's own write.
+          // Best-effort: with no record the commit saves the blob as it would for a person's.
+          const after = indexAndHeadBlobs(HYPO_DIR, rel);
+          if (after?.index) recordAutoStagedBlob(HYPO_DIR, rel, after.index, before.head);
+        },
         { timeoutMs: Number(process.env.HYPO_VAULT_LOCK_TIMEOUT_MS) || 5000 },
       );
     } catch (err) {

@@ -25,7 +25,9 @@ import { tmpdir } from 'node:os';
 import { test, suite } from './harness.mjs';
 import { PROVENANCE_FILENAME } from '../scripts/lib/pkg-provenance.mjs';
 import { loadHookInventory } from '../scripts/lib/hook-inventory.mjs';
-import { formatRootHotProjection } from '../hooks/hypo-shared.mjs';
+import { renderViews, GITIGNORE_BLOCK, GITATTRIBUTES_BLOCK } from '../hooks/session-entries.mjs';
+import { listTrackedGeneratedViews, migrationState } from '../hooks/hypo-shared.mjs';
+import { createProject } from '../scripts/lib/project-create.mjs';
 import {
   hooksDirForInstall,
   SHELL_MARKER_START,
@@ -170,8 +172,8 @@ test('init creates .gitignore with .cache/ entry', () => {
   });
 });
 
-// Root hot.md is the hooks' generated projection. A new vault has no
-// .cache/root-hot-projection-state.json yet, so the first rebuild can only
+// Root hot.md is a file the view generator writes. A new vault has no
+// .cache/generated-views.json yet, so the first rebuild can only
 // recognize the file as its own if the bytes already equal what it would write;
 // any difference costs the person a backup file and a "your hand edits were
 // preserved" notice on a file nobody touched. init writes the generator's
@@ -184,8 +186,8 @@ test('fresh init writes root hot.md byte-identical to the empty-vault projection
     assert.equal(r.status, 0, `stderr: ${r.stderr}`);
     assert.equal(
       readFileSync(join(hypoDir, 'hot.md'), 'utf-8'),
-      formatRootHotProjection([]),
-      'root hot.md from init must be exactly formatRootHotProjection([])',
+      renderViews([]).root,
+      'root hot.md from init must be exactly renderViews([]).root',
     );
   });
 });
@@ -2769,4 +2771,118 @@ test('uninstall removes in the reverse of the install order', () => {
     /hypo-pre-commit\.mjs/,
     'uninstall must still take away the copy older versions of init left behind',
   );
+});
+
+suite('init.mjs: a new vault starts on session entries');
+
+const initInto = (hypoDir, extra = []) =>
+  run('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-hooks', '--no-git-init', ...extra]);
+const gitIn = (dir, ...args) => spawnSync('git', ['-C', dir, ...args], { encoding: 'utf-8' });
+
+// A block the templates carry that drifts from the constant the migration state reads would make
+// every new vault start as `not-migrated`.
+test('templates/gitignore holds GITIGNORE_BLOCK and templates/gitattributes is GITATTRIBUTES_BLOCK', () => {
+  assert.ok(
+    readFileSync(join(REPO, 'templates', 'gitignore'), 'utf-8').includes(GITIGNORE_BLOCK),
+    'templates/gitignore must contain GITIGNORE_BLOCK byte for byte',
+  );
+  assert.equal(
+    readFileSync(join(REPO, 'templates', 'gitattributes'), 'utf-8'),
+    GITATTRIBUTES_BLOCK,
+  );
+});
+
+test('a new vault is migrated from its first commit: no generated view tracked, views on disk', () => {
+  withTmpDir((dir) => {
+    const hypoDir = join(dir, 'wiki');
+    gitIn(dir, 'init', hypoDir);
+    gitIn(hypoDir, 'config', 'user.email', 'test@hypo.test');
+    gitIn(hypoDir, 'config', 'user.name', 'Hypo Test');
+    const r = initInto(hypoDir);
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    gitIn(hypoDir, 'add', '-A');
+    const c = spawnSync('git', ['-C', hypoDir, 'commit', '-q', '-m', 'init'], {
+      encoding: 'utf-8',
+      env: HOOK_ENV,
+    });
+    assert.equal(c.status, 0, `commit: ${c.stderr}${c.stdout}`);
+    assert.deepEqual(listTrackedGeneratedViews(hypoDir, { source: 'head' }), []);
+    assert.equal(migrationState(hypoDir), 'migrated');
+    assert.ok(existsSync(join(hypoDir, 'hot.md')), 'the root view is on disk');
+    assert.equal(gitIn(hypoDir, 'ls-files', '--', 'hot.md').stdout, '', 'and not tracked');
+  });
+});
+
+// init writes the generator's own empty-vault output. Without an ownership record for it the first
+// project-create sees bytes nobody vouched for and backs up the root hot.md as a hand edit.
+test('init, commit, then project-create: the root hot.md is replaced with no backup and no warning', () => {
+  withTmpDir((dir) => {
+    const hypoDir = join(dir, 'wiki');
+    gitIn(dir, 'init', hypoDir);
+    gitIn(hypoDir, 'config', 'user.email', 'test@hypo.test');
+    gitIn(hypoDir, 'config', 'user.name', 'Hypo Test');
+    assert.equal(initInto(hypoDir).status, 0);
+    gitIn(hypoDir, 'add', '-A');
+    const c = spawnSync('git', ['-C', hypoDir, 'commit', '-q', '-m', 'init'], {
+      encoding: 'utf-8',
+      env: HOOK_ENV,
+    });
+    assert.equal(c.status, 0, `commit: ${c.stderr}${c.stdout}`);
+    assert.equal(migrationState(hypoDir), 'migrated', 'precondition: views are rendered here');
+    const r = createProject({ hypoDir, name: 'fresh', workingDir: '/tmp/fresh' });
+    assert.ok(r.created.includes('hot.md row'), `the row is written: ${JSON.stringify(r)}`);
+    assert.deepEqual(r.warnings, []);
+    assert.ok(
+      readFileSync(join(hypoDir, 'hot.md'), 'utf-8').includes('fresh'),
+      'row is in the view',
+    );
+    assert.equal(existsSync(join(hypoDir, '.cache', 'backups')), false, 'nothing was backed up');
+  });
+});
+
+test('init does not copy hot.md or session-state.md into projects/_template', () => {
+  withTmpDir((dir) => {
+    const hypoDir = join(dir, 'wiki');
+    assert.equal(initInto(hypoDir).status, 0);
+    const tpl = join(hypoDir, 'projects', '_template');
+    assert.ok(existsSync(join(tpl, 'index.md')), 'precondition: the other template files land');
+    assert.equal(existsSync(join(tpl, 'hot.md')), false);
+    assert.equal(existsSync(join(tpl, 'session-state.md')), false);
+  });
+});
+
+test('a new vault gets .gitattributes with the block once, and a second init leaves it alone', () => {
+  withTmpDir((dir) => {
+    const hypoDir = join(dir, 'wiki');
+    gitIn(dir, 'init', hypoDir);
+    assert.equal(initInto(hypoDir).status, 0);
+    const path = join(hypoDir, '.gitattributes');
+    assert.equal(readFileSync(path, 'utf-8'), GITATTRIBUTES_BLOCK);
+    const again = initInto(hypoDir);
+    assert.equal(again.status, 0, `stderr: ${again.stderr}`);
+    const text = readFileSync(path, 'utf-8');
+    assert.equal(text.split(GITATTRIBUTES_BLOCK.split('\n')[0]).length - 1, 1, text);
+    assert.equal(text, GITATTRIBUTES_BLOCK);
+    const attr = gitIn(
+      hypoDir,
+      'check-attr',
+      'merge',
+      '--',
+      'projects/p/session-log/2026-10-01.md',
+    );
+    assert.equal(attr.stdout.trim().split(': ').pop(), 'union', attr.stdout + attr.stderr);
+  });
+});
+
+test('init adds the block after a .gitattributes the vault already has and keeps its lines', () => {
+  withTmpDir((dir) => {
+    const hypoDir = join(dir, 'wiki');
+    mkdirSync(hypoDir, { recursive: true });
+    writeFileSync(join(hypoDir, '.gitattributes'), 'log.md merge=union');
+    assert.equal(initInto(hypoDir).status, 0);
+    assert.equal(
+      readFileSync(join(hypoDir, '.gitattributes'), 'utf-8'),
+      `log.md merge=union\n${GITATTRIBUTES_BLOCK}`,
+    );
+  });
 });
