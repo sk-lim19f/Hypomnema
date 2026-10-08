@@ -38,6 +38,7 @@ import {
   isSessionProjectDir,
   mergeAdditiveGitignore,
   missingBlockLines,
+  narrowestVisibilityScope,
   parseSessionEntry,
   scopeVisible,
   sessionViewPathsOf,
@@ -2750,7 +2751,13 @@ function publishNoClobber(abs, text) {
   }
 }
 
-// The baseline entries HEAD already has for `slug`, parsed: [{summary, legacy}].
+// A scope as the duplicate check compares it: absent, empty and `shared` are one value.
+const scopeKey = (scope) => {
+  const v = String(scope ?? '').trim();
+  return v === '' ? 'shared' : v;
+};
+
+// The baseline entries HEAD already has for `slug`, parsed: [{summary, legacy, scope}].
 function committedBaselines(hypoDir, slug) {
   const dir = `projects/${slug}/sessions/`;
   const listed = gitOut(hypoDir, ['ls-tree', '--name-only', '-z', 'HEAD', dir]);
@@ -2759,7 +2766,11 @@ function committedBaselines(hypoDir, slug) {
     const text = gitShowText(hypoDir, 'HEAD', `${dir}${name.split('/').at(-1)}`);
     const parsed = text === null ? null : parseSessionEntry(text);
     if (parsed?.ok) {
-      found.push({ summary: parsed.entry.summary, legacy: parsed.entry.bodies[LEGACY_TRACK_ID] });
+      found.push({
+        summary: parsed.entry.summary,
+        legacy: parsed.entry.bodies[LEGACY_TRACK_ID],
+        scope: scopeKey(parsed.entry.visibilityScope),
+      });
     }
   }
   return found;
@@ -2775,17 +2786,27 @@ function committedBaselines(hypoDir, slug) {
  * once for every distinct version of a path within one, so a path archived in two runs with
  * different bytes yields a baseline for each; the side that was not archived comes from
  * `companionRev`'s tree. A pair is not made when HEAD already has a baseline whose summary
- * and `legacy` sections are byte-equal to it (frontmatter included, so a changed `machine_note` is
- * a different memory). A path whose file is already there with the same bytes (published, not yet
+ * and `legacy` sections are byte-equal to it and the same scope (frontmatter included, so a changed
+ * `machine_note` is a different memory, and the same text under another scope is another baseline).
+ * The scope of an entry is the narrowest of the old file's, HEAD's `index.md` and the working
+ * tree's, so an uncommitted edit of `index.md` can narrow what is committed but never widen it.
+ * A path whose file is already there with the same bytes (published, not yet
  * committed) is committed without being written again. Returns `{created: [relPath], skipped:
- * [relPath], notices: [string]}`. The caller holds the vault commit lock.
+ * [relPath], unresolved: [archived member], notices: [string]}`. `unresolved` holds the members
+ * whose bytes could not be shared yet (a missing or changed backup, a conflicting destination
+ * file); a caller that deletes its record must keep them. The caller holds the
+ * vault commit lock.
  */
 export function shareLegacyBytes(hypoDir, archived) {
   const created = [];
   const skipped = [];
   const notices = [];
+  const unresolved = [];
   const patterns = loadHypoIgnore(hypoDir);
   const projects = new Map();
+  // Per project, the archived members behind each old text, so a baseline that cannot be written
+  // names the members to retry.
+  const members = new Map();
   for (const el of archived ?? []) {
     const slug = generatedViewSlug(el?.relPath ?? '');
     if (slug === null || projectHiddenByHypoignore(hypoDir, slug, patterns)) {
@@ -2806,6 +2827,7 @@ export function shareLegacyBytes(hypoDir, archived) {
     })();
     if (text === null || (el.sha256 && sha256Hex(text) !== el.sha256)) {
       skipped.push(el.relPath);
+      unresolved.push(el);
       notices.push(
         `${el.relPath}의 백업(${el.backupPath})이 없거나 달라져 추가 기준선을 만들지 않았습니다.`,
       );
@@ -2827,6 +2849,10 @@ export function shareLegacyBytes(hypoDir, archived) {
     const list = el.relPath.endsWith('/hot.md') ? group.hot : group.state;
     if (!list.includes(text)) list.push(text);
     group.rev ??= el.companionRev;
+    const memberKey = `${list === group.hot ? 'hot' : 'state'}\0${text}`;
+    const byText = members.get(slug) ?? new Map();
+    members.set(slug, byText);
+    byText.set(memberKey, [...(byText.get(memberKey) ?? []), el]);
   }
 
   const toCommit = [];
@@ -2852,7 +2878,12 @@ export function shareLegacyBytes(hypoDir, archived) {
         pairs.set(JSON.stringify([pair.hotText, pair.stateText]), pair);
       }
     }
-    const indexText = readTextOrNull(join(hypoDir, 'projects', slug, 'index.md')) ?? '';
+    // The working tree's `index.md` can only narrow what HEAD's says: an uncommitted edit that
+    // widens the scope must not publish old text to the other machines before it is committed.
+    const indexScope = narrowestVisibilityScope([
+      readVisibilityScope(gitShowText(hypoDir, 'HEAD', `projects/${slug}/index.md`) ?? ''),
+      readVisibilityScope(readTextOrNull(join(hypoDir, 'projects', slug, 'index.md')) ?? ''),
+    ]);
     let existing = null;
     for (const { hotText, stateText, dateTexts } of pairs.values()) {
       // One entry per old file, each with its own scope.
@@ -2862,7 +2893,7 @@ export function shareLegacyBytes(hypoDir, archived) {
         date: legacyBaselineDate(hypoDir, slug, dateTexts),
         project: slug,
         scopes: {
-          index: readVisibilityScope(indexText),
+          index: indexScope.scope,
           hot: readVisibilityScope(hotText),
           state: readVisibilityScope(stateText),
         },
@@ -2874,23 +2905,33 @@ export function shareLegacyBytes(hypoDir, archived) {
         const rel = `projects/${slug}/sessions/${built.fileName}`;
         // A baseline made before the split held both files in one entry, so the section of this
         // kind is what is compared, not the whole entry.
+        const scope = scopeKey(mine.visibilityScope);
         const same =
           built.kind === 'hot'
-            ? (e) => e.summary === mine.summary
-            : (e) => e.legacy === mine.bodies[LEGACY_TRACK_ID];
+            ? (e) => e.scope === scope && e.summary === mine.summary
+            : (e) => e.scope === scope && e.legacy === mine.bodies[LEGACY_TRACK_ID];
         if (existing.some(same)) {
           skipped.push(rel);
           continue;
         }
         if (publishNoClobber(join(hypoDir, rel), built.text) === 'conflict') {
           skipped.push(rel);
+          unresolved.push(
+            ...(members
+              .get(slug)
+              ?.get(`${built.kind}\0${built.kind === 'hot' ? hotText : stateText}`) ?? []),
+          );
           notices.push(`${rel}에 다른 내용의 파일이 이미 있어 추가 기준선을 쓰지 않았습니다.`);
           continue;
         }
         toCommit.push(rel);
         // A later pair in this run can name the same file (two groups with one hot text): it is
         // taken now, not published twice.
-        existing.push({ summary: mine.summary, legacy: mine.bodies[LEGACY_TRACK_ID] });
+        existing.push({
+          summary: mine.summary,
+          legacy: mine.bodies[LEGACY_TRACK_ID],
+          scope,
+        });
         notices.push(
           built.kind === 'state'
             ? `이 기계에만 있던 옛 세션 현황을 추가 기준선 ${rel}로 기록했습니다. legacy 트랙에 머리가 여럿 보일 수 있습니다.`
@@ -2906,14 +2947,15 @@ export function shareLegacyBytes(hypoDir, archived) {
     }
     created.push(...toCommit);
   }
-  return { created, skipped, notices };
+  return { created, skipped, unresolved: [...new Set(unresolved)], notices };
 }
 
 /**
  * Finish what a catch-up merge left behind: a record whose `stage` is `merged`, or whose
  * `targetSha` is already an ancestor of HEAD (the merge landed, the rest did not run). Puts the
  * archived `.gitignore` lines back, shares the archived bytes, and deletes the record once every
- * baseline it made is in HEAD. It names the backup of every local-only, unowned and cleared entry
+ * baseline it made is in HEAD and nothing was left unshared (otherwise the record keeps only the
+ * unshared views). It names the backup of every local-only, unowned and cleared entry
  * the record holds, except those whose backup path is in `announced`. A record that is still
  * `archived` with a target HEAD does not contain is the next catch-up's to recover and is left
  * alone. Independent of the migration state. Returns `{resumed, created, notices}`.
@@ -2937,12 +2979,28 @@ export function resumePullArchive(hypoDir, { announced = [] } = {}) {
     notices.push(
       `보관 기록이 가리키는 백업 파일이 없어 기록을 지우지 않고 남겼습니다: ${lost.map((v) => `${v.relPath} (${v.backupPath})`).join(', ')}. 내용을 확인한 뒤 ${PULL_ARCHIVE_REL}를 직접 지우세요.`,
     );
-  } else if (shared.created.every((rel) => pathInHead(hypoDir, rel))) {
-    rmSync(join(hypoDir, PULL_ARCHIVE_REL), { force: true });
-  } else {
+  } else if (!shared.created.every((rel) => pathInHead(hypoDir, rel))) {
     notices.push(
       '추가 기준선이 아직 커밋되지 않아 보관 기록을 남겼습니다. 다음 실행이 이어서 처리합니다.',
     );
+  } else if (shared.unresolved.length) {
+    // The merge landed and the lines above are back, so only the members that could not be shared
+    // are left to retry. Their backups stay on disk; the set-aside lists were announced above.
+    writePullArchive(hypoDir, {
+      ...rec,
+      stage: 'merged',
+      gitignoreLines: [],
+      views: shared.unresolved,
+      localOnly: [],
+      unowned: [],
+      cleared: [],
+      gitignoreSaved: [],
+    });
+    notices.push(
+      `공유하지 못한 보관 항목이 있어 기록(${PULL_ARCHIVE_REL})에 그것만 남겼습니다: ${shared.unresolved.map((v) => v.relPath).join(', ')}. 다음 실행이 다시 시도합니다.`,
+    );
+  } else {
+    rmSync(join(hypoDir, PULL_ARCHIVE_REL), { force: true });
   }
   return { resumed: true, created: shared.created, notices };
 }

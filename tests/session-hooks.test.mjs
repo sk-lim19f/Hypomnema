@@ -7808,9 +7808,9 @@ test('(L2) an untracked old file whose untracked index.md scopes it to another m
   });
 });
 
-test('(L3) an untracked old file scoped to another machine stays out of this machine even when the local index.md says entry_scope: shared, and is injected on the machine it names', () => {
-  const startOn = (device, assertCtx) =>
-    withUntrackedProject('entry_scope: shared\n', ({ dir, workZ }) => {
+test('(L3) an untracked old file scoped to another machine is injected only on the machine it names without entry_scope, and entry_scope: shared in index.md reopens it here', () => {
+  const startOn = (device, indexLine, assertCtx) =>
+    withUntrackedProject(indexLine, ({ dir, workZ }) => {
       ssPut(
         dir,
         'projects/z/session-state.md',
@@ -7821,16 +7821,19 @@ test('(L3) an untracked old file scoped to another machine stays out of this mac
       );
       const { ctx } = ssStart(dir, workZ, {
         env: { ...SS_DAY_ONE, HYPO_DEVICE: device },
-        sessionId: `sess-t12-l3-${device}`,
+        sessionId: `sess-t12-l3-${device}-${indexLine ? 'es' : 'plain'}`,
       });
       assert.match(ctx, /WIKI HOT CACHE: project=z/, 'the rest of the injection is there');
       assertCtx(ctx);
     });
-  startOn('this-device', (ctx) =>
-    assert.doesNotMatch(ctx, /Z_UNTRACKED_STATE/, 'its own machine scope still applies'),
+  startOn('this-device', '', (ctx) =>
+    assert.doesNotMatch(ctx, /Z_UNTRACKED_STATE/, 'its own machine scope decides'),
   );
-  startOn('other-device', (ctx) =>
+  startOn('other-device', '', (ctx) =>
     assert.match(ctx, /Z_UNTRACKED_STATE/, 'the machine it names is told the text'),
+  );
+  startOn('this-device', 'entry_scope: shared\n', (ctx) =>
+    assert.match(ctx, /Z_UNTRACKED_STATE/, 'entry_scope: shared replaces the machine scope'),
   );
 });
 
