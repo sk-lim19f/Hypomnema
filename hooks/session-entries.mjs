@@ -325,44 +325,101 @@ export function splitLegacyFrontmatter(text) {
 }
 
 /**
- * The entry that stands in for a project's old `hot.md` and `session-state.md`. Both texts go in
- * whole, frontmatter included (`tags`, `related`, `machine_note` survive), with line endings
- * normalized to LF. A CRLF source would otherwise leave `\r` in a blob that `.gitattributes`
- * (`eol=lf`) rewrites on checkout, so the path would read as modified forever, and a CRLF machine
- * and an LF machine would hash the same content to different paths. Returns
- * `{closeId, fileName, text}`. The id hashes the two texts, `legacyDone` and `visibilityScope`, so
- * two machines with the same inputs write the same path and bytes, and inputs that differ in any
- * of those land on different paths instead of colliding.
+ * The entry that stands in for ONE of a project's old files: `kind` `'hot'` is the old `hot.md`
+ * (the entry's summary, no tracks), `'state'` the old `session-state.md` (an empty summary and one
+ * `legacy` track whose body is the file). Each file is its own entry so it carries its own
+ * `visibilityScope`: a machine-scoped `hot.md` must not hide a shared `session-state.md`. The text
+ * goes in whole, frontmatter included (`tags`, `related`, `machine_note` survive), with line
+ * endings normalized to LF. A CRLF source would otherwise leave `\r` in a blob that
+ * `.gitattributes` (`eol=lf`) rewrites on checkout, so the path would read as modified forever, and
+ * a CRLF machine and an LF machine would hash the same content to different paths. Returns
+ * `{kind, closeId, fileName, text}`. The id hashes the kind, the text, `legacyDone` (state only)
+ * and `visibilityScope`, so two machines with the same inputs write the same path and bytes, the
+ * two files of one project never share an id, and inputs that differ in any of those land on
+ * different paths instead of colliding.
  */
-export function buildBaselineEntry({
-  hotText,
-  stateText,
-  date,
-  visibilityScope,
-  project,
-  legacyDone,
-}) {
-  const hot = (hotText ?? '').replace(/\r\n/g, '\n');
-  const state = (stateText ?? '').replace(/\r\n/g, '\n');
-  const done = Boolean(legacyDone);
+export function buildBaselineEntry({ kind, text, date, visibilityScope, project, legacyDone }) {
+  if (kind !== 'hot' && kind !== 'state')
+    throw fail('invalid-entry', `invalid baseline kind: ${kind}`);
+  const body = (text ?? '').replace(/\r\n/g, '\n');
+  const done = kind === 'state' && Boolean(legacyDone);
   const scope = visibilityScope || null;
   const h16 = createHash('sha256')
-    .update(JSON.stringify([hot, state, done, scope]))
+    .update(JSON.stringify([kind, body, done, scope]))
     .digest('hex')
     .slice(0, 16);
   const closeId = `baseline-${h16}`;
-  const legacy = { id: LEGACY_TRACK_ID, title: BASELINE_TITLE, new: true };
-  if (done) legacy.done = true;
-  const text = formatSessionEntry({
+  let tracks = [];
+  if (kind === 'state') {
+    tracks = [{ id: LEGACY_TRACK_ID, title: BASELINE_TITLE, new: true }];
+    if (done) tracks[0].done = true;
+  }
+  const entry = formatSessionEntry({
     project,
     closeId,
     date,
     visibilityScope: scope,
-    tracks: [legacy],
-    summary: hot,
-    bodies: { [LEGACY_TRACK_ID]: state },
+    tracks,
+    summary: kind === 'hot' ? body : '',
+    bodies: kind === 'state' ? { [LEGACY_TRACK_ID]: body } : {},
   });
-  return { closeId, fileName: entryFileName(date, closeId), text };
+  return { kind, closeId, fileName: entryFileName(date, closeId), text: entry };
+}
+
+/**
+ * The baseline entries of one project's old files, hot first: `[{kind, closeId, fileName, text,
+ * scope, conflict}]`. A file that is absent or empty gets no entry. `scopes` is `{index, hot,
+ * state}`, the `visibility_scope` read from `index.md` and from each old file. Each entry takes the
+ * narrower of the project's scope and ITS OWN file's, so one machine-scoped file hides only its
+ * own entry. `conflict` is `narrowestVisibilityScope`'s: the two values name different machines,
+ * the entry is `machine:` and visible nowhere. One `date` for both keeps them on one day.
+ */
+export function buildLegacyBaselines({ hotText, stateText, date, project, scopes, legacyDone }) {
+  const files = [
+    { kind: 'hot', text: hotText, scope: scopes?.hot },
+    { kind: 'state', text: stateText, scope: scopes?.state },
+  ];
+  return files
+    .filter((f) => typeof f.text === 'string' && f.text !== '')
+    .map((f) => {
+      const { scope, conflict } = narrowestVisibilityScope([scopes?.index, f.scope]);
+      const built = buildBaselineEntry({
+        kind: f.kind,
+        text: f.text,
+        date,
+        visibilityScope: scope,
+        project,
+        legacyDone,
+      });
+      return { ...built, scope, conflict };
+    });
+}
+
+/**
+ * Whether a baseline entry file still names its own content. `fileName` is the file's base name
+ * and `text` its bytes. The id in a baseline's name is a hash of the kind, body, `done` flag and
+ * scope, so a baseline whose bytes changed after it was written (git pairs it with the old file it
+ * was cut from as a rename and merges a later edit of that file into it) no longer matches its
+ * name. Returns `null` when the name and the entry's own id both equal the hash of the content (or
+ * the file is not a readable baseline), else `{expected, inName, inEntry}` (the ids as `baseline-<h16>`).
+ */
+export function baselineIdMismatch(fileName, text) {
+  const parsed = parseSessionEntry(text);
+  if (!parsed.ok || !isBaselineId(parsed.entry.closeId)) return null;
+  const e = parsed.entry;
+  const legacy = e.tracks.find((t) => t.id === LEGACY_TRACK_ID);
+  const kind = legacy ? 'state' : 'hot';
+  const rebuilt = buildBaselineEntry({
+    kind,
+    text: kind === 'hot' ? e.summary : (e.bodies[LEGACY_TRACK_ID] ?? ''),
+    date: e.date,
+    visibilityScope: e.visibilityScope,
+    project: e.project,
+    legacyDone: legacy?.done === true,
+  });
+  const inName = /-(baseline-[0-9a-f]{16})\.md$/.exec(fileName)?.[1] ?? null;
+  if (rebuilt.closeId === e.closeId && rebuilt.closeId === inName) return null;
+  return { expected: rebuilt.closeId, inName, inEntry: e.closeId };
 }
 
 // ── ids and file names ───────────────────────────────────────────────────────
@@ -512,8 +569,12 @@ export function sortRootRows(rows) {
 
 // ── order and heads ──────────────────────────────────────────────────────────
 
-/** A baseline entry (real or virtual) stands for the old `hot.md` and `session-state.md`. */
+/** A baseline entry (real or virtual) stands for the old `hot.md` or the old `session-state.md`. */
 export const isBaselineId = (closeId) => closeId.startsWith('baseline-');
+
+// The state baseline holds the old `session-state.md` as a track body and has no summary. It has no
+// place among the session summaries, which would show an empty `### <date> · baseline-...` block.
+const hasSummary = (entry) => !isBaselineId(entry.closeId) || entry.summary !== '';
 
 const supersededIdsOf = (entry) => entry.tracks.flatMap((t) => t.supersedes ?? []);
 
@@ -609,14 +670,22 @@ export function scopeVisible(scopeValue, device) {
   return true;
 }
 
+/**
+ * Whether `device` may see one session entry of `model`. Both the entry's own `visibility_scope`
+ * and the project's `entry_scope` (`model.entryScope`, when a string) must admit the device, so a
+ * wide `entry_scope` never exposes an entry scoped to another machine and a narrow one hides the
+ * entries that are otherwise shared. The one place the two scopes are combined.
+ */
+export function entryVisible(model, entry, device) {
+  if (typeof model.entryScope === 'string' && !scopeVisible(model.entryScope, device)) return false;
+  return scopeVisible(entry.visibilityScope, device);
+}
+
 // Everything the renderers and the injection share: the entries this machine may see (a hidden
 // entry is treated as absent, so it cannot replace a visible one), newest first, and the active
-// and finished tracks. `model.entryScope`, when a string, replaces every entry's own scope.
+// and finished tracks. Visibility is `entryVisible`: the entry's own scope and `entry_scope` both.
 function projectView(model, device) {
-  const forced = typeof model.entryScope === 'string' ? model.entryScope : null;
-  const entries = sortEntries(
-    model.entries.filter((e) => scopeVisible(forced ?? e.visibilityScope, device)),
-  );
+  const entries = sortEntries(model.entries.filter((e) => entryVisible(model, e, device)));
   const tracks = trackHeads(entries);
   const live = new Set();
   for (const t of tracks) {
@@ -728,13 +797,13 @@ function renderSessionState(model, view) {
 }
 
 function renderHot(model, view) {
-  const { entries } = view;
-  const recent = entries.slice(0, RECENT_SUMMARIES);
-  const older = entries.slice(RECENT_SUMMARIES, RECENT_SUMMARIES + OLDER_LINKS);
-  const rest = entries.length - recent.length - older.length;
+  const summarized = view.entries.filter(hasSummary);
+  const recent = summarized.slice(0, RECENT_SUMMARIES);
+  const older = summarized.slice(RECENT_SUMMARIES, RECENT_SUMMARIES + OLDER_LINKS);
+  const rest = summarized.length - recent.length - older.length;
   const slug = model.project;
   const blocks = [
-    `---\ntype: reference\ntitle: "hot: ${slug}"\nupdated: ${entries[0]?.date ?? ''}\ngenerated: sessions\n---`,
+    `---\ntype: reference\ntitle: "hot: ${slug}"\nupdated: ${view.entries[0]?.date ?? ''}\ngenerated: sessions\n---`,
     GENERATED_NOTE(slug),
     '## Recent sessions',
   ];
@@ -837,16 +906,21 @@ export function buildInjection(model, budget, { device } = {}) {
   const overflow = view.items.length - slots.length;
   const pointer = (item) =>
     `- ${labelOf(item)}: 이 트랙을 이어 작업하면 먼저 ${item.sourcePath}에서 이 머리를 읽으세요. 닫을 때 이 머리를 대체합니다.`;
-  const sums = view.entries.slice(0, RECENT_SUMMARIES).map((entry) => {
-    const { frontmatter, body } = summaryParts(entry);
-    const text = joinBlocks([
-      `### ${entry.date} · ${entry.closeId}`,
-      frontmatter === null ? null : yamlFence(frontmatter),
-      body,
-    ]);
-    return { text, on: false };
-  });
-  const notes = { text: model.notes ? `## Project notes\n\n${model.notes}` : null, on: false };
+  const sums = view.entries
+    .filter(hasSummary)
+    .slice(0, RECENT_SUMMARIES)
+    .map((entry) => {
+      const { frontmatter, body } = summaryParts(entry);
+      const text = joinBlocks([
+        `### ${entry.date} · ${entry.closeId}`,
+        frontmatter === null ? null : yamlFence(frontmatter),
+        body,
+      ]);
+      return { text, on: false };
+    });
+  // The note carries its own `visibility_scope`: another machine's note is not this machine's context.
+  const notesVisible = model.notes && scopeVisible(model.notesScope, device);
+  const notes = { text: notesVisible ? `## Project notes\n\n${model.notes}` : null, on: false };
 
   const render = () => {
     const sections = [];

@@ -10,6 +10,8 @@ You are running `/hypo:upgrade`. Check if the installed Hypomnema wiki is out of
 - **Hook files**: checks if any hooks in `~/.claude/hooks/` are stale or missing
 - **settings.json**: checks if all hook registrations are present in `~/.claude/settings.json`
 
+A vault with no git remote moves its session state into per-session entries (`projects/<p>/sessions/`) by itself at the next SessionStart. A vault with a remote is never moved from a hook; SessionStart only tells you it has not moved.
+
 ---
 
 ## Step 1 — Run script

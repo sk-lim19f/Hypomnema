@@ -5651,8 +5651,9 @@ test('supersedes: a unique prefix resolves and the file carries the full id, an 
 
 test('an unambiguous baseline prefix is resolved and written as the full id', () => {
   withWiki(null, (dir, today) => {
-    const baseline = loadSessionModel(dir, 'test-project').entries.find((e) =>
-      e.closeId.startsWith('baseline-'),
+    // the state baseline is the one that carries the `legacy` track
+    const baseline = loadSessionModel(dir, 'test-project').entries.find(
+      (e) => e.closeId.startsWith('baseline-') && e.bodies.legacy !== undefined,
     );
     assert.ok(baseline, 'the fixture tracks the old state files, so a virtual baseline exists');
     const sid = newPinSession('baseline-prefix');
@@ -5794,7 +5795,9 @@ test('a large legacy baseline seen only as a pointer is folded by "done" (Q5)', 
     },
     (dir, today) => {
       const model = loadSessionModel(dir, 'test-project');
-      const baseline = model.entries.find((e) => e.closeId.startsWith('baseline-'));
+      const baseline = model.entries.find(
+        (e) => e.closeId.startsWith('baseline-') && e.bodies.legacy !== undefined,
+      );
       assert.ok(baseline.bodies.legacy.length > 5000);
       const sid = newPinSession('big-legacy');
       recordObservedHeads(dir, sid, 'test-project', {
@@ -5974,14 +5977,25 @@ test('commands/crystallize.md Step 2 payload example applies for real against a 
 const LEGACY_HOT_BODY = '# 옛 hot\n\n- legacy-hot-line  \n\n- 두 번째 줄 legacy-hot-end';
 const LEGACY_STATE_BODY = '## 다음 작업\n\n- legacy-state-line  \n\n- 두 번째 legacy-state-end';
 
-// `legacy` is registered only through the baseline that HEAD's tracked old files make. Untrack
-// both (they stay on disk, which the post-apply verification needs) and no baseline exists.
+// `legacy` is registered only through the baseline that the old files on disk make. Untrack both
+// and record their bytes as the generator's own output (they stay on disk, which the post-apply
+// verification needs): they are not old memory then, and no baseline exists.
 function untrackOldStateFiles(dir) {
   const env = { ...process.env, HOME: SESSION_TMP_HOME };
   const files = ['hot.md', 'session-state.md'].map((f) => join('projects', 'test-project', f));
   spawnSync('git', ['rm', '--cached', ...files], { cwd: dir, env });
   spawnSync('git', ['commit', '-m', 'untrack old files'], { cwd: dir, env });
   appendFileSync(join(dir, '.git', 'info', 'exclude'), `${files.join('\n')}\n`);
+  const views = Object.fromEntries(
+    files.map((f) => [
+      f,
+      createHash('sha256')
+        .update(readFileSync(join(dir, f), 'utf-8'), 'utf-8')
+        .digest('hex'),
+    ]),
+  );
+  mkdirSync(join(dir, '.cache'), { recursive: true });
+  writeFileSync(join(dir, '.cache', 'generated-views.json'), JSON.stringify({ views }));
 }
 
 function legacyFormatPayload(today, tag) {

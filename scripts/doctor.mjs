@@ -41,6 +41,7 @@ import {
   isUsablePkgRootLocal,
   selfLocationPkgRootFrom,
 } from '../hooks/hypo-shared.mjs';
+import { baselineIdMismatch, parseSessionEntry } from '../hooks/session-entries.mjs';
 import { classifyProposals } from './proposal.mjs';
 import { listProposalsChecked, orphanTmpTargetName } from '../hooks/proposal-store.mjs';
 import {
@@ -1318,6 +1319,76 @@ function checkHalfClosedReceipts(hypoDir) {
         )
         .join('; ') +
       (broken.length > 3 ? ` (+${broken.length - 3} more)` : ''),
+  );
+}
+
+// A baseline entry names its own content: `baseline-<h16>` is a hash of the bytes it holds. git
+// pairs a baseline with the old `hot.md` or `session-state.md` it was cut from as a rename when it
+// merges the migration commit, so an edit another machine made to the old file lands inside the
+// baseline with no conflict. The bytes then no longer match the name. Nothing is repaired here:
+// the baseline still reads as an entry, and the report tells the user which files to look at.
+function checkBaselineIntegrity(hypoDir) {
+  let slugs = [];
+  try {
+    slugs = readdirSync(join(hypoDir, 'projects'));
+  } catch {
+    return; // no projects/: nothing to judge
+  }
+  let checked = 0;
+  const bad = [];
+  const unparseable = []; // `baselineIdMismatch` answers null for these, which would read as a match
+  for (const slug of slugs.sort()) {
+    const dir = join(hypoDir, 'projects', slug, 'sessions');
+    let names = [];
+    try {
+      names = readdirSync(dir).filter((n) => /-baseline-[0-9a-f]{16}\.md$/.test(n));
+    } catch {
+      continue; // no sessions/ in this project
+    }
+    for (const name of names.sort()) {
+      let text;
+      try {
+        text = readFileSync(join(dir, name), 'utf-8');
+      } catch {
+        continue; // unreadable: not this check's job to diagnose
+      }
+      const parsed = parseSessionEntry(text);
+      if (!parsed.ok) {
+        unparseable.push(`projects/${slug}/sessions/${name} (${parsed.reason})`);
+        continue;
+      }
+      checked++;
+      const mismatch = baselineIdMismatch(name, text);
+      if (mismatch) bad.push({ rel: `projects/${slug}/sessions/${name}`, ...mismatch });
+    }
+  }
+  if (unparseable.length) {
+    warn(
+      'Session baselines',
+      `${unparseable.length} baseline entr${unparseable.length === 1 ? 'y cannot' : 'ies cannot'} be parsed, so its name could not be checked: ` +
+        unparseable.slice(0, 3).join('; ') +
+        (unparseable.length > 3 ? ` (+${unparseable.length - 3} more)` : '') +
+        '. Open the file and repair or remove it; until then its text is missing from the session views.',
+    );
+  }
+  if (checked === 0) return;
+  if (bad.length === 0) {
+    if (unparseable.length) return; // the warning above stands; no pass line next to it
+    pass(
+      'Session baselines',
+      `${checked} baseline entr${checked === 1 ? 'y' : 'ies'} match their names`,
+    );
+    return;
+  }
+  warn(
+    'Session baselines',
+    `${bad.length} baseline entr${bad.length === 1 ? 'y holds' : 'ies hold'} bytes that do not match the name: ` +
+      bad
+        .slice(0, 3)
+        .map((b) => `${b.rel} (content hashes to ${b.expected})`)
+        .join('; ') +
+      (bad.length > 3 ? ` (+${bad.length - 3} more)` : '') +
+      '. An edit to the old hot.md or session-state.md was probably merged into it. The entry still reads, so nothing is lost; review the file and move any text that belongs elsewhere.',
   );
 }
 
@@ -2903,6 +2974,7 @@ if (rootOk && args.codex) checkExtensions(args.hypoDir, args.claudeHome, 'codex'
 if (rootOk) checkProjectIndexAnchors(args.hypoDir);
 if (rootOk) checkSessionCloseArtifacts(args.hypoDir);
 if (rootOk) checkHalfClosedReceipts(args.hypoDir);
+if (rootOk) checkBaselineIntegrity(args.hypoDir);
 if (rootOk) checkSyncState(args.hypoDir);
 if (rootOk) checkProjectSuggestions(args.hypoDir);
 if (rootOk) checkProposals(args.hypoDir);
