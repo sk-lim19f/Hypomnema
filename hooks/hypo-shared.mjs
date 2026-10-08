@@ -3971,21 +3971,27 @@ function isPidAlive(pid) {
 }
 
 /**
- * Is this porcelain record a file `withFileLock` leaves on disk while it works: the lock
+ * Is this porcelain record a file `withFileLock` leaves on disk while a close works: the lock
  * itself (`<target>.lock`) or a waiter's staging file (`<target>.lock.<16 hex>.tmp`, present
  * for the whole wait)? Both are transient and untracked, and a vault's `.gitignore` may not
  * list either (an old vault lacks `*.lock`, the maintainer's does not ignore the staging
  * file), so the dirty-tree judgments (`hypoIsClean`, `gitDirtyFiles`, and the SessionStart
  * and resume copies) skip them rather than let one close's lock read as another close's
- * uncommitted work. Only an untracked record (`??`) can be one: a tracked file that happens
- * to be named `*.lock` and is edited, renamed or deleted is a person's work and stays dirty.
- * The one rule all four callers share. Matches on the file name only.
+ * uncommitted work. Only the two files a close locks inside the tracked tree qualify: the
+ * root `log.md` and a project's `session-log/<file>.md` shard (every other lock a close
+ * takes lives under the gitignored `.cache/`). A person's own untracked `notes.md.lock` or
+ * `pages/x.lock` stays dirty, and so does a tracked `*.lock` file that is edited, renamed or
+ * deleted (only an untracked record, `??`, can be an artifact).
+ * The one rule all four callers share. Matches on the vault-relative path.
  * @param {string} xy the two-character porcelain status of the record
  * @param {string} path
  */
 export function isUntrackedLockArtifact(xy, path) {
-  return xy === '??' && /\.lock(\.[0-9a-f]{16}\.tmp)?$/.test(path);
+  return xy === '??' && CLOSE_LOCK_ARTIFACT.test(path);
 }
+
+const CLOSE_LOCK_ARTIFACT =
+  /^(?:log\.md|projects\/[^/]+\/session-log\/[^/]+\.md)\.lock(?:\.[0-9a-f]{16}\.tmp)?$/;
 
 /**
  * Run `fn` while holding an exclusive lock on `<targetPath>.lock`.

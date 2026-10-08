@@ -471,7 +471,7 @@ export function writeReceiptAtomic(hypoDir, sessionId, receipt) {
 
 /** Rename `path` to `<path>.invalidated-<ts>`. Absent is success: there was
  * nothing to invalidate under this name. */
-function invalidateOne(path) {
+export function invalidateOne(path) {
   if (!existsSync(path)) return { ok: true };
   const dest = `${path}.invalidated-${Date.now()}`;
   try {

@@ -57,11 +57,13 @@ import {
   writeSessionClosedMarker,
 } from '../hooks/hypo-shared.mjs';
 import { ensureProjectIndex } from '../scripts/crystallize.mjs';
-import { receiptPath, verifyEntriesInCommit } from '../hooks/close-receipt.mjs';
+import { receiptPath, verifyEntriesInCommit, writeReceiptAtomic } from '../hooks/close-receipt.mjs';
 import {
   buildMarkCloseProof,
   classifyExistingEntry,
+  invalidatePriorCloseArtifacts,
   landReceiptThenMarker,
+  sessionCloseLockTarget,
   withdrawOwnReceipt,
   markerWriteGenuinelyFailed,
   commitShaForUndo,
@@ -3260,6 +3262,7 @@ test('a receipt whose re-read fails is withdrawn, and the marker writer is never
     const sid = `lrm-reread-${process.pid}`;
     const rp = receiptPath(dir, sid);
     mkdirSync(dirname(rp), { recursive: true }); // created before the umask change, at a usable mode
+    mkdirSync(dirname(sessionCloseLockTarget(dir, sid)), { recursive: true }); // the session lock's directory, likewise
     let called = false;
     const old = process.umask(0o777);
     let out;
@@ -3319,6 +3322,110 @@ test('withdrawOwnReceipt takes back a receipt of the same generation, and treats
     writeFileSync(rp, JSON.stringify(fakeReceipt(sid)));
     assert.deepEqual(withdrawOwnReceipt(dir, sid, 'g'.repeat(32)), { ok: true, withdrawn: true });
     assert.equal(existsSync(rp), false);
+  });
+});
+
+// Two attempts for one session id. The second one starts while the first sits between its
+// receipt and its marker (the marker writer is the seam). Unserialized, the second lands a
+// full pair and the first then stamps its own marker over it: receipt B beside marker A,
+// both attempts reporting ok.
+// Disabling the check: in landReceiptThenMarker (scripts/lib/crystallize-close-apply.mjs)
+// call landReceiptThenMarkerLocked directly instead of through withSessionCloseLock.
+test('two attempts for one session id leave a receipt and a marker of the same generation', () => {
+  withTmpDir((dir) => {
+    const sid = `lrm-interleave-${process.pid}`;
+    const filing = (generation) => ({ ...fakeReceipt(sid), generation });
+    const markerFor = (generation) => () =>
+      writeSessionClosedMarker(dir, sid, {
+        project: 'p',
+        projects: ['p'],
+        receiptGeneration: generation,
+      });
+    const a = filing('a'.repeat(32));
+    const b = filing('b'.repeat(32));
+    let inner;
+    const outer = landReceiptThenMarker(
+      dir,
+      sid,
+      a,
+      () => {
+        inner = landReceiptThenMarker(dir, sid, b, markerFor(b.generation), { lockTimeoutMs: 100 });
+        return markerFor(a.generation)();
+      },
+      { lockTimeoutMs: 100 },
+    );
+    assert.deepEqual(outer, { ok: true }, 'the attempt holding the lock lands');
+    assert.deepEqual(inner, { ok: false, reason: 'session-close-lock-timeout' });
+    const receipt = JSON.parse(readFileSync(receiptPath(dir, sid), 'utf-8'));
+    const marker = JSON.parse(readFileSync(sessionClosedMarkerPath(dir, sid), 'utf-8'));
+    assert.equal(receipt.generation, a.generation);
+    assert.equal(marker.receipt_generation, receipt.generation, 'the marker names the receipt');
+  });
+});
+
+// The resolution is recorded in `afterLanded`, which has to sit under the same lock, and a
+// new close request's invalidation of the prior artifacts waits on it too.
+// Disabling the check: in landReceiptThenMarkerLocked move the `afterLanded()` call out of
+// the lock (return the callback instead of calling it) and run it after withSessionCloseLock.
+test('the close resolution and a new request invalidation wait behind the session lock', () => {
+  withTmpDir((dir) => {
+    const sid = `lrm-after-${process.pid}`;
+    const receipt = fakeReceipt(sid);
+    let invalidation;
+    let rival;
+    const out = landReceiptThenMarker(
+      dir,
+      sid,
+      receipt,
+      () =>
+        writeSessionClosedMarker(dir, sid, {
+          project: 'p',
+          projects: ['p'],
+          receiptGeneration: receipt.generation,
+        }),
+      {
+        lockTimeoutMs: 100,
+        afterLanded: () => {
+          invalidation = invalidatePriorCloseArtifacts(dir, sid, 100);
+          rival = landReceiptThenMarker(dir, sid, receipt, () => true, { lockTimeoutMs: 100 });
+          return { ok: true, recorded: true };
+        },
+      },
+    );
+    assert.deepEqual(out, { ok: true, afterLanded: { ok: true, recorded: true } });
+    assert.deepEqual(invalidation, { ok: false, reason: 'session-close-lock-timeout' });
+    assert.equal(rival.reason, 'session-close-lock-timeout');
+    assert.ok(existsSync(receiptPath(dir, sid)), 'the landed receipt was not invalidated');
+    assert.ok(existsSync(sessionClosedMarkerPath(dir, sid)));
+  });
+});
+
+// A failed attempt takes back only the generation it wrote. A pair another writer (an older
+// installed copy that does not take the session lock) landed in the meantime stays.
+// Disabling the check: in the marker-did-not-land branch of landReceiptThenMarkerLocked
+// replace the two withdrawOwn* calls with invalidateCloseArtifacts(hypoDir, sessionId).
+test('a failed attempt leaves the receipt and marker another close of the session landed', () => {
+  withTmpDir((dir) => {
+    const sid = `lrm-foreign-pair-${process.pid}`;
+    const theirs = { ...fakeReceipt(sid), generation: 'o'.repeat(32) };
+    const out = landReceiptThenMarker(dir, sid, fakeReceipt(sid), () => {
+      assert.equal(writeReceiptAtomic(dir, sid, theirs).ok, true);
+      writeSessionClosedMarker(dir, sid, {
+        project: 'p',
+        projects: ['p'],
+        receiptGeneration: theirs.generation,
+      });
+      return false; // this attempt's own marker write failed
+    });
+    assert.deepEqual(out, { ok: false, reason: 'marker-did-not-land' });
+    assert.equal(
+      JSON.parse(readFileSync(receiptPath(dir, sid), 'utf-8')).generation,
+      'o'.repeat(32),
+    );
+    assert.equal(
+      JSON.parse(readFileSync(sessionClosedMarkerPath(dir, sid), 'utf-8')).receipt_generation,
+      'o'.repeat(32),
+    );
   });
 });
 
