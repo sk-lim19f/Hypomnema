@@ -360,19 +360,26 @@ function runProjection(args) {
   // caller-controlled location (tests, CI) instead of always defaulting to the
   // real ~/.claude. Omitted → feedback-sync's own defaults (the production path:
   // ~/.claude + project-id derived from cwd).
-  const cliArgs = [cli, '--write', '--no-input', `--hypo-dir=${args.hypoDir}`];
+  // --ack-notices: the lines below show its warnings, so notices an older hook run left pending clear here
+  const cliArgs = [cli, '--write', '--no-input', '--ack-notices', `--hypo-dir=${args.hypoDir}`];
   if (args.claudeHome) cliArgs.push(`--claude-home=${args.claudeHome}`);
   if (args.projectId) cliArgs.push(`--project-id=${args.projectId}`);
   const r = spawnSync(process.execPath, cliArgs, { encoding: 'utf-8' });
+  // A notice the user has to act on is forwarded on every exit: feedback-sync prints it on
+  // the --write that meets it (or later, from the pending-notice file), and a failed
+  // post-step reports only its last line below. Other warnings (a skipped MEMORY projection,
+  // an excluded page) are ordinary and stay quiet here. The .gitignore note and the old-draft
+  // warning are also about the user's own text, and are shown only by the run that meets them.
+  for (const line of (r.stderr || '').split('\n')) {
+    if (
+      /^\[feedback-sync\] warn: .*(kept the hand-written line|not overwriting|added \.cache\/ to |written by an earlier version)/.test(
+        line,
+      )
+    )
+      console.error(`⚠ ${line.replace('[feedback-sync] warn: ', '')}`);
+  }
   if (r.status === 0) {
     console.log('↪ Projection refreshed (MEMORY.md / CLAUDE.md learned-behaviors)');
-    // A clean exit can still carry a notice the user has to act on: feedback-sync
-    // prints it once, on the --write that meets it. Other warnings (a skipped MEMORY
-    // projection, an excluded page) are ordinary and stay quiet here.
-    for (const line of (r.stderr || '').split('\n')) {
-      if (/^\[feedback-sync\] warn: .*(kept the hand-written line|not overwriting)/.test(line))
-        console.error(`⚠ ${line.replace('[feedback-sync] warn: ', '')}`);
-    }
     return;
   }
   const detail = (r.stderr || '').trim().split('\n').slice(-1)[0] || `exit ${r.status}`;

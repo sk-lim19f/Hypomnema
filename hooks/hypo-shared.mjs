@@ -1650,6 +1650,24 @@ export function backUpGeneratedPath(hypoDir, viewPath, content, testHooks) {
   return fresh;
 }
 
+/**
+ * Append `pattern` to the vault's own `.gitignore` when it is not already
+ * there. NOT best-effort: a caller about to write a file git must never see
+ * calls this first and lets a thrown error stop that write, since a file git can
+ * see and auto-commit is a leak, not a private copy.
+ * @returns {boolean} true when the file was actually changed
+ */
+export function ensureVaultGitignorePattern(hypoDir, pattern) {
+  const path = join(hypoDir, '.gitignore');
+  const content = existsSync(path) ? readFileSync(path, 'utf-8') : '';
+  if (content.split('\n').some((l) => l.trim() === pattern)) return false;
+  // An append, not a rewrite: the file may be a symlink into a dotfiles repo, have a mode of
+  // its own, or be saved by an editor at this moment; a replace would change the first two
+  // and could drop the third.
+  appendFileSync(path, `${content.length > 0 && !content.endsWith('\n') ? '\n' : ''}${pattern}\n`);
+  return true;
+}
+
 // ── vault git path helpers ───────────────────────────────────────────────────
 // The vault may be a subdirectory of a larger repository. `<rev>:./<path>` makes
 // git resolve the path from the vault; `update-index --cacheinfo` and other
