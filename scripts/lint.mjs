@@ -40,6 +40,7 @@ import {
 } from './lib/frontmatter.mjs';
 import { buildSlugMap } from './lib/slug-resolver.mjs';
 import { parseStrictDate } from './lib/time.mjs';
+import { isSessionEntryPath, parseSessionEntry } from '../hooks/session-entries.mjs';
 
 // ── arg parsing ──────────────────────────────────────────────────────────────
 
@@ -301,6 +302,7 @@ const VALID_TYPES = [
   'adr',
   'session-log',
   'session-state',
+  'session-entry',
   'project-index',
   'postmortem',
   'open-questions',
@@ -403,6 +405,44 @@ function lintSessionStateHeadings(content, rel) {
       `Missing required session-state heading: one of ${SESSION_STATE_NEXT_HEADINGS.map((h) => `## ${h}`).join(', ')}`,
     );
   }
+}
+
+// Session entries (projects/*/sessions/*.md) carry more than `title` and `type`:
+// the reader needs these to place the entry. `title` is covered by REQUIRED_FIELDS.
+const ENTRY_REQUIRED_FIELDS = ['close_id', 'date', 'project', 'tracks'];
+// parseSessionEntry reasons that mean a body section and the frontmatter `tracks` disagree.
+const ENTRY_TRACK_MISMATCH_REASONS = new Set(['unknown-track-body', 'duplicate-track-body']);
+// {rel, project, closeId, supersedes} of every entry that parsed, for the W20 pass after the page loop.
+const sessionEntries = [];
+
+function lintSessionEntry(content, rel, fm) {
+  let missing = false;
+  for (const field of ENTRY_REQUIRED_FIELDS) {
+    if (!fm[field]) {
+      issue('error', rel, `Missing required frontmatter field: ${field}`);
+      missing = true;
+    }
+  }
+  // A missing field is already named above; the parser would only repeat it.
+  if (missing) return;
+  const parsed = parseSessionEntry(content);
+  if (!parsed.ok) {
+    issue(
+      'error',
+      rel,
+      ENTRY_TRACK_MISMATCH_REASONS.has(parsed.reason)
+        ? `Session entry body sections do not match the frontmatter tracks (${parsed.reason})`
+        : `Session entry does not parse: ${parsed.reason}`,
+    );
+    return;
+  }
+  const e = parsed.entry;
+  sessionEntries.push({
+    rel,
+    project: e.project,
+    closeId: e.closeId,
+    supersedes: e.tracks.flatMap((t) => t.supersedes ?? []),
+  });
 }
 
 function lintPage({ path, rel }, slugMap, tagVocab, pageDirs, validTypes) {
@@ -629,6 +669,14 @@ function lintPage({ path, rel }, slugMap, tagVocab, pageDirs, validTypes) {
 
   lintSessionStateHeadings(content, rel);
 
+  // An entry is an immutable source record: its links are not reported, because
+  // nothing is allowed to repair them (lint --fix and rename both leave entries alone).
+  const isEntry = isSessionEntryPath(rel.replace(/\\/g, '/'));
+  if (isEntry) {
+    lintSessionEntry(content, rel, fm);
+    return;
+  }
+
   for (const link of extractWikilinks(content)) {
     if (!slugMap.has(link)) {
       issue('warn', rel, `Broken wikilink: [[${link}]]`, null, 'W4');
@@ -676,6 +724,29 @@ const pageDirs = parseSchemaPageDirs(args.hypoDir);
 const validTypes = new Set([...VALID_TYPES, ...parseSchemaTypes(args.hypoDir)]);
 
 for (const page of pages) lintPage(page, slugMap, tagVocab, pageDirs, validTypes);
+
+// W20: a `supersedes` id that names no entry of the same project. The reader ignores such an
+// id (it only matches an exact close id), so the track it was meant to replace stays a head.
+{
+  const idsByProject = new Map();
+  for (const e of sessionEntries) {
+    if (!idsByProject.has(e.project)) idsByProject.set(e.project, new Set());
+    idsByProject.get(e.project).add(e.closeId);
+  }
+  for (const e of sessionEntries) {
+    for (const id of e.supersedes) {
+      if (!idsByProject.get(e.project).has(id)) {
+        issue(
+          'warn',
+          e.rel,
+          `Session entry ${e.closeId} supersedes "${id}", but project ${e.project} has no entry with that close_id`,
+          null,
+          'W20',
+        );
+      }
+    }
+  }
+}
 
 // W4 (broken-wikilink) plus a reduced W1 (closed frontmatter block presence)
 // and W9 (invalid YAML inside that block), NOT the full lintPage, for close's
@@ -967,7 +1038,8 @@ if (args.fix) {
     if (
       iss.severity === 'warn' &&
       iss.message === 'Missing frontmatter field: updated' &&
-      iss.path
+      iss.path &&
+      !isSessionEntryPath(iss.file.replace(/\\/g, '/'))
     ) {
       const content = readFileSync(iss.path, 'utf-8');
       const fmMatch = /^---\r?\n[\s\S]*?\r?\n---/.exec(content);

@@ -51,6 +51,7 @@ import {
 import { join, basename, dirname, normalize, isAbsolute } from 'path';
 import { resolveHypoRoot, expandHome } from './lib/hypo-root.mjs';
 import { loadHypoIgnore } from './lib/hypo-ignore.mjs';
+import { isSessionEntryPath } from '../hooks/session-entries.mjs';
 import { collectPagesRename } from './lib/wikilink.mjs';
 import { RENAME_MARKER_REL, renameMarkerPath, readRenameMarker } from './lib/rename-marker.mjs';
 import {
@@ -587,6 +588,8 @@ function runDirectory(args, fromDirRel, ignorePatterns) {
     //                         label via [[new|old]] (the page genuinely relocated).
     //  ordinary page        → rewrite normally.
     if (cls === 'sources') continue;
+    //  session entry        → never rewritten (immutable source record), even inside the subtree.
+    if (isSessionEntryPath(p.rel)) continue;
     if (cls === 'timerecord' && !inSubtree) continue;
     const aliasPreserve = cls === 'timerecord' && inSubtree;
     let raw;
@@ -816,7 +819,7 @@ function run(args) {
   let totalRewrites = 0;
   const ambiguities = [];
   for (const p of pages) {
-    if (isPreservedSource(p.rel)) continue;
+    if (isPreservedSource(p.rel) || isSessionEntryPath(p.rel)) continue;
     let raw;
     try {
       raw = readFileSync(p.path, 'utf-8');
