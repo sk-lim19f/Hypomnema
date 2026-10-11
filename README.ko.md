@@ -162,8 +162,9 @@ Hypomnema         ───►  합성 · 마크다운 · git · 훅 · 로컬
 | 단일 원천(source of truth, SoT) | 사용자가 편집하는 단 하나의 파일. projection은 거기서만 파생되고 역방향은 없습니다 |
 | 훅(hook) | Claude Code가 라이프사이클 이벤트(`SessionStart`, `Stop` 등)에 자동으로 실행하는 스크립트 |
 | 라이프사이클 이벤트 | Claude Code가 플러그인에 알리는 시점. 세션 시작·프롬프트 제출·도구 사용·compact 요청·세션 종료 등 |
-| `hot.md` | 프로젝트별 캐시. "방금 무엇을 했는지"(직전 세션의 핵심) |
-| `session-state.md` | 프로젝트별 캐시. "다음에 무엇을 할지"(다음 세션 시작 때 주입되는 이어받기 데이터) |
+| 세션 원본(session entry) | 세션을 마무리할 때마다 `projects/<name>/sessions/`에 하나씩 쌓이는 파일. 요약 하나와 트랙별 갱신으로 이뤄집니다. `hot.md`와 `session-state.md`의 원본이고 지워지지 않습니다 |
+| `hot.md` | 생성되는 현황 파일. "방금 무엇을 했는지"(최근 세션 요약). 세션 원본에서 만듭니다 |
+| `session-state.md` | 생성되는 현황 파일. "다음에 무엇을 할지"(다음 세션 시작 때 주입되는 이어받기 데이터). 세션 원본에서 만듭니다 |
 | `.hypoignore` | 모든 콘텐츠 주입 훅과 `ingest`에서 제외할 경로(글롭 패턴). 프라이버시 경계 |
 | `.hyposcanignore` | 카탈로그 스캔(`lint`, `stats`, `query`, `verify`, `doctor`)에서만 제외할 경로. 프라이버시 경계가 아니며, 매치돼도 여전히 커밋되고 훅이 읽음 |
 | 관측성 점수(observability score) | 세션별 측정값(search·ingest·feedback 활동). 위키가 실제로 쓰였는지 보여줍니다 |
@@ -211,11 +212,13 @@ Hypomnema는 청크가 아니라 페이지를 지식 단위로 봅니다. 새 �
 
 ### 4. 왜 재개에 `hot.md` 캐시를 쓰는가
 
-멈춘 프로젝트에서 가장 비싼 건 일을 다시 하는 게 아니라 컨텍스트를 다시 쌓는 일입니다. `session-log/`를 처음부터 다시 읽으면 분 단위 시간과 토큰이 들지만, 한 페이지짜리 `hot.md`를 읽는 건 둘 다 들지 않습니다. 그래서 최근 상태를 명시적으로 캐싱합니다. `hot.md`는 두 층입니다. 프로젝트별 `hot.md`는 세션 마무리(`crystallize`)가 쓰고, 볼트 루트의 `hot.md`는 그 파일들을 훑어 만드는 포인터 표입니다. 루트 쪽은 `SessionStart`와 `Stop`에서 훅이 다시 만드니 손으로 고치지 마세요. 둘 다 `SessionStart`에 주입됩니다. 재개는 O(1)입니다.
+멈춘 프로젝트에서 가장 비싼 건 일을 다시 하는 게 아니라 컨텍스트를 다시 쌓는 일입니다. `session-log/`를 처음부터 다시 읽으면 분 단위 시간과 토큰이 들지만, 한 페이지짜리 `hot.md`를 읽는 건 둘 다 들지 않습니다. 그래서 최근 상태를 명시적으로 캐싱합니다. 세션을 마무리할 때마다 `projects/<name>/sessions/`에 **세션 원본**이 하나씩 쌓이고, 세 파일이 그 원본에서 만들어집니다. 볼트 루트의 `hot.md`(프로젝트 포인터 표), 프로젝트별 `hot.md`, 프로젝트별 `session-state.md`입니다. 훅이 `SessionStart`와 `Stop`에서 다시 만들고, `SessionStart`에 주입됩니다. 재개는 O(1)입니다. 세션마다 자기 파일을 따로 쓰므로 두 세션이 동시에 마무리돼도 서로의 기록을 덮어쓰지 않습니다.
 
-루트 `hot.md`는 훅이 만들어 내는 결과물이지, 손으로 편집하는 자리가 아닙니다. 거기 직접 써 넣은 내용은 다음번 재생성(다음 `SessionStart`나 `Stop`) 때 사라집니다. 훅이 만든 내용인지 사람이 쓴 내용인지 구분해서 판단할 방법이 없기 때문입니다. 파일 rename에는 범용 compare and swap이 없고, 편집기도 훅이 잡은 advisory lock을 따르지 않습니다. 그래서 훅은 자기가 쓴 내용인지 먼저 확인하고, 아니라고 판단되면 그 내용을 버리는 대신 `hot.md.pre-projection-backup.md`(둘 이상 쌓이면 `-2.md`, `-3.md`, ...)로 같은 자리에 백업해 둡니다. 다만 이 백업은 보장이 아니라 최선을 다한 구조일 뿐입니다. 재작성 도중에 저장이 겹치거나, 편집기가 제자리 저장 방식을 쓰면 백업이 일부만 담기거나 아예 안 남을 수도 있습니다. 안전망이지 쓰는 자리가 아니라는 뜻입니다.
+이 세 파일은 손으로 고치는 자리가 아니고 커밋되지도 않습니다(볼트 `.gitignore`에 들어 있어서, 기계마다 pull로 받은 원본으로 각자 만듭니다). 직접 써 넣은 내용은 다음번 재생성(다음 `SessionStart`나 `Stop`) 때 사라집니다. 생성기가 남길 내용인지 방해되는 내용인지 구분할 방법이 없기 때문입니다. 파일 rename에는 범용 compare and swap이 없고, 편집기도 훅이 잡은 advisory lock을 따르지 않습니다. 그래서 생성기는 자기가 쓴 내용인지 먼저 확인하고, 아니라고 판단되면 그 내용을 버리는 대신 `.cache/backups/` 아래에 백업해 둡니다(예: `.cache/backups/hot.md.pre-projection-backup.md`, 둘 이상 쌓이면 `-2.md`, `-3.md`, ...). 다만 이 백업은 보장이 아니라 최선을 다한 구조일 뿐입니다. 재작성 도중에 저장이 겹치거나, 편집기가 제자리 저장 방식을 쓰면 백업이 일부만 담기거나 아예 안 남을 수도 있습니다. 안전망이지 쓰는 자리가 아니라는 뜻입니다.
 
-백업을 다시 루트 `hot.md`로 되돌리지 마세요. 다음 훅 실행이 곧바로 또 덮어씁니다. 대신 백업 파일을 열어 읽어 보고, 남길 내용은 해당 프로젝트의 `projects/<slug>/hot.md`나 별도 페이지로 옮긴 뒤(어느 프로젝트 것인지는 훅이 판단 못 하니 사람이 정합니다) 백업을 지우세요. 볼트 전체에 얼마나 쌓였는지 보려면 볼트 루트에서 `ls hot.md.pre-projection-backup*.md`를 실행하면 됩니다.
+생성 파일의 내용을 바꾸고 싶으면 바꿀 내용으로 세션을 마무리하세요. 프로젝트의 모든 세션이 봐야 할 메모는 `projects/<name>/notes.md`에 적습니다. 이 파일은 생성되지 않는 내 파일이고, 프로젝트 현황과 함께 주입됩니다. 백업을 생성 파일로 되돌리지는 마세요. 다음 훅 실행이 곧바로 또 덮어씁니다. 대신 백업 파일을 열어 읽어 보고, 남길 내용은 `projects/<slug>/notes.md`나 별도 페이지로 옮긴 뒤(어느 프로젝트 것인지는 훅이 판단 못 하니 사람이 정합니다) 백업을 지우세요. 얼마나 쌓였는지 보려면 볼트 루트에서 `ls -R .cache/backups`를 실행하면 됩니다.
+
+`sessions/`의 원본은 지워지지 않습니다. 생성된 `hot.md`에는 최근 요약 몇 개만 보이고 나머지는 링크로 이어집니다. 기존 볼트를 옮기는 방법은 [세션 원본과 기존 볼트 이행](#세션-원본과-기존-볼트-이행)을 보세요.
 
 ### 5. 왜 feedback → behavior 파이프라인인가
 
@@ -256,14 +259,14 @@ Hypomnema는 청크가 아니라 페이지를 지식 단위로 봅니다. 새 �
 | 훅 | 이벤트 | 역할 |
 |---|---|---|
 | `hypo-close-guard.mjs` | `PreToolUse` | Write/Edit/MultiEdit가 세션 마무리 쓰기로 보이는데 트랜스크립트에 사용자의 마무리 신호가 없으면, 파일이 바뀌기 전에 확인을 받음 |
-| `hypo-session-start.mjs` | `SessionStart` | `git pull --ff-only`, 루트 `hot.md` 투영 재생성, `hot.md` / `session-state.md` 주입 |
+| `hypo-session-start.mjs` | `SessionStart` | `git pull --ff-only`, `projects/*/sessions/`에서 세션 현황 파일(루트 `hot.md`, 프로젝트별 `hot.md`와 `session-state.md`) 재생성, 그 파일들 주입 |
 | `hypo-first-prompt.mjs` | `UserPromptSubmit` | 마커 기반으로 첫 프롬프트에 재개 한 줄을 요구한다(10분 TTL). `hot.md`를 다시 읽지는 않는다 |
 | `hypo-lookup.mjs` | `UserPromptSubmit` | BM25 top-3 HIT 주입 / MISS면 가까운 슬러그 신호 |
 | `hypo-compact-guard.mjs` | `UserPromptSubmit` | 채팅에 입력된 `/compact`나 `/clear`를 감지해 마무리가 덜 됐으면 알린다. compact 자체는 막지 않는다 |
 | `hypo-cwd-change.mjs` | `CwdChanged` | cwd에 맞는 프로젝트 `hot.md`로 알림을 만든다(아래 전송 안내 참조) |
 | `hypo-file-watch.mjs` | `FileChanged` | 바뀐 위키 파일로 알림을 만든다(`.hypoignore` 준수). 이 패키지는 감시 경로를 등록하지 않아 기본 설치에서는 이벤트가 발생할 계기 자체가 없다(아래 전송 안내 참조) |
 | `hypo-auto-stage.mjs` | `PostToolUse(Write/Edit/MultiEdit)` | 위키 파일 자동 stage |
-| `hypo-stop.mjs` | `Stop` | 등록된 유일한 `Stop` 훅이다. 네 단계를 병렬이 아니라 순서대로 돌린다: 루트 `hot.md` 투영 재생성(`SessionStart`도 같은 생성기를 부른다), observability 점수와 auto-resume 신호용 세션 메타데이터 기록, commit + pull + push, 그리고 사용자가 마무리를 신호한 뒤 의미 있는 작업을 했는데 마무리가 확인되지 않으면 Stop을 막고 `crystallize.mjs --mark-session-closed` 명령을 돌려준다(미커밋 변경이나 진행 중인 작업이 있으면 명령 대신 지금 닫을지 되묻는다) |
+| `hypo-stop.mjs` | `Stop` | 등록된 유일한 `Stop` 훅이다. 네 단계를 병렬이 아니라 순서대로 돌린다: 세션 현황 파일 재생성(`SessionStart`도 같은 생성기를 부른다), observability 점수와 auto-resume 신호용 세션 메타데이터 기록, commit + pull + push, 그리고 사용자가 마무리를 신호한 뒤 의미 있는 작업을 했는데 마무리가 확인되지 않으면 Stop을 막고 `crystallize.mjs --mark-session-closed` 명령을 돌려준다(미커밋 변경이나 진행 중인 작업이 있으면 명령 대신 지금 닫을지 되묻는다) |
 | `hypo-personal-check.mjs` | `PreCompact` | session-close 미완, 위키 커밋/푸시 누락, hot.md 구조 위반, lint 블로커를 `systemMessage`로 알린다. `/compact`는 여기서 막지 않는다. 세션 마무리 강제는 다른 자리에 남아 있다: `hypo-stop.mjs`의 crystallize 단계가 마무리 확인 없는 의미 있는 세션을 막고, `--mark-session-closed`는 여전히 red 게이트에서 마커를 거부한다 |
 | `hypo-session-end.mjs` | `SessionEnd` | SessionEnd 마커를 기록해 다음 SessionStart가 `source=clear` 복구를 감지하게 한다 |
 | `hypo-web-fetch-ingest.mjs` | `PostToolUse(WebFetch/WebSearch)` | WebFetch/WebSearch 뒤 `additionalContext`에 `/hypo:ingest` 권유를 주입한다(URL의 query/hash/userinfo는 제거) |
@@ -364,13 +367,29 @@ E. 멈춘 프로젝트 재개.
 ├── projects/            ← 프로젝트 아티팩트 및 세션 로그
 │   ├── _template/       ← 새 프로젝트를 만들 때 복사되는 스캐폴드
 │   └── <name>/
-│       ├── hot.md
-│       ├── session-state.md
+│       ├── sessions/         ← 세션 마무리마다 하나씩 쌓이는 원본 (지워지지 않음)
+│       ├── notes.md          ← 모든 세션이 공유하는 메모 (직접 쓰는 파일, 선택)
+│       ├── hot.md            ← sessions/에서 생성, 커밋되지 않음
+│       ├── session-state.md  ← sessions/에서 생성, 커밋되지 않음
 │       └── session-log/
 ├── journal/             ← daily / weekly / monthly 기록
 ├── sources/             ← 원본 인제스트 소스 (수정 금지)
-└── .cache/              ← 런타임 상태(gitignore 대상). 세션 범위, 보류된 proposal, 동기화 상태
+└── .cache/              ← 런타임 상태(gitignore 대상). 세션 범위, 보류된 proposal, 동기화 상태, 덮어쓴 생성 파일의 백업
 ```
+
+### 세션 원본과 기존 볼트 이행
+
+세션을 마무리하면 `projects/<name>/sessions/<date>-<close_id>.md`가 하나 생깁니다. 루트 `hot.md`와 프로젝트별 `hot.md`, `session-state.md`는 이 원본에서 만들어지는 파일이라 커밋되지 않습니다. 공통 메모는 `projects/<name>/notes.md`에 적습니다.
+
+- **새 볼트**는 처음부터 세션 원본으로 시작합니다.
+- **git 원격이 없는 기존 볼트**는 업그레이드한 뒤 첫 세션 시작 때 저절로 옮겨집니다.
+- **git 원격이 있는 기존 볼트**는 저절로 옮겨지지 않습니다. 같은 볼트를 쓰는 모든 기계를 먼저 업그레이드하고, 한 기계에서 `/hypo:upgrade --migrate-sessions`를 한 번 실행하세요. 이 명령은 이행을 기록하고 바로 푸시하니, 모든 기계를 올린 뒤에만 실행해야 합니다. 그 전까지 세션 시작 때 하루에 한 번까지 안내가 나옵니다.
+
+이행 전에 새 버전에서 마무리하면 원본만 쌓입니다. 생성 파일은 옛 내용 그대로 멈춰 있고, 세션 시작과 `/hypo:resume`은 옛 파일을 출발점으로 보여 주면서 그 위에 새 원본을 얹습니다.
+
+업그레이드를 빠뜨린 기계는 이행 커밋을 pull하는 순간부터 영향을 받습니다. `hot.md`와 `session-state.md`가 사라지고, 세션 시작 때 주입할 내용이 없고, 그 기계의 마무리는 기록되지 않으며(마무리 영수증이 실패합니다), `sessions/`를 읽지 못하고, 그 파일을 고친 푸시 전 변경이 있으면 동기화가 멈춥니다. 그 기계를 업그레이드한 뒤 `/hypo:doctor`를 실행하세요. 구버전 기계의 최근 흔적을 알려 줍니다.
+
+평면 파일로 돌아가려면 `node scripts/session-entries.mjs rollback --at=<commit>`을 실행합니다. 그 커밋 시점의 원본으로 평면 `hot.md`와 `session-state.md`를 만들어 다시 추적하고, 표지 파일(`.hypo-session-entries-off`)을 더해 커밋 하나로 남깁니다. `sessions/` 아래는 아무것도 지우지 않습니다. 그 커밋 뒤에 쌓인 원본은 평면 파일에 없고, 구버전 기계는 여전히 `sessions/`를 읽지 못하며, 같은 내용이 원본과 평면 파일에 두 번 보일 수 있습니다. 표지가 있는 동안에는 어떤 훅도 볼트를 다시 옮기지 않습니다. 세션 원본을 다시 켜려면 `/hypo:upgrade --migrate-sessions`를 실행하세요.
 
 ---
 

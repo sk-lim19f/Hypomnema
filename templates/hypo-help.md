@@ -49,6 +49,7 @@ Quick reference for all `/hypo:*` commands.
 ## Tips
 
 - **Session start**: `hot.md` → `session-state.md` → begin work
-- **Session end**: run `/session-compact` (if available) or update session-state.md manually
+- **Session end**: run `/hypo:crystallize`. It writes one entry under `projects/<name>/sessions/`; `hot.md` and `session-state.md` are generated from the entries, so do not edit them. Notes for every session go in `projects/<name>/notes.md`.
+- **Existing vault with a git remote**: after every machine is upgraded, run `/hypo:upgrade --migrate-sessions` once to start using session entries
 - **Privacy**: edit `.hypoignore` to exclude sensitive paths from hooks
 - **Verify schedule**: add `verify_by:` and `verify_by_date:` to pages you want to review periodically
