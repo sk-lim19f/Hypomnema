@@ -10,7 +10,7 @@
  */
 
 import { readFileSync, existsSync, readdirSync, statSync } from 'fs';
-import { join, basename } from 'path';
+import { join, basename, sep } from 'path';
 import {
   HYPO_DIR,
   buildOutput,
@@ -23,6 +23,7 @@ import {
   scopeVisible,
   readVisibilityScope,
 } from './hypo-shared.mjs';
+import { isSessionEntryPath } from './session-entries.mjs';
 
 const INDEX_PATH = join(HYPO_DIR, 'index.md');
 const MAX_HITS = 3;
@@ -47,6 +48,12 @@ function buildPageMap(dir, root = dir, map = {}, ignorePatterns = [], hypoDir = 
     if (st.isDirectory()) {
       buildPageMap(full, root, map, ignorePatterns, hypoDir);
     } else if (entry.endsWith('.md')) {
+      // Session entries are source records of the generated views, not pages: never a lookup hit.
+      const fromVault = full
+        .slice(hypoDir.length + 1)
+        .split(sep)
+        .join('/');
+      if (isSessionEntryPath(fromVault)) continue;
       const rel = full.slice(root.length + 1).replace(/\.md$/, '');
       map[rel] = full;
       const bare = basename(entry, '.md');
