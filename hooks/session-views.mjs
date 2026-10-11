@@ -284,6 +284,68 @@ export function projectEntryScope(hypoDir, project, model) {
   ]).scope;
 }
 
+/**
+ * The models of every session project as the tree of `rev` holds them (what a rollback renders
+ * from): the entries, `index.md` and `notes.md` are read with `git show`, never from the working
+ * tree, so an entry that arrived after `rev` cannot get in. A project `.hypoignore` hides is left
+ * out, as the generator leaves it out. The models are `migrated` (the rendered views are those of
+ * the scheme). Throws when git cannot list or read the tree.
+ */
+export function loadSessionModelsAt(hypoDir, rev) {
+  const listed = git(hypoDir, ['ls-tree', '-r', '-z', '--name-only', rev]);
+  if (listed.status !== 0) throw new Error(`git ls-tree ${rev}: ${String(listed.stderr).trim()}`);
+  const paths = listed.stdout.split('\0').filter(Boolean);
+  const have = new Set(paths);
+  const slugs = [...new Set(paths.map((p) => /^projects\/([^/]+)\//.exec(p)?.[1]).filter(Boolean))]
+    .filter((slug) =>
+      isSessionProjectDir({
+        slug,
+        hasIndex: have.has(`projects/${slug}/index.md`),
+        hasSessions: paths.some((p) => p.startsWith(`projects/${slug}/sessions/`)),
+      }),
+    )
+    .sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+  const patterns = loadHypoIgnore(hypoDir);
+  const read = (rel) => {
+    const r = git(hypoDir, ['show', revPathArg(rev, rel)]);
+    if (r.status !== 0)
+      throw new Error(`git show ${revPathArg(rev, rel)}: ${String(r.stderr).trim()}`);
+    return r.stdout;
+  };
+  return slugs
+    .filter((slug) => !projectHiddenByHypoignore(hypoDir, slug, patterns))
+    .map((project) => {
+      const entries = [];
+      const unreadable = [];
+      const files = paths
+        .filter((p) => p.startsWith(`projects/${project}/sessions/`) && isSessionEntryPath(p))
+        .sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+      for (const rel of files) {
+        const parsed = parseSessionEntry(read(rel));
+        const fileName = rel.slice(rel.lastIndexOf('/') + 1);
+        if (!parsed.ok) unreadable.push({ fileName, reason: parsed.reason });
+        else if (!entries.some((e) => e.closeId === parsed.entry.closeId))
+          entries.push(parsed.entry);
+      }
+      const base = `projects/${project}`;
+      const indexText = have.has(`${base}/index.md`) ? read(`${base}/index.md`) : null;
+      const notesPath = join(hypoDir, base, 'notes.md');
+      const notesText =
+        have.has(`${base}/notes.md`) && !isIgnored(notesPath, hypoDir, patterns)
+          ? read(`${base}/notes.md`)
+          : null;
+      return {
+        project,
+        migrated: true,
+        entries,
+        unreadable,
+        notes: notesText === null ? null : splitLegacyFrontmatter(notesText).body.trim() || null,
+        notesScope: notesText === null ? '' : readVisibilityScope(notesText),
+        entryScope: indexText === null ? null : entryScopeOf(indexText),
+      };
+    });
+}
+
 // ── writing the views ────────────────────────────────────────────────────────
 
 // `.cache/generated-views.json` = {views: {relPath: sha}}, read and written by hypo-shared's one

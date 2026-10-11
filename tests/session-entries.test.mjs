@@ -101,8 +101,9 @@ import {
 } from '../hooks/session-views.mjs';
 import { isIgnored as isIgnoredScripts } from '../scripts/lib/hypo-ignore.mjs';
 import { isValidProjectName } from '../scripts/lib/project-create.mjs';
+import { ROLLBACK_LIMITS, rollbackSessionEntries } from '../scripts/session-entries.mjs';
 import { test, suite } from './harness.mjs';
-import { SESSION_TMP_HOME, withTmpDir } from './helpers.mjs';
+import { REPO, SESSION_TMP_HOME, withTmpDir } from './helpers.mjs';
 
 const CID = '2b1c4d5e-aaaa-bbbb-cccc-0123456789ab-412';
 const OTHER_CID = '9f9f9f9f-aaaa-bbbb-cccc-0123456789ab-7';
@@ -5942,5 +5943,168 @@ test('a vault that is simply not migrated stays silent when the writer declines 
     assert.equal(r.notMigrated, true);
     assert.equal(r.missingBlockLines, undefined);
     assert.equal(consumeRootHotHealthNotice(dir), null);
+  });
+});
+
+// ── rollback to the flat files ───────────────────────────────────────────────
+
+suite('session entries: rollback and render commands');
+
+const RB_IDS = [1, 2, 3].map((n) => `2b1c4d5e-aaaa-bbbb-cccc-0123456789ab-${410 + n}`);
+const RB_MARKER = SESSION_ENTRIES_OFF_MARKER;
+const RB_TRACKED = ['hot.md', ':(glob)projects/*/hot.md', ':(glob)projects/*/session-state.md'];
+
+// A migrated vault with three originals, each in a commit of its own (`shas[i]` is the commit that
+// added original i), the generator's views written and owned, on top of the move from the old files.
+function withRollbackVault(fn) {
+  withOldGit((dir) => {
+    const old = headOf(dir);
+    assert.equal(migrate(dir).migrated, true);
+    const shas = RB_IDS.map((id, i) => {
+      putEntry(dir, 'p', id, { date: `2026-10-0${i + 1}` });
+      commitIn(dir);
+      return headOf(dir);
+    });
+    assert.equal(writeGeneratedViews(dir, WRITE).notMigrated, false);
+    fn({ dir, shas, old });
+  });
+}
+
+const rbRun = (dir, args) =>
+  spawnSync(process.execPath, [join(REPO, 'scripts', 'session-entries.mjs'), ...args], {
+    encoding: 'utf-8',
+    env: {
+      ...process.env,
+      HOME: SESSION_TMP_HOME,
+      HYPO_DIR: dir,
+      CLAUDE_CONFIG_DIR: '',
+      GIT_CONFIG_GLOBAL: CATCH_UP_CONFIG(),
+      GIT_CONFIG_NOSYSTEM: '1',
+    },
+  });
+
+test('rollback at the second original renders the flat files from that commit only, tracks the three paths and keeps sessions/', () => {
+  withRollbackVault(({ dir, shas }) => {
+    const sessionsBefore = listDir(sessionsDir(dir));
+    const before = commitCount(dir);
+    const r = rollbackSessionEntries(dir, { at: shas[1] });
+    assert.equal(r.rolledBack, true, r.notices.join('\n'));
+    assert.equal(r.commit, headOf(dir));
+    assert.equal(commitCount(dir), before + 1);
+    const tracked = cgitOk(dir, ['ls-files', '--', ...RB_TRACKED])
+      .trim()
+      .split('\n')
+      .filter((rel) => !rel.includes('_template')); // tracked before and not a generated path
+    assert.deepEqual(tracked, ['hot.md', 'projects/p/hot.md', 'projects/p/session-state.md']);
+    const flat = ['projects/p/hot.md', 'projects/p/session-state.md', 'hot.md']
+      .map((rel) => showHead(dir, rel))
+      .join('\n');
+    assert.ok(flat.includes(`summary ${RB_IDS[0]}`), 'the first original is in the flat files');
+    assert.ok(flat.includes(`summary ${RB_IDS[1]}`), 'the second original is in the flat files');
+    assert.ok(!flat.includes(RB_IDS[2]), 'the original added after the rollback point is not');
+    assert.deepEqual(listDir(sessionsDir(dir)), sessionsBefore, 'sessions/ is left as it is');
+    assert.ok(!showHead(dir, '.gitignore').includes(GITIGNORE_BLOCK));
+    assert.ok(showHead(dir, '.gitignore').includes('.cache/'), 'the cache stays ignored');
+  });
+});
+
+test('rollback leaves HEAD, the index and the working tree together: status is empty and the flat bytes are the commit blobs', () => {
+  withRollbackVault(({ dir, shas }) => {
+    assert.equal(rollbackSessionEntries(dir, { at: shas[1] }).rolledBack, true);
+    assert.equal(cgitOk(dir, ['status', '--porcelain']), '');
+    for (const rel of ['hot.md', 'projects/p/hot.md', 'projects/p/session-state.md']) {
+      assert.equal(readRel(dir, rel), showHead(dir, rel), `${rel} is the committed blob`);
+    }
+  });
+});
+
+test('rollback writes the off marker into HEAD: the default move makes no commit and reenable makes one', () => {
+  withRollbackVault(({ dir, shas }) => {
+    assert.equal(rollbackSessionEntries(dir, { at: shas[1] }).rolledBack, true);
+    assert.match(
+      showHead(dir, RB_MARKER),
+      new RegExp(`^rolled back to ${shas[1]} on \\d{4}-\\d{2}-\\d{2}\\n$`),
+    );
+    assert.equal(migrationState(dir), 'opted-out');
+    const before = commitCount(dir);
+    const again = migrate(dir);
+    assert.equal(again.skipped, 'opted-out');
+    assert.equal(again.migrated, false);
+    assert.equal(commitCount(dir), before, 'a SessionStart move makes no commit');
+    const back = migrate(dir, { reenable: true });
+    assert.equal(back.migrated, true, back.notices.join('\n'));
+    assert.equal(commitCount(dir), before + 1, 'reenable makes the one move commit');
+    assert.ok(!treeNames(dir).includes(RB_MARKER));
+  });
+});
+
+test('rollback keeps the bytes of a generated file the generator did not write, in a backup', () => {
+  withRollbackVault(({ dir, shas }) => {
+    put(dir, 'projects/p/hot.md', "my own hot, not the generator's\n");
+    assert.equal(rollbackSessionEntries(dir, { at: shas[1] }).rolledBack, true);
+    const backups = backupsIn(dir, 'projects/p/hot.md');
+    assert.equal(backups.length, 1);
+    assert.equal(readRel(dir, backups[0]), "my own hot, not the generator's\n");
+    assert.notEqual(readRel(dir, 'projects/p/hot.md'), "my own hot, not the generator's\n");
+    assert.equal(backupsIn(dir, 'projects/p/session-state.md').length, 0, 'owned bytes need none');
+  });
+});
+
+test('rollback defers with the reason and changes nothing: unknown commit, a commit from before the move, a vault not moved', () => {
+  withRollbackVault(({ dir, old }) => {
+    const head = headOf(dir);
+    const unknown = rollbackSessionEntries(dir, { at: 'no-such-rev' });
+    assert.equal(unknown.rolledBack, false);
+    assert.equal(unknown.deferred, 'revision-unreadable');
+    const early = rollbackSessionEntries(dir, { at: old });
+    assert.equal(early.deferred, 'at-not-migrated');
+    assert.match(early.notices[0], /롤백을 미뤘습니다/);
+    assert.equal(headOf(dir), head);
+    assert.equal(cgitOk(dir, ['status', '--porcelain']), '');
+  });
+  withOldGit((dir) => {
+    const r = rollbackSessionEntries(dir, { at: headOf(dir) });
+    assert.equal(r.deferred, 'not-migrated');
+  });
+});
+
+test('the off marker is not matched by the template .gitignore or by the migrated vault .gitignore', () => {
+  withTmpDir((dir) => {
+    cgitOk(dir, ['init', '-q']);
+    put(dir, '.gitignore', readFileSync(join(REPO, 'templates', 'gitignore'), 'utf-8'));
+    assert.equal(cgit(dir, ['check-ignore', '-q', RB_MARKER]).status, 1, 'template');
+    put(dir, '.gitignore', `.cache/\n${GITIGNORE_BLOCK}`);
+    assert.equal(cgit(dir, ['check-ignore', '-q', RB_MARKER]).status, 1, 'migrated vault');
+  });
+});
+
+test('rollback command: exit 0 with the limits printed and the commit made, 1 when deferred, 2 for an unknown flag', () => {
+  withRollbackVault(({ dir, shas }) => {
+    const bad = rbRun(dir, ['rollback', `--at=${shas[1]}`, '--force']);
+    assert.equal(bad.status, 2);
+    assert.equal(rbRun(dir, ['rollback']).status, 2, 'no --at');
+    assert.equal(rbRun(dir, ['migrate']).status, 2, 'no migrate subcommand');
+    assert.equal(rbRun(dir, ['render', '--at=x']).status, 2, 'a flag of another subcommand');
+    assert.equal(commitCount(dir), 5, 'a refused command made no commit');
+    const missing = rbRun(dir, ['rollback', '--at=no-such-rev']);
+    assert.equal(missing.status, 1);
+    assert.match(missing.stdout, /롤백을 미뤘습니다/);
+    const ok = rbRun(dir, ['rollback', `--at=${shas[1]}`]);
+    assert.equal(ok.status, 0, ok.stdout + ok.stderr);
+    assert.ok(ok.stdout.includes(`롤백했습니다: ${headOf(dir)}`));
+    for (const line of ROLLBACK_LIMITS) assert.ok(ok.stdout.includes(line), line);
+    assert.equal(migrationState(dir), 'opted-out');
+  });
+});
+
+test('render command prints both views of the project to stdout and writes nothing', () => {
+  withRollbackVault(({ dir }) => {
+    const r = rbRun(dir, ['render', '--project=p']);
+    assert.equal(r.status, 0, r.stderr);
+    assert.ok(r.stdout.includes('==> projects/p/hot.md <=='));
+    assert.ok(r.stdout.includes('==> projects/p/session-state.md <=='));
+    assert.ok(r.stdout.includes(`summary ${RB_IDS[2]}`));
+    assert.equal(cgitOk(dir, ['status', '--porcelain']), '');
+    assert.equal(rbRun(dir, ['render', '--project=nope']).status, 1);
   });
 });
