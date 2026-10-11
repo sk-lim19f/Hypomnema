@@ -379,6 +379,37 @@ test('fallback scope: --fallback-all-projects opts in to full scan', () => {
   });
 });
 
+suite('weekly-report.mjs with session entries');
+
+test('40 session entries on disk leave the report bytes unchanged', () => {
+  const out = [];
+  for (const withEntries of [true, false]) {
+    withTmpDir((dir) => {
+      mkdirSync(join(dir, 'pages'), { recursive: true });
+      mkdirSync(join(dir, 'projects', 'p', 'sessions'), { recursive: true });
+      if (withEntries) {
+        for (let i = 0; i < 40; i++) {
+          writeFileSync(
+            join(
+              dir,
+              'projects',
+              'p',
+              'sessions',
+              `2026-05-${String((i % 28) + 1).padStart(2, '0')}-c${i}.md`,
+            ),
+            '---\ntype: session-entry\n---\nentry\n',
+          );
+        }
+      }
+      const r = run('weekly-report.mjs', [`--hypo-dir=${dir}`, '--week=2026-W19', '--json']);
+      assert.equal(r.status, 0, r.stderr);
+      assert.equal(JSON.parse(r.stdout).week, '2026-W19', 'a real report, not a refusal');
+      out.push(r.stdout);
+    });
+  }
+  assert.equal(out[0], out[1]);
+});
+
 suite('weekly-report.mjs — privacy contract');
 
 test('weekly report does not leak transcript text, URLs, or tool inputs', () => {

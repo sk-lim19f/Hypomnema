@@ -19,6 +19,7 @@ import { join } from 'path';
 import { resolveHypoRootInfo, checkVaultOrExit, expandHome } from './lib/hypo-root.mjs';
 import { loadHypoIgnore } from './lib/hypo-ignore.mjs';
 import { collectPagesGraph, extractWikilinks } from './lib/wikilink.mjs';
+import { isSessionEntryPath } from '../hooks/session-entries.mjs';
 
 // ── arg parsing ───────────────────────────────────────────────────────────────
 
@@ -186,7 +187,11 @@ const vaultMissing = args.hypoDirSource
 
 const ignorePatterns = loadHypoIgnore(args.hypoDir);
 const scanDirs = ['pages', 'projects'].map((d) => join(args.hypoDir, d));
-const pages = scanDirs.flatMap((d) => collectPagesGraph(d, args.hypoDir, ignorePatterns));
+// Session entries stay out of the nodes (they would flood the graph); the walker is shared with lint,
+// which must keep them, so the filter lives here. Links to an entry then resolve to nothing and drop.
+const pages = scanDirs
+  .flatMap((d) => collectPagesGraph(d, args.hypoDir, ignorePatterns))
+  .filter((p) => !isSessionEntryPath(`${p.slug}.md`));
 const slugIndex = buildSlugIndex(pages);
 const graph = buildGraph(pages, slugIndex);
 
