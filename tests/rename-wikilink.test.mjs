@@ -28,6 +28,7 @@ import {
   slugForms,
   extractWikilinks,
 } from '../scripts/lib/wikilink.mjs';
+import { formatSessionEntry } from '../hooks/session-entries.mjs';
 import { test, suite } from './harness.mjs';
 import { run, withTmpDir, SCRIPTS, HOOKS, SESSION_TMP_HOME } from './helpers.mjs';
 
@@ -1366,5 +1367,69 @@ test('collectPages presets emit the historical output shape', () => {
     const [l] = collectPagesLint(dir, dir, []);
     assert.equal(norm(l.rel), 'sub/b.md');
     assert.equal(l.slug, undefined);
+  });
+});
+
+// ── rename.mjs leaves session entries alone ──────────────────────────────────
+
+suite('rename.mjs session entries');
+
+function entryLinking(target) {
+  return formatSessionEntry({
+    project: 'p',
+    closeId: 's1-0',
+    date: '2026-10-01',
+    tracks: [{ id: 'main', new: true }],
+    summary: `see [[${target}]] for the design`,
+    bodies: { main: `and [[${target}|again]]` },
+  });
+}
+
+test('renaming a page rewrites the pages that link it but never a session entry', () => {
+  withTmpDir((dir) => {
+    mkdirSync(join(dir, 'pages'), { recursive: true });
+    mkdirSync(join(dir, 'projects', 'p', 'sessions'), { recursive: true });
+    writeFileSync(join(dir, 'pages', 'foo.md'), '---\ntitle: foo\n---\nself\n');
+    writeFileSync(join(dir, 'pages', 'a.md'), '---\ntitle: a\n---\nsee [[foo]].\n');
+    const entryPath = join(dir, 'projects', 'p', 'sessions', '2026-10-01-s1-0.md');
+    const entry = entryLinking('foo');
+    writeFileSync(entryPath, entry);
+
+    const r = run('rename.mjs', [
+      `--hypo-dir=${dir}`,
+      '--from=foo',
+      '--to=bar',
+      '--apply',
+      '--json',
+    ]);
+    assert.equal(r.status, 0, `${r.stdout}${r.stderr}`);
+    assert.equal(JSON.parse(r.stdout).links_rewritten, 1, `only the page link: ${r.stdout}`);
+    assert.ok(readFileSync(join(dir, 'pages', 'a.md'), 'utf-8').includes('[[bar]]'));
+    assert.ok(existsSync(join(dir, 'pages', 'bar.md')), 'the page moved');
+    assert.equal(readFileSync(entryPath, 'utf-8'), entry, 'entry bytes unchanged');
+  });
+});
+
+test('renaming a directory never rewrites a session entry that links into it', () => {
+  withTmpDir((dir) => {
+    mkdirSync(join(dir, 'pages', 'old'), { recursive: true });
+    mkdirSync(join(dir, 'projects', 'p', 'sessions'), { recursive: true });
+    writeFileSync(join(dir, 'pages', 'old', 'foo.md'), '---\ntitle: foo\n---\nself\n');
+    writeFileSync(join(dir, 'pages', 'a.md'), '---\ntitle: a\n---\nsee [[pages/old/foo]].\n');
+    const entryPath = join(dir, 'projects', 'p', 'sessions', '2026-10-01-s1-0.md');
+    const entry = entryLinking('pages/old/foo');
+    writeFileSync(entryPath, entry);
+
+    const r = run('rename.mjs', [
+      `--hypo-dir=${dir}`,
+      '--from=pages/old',
+      '--to=pages/new',
+      '--apply',
+      '--json',
+    ]);
+    assert.equal(r.status, 0, `${r.stdout}${r.stderr}`);
+    assert.ok(readFileSync(join(dir, 'pages', 'a.md'), 'utf-8').includes('[[pages/new/foo]]'));
+    assert.ok(existsSync(join(dir, 'pages', 'new', 'foo.md')), 'the directory moved');
+    assert.equal(readFileSync(entryPath, 'utf-8'), entry, 'entry bytes unchanged');
   });
 });

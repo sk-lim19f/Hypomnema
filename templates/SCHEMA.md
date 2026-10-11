@@ -31,7 +31,8 @@ Read this before any wiki operation (ingest / query / lint).
 | `prd` | `projects/*/prd.md` | Project purpose, success criteria, constraints | mutable |
 | `adr` | `projects/*/decisions/NNNN-*.md` | Architecture decision records | immutable |
 | `session-log` | `projects/*/session-log/YYYY-MM-DD.md` | Chronological session narrative (daily shard) | append-only |
-| `session-state` | `projects/*/session-state.md` | Next-session handoff — overwritten each close | overwrite |
+| `session-entry` | `projects/*/sessions/*.md` | One close's record: summary plus per-track notes | immutable |
+| `session-state` | `projects/*/session-state.md` | Next-session handoff, generated from session entries | generated |
 | `project-index` | `projects/*/index.md` | Project overview + progress checklist | mutable |
 | `open-questions` | `pages/open-questions.md` | Unresolved question queue | append+resolve |
 | `schema` | `SCHEMA.md` (this file) | Type system + vocabulary standard | versioned |
