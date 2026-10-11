@@ -5,6 +5,39 @@ All notable changes to Hypomnema are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.9.1] - 2026-10-12
+
+### Bug Fixes
+#### English
+- feedback-sync keeps drafts and copies of your text out of git in a vault that is not a git repo (judged by what git really ignores), appends the managed block to CLAUDE.md instead of rewriting it, and no longer loses a "kept the hand-written line" notice from a run nobody saw. ([#314](https://github.com/sk-lim19f/Hypomnema/pull/314))
+- feedback-sync drafts of your own CLAUDE.md and MEMORY.md text are now written under `.cache/feedback-drafts/`, only when the vault's git ignores `.cache/`, never over another file, and old drafts git can see are reported ([#313](https://github.com/sk-lim19f/Hypomnema/pull/313))
+- `feedback-sync` adds `--accept-wiki` for hand-edited managed blocks, removes exactly the hand-written index line a promoted bootstrap draft came from, keeps a copy before every write that can destroy your own text, never overwrites a side file you edited, leaves marker examples inside code alone, and PreCompact and doctor now show edited side files and write-time warnings. ([#312](https://github.com/sk-lim19f/Hypomnema/pull/312))
+- Lint ignores session-log and design-history headings inside code fences, HTML comments and frontmatter, ends a fence one session left open at the next session entry, and session close lists W19 (a heading date not on the calendar) as a non-blocking notice instead of printing "lint clean". ([#311](https://github.com/sk-lim19f/Hypomnema/pull/311))
+- `--check-session-close` and the close docs no longer say `/compact` is blocked. The verdict line says what it measures, the text output names `close_state` with `--session-id`, and a receipt is described as recording the close checkpoint with the Stop hook having the final say. ([#310](https://github.com/sk-lim19f/Hypomnema/pull/310))
+- A session-log heading with a date that is not on the calendar (`2026-02-30`, month 13) no longer invents a date or a day gap. Lint names it and tells you to fix it; when it is the only reason for a finding, it is a new non-blocking warning, W19, so a typo heading alone no longer blocks close. ([#309](https://github.com/sk-lim19f/Hypomnema/pull/309))
+- When the vault sits inside a larger git repository under a directory whose name starts with a space, close and commit attribution now see the vault's uncommitted files instead of none. Paths printed by git are no longer trimmed, only their line ending is removed. ([#308](https://github.com/sk-lim19f/Hypomnema/pull/308))
+- feedback-sync writes its MEMORY.md index lines as `- [Title](file): summary` and its learned-behavior lines as `- [date] rule. 근거: [[slug]]`, with no dash separator. Blocks written in the old form are rewritten once on the next sync, and `--bootstrap` reads both forms. ([#307](https://github.com/sk-lim19f/Hypomnema/pull/307))
+#### 한국어
+- git 저장소가 아닌 볼트에서도 feedback-sync 의 초안과 사용자 글 사본이 git 에 들어가지 않고(git 이 실제로 무시하는지로 판정), CLAUDE.md 를 다시 쓰지 않고 관리 블록을 덧붙이며, 아무도 보지 못한 실행의 "손으로 쓴 줄을 남겼다" 알림을 더 이상 잃지 않습니다. ([#314](https://github.com/sk-lim19f/Hypomnema/pull/314))
+- 직접 쓴 CLAUDE.md·MEMORY.md 를 복사한 feedback-sync 초안을 이제 `.cache/feedback-drafts/` 에, 볼트의 git 이 `.cache/` 를 무시할 때만, 다른 파일을 덮지 않고 쓰며, git 이 볼 수 있는 옛 초안은 알려 줍니다 ([#313](https://github.com/sk-lim19f/Hypomnema/pull/313))
+- `feedback-sync` 에 손으로 고친 관리 블록을 위한 `--accept-wiki` 가 생기고, 승격된 bootstrap 초안의 근거가 된 손 색인 줄만 정확히 지우며, 사용자 글을 지울 수 있는 쓰기 전에 항상 사본을 남기고, 사용자가 고친 side 파일을 덮지 않고, 코드 안의 마커 예시를 건드리지 않습니다. PreCompact 와 doctor 는 고친 side 파일과 쓰기 시점 경고를 보입니다. ([#312](https://github.com/sk-lim19f/Hypomnema/pull/312))
+- lint 가 코드펜스, HTML 주석, frontmatter 안의 session-log·design-history 헤딩을 읽지 않고, 한 세션이 열어 둔 펜스를 다음 세션 항목에서 끊으며, session close 는 "lint clean" 대신 W19(달력에 없는 헤딩 날짜)를 막지 않는 알림으로 보입니다. ([#311](https://github.com/sk-lim19f/Hypomnema/pull/311))
+- `--check-session-close` 와 close 문서가 더 이상 `/compact` 가 막혀 있다고 말하지 않습니다. 판정 줄은 실제로 재는 것을 말하고, `--session-id` 를 주면 텍스트 출력이 `close_state` 를 이름째로 보이며, 영수증은 close 체크포인트를 기록하는 것이고 최종 판정은 Stop 훅이 한다고 설명합니다. ([#310](https://github.com/sk-lim19f/Hypomnema/pull/310))
+- 달력에 없는 날짜(`2026-02-30`, 13월)를 단 session-log 헤딩이 더 이상 날짜나 일 차이를 지어내지 않습니다. lint 가 그 헤딩을 짚어 고치라고 안내하고, 그것만이 이유일 때는 막지 않는 새 경고 W19 로 냅니다. 오타 헤딩 하나만으로는 close 가 막히지 않습니다. ([#309](https://github.com/sk-lim19f/Hypomnema/pull/309))
+- 볼트가 더 큰 git 저장소 안에서 이름이 공백으로 시작하는 디렉터리 아래에 있을 때, close 와 커밋 귀속이 볼트의 미커밋 파일을 하나도 못 보던 문제를 고쳤습니다. git 이 출력한 경로는 더 이상 trim 하지 않고 줄 끝만 지웁니다. ([#308](https://github.com/sk-lim19f/Hypomnema/pull/308))
+- feedback-sync 가 MEMORY.md 색인 줄을 `- [제목](파일): 설명`, learned-behavior 줄을 `- [날짜] 규칙. 근거: [[slug]]` 형식으로 대시 구분자 없이 씁니다. 옛 형식으로 쓰인 블록은 다음 동기화 때 한 번 다시 쓰이고, `--bootstrap` 은 두 형식을 모두 읽습니다. ([#307](https://github.com/sk-lim19f/Hypomnema/pull/307))
+
+### Changelog
+- [#314](https://github.com/sk-lim19f/Hypomnema/pull/314) fix(feedback-sync): keep user text out of git and stop losing notices an old hook never showed
+- [#313](https://github.com/sk-lim19f/Hypomnema/pull/313) fix(feedback-sync): keep drafts of your own text out of git and never write over another file
+- [#312](https://github.com/sk-lim19f/Hypomnema/pull/312) fix(feedback-sync): resolve hand-edited blocks and keep a copy before every destructive write
+- [#311](https://github.com/sk-lim19f/Hypomnema/pull/311) fix(lint): ignore session-log headings in fences, comments and frontmatter, and show W19 at close
+- [#310](https://github.com/sk-lim19f/Hypomnema/pull/310) fix(close): stop telling the model that /compact is blocked
+- [#309](https://github.com/sk-lim19f/Hypomnema/pull/309) fix(lint): keep calendar-overflow session-log dates as written and report them as W19
+- [#308](https://github.com/sk-lim19f/Hypomnema/pull/308) fix(hooks): keep spaces in git-printed paths, strip only the line ending
+- [#307](https://github.com/sk-lim19f/Hypomnema/pull/307) fix(feedback-sync): write projected lines without a dash separator
+Contributors: @sk-lim19f
+
 ## [1.9.0] - 2026-09-30
 
 ### New Features
@@ -94,6 +127,11 @@ Contributors: @sk-lim19f
 #### 한국어
 
 - 위키 결정 문서 포인터를 이 changelog 를 포함한 모든 공개 표면에서 없앴습니다. 레포가 그 문서를 담은 디렉터리를 출하하지 않아서, 관리자의 개인 기록 밖에 있는 독자에게는 아무것도 가리키지 않는 포인터였습니다. ([#294](https://github.com/sk-lim19f/Hypomnema/pull/294))
+
+### Notes
+
+- This version shipped on the plugin channel only. It was never tagged and never published to npm, so `npm view` does not list it.
+- 이 버전은 플러그인 채널로만 나갔습니다. 태그와 npm 발행이 없어서 `npm view` 목록에는 없습니다.
 
 ## [1.8.2] - 2026-09-10
 
