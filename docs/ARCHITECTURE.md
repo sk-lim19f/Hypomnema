@@ -127,13 +127,13 @@ Hooks run automatically at Claude Code lifecycle events. They are deployed to `~
 
 | Hook | Responsibility |
 |---|---|
-| `hypo-session-start` | Run `git pull --ff-only` (silent fail on missing remote), rebuild the root `hot.md` projection, inject `index.md`, root `hot.md`, project `hot.md`/`session-state.md` |
+| `hypo-session-start` | Run `git pull --ff-only` (silent fail on missing remote), rebuild the generated session views from `projects/*/sessions/` (not on a vault with a remote that has not moved yet, which gets a notice instead), inject `index.md`, root `hot.md`, project `hot.md`/`session-state.md` |
 | `hypo-first-prompt` | Reads the marker left by `hypo-session-start` or `hypo-cwd-change` and forces a one-line resume on the first user prompt (10-min TTL). It does not re-read or re-inject `hot.md` |
 | `hypo-lookup` | BM25 search over the wiki on every prompt. **HIT** → inject top-3 page snippets (≤2000 chars each; a page whose `verify_by_date` is overdue gets a `[STALE verify_by_date=…]` marker prepended). **MISS** → emit closest-slug signal that prompts Claude to research + `/hypo:ingest` |
 | `hypo-compact-guard` | Detect `/compact` or `/clear` typed in chat and, if session close is incomplete, tell Claude so. It never blocks `/compact` |
 | `hypo-personal-check` | PreCompact detection: lint blockers, uncommitted changes, missing session-log entries surface as a `systemMessage`; `/compact` is never blocked here |
 | `hypo-auto-stage` | After Write/Edit on a wiki path, run `git add` (skips paths matching `.hypoignore`, and every path while a merge is open) |
-| `hypo-hot-rebuild` | At session stop, regenerate the root `hot.md` projection (the same generator `hypo-session-start` also calls); emit growth metrics + cache for next SessionStart. A scan failure (not just an empty `projects/`) skips the write and leaves a health notice for the next `SessionStart` to surface |
+| `hypo-hot-rebuild` | At session stop, regenerate the generated session views (root `hot.md`, project `hot.md` and `session-state.md`; the same generator `hypo-session-start` also calls); emit growth metrics + cache for next SessionStart. A scan failure (not just an empty `projects/`) skips the write and leaves a health notice for the next `SessionStart` to surface |
 | `hypo-session-record` | At session stop, append `{session_id, transcript_path, recorded_at, cwd, device}` to `.cache/sessions/index.jsonl` (primary source for the observability audit) |
 | `hypo-auto-commit` | At session stop, filter changed paths through `.hypoignore`, finish a merge Hypomnema left open, commit non-ignored changes, `git pull --no-rebase` + `git push` (silent fail on missing remote; the push is skipped after a pull that did not land, and when the tree tracks generated views under a migrated upstream) |
 | `hypo-cwd-change` | When working directory changes, re-resolve the active project and build a notice carrying its `hot.md`. The hook reference documents `watchPaths` and `systemMessage` as `CwdChanged`'s output fields and says only that "it shows the `systemMessage` as a brief terminal notification" and "the message doesn't reach the SDK message stream"; it does not say whether `systemMessage` reaches the model on this event either way. As of Claude Code 2.1.276 (checked 2026-09-18) and reconfirmed on 2.1.283, tracing the installed binary shows the only consumer of that `systemMessage` is the terminal notification queue, a low-priority toast that a same-keyed message replaces and that disappears after five seconds, with no branch that forwards it to the model; outside the interactive REPL the injecting function is null. No live-session observation of this path exists either way. Until the documentation says otherwise, this event is treated as not reaching the model |
@@ -185,7 +185,7 @@ Helpers used by command scripts only. Not deployed to hooks.
 <hypo-root>/
 ├── hypo-config.md        ← root marker + settings (presence == wiki root)
 ├── index.md              ← searchable page catalog
-├── hot.md                ← active project pointers (root-level)
+├── hot.md                ← active project pointers (root-level, generated, not committed)
 ├── log.md                ← append-only activity log
 ├── SCHEMA.md             ← type system reference
 ├── hypo-guide.md         ← operations guide
@@ -194,8 +194,10 @@ Helpers used by command scripts only. Not deployed to hooks.
 │   └── feedback/         ← AI behavior corrections
 ├── projects/             ← per-project artifacts
 │   └── <name>/
-│       ├── hot.md            ← project-level current state
-│       ├── session-state.md  ← next tasks + last session summary
+│       ├── sessions/         ← one entry per session close (source of truth, never deleted)
+│       ├── notes.md          ← notes every session shares (hand-written, optional)
+│       ├── hot.md            ← recent session summaries (generated, not committed)
+│       ├── session-state.md  ← next tasks per track (generated, not committed)
 │       └── session-log/
 │           └── YYYY-MM-DD.md ← append-only daily session-log shard
 ├── journal/
@@ -229,7 +231,7 @@ Hooks inline this logic in `hypo-shared.mjs`. Scripts use `scripts/lib/hypo-root
 
 1. Wizard collects: wiki path, hook scope (`~/.claude` and/or `~/.codex`), git remote URL.
 2. Creates the vault directory structure: `pages/`, `projects/`, `sources/`, `journal/{daily,weekly,monthly}/`.
-3. Copies `templates/` files: 6 root files (`hypo-config.md`, `index.md`, `hot.md`, `log.md`, `SCHEMA.md`, `hypo-guide.md`) + 4 helpers (`Home.md`, `Overview.md`, `hypo-automation.md`, `hypo-help.md`) + `pages/_index.md` + `projects/_template/`.
+3. Copies `templates/` files: 5 root files (`hypo-config.md`, `index.md`, `log.md`, `SCHEMA.md`, `hypo-guide.md`) and a generated root `hot.md` + 4 helpers (`Home.md`, `Overview.md`, `hypo-automation.md`, `hypo-help.md`) + `pages/_index.md` + `projects/_template/`.
 4. Deploys 10 hooks to `~/.claude/hooks/` and merges entries into `~/.claude/settings.json` (idempotent; preserves non-hypo hooks).
 5. Writes `~/.claude/hypo-pkg.json` with `pkgRoot` for upgrade tracking (skipped when the
    plugin channel judgment fails; see `init.mjs`'s `resolveDurableRoot`).
@@ -293,7 +295,7 @@ SessionStart
   │
   ├─► hypo-session-start.mjs
   │     ├─► git pull --ff-only (if remote)
-  │     ├─► rebuild root hot.md (projection of projects/*/hot.md)
+  │     ├─► rebuild the generated views (root hot.md, project hot.md and session-state.md, from projects/*/sessions/)
   │     ├─► inject index.md / hot.md / project session-state.md
   │     └─► (Claude resumes work)
   │
@@ -313,21 +315,45 @@ SessionStart
   │
   └─► Stop
         └─► hypo-stop.mjs, running four stages in order:
-              ├─► hypo-hot-rebuild.mjs (regenerate root hot.md projection + growth cache; SessionStart also calls this generator)
+              ├─► hypo-hot-rebuild.mjs (regenerate the session views + growth cache; SessionStart also calls this generator)
               ├─► hypo-session-record.mjs (append .cache/sessions/index.jsonl)
               ├─► hypo-auto-commit.mjs (.hypoignore-filtered stage + commit + pull + push)
               └─► hypo-auto-minimal-crystallize.mjs (blocks Stop if session close never ran)
 ```
 
-Root hot.md's frontmatter `updated:` is the max of every `projects/*/hot.md` row date, not the
-date the projection itself was last rewritten. A vault whose newest project row is a week old
-keeps that same week-old date across every SessionStart and Stop until a project's own `hot.md`
-moves forward, even though the root file's bytes get recomputed and checked far more often.
+Root hot.md's frontmatter `updated:` is the max of every project row date, and a row's date is the
+date of that project's newest session entry, not the date the file itself was last rewritten.
+A vault whose newest entry is a week old keeps that same week-old date across every SessionStart
+and Stop, even though the root file's bytes get recomputed and checked far more often.
 
-Before overwriting content it does not recognize as its own, the projection backs it up under
+Before overwriting content it does not recognize as its own, the generator backs it up under
 `.cache/backups/<relPath>` (for the root file, `.cache/backups/hot.md.pre-projection-backup.md`, or
 a numbered variant, `-2.md`, `-3.md`, ...). These
 backups are never cleaned up automatically. Delete the ones you no longer need by hand.
+
+### Session entries
+
+Session close does not write `hot.md` or `session-state.md`. Each close writes one entry,
+`projects/<p>/sessions/<date>-<close_id>.md`, whose frontmatter lists the tracks it updated
+(`entry_schema`, `close_id`, `tracks`) and whose body holds a summary and one section per track.
+Entries are never deleted. Concurrent closes (two sessions, two machines) write different files, so
+nothing is overwritten; the head of a track is the update no later update supersedes, and a track
+with several heads shows all of them. `hooks/session-entries.mjs` holds the entry format and the
+renderers, `hooks/session-views.mjs` loads the model and writes the views. Root `hot.md`, project
+`hot.md` and project `session-state.md` are listed in the vault `.gitignore` (the block in
+`templates/gitignore`) and are not committed. `projects/<p>/notes.md` is hand-written, not
+generated, and is injected with the views.
+
+Vaults move to this layout in one of three ways. A vault with no git remote moves at its first
+SessionStart. A vault with a remote only gets a notice (at most once a day) until a person runs
+`/hypo:upgrade --migrate-sessions` after every machine has the new version; the command pulls first,
+migrates, then pushes. Before the move, a close writes entries only, the tracked old files are read
+as a virtual baseline for injection and resume, and nothing is written to the generated paths.
+`node scripts/session-entries.mjs rollback --at=<commit>` re-tracks flat files rendered from the
+entries at that commit and adds the `.hypo-session-entries-off` marker; the vault then counts as
+opted out and no hook migrates it again until `--migrate-sessions` is run. A machine on an older
+version that pulls the move loses the three files, cannot read `sessions/`, and its closes are not
+recorded; `/hypo:doctor` reports recent traces of such a machine.
 
 The write itself goes through `writeGeneratedViews` in `hooks/session-views.mjs`, which holds
 the vault commit lock (`vaultCommitLockTarget`, the same lock `hypo-auto-commit.mjs` and

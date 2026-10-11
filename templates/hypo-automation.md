@@ -19,7 +19,7 @@ All 12 hooks registered in `hooks/hooks.json` are listed below, in registration 
 | Hook | Event | Purpose |
 |------|-------|---------|
 | `hypo-close-guard.mjs` | `PreToolUse` | Blocks a direct Write/Edit/MultiEdit bypass of the session-close approval flow |
-| `hypo-session-start.mjs` | `SessionStart` | Rebuilds the root `hot.md` projection, then injects `hot.md` and `session-state.md` into context on session start |
+| `hypo-session-start.mjs` | `SessionStart` | Rebuilds the generated session views (root `hot.md`, and each project's `hot.md` and `session-state.md`, built from `projects/*/sessions/`), then injects them into context on session start. A vault with a git remote that has not moved to session entries yet is not rewritten: it gets a notice to run `/hypo:upgrade --migrate-sessions` |
 | `hypo-session-end.mjs` | `SessionEnd` | Records the dying session's identity so a `/clear` can be detected and recovered from on the next start |
 | `hypo-first-prompt.mjs` | `UserPromptSubmit` | Injects a one-line resume summary on the first prompt after a session start or cwd change |
 | `hypo-lookup.mjs` | `UserPromptSubmit` | Searches the wiki index for each prompt and injects matched pages as context |
@@ -27,7 +27,7 @@ All 12 hooks registered in `hooks/hooks.json` are listed below, in registration 
 | `hypo-personal-check.mjs` | `PreCompact` | Detects missing session-close files, uncommitted wiki changes, or lint blockers and surfaces them as a `systemMessage`; it does not block `/compact` |
 | `hypo-auto-stage.mjs` | `PostToolUse` | Auto-stages a wiki file after it is written |
 | `hypo-web-fetch-ingest.mjs` | `PostToolUse` | Nudges Claude to ingest WebFetch/WebSearch results into `sources/` |
-| `hypo-stop.mjs` | `Stop` | Runs the session-end chain as four ordered stages, one after another, not in parallel: rebuilds the root `hot.md` projection, appends the session to the session index, stages/commits/pushes this session's touched wiki paths, then blocks `Stop` if the session did substantial work, the user signalled wrap-up, and no close was recorded |
+| `hypo-stop.mjs` | `Stop` | Runs the session-end chain as four ordered stages, one after another, not in parallel: rebuilds the generated session views (root `hot.md` and each project's `hot.md` and `session-state.md`), appends the session to the session index, stages/commits/pushes this session's touched wiki paths, then blocks `Stop` if the session did substantial work, the user signalled wrap-up, and no close was recorded |
 | `hypo-cwd-change.mjs` | `CwdChanged` | Builds a `systemMessage` with the matching project's `hot.md` when the working directory changes mid-session. `additionalContext` is not among `CwdChanged`'s documented output fields, so this never becomes `additionalContext`; the reference says only that it "shows the `systemMessage` as a brief terminal notification," without saying whether it also reaches the model. As of Claude Code 2.1.276 (checked 2026-09-18) and reconfirmed on 2.1.283, tracing the installed binary shows the only consumer of that `systemMessage` is the terminal notification queue, with no branch that forwards it to the model; no live-session observation of this path exists either way, and this event is treated as not reaching the model until the documentation says otherwise |
 | `hypo-file-watch.mjs` | `FileChanged` | Builds a `systemMessage` for a changed vault file once it passes the ignore and visibility filters, over the same field as `hypo-cwd-change` whose reach to the model the reference leaves undocumented; as of Claude Code 2.1.276 (checked 2026-09-18) and reconfirmed on 2.1.283 it is likewise treated as not reaching the model (see the row above). On a stock install the event still has no trigger here, because nothing in this package returns `watchPaths` to seed the watch list; that list is session-global, so another hook or plugin seeding it would still make this matcher-less group fire, though it returns immediately for any path that does not start with `HYPO_DIR` (a string-prefix check, not a symlink-resolving one) |
 
@@ -62,7 +62,7 @@ affect the git sync above.
 
 ```
 Session start
-  └─ hypo-session-start.mjs → rebuilds root hot.md → reads hot.md + session-state.md → injects context
+  └─ hypo-session-start.mjs → rebuilds the generated views from projects/*/sessions/ → injects them as context
 
 During session
   └─ hypo-auto-stage.mjs → git-adds any wiki path a tool touched (not only .md edits)
@@ -70,7 +70,7 @@ During session
   └─ hypo-lookup.mjs → BM25-matches each prompt against the wiki index
 
 Session end (single Stop hook, hypo-stop.mjs, running four stages in order)
-  └─ hypo-hot-rebuild.mjs → refreshes root hot.md (same generator SessionStart also calls)
+  └─ hypo-hot-rebuild.mjs → refreshes the generated session views (same generator SessionStart also calls)
   └─ hypo-session-record.mjs → appends to the session index
   └─ hypo-auto-commit.mjs → git commit + push
   └─ hypo-auto-minimal-crystallize.mjs → blocks Stop if session close never ran
