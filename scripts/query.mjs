@@ -20,6 +20,7 @@ import { existsSync, readFileSync, readdirSync, statSync } from 'fs';
 import { join, relative, extname } from 'path';
 import { resolveHypoRootInfo, checkVaultOrExit, expandHome } from './lib/hypo-root.mjs';
 import { loadHypoIgnore, isScanIgnored } from './lib/hypo-ignore.mjs';
+import { isSessionEntryPath } from '../hooks/session-entries.mjs';
 import { currentDevice, scopeVisible, readVisibilityScope } from '../hooks/hypo-shared.mjs';
 
 // ── arg parsing ──────────────────────────────────────────────────────────────
@@ -70,7 +71,11 @@ function collectMdFiles(dir, root, acc = [], ignorePatterns = []) {
     if (isScanIgnored(full, root, ignorePatterns)) continue;
     const st = statSync(full);
     if (st.isDirectory()) collectMdFiles(full, root, acc, ignorePatterns);
-    else if (extname(entry) === '.md') acc.push({ path: full, rel: relative(root, full) });
+    else if (extname(entry) === '.md') {
+      const rel = relative(root, full);
+      // Session entries are history; the generated hot.md and session-state.md carry the current state.
+      if (!isSessionEntryPath(rel.replace(/\\/g, '/'))) acc.push({ path: full, rel });
+    }
   }
   return acc;
 }

@@ -28,9 +28,11 @@ import {
   expandHome,
   resolveHypoRoot,
   resolveHypoRootInfo,
+  run,
   withTmpDir,
 } from './helpers.mjs';
 import { atomicWrite } from '../hooks/atomic-write.mjs';
+import { formatSessionEntry, renderViews } from '../hooks/session-entries.mjs';
 
 suite('expandHome()');
 
@@ -1024,5 +1026,160 @@ test('a write that cannot open its tmp file throws and creates nothing', () => {
     } finally {
       chmodSync(sub, 0o700); // restore so withTmpDir's cleanup can remove the tree
     }
+  });
+});
+
+// ── catalog scanners and session entries ─────────────────────────────────────
+
+suite('stats/graph/verify/lint catalogs vs projects/*/sessions/ entries');
+
+const ENTRY_COUNT = 40;
+const ENTRY_ONLY_WORD = 'ZZSESSIONONLY';
+
+// One vault, two shapes: with the 40 entries on disk or without them. The generated hot.md is
+// the same in both (it links to the newest older entries), so any difference in a scanner's
+// output comes from the entry files alone. `verifyEntry` makes entry 0 carry an overdue
+// `verify_by`, which verify.mjs would report if it looked at the file.
+function scanVault(dir, { entries, verifyEntry = false, verifyPage = false }) {
+  mkdirSync(join(dir, 'pages'), { recursive: true });
+  mkdirSync(join(dir, 'projects', 'p', 'sessions'), { recursive: true });
+  writeFileSync(
+    join(dir, 'pages', 'a.md'),
+    '---\ntitle: a\ntype: page\nverify_by: still true?\nverify_by_date: 2099-01-01\n---\nsee [[b]]\n',
+  );
+  writeFileSync(join(dir, 'pages', 'b.md'), '---\ntitle: b\ntype: page\n---\nback to [[a]]\n');
+  writeFileSync(
+    join(dir, 'projects', 'p', 'notes.md'),
+    '---\ntitle: notes\ntype: reference\n---\nn\n',
+  );
+  const models = [];
+  for (let i = 0; i < ENTRY_COUNT; i++) {
+    const closeId = `c${String(i).padStart(2, '0')}`;
+    const date = `2026-09-${String((i % 28) + 1).padStart(2, '0')}`;
+    models.push({
+      project: 'p',
+      closeId,
+      sessionId: null,
+      date,
+      updated: date,
+      visibilityScope: null,
+      tracks: [{ id: 'masking', title: 'Masking' }],
+      summary: `summary of ${closeId} ${ENTRY_ONLY_WORD}`,
+      bodies: { masking: `body of ${closeId}` },
+    });
+  }
+  const model = {
+    project: 'p',
+    migrated: true,
+    entries: models,
+    unreadable: [],
+    notes: null,
+    entryScope: null,
+  };
+  writeFileSync(join(dir, 'projects', 'p', 'hot.md'), renderViews([model]).projects.p.hot);
+  if (!entries) return;
+  models.forEach((m, i) => {
+    let text = formatSessionEntry(m);
+    if (i === 0 && verifyEntry) {
+      text = text.replace(
+        'type: session-entry',
+        'type: page\nverify_by: entry claim\nverify_by_date: 2020-01-01',
+      );
+    }
+    writeFileSync(join(dir, 'projects', 'p', 'sessions', `${m.date}-${m.closeId}.md`), text);
+  });
+  if (verifyPage) {
+    writeFileSync(
+      join(dir, 'pages', 'z.md'),
+      '---\ntitle: z\ntype: page\nverify_by: page claim\nverify_by_date: 2020-01-01\n---\nz\n',
+    );
+  }
+}
+
+// Same vault with and without the entries, the CLI's stdout for each.
+function withAndWithout(script, args, opts = {}) {
+  let withOut;
+  let withoutOut;
+  withTmpDir((a) => {
+    scanVault(a, { entries: true, ...opts });
+    withOut = run(script, [`--hypo-dir=${a}`, ...args]);
+  });
+  withTmpDir((b) => {
+    scanVault(b, { entries: false, ...opts });
+    withoutOut = run(script, [`--hypo-dir=${b}`, ...args]);
+  });
+  return { withOut, withoutOut };
+}
+
+test('stats: 40 session entries do not change the page or project counts', () => {
+  const { withOut, withoutOut } = withAndWithout('stats.mjs', ['--json']);
+  assert.equal(withOut.status, 0, withOut.stderr);
+  const stats = JSON.parse(withOut.stdout);
+  assert.equal(stats.pages.total, 2, 'the two pages/ files are the whole page count');
+  assert.equal(stats.projects, 1);
+  assert.equal(withOut.stdout, withoutOut.stdout);
+});
+
+test('graph: 40 session entries add no nodes and no edges', () => {
+  const { withOut, withoutOut } = withAndWithout('graph.mjs', ['--format=json']);
+  assert.equal(withOut.status, 0, withOut.stderr);
+  const graph = JSON.parse(withOut.stdout);
+  assert.ok(
+    graph.nodes.some((n) => n.slug === 'pages/a'),
+    'the graph still lists real pages',
+  );
+  assert.ok(
+    !graph.nodes.some((n) => n.slug.includes('/sessions/')),
+    `entries leaked into nodes: ${withOut.stdout}`,
+  );
+  assert.equal(withOut.stdout, withoutOut.stdout);
+});
+
+test('verify: an overdue verify_by inside an entry is neither counted nor reported', () => {
+  const { withOut, withoutOut } = withAndWithout('verify.mjs', ['--json'], { verifyEntry: true });
+  assert.equal(withOut.status, 0, withOut.stderr);
+  assert.ok(
+    !withOut.stdout.includes('sessions/'),
+    `entry path in verify output: ${withOut.stdout}`,
+  );
+  const report = JSON.parse(withOut.stdout);
+  assert.equal(report.overdue.length, 0);
+  assert.equal(report.ok.length, 1, 'pages/a.md is the one checked page');
+  assert.equal(withOut.stdout, withoutOut.stdout);
+});
+
+test('verify: the same overdue field in pages/z.md is reported (verify does read the field)', () => {
+  const { withOut } = withAndWithout('verify.mjs', ['--json'], {
+    verifyEntry: true,
+    verifyPage: true,
+  });
+  assert.equal(withOut.status, 1, `overdue page exits 1: ${withOut.stderr}`);
+  const report = JSON.parse(withOut.stdout);
+  assert.deepEqual(
+    report.overdue.map((e) => e.file),
+    [join('pages', 'z.md')],
+  );
+  assert.ok(!withOut.stdout.includes('sessions/'), withOut.stdout);
+});
+
+test('lint: the generated hot.md Older sessions links resolve to the entries', () => {
+  withTmpDir((dir) => {
+    scanVault(dir, { entries: true });
+    const hot = readFileSync(join(dir, 'projects', 'p', 'hot.md'), 'utf-8');
+    assert.ok(hot.includes('## Older sessions'), 'fixture must render an Older sessions section');
+    const linked = hot.match(/\[\[projects\/p\/sessions\/[^\]]+\]\]/g) ?? [];
+    assert.equal(linked.length, 20, 'twenty older entries are linked');
+    writeFileSync(
+      join(dir, 'pages', 'c.md'),
+      '---\ntitle: c\ntype: page\n---\n[[projects/p/sessions/2026-09-01-nope]]\n',
+    );
+    const r = run('lint.mjs', [`--hypo-dir=${dir}`, '--json']);
+    const out = JSON.parse(r.stdout);
+    const broken = [...out.errors, ...out.warns].filter((i) => /Broken wikilink/.test(i.message));
+    // The pair: a link to an entry that does not exist is reported, so zero for the real ones means resolved.
+    assert.deepEqual(
+      broken.map((i) => i.message),
+      ['Broken wikilink: [[projects/p/sessions/2026-09-01-nope]]'],
+    );
   });
 });

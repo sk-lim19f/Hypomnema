@@ -62,6 +62,32 @@ test('with results: ingest prompt not shown', () => {
   });
 });
 
+test('query: a word only a session entry contains finds nothing, the same word in a page is found', () => {
+  withTmpDir((dir) => {
+    mkdirSync(join(dir, 'pages'), { recursive: true });
+    mkdirSync(join(dir, 'projects', 'p', 'sessions'), { recursive: true });
+    writeFileSync(
+      join(dir, 'projects', 'p', 'sessions', '2026-09-01-c1.md'),
+      '---\ntype: session-entry\ntitle: "session entry: p 2026-09-01"\n---\nZZSESSIONONLY lives here\n',
+    );
+    const args = [`--hypo-dir=${dir}`, '--q=ZZSESSIONONLY', '--json'];
+    let r = run('query.mjs', args);
+    assert.equal(r.status, 0, r.stderr);
+    assert.deepEqual(JSON.parse(r.stdout), [], `entry leaked into query: ${r.stdout}`);
+
+    writeFileSync(
+      join(dir, 'pages', 'y.md'),
+      '---\ntitle: y\ntype: note\n---\nZZSESSIONONLY lives here too\n',
+    );
+    r = run('query.mjs', args);
+    assert.equal(r.status, 0, r.stderr);
+    assert.deepEqual(
+      JSON.parse(r.stdout).map((x) => x.slug),
+      ['pages/y'],
+    );
+  });
+});
+
 // ── resume.mjs smoke tests ───────────────────────────────────────────────────
 
 suite('resume.mjs — fresh-init + commented-example hot.md');
