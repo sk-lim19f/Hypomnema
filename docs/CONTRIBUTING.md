@@ -129,6 +129,7 @@ npm test           # tests/*.test.mjs, sharded across processes — unit + smoke
 npm run lint       # scripts/lint.mjs — frontmatter + wikilink validation + W8 (design-history stale
                    # vs session-log) + W14 (design-history missing but session-log implies one)
                    # + W19 (session-log heading date not on the calendar, no real later date)
+                   # + W20 (a session entry's supersedes id names no entry of its project)
                    # + W15 (synthesis older than the newest page in its sources_consulted)
                    # + W16 (sources_consulted content problems: a source name W15 could not
                    #   resolve, a source or the synthesis's own updated that fails a strict

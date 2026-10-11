@@ -1423,11 +1423,6 @@ function sessionEntriesNow() {
 
 const OLD_VERSION_WINDOW_DAYS = 7;
 
-function localDateString(ms) {
-  const d = new Date(ms);
-  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
-}
-
 function vaultHasRemote(hypoDir) {
   const r = spawnSync('git', ['-C', hypoDir, 'remote'], { encoding: 'utf-8' });
   return r.status === 0 && r.stdout.trim().length > 0;
@@ -1520,7 +1515,7 @@ function checkSessionEntries(hypoDir) {
   const traces = [];
   for (const slug of projects) {
     for (let i = 0; i < OLD_VERSION_WINDOW_DAYS; i++) {
-      const date = localDateString(now - i * 86_400_000);
+      const date = localAndUtcDates(new Date(now - i * 86_400_000))[0];
       const logged = sessionLogReadCandidates(slug, date).some((rel) => {
         try {
           return hasSessionLogHeading(readFileSync(join(hypoDir, rel), 'utf-8'), date);
