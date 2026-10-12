@@ -58,6 +58,7 @@ import {
   sortRootRows,
   splitLegacyFrontmatter,
   trackHeads,
+  nfcRenameCommands,
 } from '../hooks/session-entries.mjs';
 import {
   clearGeneratedPathsBlockingPull,
@@ -6360,16 +6361,48 @@ test('a tracked project directory that is not in NFC defers the move and names t
       assert.equal(r.migrated, false);
       assert.equal(r.deferred, 'invalid-project-name', JSON.stringify(r));
       const notice = r.notices.join('\n');
-      assert.ok(
-        notice.includes(
-          `/hypo:rename --from="projects/${nfd}" --to="${nfc}.nfc-tmp" 다음에 /hypo:rename --from="projects/${nfc}.nfc-tmp" --to="${nfc}"`,
-        ),
-        notice,
-      );
+      const [first, second] = nfcRenameCommands(nfd);
+      assert.equal(first, `/hypo:rename --from="projects/${nfd}" --to="projects/${nfc}.nfc-tmp"`);
+      assert.equal(second, `/hypo:rename --from="projects/${nfc}.nfc-tmp" --to="projects/${nfc}"`);
+      assert.ok(notice.includes(`${first} 다음에 ${second}`), notice);
+      assert.ok(notice.includes('.hypoignore'), notice);
       assert.match(notice, /NFC/);
       assert.doesNotMatch(notice, /projects\/ok:/);
       assert.equal(headOf(dir), head);
       assert.equal(migrationState(dir), 'not-migrated');
+    }),
+  );
+});
+
+test('a decomposed project directory defers the move even when git reports its path precomposed', () => {
+  const nfd = '프로젝트'.normalize('NFD');
+  const nfc = nfd.normalize('NFC');
+  inCatchUpEnv(() =>
+    withTmpDir((dir) => {
+      cgitOk(dir, ['init', '-q']);
+      // The macOS default: git prints the decomposed directory in NFC. Elsewhere git ignores the
+      // setting and prints the bytes as they are; the move must be deferred either way.
+      cgitOk(dir, ['config', 'core.precomposeunicode', 'true']);
+      for (const [rel, text] of Object.entries({
+        '.gitignore': '.cache/\n',
+        ...oldProjectFiles(nfd),
+        ...oldProjectFiles('ok'),
+      })) {
+        put(dir, rel, text);
+      }
+      commitIn(dir);
+      assert.ok(
+        readdirSync(join(dir, 'projects')).includes(nfd),
+        'precondition: the directory is decomposed on disk',
+      );
+      const head = headOf(dir);
+      const r = migrate(dir);
+      assert.equal(r.migrated, false, JSON.stringify(r));
+      assert.equal(r.deferred, 'invalid-project-name', JSON.stringify(r));
+      const [first, second] = nfcRenameCommands(nfd);
+      assert.ok(r.notices.join('\n').includes(`${first} 다음에 ${second}`), r.notices.join('\n'));
+      assert.equal(headOf(dir), head, 'nothing committed');
+      assert.equal(existsSync(join(dir, 'projects', nfc, 'sessions')), false, 'no entries written');
     }),
   );
 });

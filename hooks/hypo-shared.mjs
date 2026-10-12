@@ -45,6 +45,7 @@ import {
   projectNameProblem,
   scopeVisible,
   sessionViewPathsOf,
+  nfcRenameCommands,
 } from './session-entries.mjs';
 
 const HOME = homedir();
@@ -1341,13 +1342,11 @@ export function nonNfcProjectDir(hypoDir, slug) {
 // NFC and NFD spellings as one name, so a direct rename is refused as "already exists": the move
 // goes through a temporary name.
 export function nonNfcProjectMessage(onDisk) {
-  const nfc = onDisk.normalize('NFC');
-  const tmp = `${nfc}.nfc-tmp`;
+  const [first, second] = nfcRenameCommands(onDisk);
   return (
     `projects/${onDisk} is spelled in decomposed (NFD) Unicode, and git reports project paths ` +
     `precomposed (NFC), so the close cannot match its files. Rename projects/${onDisk} to its NFC ` +
-    `spelling first: /hypo:rename --from=projects/${onDisk} --to=${tmp}, then ` +
-    `/hypo:rename --from=projects/${tmp} --to=${nfc}`
+    `spelling first: ${first}, then ${second}`
   );
 }
 

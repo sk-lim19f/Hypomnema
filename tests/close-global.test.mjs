@@ -644,7 +644,10 @@ test('--project: a directory stored in NFD is refused with the rename message, n
       assert.equal(r.status, 1, r.stdout);
       const err = JSON.parse(r.stdout).error;
       assert.match(err, /Rename projects\/.+ to its NFC spelling/, err);
-      assert.ok(err.includes(`/hypo:rename --from=projects/${KO_PROJECT_NFD}`), err);
+      assert.ok(
+        err.includes(`/hypo:rename --from="projects/${KO_PROJECT_NFD}" --to="projects/`),
+        err,
+      );
       assert.doesNotMatch(err, /does not exist/);
     }
   });
