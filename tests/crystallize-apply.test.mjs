@@ -6522,6 +6522,35 @@ test('a commit failure lists only what is still on disk: the withdrawn session-l
   });
 });
 
+// Disabling the check: in buildCloseResult read only `applied` again (`[...applied]`). On the
+// second failure the unchanged entry is in `skipped`, so the list comes back empty.
+test('a second commit failure under the same session still lists the entry it left uncommitted', () => {
+  withWiki(null, (dir, today) => {
+    const sid = newPinSession('commit-fail-twice');
+    const unblock = blockCommits(dir);
+    const payload = v2Payload(today, { summary: 'first summary' });
+    const first = applyJson(dir, payload, sid);
+    assert.equal(first.out.stage, 'commit-failed', JSON.stringify(first.out));
+    const second = applyJson(dir, payload, sid);
+    assert.equal(second.out.stage, 'commit-failed', JSON.stringify(second.out));
+    assert.ok(
+      second.out.skipped.some((a) => a.startsWith('sessionEntry (')),
+      `fixture: the entry is unchanged, so it is skipped now: ${JSON.stringify(second.out)}`,
+    );
+    const rel = join('projects', 'test-project', 'sessions', sessionFilesOf(dir)[0]);
+    assert.ok(
+      second.out.appliedUncommitted.some((a) => a.includes(rel)),
+      `the entry is still uncommitted and is named: ${JSON.stringify(second.out.appliedUncommitted)}`,
+    );
+    assert.deepEqual(
+      second.out.appliedUncommitted.filter((a) => /sessionLog|log \(/.test(a)),
+      [],
+      'the withdrawn appends stay out of it',
+    );
+    unblock();
+  });
+});
+
 test('a normal close is ok:true, committed, no stage, and the entry is in HEAD', () => {
   withWiki(null, (dir, today) => {
     const r = applyJson(dir, v2Payload(today), newPinSession('normal-close'));

@@ -6549,8 +6549,11 @@ test('a tracked project directory that is not in NFC defers the move and names t
       assert.equal(r.deferred, 'invalid-project-name', JSON.stringify(r));
       const notice = r.notices.join('\n');
       const [first, second] = nfcRenameCommands(nfd);
-      assert.equal(first, `/hypo:rename --from="projects/${nfd}" --to="projects/${nfc}.nfc-tmp"`);
-      assert.equal(second, `/hypo:rename --from="projects/${nfc}.nfc-tmp" --to="projects/${nfc}"`);
+      assert.equal(first, `/hypo:rename --from="projects/${nfd}/" --to="projects/${nfc}.nfc-tmp/"`);
+      assert.equal(
+        second,
+        `/hypo:rename --from="projects/${nfc}.nfc-tmp/" --to="projects/${nfc}/"`,
+      );
       assert.ok(notice.includes(`${first} 다음에 ${second}`), notice);
       assert.ok(notice.includes('.hypoignore'), notice);
       assert.match(notice, /NFC/);
