@@ -2062,7 +2062,8 @@ export function writeGeneratedViewsRecord(hypoDir, views) {
 export function offMarkerHashes(text) {
   const out = {};
   for (const line of String(text ?? '').split('\n')) {
-    const m = /^([0-9a-f]{64}) {2}(.+)$/.exec(line);
+    // A marker recommitted with CRLF bytes (autocrlf off) leaves one `\r` on every line.
+    const m = /^([0-9a-f]{64}) {2}(.+)$/.exec(line.replace(/\r$/, ''));
     if (m) out[m[2]] = m[1];
   }
   return out;
@@ -2350,6 +2351,31 @@ function generatedViewPathsOnDisk(hypoDir) {
   ].filter((rel) => isGeneratedViewPath(rel) && statIs(join(hypoDir, rel), 'file'));
 }
 
+// Adds the vault paths `relPaths` to the repository's local exclude file (never the committed
+// `.gitignore`, which would publish a hidden project's name). The patterns are relative to the
+// repository root, so a vault inside a larger repository gets its prefix. Only lines not already
+// there are appended. Returns false when the file could not be written.
+function excludeLocally(hypoDir, relPaths) {
+  if (!relPaths.length) return true;
+  const r = vaultGit(hypoDir, ['rev-parse', '--git-path', 'info/exclude']);
+  if (r.status !== 0) return false;
+  const file = resolvePath(hypoDir, r.stdout.replace(/\r?\n$/, ''));
+  const prefix = vaultGitPrefix(hypoDir);
+  try {
+    const have = new Set(existsSync(file) ? readFileSync(file, 'utf-8').split(/\r?\n/) : []);
+    const add = relPaths
+      .map((p) => `/${prefix}${p}`.replace(/[\\*?[]/g, '\\$&').replace(/ $/, '\\ '))
+      .filter((line) => !have.has(line));
+    if (!add.length) return true;
+    mkdirSync(dirname(file), { recursive: true });
+    const old = existsSync(file) ? readFileSync(file, 'utf-8') : '';
+    appendFileSync(file, `${old.length > 0 && !old.endsWith('\n') ? '\n' : ''}${add.join('\n')}\n`);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 // Thrown by `clearBlockingPaths` (carrying its stop result) at the first write under `.cache/` when
 // no ignore rule covers it, so a vault with nothing to set aside never meets the check.
 const CACHE_NOT_IGNORED = 'cache-not-ignored';
@@ -2586,6 +2612,15 @@ function clearBlockingPaths(hypoDir, targetRev, opts) {
         (p) => !added.includes(p) && !hidden(p) && gitShowText(hypoDir, ':0', p) === null,
       )
     : [];
+  // A hidden project's local views are not swept: the rollback commit drops the ignore block, so
+  // they would show up untracked and a `git add -A` would publish them. They stay on disk and go
+  // into this clone's own exclude file.
+  const hiddenLocal = rollsBack
+    ? generatedViewPathsOnDisk(hypoDir).filter(
+        (p) => !added.includes(p) && hidden(p) && gitShowText(hypoDir, ':0', p) === null,
+      )
+    : [];
+  if (!excludeLocally(hypoDir, hiddenLocal)) return stop({ reason: 'exclude-write-failed' });
   const untracked = [];
   for (const path of [...added.filter(isGeneratedViewPath), ...sweep]) {
     if (blocked.includes(path)) continue;
