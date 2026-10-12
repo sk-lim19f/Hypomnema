@@ -2969,14 +2969,26 @@ test('two clones of an init vault that both append to log.md and sync on the sam
     const remote = join(base, 'remote.git');
     const a = join(base, 'a');
     const b = join(base, 'b');
-    const gitq = (dir, ...args) => spawnSync('git', ['-C', dir, ...args], { encoding: 'utf-8' });
+    // Every git call, including the ones syncRemote makes in this process, runs with the seeded test
+    // HOME (the vault's pre-commit hook resolves the install root from it) and a git config of its
+    // own, so nothing depends on the developer's HOME or ~/.gitconfig.
+    const gitConfig = join(base, 'gitconfig');
+    writeFileSync(gitConfig, '[init]\n\tdefaultBranch = main\n[commit]\n\tgpgsign = false\n');
+    const gitEnv = {
+      ...process.env,
+      HOME: SESSION_TMP_HOME,
+      GIT_CONFIG_GLOBAL: gitConfig,
+      GIT_CONFIG_NOSYSTEM: '1',
+    };
+    const gitq = (dir, ...args) =>
+      spawnSync('git', ['-C', dir, ...args], { encoding: 'utf-8', env: gitEnv });
     const gitOk = (dir, ...args) => {
       const r = gitq(dir, ...args);
       assert.equal(r.status, 0, `git ${args.join(' ')}: ${r.stderr}`);
       return r.stdout;
     };
-    spawnSync('git', ['init', '--bare', '-q', remote]);
-    spawnSync('git', ['init', '-q', a]);
+    spawnSync('git', ['init', '--bare', '-q', remote], { env: gitEnv });
+    spawnSync('git', ['init', '-q', a], { env: gitEnv });
     gitq(a, 'config', 'user.email', 'a@test.com');
     gitq(a, 'config', 'user.name', 'A');
     const init = run('init.mjs', [`--hypo-dir=${a}`, '--no-hooks', '--no-git-init']);
@@ -2986,7 +2998,7 @@ test('two clones of an init vault that both append to log.md and sync on the sam
     gitOk(a, 'commit', '-q', '-m', 'init');
     gitOk(a, 'remote', 'add', 'origin', remote);
     gitOk(a, 'push', '-q', '-u', 'origin', 'HEAD');
-    spawnSync('git', ['clone', '-q', remote, b]);
+    spawnSync('git', ['clone', '-q', remote, b], { env: gitEnv });
     gitq(b, 'config', 'user.email', 'b@test.com');
     gitq(b, 'config', 'user.name', 'B');
 
@@ -3000,7 +3012,17 @@ test('two clones of an init vault that both append to log.md and sync on the sam
     gitOk(a, 'push', '-q');
     append(b, '- 2026-10-12 close from B');
 
-    const res = syncRemote(b);
+    const saved = Object.fromEntries(Object.keys(gitEnv).map((k) => [k, process.env[k]]));
+    Object.assign(process.env, gitEnv);
+    let res;
+    try {
+      res = syncRemote(b);
+    } finally {
+      for (const [k, v] of Object.entries(saved)) {
+        if (v === undefined) delete process.env[k];
+        else process.env[k] = v;
+      }
+    }
     assert.equal(res.conflict, false, JSON.stringify(res));
     assert.equal(res.pulled, true, JSON.stringify(res));
     assert.equal(res.pushed, true, JSON.stringify(res));

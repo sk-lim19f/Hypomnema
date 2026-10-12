@@ -917,18 +917,133 @@ export function buildCommitInTempIndex(hypoDir, edits, { testHooks } = {}) {
 function returnStrandedIndex(hypoDir, sha, headBefore) {
   const headNow = gitRun(hypoDir, ['rev-parse', '--verify', '--quiet', 'HEAD']).stdout.trim();
   if (!headBefore || headNow !== headBefore) return { ok: true };
-  const changed = gitRun(hypoDir, ['diff', '--name-only', '-z', '--relative', headBefore, sha]);
-  const paths = String(changed.stdout).split('\0').filter(Boolean);
-  if (changed.status !== 0 || !paths.length) return { ok: true };
+  const paths = movePaths(hypoDir, headBefore, sha);
+  if (!paths.length) return { ok: true };
   const specs = paths.map((p) => `:(literal)${p}`);
   // 0 when the index holds the target's bytes on every one of those paths.
   if (gitRun(hypoDir, ['diff', '--cached', '--quiet', sha, '--', ...specs]).status !== 0) {
     return { ok: true };
   }
+  return readTreeBack(hypoDir, sha, headBefore);
+}
+
+// `read-tree -m -u <target> <old>`: back from the target layout to the old one, on the paths the two
+// differ in only.
+function readTreeBack(hypoDir, sha, headBefore) {
   if (gitRun(hypoDir, ['read-tree', '-m', '-u', sha, headBefore]).status === 0) return { ok: true };
   const notice = `이행 커밋 적용이 HEAD 갱신에서 멈췄고 인덱스와 작업 트리가 새 구성에 남았습니다. 되돌리려면 이 명령을 실행하세요: git -C '${hypoDir}' read-tree -m -u ${sha} ${headBefore}`;
   writeRootHotHealthNotice(hypoDir, notice);
   return { ok: false, notice };
+}
+
+// The paths (relative to the vault) a move from `from` to `to` changes.
+function movePaths(hypoDir, from, to) {
+  const changed = gitRun(hypoDir, ['diff', '--name-only', '-z', '--relative', from, to]);
+  return changed.status === 0 ? String(changed.stdout).split('\0').filter(Boolean) : [];
+}
+
+// A kill (not a git error) between git installing the target layout and the ref update leaves no
+// process to run `returnStrandedIndex`. So `fastForwardTo` leaves `.cache/migration-move.json` before
+// the merge: {v: 1, oldHead, target, paths}. The next run reads it first (`recoverInterruptedMove`).
+const MOVE_RECORD_REL = '.cache/migration-move.json';
+
+function readMoveRecord(hypoDir) {
+  try {
+    const rec = JSON.parse(readFileSync(join(hypoDir, MOVE_RECORD_REL), 'utf-8'));
+    const ok =
+      rec?.v === 1 &&
+      typeof rec.oldHead === 'string' &&
+      typeof rec.target === 'string' &&
+      Array.isArray(rec.paths) &&
+      rec.paths.every((p) => typeof p === 'string');
+    return ok ? rec : null;
+  } catch {
+    return null;
+  }
+}
+
+const dropMoveRecord = (hypoDir) => rmSync(join(hypoDir, MOVE_RECORD_REL), { force: true });
+
+// Best effort: a move without its record is the move as it was before the record existed. A vault
+// whose rules would let `git add -A` stage `.cache/` gets none (the same rule every cache write follows).
+function writeMoveRecord(hypoDir, oldHead, target) {
+  const paths = oldHead ? movePaths(hypoDir, oldHead, target) : [];
+  if (!paths.length || unignoredPaths(hypoDir, [MOVE_RECORD_REL]).length) return;
+  try {
+    atomicWrite(join(hypoDir, MOVE_RECORD_REL), JSON.stringify({ v: 1, oldHead, target, paths }));
+  } catch {
+    // the move goes on without a record
+  }
+}
+
+/**
+ * Finish or undo a move that a kill stopped between git installing the target layout and moving
+ * HEAD. Runs before any dirty check, because the staged baselines of that state read as
+ * `other-dirty`. With a record: HEAD already at the target means the move landed (record dropped);
+ * HEAD anywhere else than the recorded old head means the record is stale (dropped with a notice,
+ * nothing rewritten); HEAD at the old head with the index and working tree equal to the target on
+ * the recorded paths gets the ref update (`update-ref` with the old head as the expected value);
+ * any other state goes back to the old head with the two-tree `read-tree` (only the paths the two
+ * heads differ in, and it refuses to overwrite a changed file). Returns `{state, ok, notices,
+ * target?}`: `state` is `'none'`, `'finished'` (HEAD is at the target now), `'restored'` or
+ * `'dropped'`. `ok: false` keeps the record and the state stranded, with the git command in a notice.
+ */
+export function recoverInterruptedMove(hypoDir) {
+  const rec = readMoveRecord(hypoDir);
+  if (!rec) return { state: 'none', ok: true, notices: [] };
+  const headNow = gitRun(hypoDir, ['rev-parse', '--verify', '--quiet', 'HEAD']).stdout.trim();
+  if (headNow === rec.target) {
+    dropMoveRecord(hypoDir);
+    return { state: 'finished', ok: true, notices: [], target: rec.target };
+  }
+  if (headNow !== rec.oldHead) {
+    dropMoveRecord(hypoDir);
+    return {
+      state: 'dropped',
+      ok: true,
+      notices: [
+        '중단된 이행 기록을 버렸습니다. 그사이 HEAD가 움직여서 아무것도 다시 쓰지 않았습니다.',
+      ],
+    };
+  }
+  const specs = rec.paths.map((p) => `:(literal)${p}`);
+  const same = (...flags) =>
+    gitRun(hypoDir, ['diff', ...flags, '--quiet', rec.target, '--', ...specs]).status === 0;
+  const atTarget = same('--cached');
+  if (atTarget && same()) {
+    const moved = gitRun(hypoDir, [
+      'update-ref',
+      '-m',
+      'hypomnema: finish interrupted session entries move',
+      'HEAD',
+      rec.target,
+      rec.oldHead,
+    ]);
+    if (moved.status === 0) {
+      dropMoveRecord(hypoDir);
+      return {
+        state: 'finished',
+        ok: true,
+        target: rec.target,
+        notices: ['중단된 세션 원본 이행을 마저 끝냈습니다.'],
+      };
+    }
+    return {
+      state: 'none',
+      ok: false,
+      notices: [`중단된 이행의 HEAD 갱신에 실패했습니다: ${String(moved.stderr).trim()}`],
+    };
+  }
+  const back = readTreeBack(hypoDir, rec.target, rec.oldHead);
+  if (!back.ok) return { state: 'none', ok: false, notices: [back.notice] };
+  dropMoveRecord(hypoDir);
+  return {
+    state: 'restored',
+    ok: true,
+    notices: atTarget
+      ? ['중단된 이행이 남긴 인덱스와 작업 트리를 이전 구성으로 되돌렸습니다.']
+      : [],
+  };
 }
 
 /**
@@ -947,6 +1062,18 @@ function returnStrandedIndex(hypoDir, sha, headBefore) {
  * any path that could not be put back.
  */
 export function fastForwardTo(hypoDir, sha, { testHooks } = {}) {
+  const interrupted = recoverInterruptedMove(hypoDir);
+  if (!interrupted.ok) {
+    const pre = { ...EMPTY_PRE, ok: false };
+    return { ok: false, pre, reason: 'interrupted-move', notice: interrupted.notices.join('\n') };
+  }
+  if (interrupted.state === 'finished') {
+    // The kill also skipped what follows a landed move (`afterFastForward`); its notices wait for the
+    // next SessionStart because this caller has nowhere to return them.
+    const after = afterFastForward(hypoDir, EMPTY_PRE);
+    const lines = [...interrupted.notices, ...after.notices];
+    if (lines.length) writeRootHotHealthNotice(hypoDir, lines.join('\n'));
+  }
   const pre = clearGeneratedPathsBlockingPull(hypoDir, sha, { testHooks });
   const moved =
     pre.archived.length +
@@ -962,10 +1089,13 @@ export function fastForwardTo(hypoDir, sha, { testHooks } = {}) {
     return { ok: false, pre, deferred: pre.deferred, reason: pre.reason, notice };
   }
   const headBefore = gitRun(hypoDir, ['rev-parse', '--verify', '--quiet', 'HEAD']).stdout.trim();
+  writeMoveRecord(hypoDir, headBefore, sha);
   const merged = gitRun(hypoDir, ['merge', '--ff-only', sha]);
+  testHooks?.afterMergeAttempt?.();
   if (merged.status !== 0) {
     const stderr = String(merged.stderr).trim();
     const stranded = returnStrandedIndex(hypoDir, sha, headBefore);
+    if (stranded.ok) dropMoveRecord(hypoDir);
     const undone =
       moved && stranded.ok
         ? undoClearedPaths(hypoDir, pre).notices
@@ -977,6 +1107,7 @@ export function fastForwardTo(hypoDir, sha, { testHooks } = {}) {
       notice: [`git merge --ff-only 실패: ${stderr}`, ...undone].join('\n'),
     };
   }
+  dropMoveRecord(hypoDir);
   return { ok: true, pre };
 }
 
@@ -996,6 +1127,15 @@ export function afterFastForward(hypoDir, pre) {
   });
   return { notices: [...setAside, ...resumed.notices], created: resumed.created };
 }
+
+const EMPTY_PRE = Object.freeze({
+  archived: [],
+  localOnly: [],
+  unowned: [],
+  cleared: [],
+  gitignoreSaved: [],
+  ownedRemoved: [],
+});
 
 const migrationResult = (over) => ({
   migrated: false,
@@ -1071,6 +1211,21 @@ function renameAdvice(slug, problem) {
  */
 export function migrateVaultToSessionEntriesUnlocked(hypoDir, opts = {}) {
   const { reenable = false, testHooks } = opts;
+  // A kill during an earlier move can have left the index and disk on the target layout with HEAD
+  // behind; every check below would read that as someone's staged work.
+  const interrupted = recoverInterruptedMove(hypoDir);
+  if (!interrupted.ok) {
+    return deferredMigration('interrupted-move', interrupted.notices.join('\n'));
+  }
+  if (interrupted.state === 'finished') {
+    const after = afterFastForward(hypoDir, EMPTY_PRE);
+    return migrationResult({
+      migrated: true,
+      commit: interrupted.target,
+      shared: after.created,
+      notices: [...interrupted.notices, ...after.notices],
+    });
+  }
   const state = migrationState(hypoDir);
   if (state === 'migrated') return migrationResult({ migrated: true, skipped: 'already-migrated' });
   if (state === 'opted-out' && !reenable) return migrationResult({ skipped: 'opted-out' });
@@ -1115,7 +1270,7 @@ export function migrateVaultToSessionEntriesUnlocked(hypoDir, opts = {}) {
         'git restore --staged로 스테이징을 풀거나 먼저 커밋한 뒤 다시 시도합니다',
     );
   }
-  const notices = [];
+  const notices = [...interrupted.notices];
   const patterns = loadHypoIgnore(hypoDir);
   const { views: ownViews } = readGeneratedViewsRecord(hypoDir);
   // The flat files a rollback committed are named, with their hashes, by the marker in HEAD.
