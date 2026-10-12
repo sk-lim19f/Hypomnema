@@ -14,7 +14,7 @@
  *   --min-group=<n>          Min pages per tag group to report (default: 2)
  *   --check-session-close    Verify the strict session-close memory files: 4 mandatory + open-questions conditional
  *   --project=<slug>         Override the recency-inferred project on --check / --mark (single segment
- *                            [A-Za-z0-9._-]+, projects/<slug>/ must exist). On --check it NARROWS the
+ *                            letters/marks/numbers of any script plus ._-, projects/<slug>/ must exist). On --check it NARROWS the
  *                            gate to that one project: a project-scoped diagnostic, NOT a global
  *                            close verdict. On --mark it is ATTRIBUTION only; the gate stays
  *                            global (the marker gate is the global gate with the git axis narrowed). Ignored on --apply.
@@ -36,7 +36,7 @@
  *
  * Payload schema:
  *   {
- *     "project":      "<slug>",                       // REQUIRED — single segment [A-Za-z0-9._-]+ (≥1 alnum, not dot-only), projects/<slug>/ dir must exist (B-3: no recency fallback for apply)
+ *     "project":      "<slug>",                       // REQUIRED — single segment of Unicode letters/marks/numbers plus ._- (≥1 letter or number, not dot-only), projects/<slug>/ dir must exist (B-3: no recency fallback for apply)
  *     "sessionId":    "<session id>",                 // recommended: must equal --session-id when present (null or absent skips the check)
  *     "date":         "YYYY-MM-DD",                   // optional — defaults to today (local)
  *     "summary":      "<markdown>",                   // REQUIRED: string; becomes the summary of this close's session entry

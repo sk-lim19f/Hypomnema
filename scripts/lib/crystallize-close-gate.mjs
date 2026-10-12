@@ -1,6 +1,9 @@
-import { existsSync, statSync } from 'fs';
+import { existsSync } from 'fs';
 import { join } from 'path';
-import { extractTouchedWikiFilesWithTrust } from '../../hooks/hypo-shared.mjs';
+import {
+  extractTouchedWikiFilesWithTrust,
+  resolveProjectDirName,
+} from '../../hooks/hypo-shared.mjs';
 
 // ── session-close hard gate ───────────────────────────────────────────────────
 // The marker attests "the USER closed this session". Its evidence transcript is
@@ -20,12 +23,15 @@ import { extractTouchedWikiFilesWithTrust } from '../../hooks/hypo-shared.mjs';
 // projects/<slug> is a hard error so the override never silently resolves to an
 // all-missing status (which a reader would misread as "exists but incomplete").
 export function requireProjectDir(args, slug) {
-  const projectDir = join(args.hypoDir, 'projects', slug);
-  if (!existsSync(projectDir) || !statSync(projectDir).isDirectory()) {
+  // NFC lookup: the directory keeps its on-disk spelling, and `args.project` is rewritten to it so
+  // every later join and slug comparison uses that spelling.
+  const onDisk = resolveProjectDirName(args.hypoDir, slug);
+  if (onDisk === null) {
     const msg = `--project "${slug}" does not exist as a directory (no projects/${slug}/ directory)`;
     console.log(args.json ? JSON.stringify({ ok: false, error: msg }, null, 2) : `✗ ${msg}`);
     process.exit(1);
   }
+  if (args.project === slug) args.project = onDisk;
 }
 
 // When the global gate's own discovery (hot.md pointer table + today

@@ -1,5 +1,5 @@
 import { resolveHypoRoot, expandHome } from './hypo-root.mjs';
-import { isValidProjectName } from './project-create.mjs';
+import { isValidProjectName } from '../../hooks/session-entries.mjs';
 
 // ── arg parsing ──────────────────────────────────────────────────────────────
 
@@ -73,12 +73,12 @@ export function parseArgs(argv) {
   // --project=<slug> override (check/mark only). Validate the SYNTAX here so a
   // traversal/charset attack (`--project=../x`) is rejected before any path is
   // built from it — sessionCloseFileStatus(projectOverride) joins it directly.
-  // isValidProjectName is the SHARED validator (project-create.mjs), so the
+  // isValidProjectName is the SHARED validator (hooks/session-entries.mjs), so the
   // override accepts exactly the namespace createProject can scaffold. Existence
   // (a real projects/<slug>/ directory) is checked in the run functions, where
   // hypoDir is resolved and only the check/mark paths consume --project.
   if (args.project != null && !isValidProjectName(args.project)) {
-    const msg = `--project "${args.project}" is not a valid project name (need a single segment with ≥1 alnum, charset A-Za-z0-9._-, not "."/"..")`;
+    const msg = `--project "${args.project}" is not a valid project name (need a single segment of letters, marks, numbers, ".", "_" or "-" with at least one letter or number, not "."/"..")`;
     console.log(args.json ? JSON.stringify({ ok: false, error: msg }, null, 2) : `✗ ${msg}`);
     process.exit(1);
   }

@@ -2293,6 +2293,42 @@ test('createProject rejects an invalid project name', () => {
   });
 });
 
+test('createProject takes a Korean name, and an NFD spelling reuses the NFC directory', () => {
+  const ko = '인수인계-runbook';
+  withTmpDir((dir) => {
+    writeFileSync(join(dir, 'log.md'), '# Log\n');
+    const opts = {
+      hypoDir: dir,
+      name: ko,
+      workingDir: '/x',
+      started: '2026-05-21',
+      today: '2026-05-21',
+    };
+    const first = createProject(opts);
+    assert.ok(first.created.includes(`projects/${ko}/index.md`), JSON.stringify(first));
+    assert.ok(existsSync(join(dir, 'projects', ko, 'index.md')));
+    const again = createProject({ ...opts, name: ko.normalize('NFD') });
+    assert.ok(again.skipped.includes(`projects/${ko}/index.md`), JSON.stringify(again));
+    assert.deepEqual(
+      readdirSync(join(dir, 'projects')),
+      [ko],
+      'no second directory beside the first',
+    );
+  });
+});
+
+test('createProject still rejects whitespace, separator and control-character names', () => {
+  withGrowthWiki((dir) => {
+    for (const bad of ['a b', 'a/b', 'a\\b', '', 'a\u0001b', 'a\u0000b', '인수 인계']) {
+      assert.throws(
+        () => createProject({ hypoDir: dir, name: bad, workingDir: '/x' }),
+        /invalid project name/,
+        `name ${JSON.stringify(bad)} must be rejected`,
+      );
+    }
+  });
+});
+
 // Dot-only names pass the charset regex but resolve outside projects/<name>.
 // Must be rejected.
 test('createProject rejects path-escape dot names (.., ., ...)', () => {

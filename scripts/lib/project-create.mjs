@@ -32,8 +32,9 @@ import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync } from 
 import { join, dirname, resolve, sep } from 'path';
 import { fileURLToPath } from 'url';
 import { resolveHypoRoot, expandHome } from './hypo-root.mjs';
-import { rootHotBackupRecoveryNotice } from '../../hooks/hypo-shared.mjs';
+import { resolveProjectDirName, rootHotBackupRecoveryNotice } from '../../hooks/hypo-shared.mjs';
 import { writeGeneratedViews } from '../../hooks/session-views.mjs';
+import { isValidProjectName } from '../../hooks/session-entries.mjs';
 
 const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url));
 const PKG_ROOT = join(SCRIPT_DIR, '..', '..');
@@ -77,38 +78,24 @@ export function substituteTokens(content, { name, started, workingDir, today }) 
  *   `testHooks.templateDir` replaces the shipped template directory (tests only).
  * @returns {{created: string[], skipped: string[], warnings: string[], projectDir: string}}
  */
-/**
- * A project name must be a SINGLE path segment with at least one alnum. The
- * charset alone is not enough: `.`, `..`, `...` all pass `[A-Za-z0-9._-]+` yet
- * would resolve `projects/<name>` to the wiki root or `projects/` itself (codex
- * review 2026-05-22, both workers) — so dot-only names are rejected and ≥1 alnum
- * required. The leading `typeof` guard lets non-CLI callers (e.g. a JSON payload
- * where the value could be a number) reuse this without a JS regex coercing a
- * non-string into a "valid" name. Shared so the apply path (crystallize.mjs B-3)
- * accepts exactly the namespace createProject can scaffold — no wider, no narrower.
- *
- * @param {unknown} name
- * @returns {boolean}
- */
-export function isValidProjectName(name) {
-  return (
-    typeof name === 'string' &&
-    /^[A-Za-z0-9._-]+$/.test(name) &&
-    !/^\.+$/.test(name) &&
-    /[A-Za-z0-9]/.test(name)
-  );
-}
+// The project-name rule lives in hooks/session-entries.mjs (isValidProjectName), the one copy every
+// gate shares. Re-exported so apply, the CLI parser and createProject accept exactly the same
+// namespace: single segment, Unicode letters/marks/numbers plus `._-`, not dot-only.
+export { isValidProjectName };
 
 export function createProject(opts) {
-  const { name, workingDir } = opts;
-  if (!isValidProjectName(name)) {
+  const { workingDir } = opts;
+  if (!isValidProjectName(opts.name)) {
     throw new Error(
-      `invalid project name: ${JSON.stringify(name)} (need a single segment with ≥1 alnum, charset A-Za-z0-9._-, not "."/"..")`,
+      `invalid project name: ${JSON.stringify(opts.name)} (need a single segment of letters, marks, numbers, ".", "_" or "-" with at least one letter or number, not "."/"..")`,
     );
   }
   if (!workingDir) throw new Error('workingDir is required');
 
   const hypoDir = opts.hypoDir || resolveHypoRoot();
+  // NFC is the stored form; an existing directory keeps the spelling it has on disk, so an NFD
+  // name never scaffolds a second directory beside an NFC one.
+  const name = resolveProjectDirName(hypoDir, opts.name) ?? opts.name.normalize('NFC');
   const today = opts.today || todayISO();
   const started = opts.started || today;
   const vars = { name, started, workingDir, today };

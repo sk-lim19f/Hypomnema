@@ -23,10 +23,30 @@ const ENTRY_SCHEMA = 1;
 // a close id never holds a space or a dot. The markers rely on that to be unambiguous.
 const CLOSE_ID_RE = /^[A-Za-z0-9_-]+$/;
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
-// The vault project slug rule (hypo-shared `isProjectSlugDirectory`, scripts/lib/project-create.mjs):
-// `[A-Za-z0-9._-]`, not all dots, at least one alphanumeric. It is written unquoted into
-// `project:`, so a space or `#` would read differently in a generic frontmatter reader.
-const PROJECT_RE = /^(?!\.+$)(?=.*[A-Za-z0-9])[A-Za-z0-9._-]+$/;
+const PROJECT_CHARS_RE = /^[\p{L}\p{M}\p{N}._-]+$/u;
+
+/**
+ * The one project-name rule, shared by the entry format, the crystallize CLI and payload gates,
+ * project creation and the hook-side slug checks. A name is a single path segment of Unicode
+ * letters, marks and numbers (any script) plus `.`, `_` and `-`, not all dots, with at least one
+ * letter or number. Whitespace, `/`, `\`, NUL and other control characters are outside the
+ * charset. It is written unquoted into `project:`, so a space or `#` would read differently in a
+ * generic frontmatter reader. Names are compared in NFC (callers normalize before comparing with
+ * a directory name), but the rule itself accepts either form.
+ *
+ * @param {unknown} name
+ * @returns {boolean}
+ */
+export function isValidProjectName(name) {
+  return (
+    typeof name === 'string' &&
+    PROJECT_CHARS_RE.test(name) &&
+    !/^\.+$/.test(name) &&
+    /[\p{L}\p{N}]/u.test(name)
+  );
+}
+// `scalar` and the parser take anything with `.test`, so the project rule slots in beside the regexes.
+const PROJECT_RE = { test: isValidProjectName };
 const BASELINE_TITLE = '이행 전 기록';
 
 // Byte-fixed blocks. Two machines that append them independently must produce the same change.
@@ -566,13 +586,13 @@ export function mergeAdditiveGitignore(base, ours, theirs) {
 // ── project directories and root rows ────────────────────────────────────────
 
 /**
- * A `projects/` child that is a session project: a vault slug (`PROJECT_RE`, the rule an entry's
+ * A `projects/` child that is a session project: a vault slug (`isValidProjectName`, the rule an entry's
  * `project:` uses), has `index.md` or `sessions/`, not `_template`.
  */
 export function isSessionProjectDir({ slug, hasIndex, hasSessions }) {
   return (
     typeof slug === 'string' &&
-    PROJECT_RE.test(slug) &&
+    isValidProjectName(slug) &&
     slug !== '_template' &&
     !!(hasIndex || hasSessions)
   );
