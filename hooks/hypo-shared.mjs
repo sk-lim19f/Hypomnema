@@ -2256,6 +2256,17 @@ export function setAsideNotices(
   return notices;
 }
 
+// The notice lines for everything the clearing step sets aside, views included: where each backup
+// is. `clearBlockingPaths` makes them durable before it removes anything, and `undoClearedPaths`
+// takes the same lines back out once every path is back in place.
+function clearingNoticeLines(hypoDir, moved) {
+  const views = (moved.archived ?? []).map(
+    ({ relPath, kind, backupPath }) =>
+      `${relPath}의 이 기계 쪽 ${kind === 'stage' ? '스테이징본' : '작업 트리본'}을 ${relative(hypoDir, backupPath)}에 보관했습니다.`,
+  );
+  return [...views, ...setAsideNotices(hypoDir, moved)];
+}
+
 /**
  * Append the lines of `lines` that the working-tree `.gitignore` does not have, at the end (the
  * file stays uncommitted). Lines are compared without a trailing `\r`, so a CRLF file does not get
@@ -2390,6 +2401,9 @@ function clearBlockingPaths(hypoDir, targetRev, opts) {
   let archived = [];
   let gitignoreLines = [];
   let gitignoreSaved = [];
+  // Owned views removed without a backup (the generator wrote those bytes); a failed move writes
+  // them back from here.
+  const ownedRemoved = [];
   const stop = (extra) => ({
     ok: false,
     backups,
@@ -2399,6 +2413,7 @@ function clearBlockingPaths(hypoDir, targetRev, opts) {
     cleared,
     gitignoreLines,
     gitignoreSaved,
+    ownedRemoved,
     ...extra,
   });
 
@@ -2658,6 +2673,13 @@ function clearBlockingPaths(hypoDir, targetRev, opts) {
     } catch {
       return stop({ reason: 'archive-write-failed' });
     }
+    // The notice naming every backup is on disk before anything is removed or unstaged: a stop at
+    // any later point (a kill included) leaves the next SessionStart something to show. Delivery
+    // can repeat a line the caller prints too. No notice, no clearing.
+    const lines = clearingNoticeLines(hypoDir, { archived, localOnly, unowned, cleared });
+    if (lines.length && !writeRootHotHealthNotice(hypoDir, lines.join('\n'))) {
+      return stop({ reason: 'notice-write-failed' });
+    }
   }
   // The vault's own writers are shut out by the vault commit lock the caller holds, so a change
   // since the snapshot came from another Hypomnema process that does not take it, or a person.
@@ -2704,6 +2726,7 @@ function clearBlockingPaths(hypoDir, targetRev, opts) {
   for (const { path, text } of untracked) {
     if (read(path) !== text) return stop(changedSince());
     rmSync(join(hypoDir, path), { force: true });
+    if (!cleared.some((c) => c.relPath === path)) ownedRemoved.push({ relPath: path, text });
   }
   if (restore.length) {
     const r = vaultGit(hypoDir, ['checkout', 'HEAD', '--', ...literalSpecs(restore)]);
@@ -2720,6 +2743,7 @@ function clearBlockingPaths(hypoDir, targetRev, opts) {
     cleared,
     gitignoreLines,
     gitignoreSaved,
+    ownedRemoved,
   };
 }
 
@@ -2801,6 +2825,17 @@ export function undoClearedPaths(hypoDir, moved, { keepRecord = false } = {}) {
     return true;
   };
   let allBack = true;
+  // A view the generator wrote and the clearing step removed has no backup: write it back when the
+  // path is still absent (a file there now is someone's, and rendering rebuilds the view anyway).
+  for (const { relPath, text } of moved.ownedRemoved ?? []) {
+    try {
+      if (lenient(join(hypoDir, relPath)) === null) {
+        atomicWrite(join(hypoDir, relPath), text, { durable: true });
+      }
+    } catch {
+      // rendering writes it again
+    }
+  }
   for (const item of all) {
     const bytes = lenient(item.backupPath);
     let back = false;
@@ -2819,6 +2854,11 @@ export function undoClearedPaths(hypoDir, moved, { keepRecord = false } = {}) {
     }
   }
   if (allBack) {
+    // Every path is back where it was, so the lines naming the backups are retracted before the
+    // backups go. A stop in between leaves a notice for a backup that is still there.
+    if (!keepRecord) {
+      retractRootHotHealthNotice(hypoDir, clearingNoticeLines(hypoDir, moved).join('\n'));
+    }
     // Each deletion is synced before the next step relies on it: a power loss that replays the
     // backup removal but not the record removal would leave a record naming a backup that is gone.
     const syncDir = (dir) => {
@@ -3117,6 +3157,20 @@ export function resumePullArchive(hypoDir, { announced = [] } = {}) {
   for (const { backupPath } of rec.gitignoreSaved) rmSync(backupPath, { force: true });
   const shared = shareLegacyBytes(hypoDir, rec.views);
   const notices = [...shared.notices, ...setAsideNotices(hypoDir, rec, announced)];
+  // The record is the only other place that names these backups, and every branch below may drop
+  // or shrink it. Their lines are in the notice store first, announced ones included (the caller's
+  // copy lives in memory), or the record stays as it is for the next run. A line can show twice.
+  const durable = [...shared.notices, ...setAsideNotices(hypoDir, rec)];
+  if (durable.length && !writeRootHotHealthNotice(hypoDir, durable.join('\n'))) {
+    return {
+      resumed: true,
+      created: shared.created,
+      notices: [
+        ...notices,
+        `알림을 저장하지 못해 보관 기록(${PULL_ARCHIVE_REL})을 지우지 않고 남겼습니다. 다음 실행이 이어서 처리합니다.`,
+      ],
+    };
+  }
   // A backup the record names that is not on disk (a crash lost it) means nothing was shared for
   // that entry, so "no baseline was created" must not read as "nothing left to do".
   const lost = [...rec.views, ...rec.localOnly, ...rec.unowned, ...rec.cleared].filter(
@@ -3252,6 +3306,35 @@ export function consumeRootHotHealthNotice(hypoDir) {
     // lock-timeout path in this file: the notice just waits for the next
     // reader instead of being lost.
     return null;
+  }
+}
+
+/**
+ * Take lines back out of the pending notice: the ones `message` holds, nothing else. For a notice
+ * written ahead of a move that was then taken back, so it does not name backups that are gone.
+ * The file goes when no line is left. Best-effort like the writer; returns whether it succeeded.
+ */
+export function retractRootHotHealthNotice(hypoDir, message) {
+  const path = join(hypoDir, '.cache', ROOT_HOT_HEALTH_NOTICE_FILENAME);
+  if (!existsSync(path)) return true;
+  const drop = new Set(String(message).split('\n'));
+  try {
+    withFileLock(path, () => {
+      let pending;
+      try {
+        pending = JSON.parse(readFileSync(path, 'utf-8')).message;
+      } catch {
+        return;
+      }
+      if (typeof pending !== 'string') return;
+      const lines = pending.split('\n').filter((l) => !drop.has(l));
+      if (lines.length === pending.split('\n').length) return;
+      if (!lines.length) unlinkSync(path);
+      else atomicWrite(path, JSON.stringify({ message: lines.join('\n'), ts: Date.now() }));
+    });
+    return true;
+  } catch {
+    return false;
   }
 }
 
@@ -5181,7 +5264,8 @@ export function pullRemote(hypoDir, { testHooks, leaveNotices = true } = {}) {
         pre.localOnly.length +
         pre.unowned.length +
         pre.cleared.length +
-        pre.gitignoreSaved.length
+        pre.gitignoreSaved.length +
+        pre.ownedRemoved.length
       : 0;
     if (moved > 0) notices.push(...undoClearedPaths(hypoDir, pre).notices);
     pre = null;

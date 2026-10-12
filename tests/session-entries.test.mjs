@@ -5606,6 +5606,12 @@ test('a vault whose own .gitignore leaves .cache/ out is not moved: the backup o
 test('the writer leaves .cache/ alone while a later rule un-ignores it, and says so', () => {
   withOldGit((dir) => {
     assert.equal(migrate(dir).migrated, true, 'precondition: the vault is migrated');
+    // The move backed up the old hand-kept files and stored a notice naming the backups first.
+    assert.match(
+      consumeRootHotHealthNotice(dir) ?? '',
+      /\.cache\/backups\//,
+      'the move names its backups',
+    );
     put(dir, '.gitignore', `${showHead(dir, '.gitignore')}!/.cache/\n`);
     commitIn(dir);
     assert.equal(migrationState(dir), 'migrated', 'precondition: the block itself is whole');
@@ -5965,6 +5971,12 @@ test('an archive record of the old shape (views without run) with two versions o
 test('a migrated vault whose HEAD .gitignore later loses a view pattern renders nothing and leaves a notice naming the missing lines', () => {
   withOldGit((dir) => {
     assert.equal(migrate(dir).migrated, true, 'precondition: the vault is migrated');
+    // The move backed up the old hand-kept files and stored a notice naming the backups first.
+    assert.match(
+      consumeRootHotHealthNotice(dir) ?? '',
+      /\.cache\/backups\//,
+      'the move names its backups',
+    );
     const healthy = writeGeneratedViews(dir, WRITE);
     assert.equal(healthy.state, 'migrated');
     assert.equal(healthy.missingBlockLines, undefined);
@@ -6485,5 +6497,150 @@ test('render command prints both views of the project to stdout and writes nothi
     assert.ok(r.stdout.includes(`summary ${RB_IDS[2]}`));
     assert.equal(cgitOk(dir, ['status', '--porcelain']), '');
     assert.equal(rbRun(dir, ['render', '--project=nope']).status, 1);
+  });
+});
+
+// ── a move that fails after git started applying it, and notices that outlive a stop ─────────
+
+const VIEW_PATHS = ['hot.md', 'projects/p/hot.md', 'projects/p/session-state.md'];
+const NOTICE_FILE = (dir) => join(dir, '.cache', 'root-hot-projection-notice.json');
+
+test('rollback with HEAD.lock held leaves HEAD, index and disk as they were, then succeeds once the lock is gone', () => {
+  withRollbackVault(({ dir, shas }) => {
+    const head = headOf(dir);
+    const before = VIEW_PATHS.map((rel) => readRel(dir, rel));
+    put(dir, '.git/HEAD.lock', '');
+    const r = rollbackSessionEntries(dir, { at: shas[1] });
+    assert.equal(r.rolledBack, false);
+    assert.match(r.deferred, /^fast-forward-failed/);
+    assert.equal(headOf(dir), head, 'HEAD did not move');
+    assert.equal(cgitOk(dir, ['status', '--porcelain']), '', 'no staged or stray file is left');
+    assert.ok(!treeNames(dir).includes(RB_MARKER));
+    assert.deepEqual(
+      VIEW_PATHS.map((rel) => readRel(dir, rel)),
+      before,
+      'the views are as they were',
+    );
+    unlinkSync(join(dir, '.git/HEAD.lock'));
+    const again = rollbackSessionEntries(dir, { at: shas[1] });
+    assert.equal(again.rolledBack, true, again.notices.join('\n'));
+    assert.equal(cgitOk(dir, ['status', '--porcelain']), '');
+    assert.ok(treeNames(dir).includes(RB_MARKER));
+  });
+});
+
+test('re-enabling with HEAD.lock held keeps the marker and the flat files, then succeeds once the lock is gone', () => {
+  withRollbackVault(({ dir, shas }) => {
+    assert.equal(rollbackSessionEntries(dir, { at: shas[1] }).rolledBack, true);
+    const head = headOf(dir);
+    const flat = VIEW_PATHS.map((rel) => readRel(dir, rel));
+    put(dir, '.git/HEAD.lock', '');
+    const r = migrate(dir, { reenable: true });
+    assert.equal(r.migrated, false);
+    assert.match(r.deferred, /^fast-forward-failed/);
+    assert.equal(headOf(dir), head);
+    assert.equal(cgitOk(dir, ['status', '--porcelain']), '', 'no deletion is left staged');
+    assert.ok(existsSync(join(dir, RB_MARKER)), 'the marker is still on disk');
+    assert.deepEqual(
+      VIEW_PATHS.map((rel) => readRel(dir, rel)),
+      flat,
+      'the flat files are still on disk',
+    );
+    unlinkSync(join(dir, '.git/HEAD.lock'));
+    const again = migrate(dir, { reenable: true });
+    assert.equal(again.migrated, true, again.notices.join('\n'));
+  });
+});
+
+test('rollback with index.lock held leaves the three owned views on disk', () => {
+  withRollbackVault(({ dir, shas }) => {
+    const before = VIEW_PATHS.map((rel) => readRel(dir, rel));
+    put(dir, '.git/index.lock', '');
+    const r = rollbackSessionEntries(dir, { at: shas[1] });
+    assert.equal(r.rolledBack, false);
+    assert.match(r.deferred, /^fast-forward-failed/);
+    assert.deepEqual(
+      VIEW_PATHS.map((rel) => readRel(dir, rel)),
+      before,
+    );
+    unlinkSync(join(dir, '.git/index.lock'));
+    assert.equal(cgitOk(dir, ['status', '--porcelain']), '');
+  });
+});
+
+test('a rollback that is taken back leaves no notice about the backups it removed', () => {
+  withRollbackVault(({ dir, shas }) => {
+    consumeRootHotHealthNotice(dir); // what the fixture's own writes left
+    put(dir, 'projects/p/hot.md', 'my own hot\n');
+    put(dir, '.git/index.lock', '');
+    assert.equal(rollbackSessionEntries(dir, { at: shas[1] }).rolledBack, false);
+    assert.equal(readRel(dir, 'projects/p/hot.md'), 'my own hot\n', 'the edit is back');
+    assert.equal(backupsIn(dir, 'projects/p/hot.md').length, 0, 'the backup is gone');
+    assert.equal(consumeRootHotHealthNotice(dir), null, 'so is the notice that named it');
+  });
+});
+
+test('a stop right after the clearing step leaves a pending notice that names the backup', () => {
+  withRollbackVault(({ dir, shas }) => {
+    put(dir, 'projects/p/hot.md', 'my own hot\n');
+    assert.throws(
+      () =>
+        rollbackSessionEntries(dir, {
+          at: shas[1],
+          testHooks: {
+            afterArchive: () => {
+              throw new Error('killed');
+            },
+          },
+        }),
+      /killed/,
+    );
+    const [backup] = backupsIn(dir, 'projects/p/hot.md');
+    assert.ok(backup, 'the edit is in a backup');
+    const notice = consumeRootHotHealthNotice(dir) ?? '';
+    assert.ok(notice.includes(backup), `the notice names ${backup}: ${notice}`);
+  });
+});
+
+test('a notice that cannot be stored stops the clearing before it removes the edit', () => {
+  withRollbackVault(({ dir, shas }) => {
+    consumeRootHotHealthNotice(dir);
+    put(dir, 'projects/p/hot.md', 'my own hot\n');
+    mkdirSync(NOTICE_FILE(dir), { recursive: true });
+    const r = rollbackSessionEntries(dir, { at: shas[1] });
+    assert.equal(r.rolledBack, false);
+    assert.equal(r.deferred, 'notice-write-failed');
+    assert.equal(readRel(dir, 'projects/p/hot.md'), 'my own hot\n', 'the edit was not touched');
+    assert.equal(cgitOk(dir, ['status', '--porcelain']), '');
+  });
+});
+
+test('a successful rollback has every notice it returns in the store, with the archive already gone', () => {
+  withRollbackVault(({ dir, shas }) => {
+    put(dir, 'projects/p/hot.md', 'my own hot\n');
+    const r = rollbackSessionEntries(dir, { at: shas[1] });
+    assert.equal(r.rolledBack, true, r.notices.join('\n'));
+    assert.ok(r.notices.length > 0);
+    assert.ok(!existsSync(join(dir, '.cache', 'pull-archive.json')), 'the archive is deleted');
+    const stored = consumeRootHotHealthNotice(dir) ?? '';
+    for (const line of r.notices) assert.ok(stored.includes(line), `stored: ${line}`);
+  });
+});
+
+test('a notice that cannot be stored after the move keeps the archive for the next run', () => {
+  withRollbackVault(({ dir, shas }) => {
+    put(dir, 'projects/p/hot.md', 'my own hot\n');
+    const r = rollbackSessionEntries(dir, {
+      at: shas[1],
+      testHooks: {
+        // the clearing step stored its notice; now the store becomes unwritable
+        afterArchive: () => {
+          unlinkSync(NOTICE_FILE(dir));
+          mkdirSync(NOTICE_FILE(dir));
+        },
+      },
+    });
+    assert.equal(r.rolledBack, true, r.notices.join('\n'));
+    assert.ok(existsSync(join(dir, '.cache', 'pull-archive.json')), 'the archive stays');
   });
 });
