@@ -645,7 +645,7 @@ test('--project: a directory stored in NFD is refused with the rename message, n
       const err = JSON.parse(r.stdout).error;
       assert.match(err, /Rename projects\/.+ to its NFC spelling/, err);
       assert.ok(
-        err.includes(`/hypo:rename --from="projects/${KO_PROJECT_NFD}" --to="projects/`),
+        err.includes(`/hypo:rename --from="projects/${KO_PROJECT_NFD}/" --to="projects/`),
         err,
       );
       assert.doesNotMatch(err, /does not exist/);
@@ -6078,6 +6078,50 @@ test('IMPR-34: a non-close file under the foreign project does NOT put it in sco
       );
     },
   );
+});
+
+// A transcript path can spell a Korean project in NFD while the directory, and so the evaluation
+// target, is NFC. Left as written, the slug misses `scopeSet.has(p.project)` and this session's own
+// incomplete project is demoted to another session's debt, which lets the marker through.
+test('a transcript naming this session’s incomplete project by an NFD path keeps it in scope, as the NFC path does', () => {
+  const today = todayLocal();
+  const projects = [
+    { slug: 'mine', date: today },
+    { slug: KO_PROJECT, date: today, sessionLog: false },
+  ];
+  assert.notEqual(KO_PROJECT_NFD, KO_PROJECT, 'fixture: the two spellings differ in bytes');
+  const seen = {};
+  for (const [label, spelled] of [
+    ['nfc', KO_PROJECT],
+    ['nfd', KO_PROJECT_NFD],
+  ]) {
+    withClosePartitionWiki(
+      projects,
+      [`projects/${spelled}/session-log/x.md`],
+      (dir, transcript) => {
+        const gate = precompactGateStatus(dir, {
+          closeScope: ['mine'],
+          transcriptPath: transcript,
+          claudeHome: join(dir, '.claude-none'),
+        });
+        const close = gate.blockers.find((b) => b.type === 'close');
+        assert.ok(
+          close,
+          `[${label}] the incomplete project is this session's: ${JSON.stringify(gate)}`,
+        );
+        assert.ok(close.reason.includes(`projects/${KO_PROJECT}/`), `[${label}] ${close.reason}`);
+        assert.deepEqual(
+          gate.notices.filter((n) => n.type === 'close-debt'),
+          [],
+          `[${label}] it is not reported as another session's debt`,
+        );
+        assert.ok(gate.close.scope.includes(KO_PROJECT), `[${label}] ${gate.close.scope}`);
+        assert.equal(gate.close.scope.includes(KO_PROJECT_NFD), false, `[${label}] scope is NFC`);
+        seen[label] = gate.close.scope;
+      },
+    );
+  }
+  assert.deepEqual(seen.nfd, seen.nfc, 'the NFD spelling scopes exactly as the NFC one');
 });
 
 // The session's OWN incomplete close must still hard-block. This is the guard that

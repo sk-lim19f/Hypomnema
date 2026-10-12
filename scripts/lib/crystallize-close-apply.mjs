@@ -4755,12 +4755,24 @@ function buildCloseResult({
   restructureWaivers,
   obsoleteNotices,
   hostTagWarning,
+  hypoDir,
+  appliedPaths,
 }) {
-  // `applied` names every write this run made; the session-log and log.md appends that were taken
-  // back are not on disk any more, so they are not listed as uncommitted work.
-  const stillOnDisk = applied.filter(
-    (a) => !withdrawnAppends.some((rel) => a.includes(`(${rel})`) || a.includes(`(${rel},`)),
-  );
+  // The paths this close owns (`appliedPaths`) and still has on disk uncommitted. A write that was
+  // already current on a retry sits in `skipped`, not `applied`, yet is as uncommitted as a fresh
+  // one, so both lists are read. The session-log and log.md appends that were taken back are not
+  // on disk any more, and a path whose bytes HEAD already holds is not uncommitted work.
+  const stillOnDisk = [...applied, ...skipped].filter((line) => {
+    const rel = appliedPaths.find((p) => line.includes(`(${p})`) || line.includes(`(${p},`));
+    if (rel === undefined || withdrawnAppends.includes(rel)) return false;
+    let disk;
+    try {
+      disk = readFileSync(join(hypoDir, rel), 'utf-8');
+    } catch {
+      return false;
+    }
+    return headBlobText(hypoDir, rel) !== disk;
+  });
   return {
     ok,
     stage,
@@ -5736,6 +5748,8 @@ export function applySessionClose(args, testHooks = null) {
     restructureWaivers,
     obsoleteNotices: [...obsoleteNotices, ...notices],
     hostTagWarning: hostTagNotice,
+    hypoDir: args.hypoDir,
+    appliedPaths,
   });
 
   if (args.json) {

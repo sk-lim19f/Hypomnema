@@ -8153,8 +8153,12 @@ export function resolveCloseScope(hypoDir, opts = {}, marker = null) {
   // that project's stale close block an unrelated close today (codex round 2,
   // reproduced with a 24h-old marker). The returned Set carries `direct` as a
   // property so the caller does not re-derive it, and the transcript is parsed once.
-  const scope = new Set(opts.closeScope || []);
-  for (const p of projectsFromTouchedCloseFiles(opts.transcriptPath, hypoDir)) scope.add(p);
+  // Every slug enters the sets in NFC: valid project directories are NFC and NFD ones are refused, so
+  // NFC is the key the evaluation targets and `scope.has(p.project)` use. A transcript path spelled
+  // in NFD would otherwise make this session's own project look foreign.
+  const nfc = (p) => (typeof p === 'string' ? p.normalize('NFC') : p);
+  const scope = new Set((opts.closeScope || []).map(nfc));
+  for (const p of projectsFromTouchedCloseFiles(opts.transcriptPath, hypoDir)) scope.add(nfc(p));
   // Marker attribution (session-close attribution). A v4 marker carries `projects` — the
   // evidence-based set it closed (never recency) — trusted directly. A pre-v4
   // legacy marker carries only `project` with no provenance, and that value may be
@@ -8174,12 +8178,12 @@ export function resolveCloseScope(hypoDir, opts = {}, marker = null) {
   // also narrows sessionCloseGlobalStatus's own evaluation and turns off the
   // partition below), while this one only widens the set the partition demotes
   // everything outside of.
-  if (opts.attributionScope) scope.add(opts.attributionScope);
+  if (opts.attributionScope) scope.add(nfc(opts.attributionScope));
   // Snapshot the direct signals BEFORE the marker union below widens the set.
   scope.direct = new Set(scope);
 
   if (Array.isArray(marker?.projects)) {
-    for (const p of marker.projects) if (p) scope.add(p);
+    for (const p of marker.projects) if (p) scope.add(nfc(p));
   }
   return scope;
 }
