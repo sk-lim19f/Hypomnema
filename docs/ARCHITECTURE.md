@@ -338,7 +338,10 @@ Session close does not write `hot.md` or `session-state.md`. Each close writes o
 (`entry_schema`, `close_id`, `tracks`) and whose body holds a summary and one section per track.
 Entries are never deleted. Concurrent closes (two sessions, two machines) write different files, so
 nothing is overwritten; the head of a track is the update no later update supersedes, and a track
-with several heads shows all of them. `hooks/session-entries.mjs` holds the entry format and the
+with several heads shows all of them. Entries are ordered newest first by `date`, then by the
+`closed_at` time the close wrote (ISO 8601 UTC), so two closes on one day sort by when they ran, and
+an entry without `closed_at` (a baseline, or one written by an older version) sorts after the
+same-day entries that have it. `hooks/session-entries.mjs` holds the entry format and the
 renderers, `hooks/session-views.mjs` loads the model and writes the views. Root `hot.md`, project
 `hot.md` and project `session-state.md` are listed in the vault `.gitignore` (the block in
 `templates/gitignore`) and are not committed. `projects/<p>/notes.md` is hand-written, not
@@ -349,6 +352,11 @@ SessionStart. A vault with a remote only gets a notice (at most once a day) unti
 `/hypo:upgrade --migrate-sessions` after every machine has the new version; the command pulls first,
 migrates, then pushes. Before the move, a close writes entries only, the tracked old files are read
 as a virtual baseline for injection and resume, and nothing is written to the generated paths.
+The move turns each old `hot.md` and `session-state.md` into a baseline entry. An old
+`session-state.md` that has a `## Next Up` (or `## 다음 이어받기`) section with `###` tracks, or one
+with a `트랙:` / `Tracks:` list line whose named `##` sections follow, becomes one head per track,
+so a later close can finish one track without touching the others; any other file stays one
+`legacy` head.
 `node scripts/session-entries.mjs rollback --at=<commit>` re-tracks flat files rendered from the
 entries at that commit and adds the `.hypo-session-entries-off` marker; the vault then counts as
 opted out and no hook migrates it again until `--migrate-sessions` is run. A machine on an older

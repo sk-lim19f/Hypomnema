@@ -31,6 +31,7 @@ import {
   missingBlockLines,
   narrowestVisibilityScope,
   parseSessionEntry,
+  projectNameProblem,
   renderViews,
   splitLegacyFrontmatter,
   trackHeads,
@@ -85,8 +86,10 @@ export {
 /**
  * How long into a SessionStart the hook may still begin moving a vault to the scheme. Past this the
  * move waits for the next session; a move that has begun always runs to its end. Measured on a
- * 17-project vault: the migration stage took 7.0s and rendering 0.6s, so a start at 15s ends well
- * inside the 30s SessionStart timeout (a start at 20s left 2.4s).
+ * 17-project vault: the migration stage took 7.0s (about 0.4s per project for the move) and
+ * rendering 0.6s, so a start at 15s ends well inside the 30s SessionStart timeout (a start at 20s
+ * left 2.4s). The 15s value assumes a vault of about that size: the move costs about 0.4s per
+ * project, so a vault several times larger can still overrun the timeout once begun.
  */
 export const MIGRATION_START_DEADLINE_MS = 15000;
 
@@ -200,6 +203,15 @@ function oldFileText(views, rel, text, rolledBack = {}) {
 export function offMarkerText(point, date, flat) {
   const lines = flat.map((f) => `${sha256(f.text)}  ${f.relPath}`);
   return `rolled back to ${point} on ${date}\n${lines.map((l) => `${l}\n`).join('')}`;
+}
+
+// The ids of the old-scheme tracks (`legacy` and each `legacy-*` split out of one file) whose every
+// head is done in the project's real entries. Each id is judged on its own: finishing the leftover
+// `legacy` does not finish a track that was split out of the same file.
+function doneLegacyTracks(hypoDir, slug) {
+  return trackHeads(listSessionEntries(hypoDir, slug).entries)
+    .filter((t) => t.done && (t.trackId === LEGACY_TRACK_ID || t.trackId.startsWith('legacy-')))
+    .map((t) => t.trackId);
 }
 
 // The in-memory entries that stand for a not-yet-migrated project's old `hot.md` and
@@ -547,9 +559,6 @@ export function moveLegacyFilesToEntriesUnlocked(hypoDir, own) {
       continue;
     }
     const indexText = lenientRead(join(base, 'index.md'));
-    const legacy = trackHeads(listSessionEntries(hypoDir, slug).entries).find(
-      (t) => t.trackId === LEGACY_TRACK_ID,
-    );
     const indexScope = readVisibilityScope(indexText ?? '');
     const plan = buildLegacyBaselines({
       hotText,
@@ -557,7 +566,7 @@ export function moveLegacyFilesToEntriesUnlocked(hypoDir, own) {
       date: legacyBaselineDate(hypoDir, slug, [hotText ?? '', stateText ?? '']),
       project: slug,
       scopes: baselineScopes(indexText, hotText, stateText),
-      legacyDone: legacy?.done === true,
+      legacyDone: doneLegacyTracks(hypoDir, slug),
     }).map((built) => ({
       built,
       relPath: `projects/${slug}/sessions/${built.fileName}`,
@@ -981,6 +990,28 @@ const deferredMigration = (reason, detail) =>
     notices: [`이행을 다음 세션으로 미뤘습니다: ${detail ?? reason}`],
   });
 
+// A name `projectNameProblem` accepts, close to `slug`: runs of characters outside the project
+// charset become `-`, the NFC form is taken, and a name left without a letter or number falls back.
+function suggestedProjectName(slug) {
+  const name = slug
+    .normalize('NFC')
+    .replace(/[^\p{L}\p{M}\p{N}._-]+/gu, '-')
+    .replace(/^-+|-+$/g, '');
+  return projectNameProblem(name) === null ? name : 'project';
+}
+
+// One directory's line of the invalid-name notice: why, and the `/hypo:rename` command to a valid name.
+function renameAdvice(slug, problem) {
+  const why =
+    problem === 'not-nfc'
+      ? '이름이 NFC 형태가 아니라(macOS에서 만든 분해형 한글 등) git이 보고하는 경로와 맞지 않습니다'
+      : '이름에 공백이나 기호가 있습니다';
+  return (
+    `projects/${slug}: ${why}. ` +
+    `/hypo:rename --from="projects/${slug}" --to="projects/${suggestedProjectName(slug)}" (--to는 예시이고, 쓸 수 있는 글자는 문자, 숫자, ., _, - 입니다).`
+  );
+}
+
 /**
  * Move a vault from tracked `hot.md`/`session-state.md` files to session entries: one commit with a
  * baseline entry per old file HEAD tracks, in each project (each whole, as HEAD has it, with its own
@@ -1064,6 +1095,21 @@ export function migrateVaultToSessionEntriesUnlocked(hypoDir, opts = {}) {
   const slugs = [...new Set(tracked.map((rel) => generatedViewSlug(rel)))]
     .filter(Boolean)
     .sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+  // A project directory whose name an entry cannot carry (a space or symbol, or not in NFC) would
+  // make the baseline build throw. Nothing is written until the person renames it; the notice names
+  // each directory, the reason and the command.
+  const badNames = slugs
+    .filter((slug) => !projectHiddenByHypoignore(hypoDir, slug, patterns))
+    .map((slug) => [slug, projectNameProblem(slug)])
+    .filter(([, problem]) => problem !== null);
+  if (badNames.length) {
+    return deferredMigration(
+      'invalid-project-name',
+      '프로젝트 디렉터리 이름을 세션 원본에 쓸 수 없어 아무것도 쓰지 않았습니다. ' +
+        `${badNames.map(([slug, problem]) => renameAdvice(slug, problem)).join(' ')} ` +
+        '이름을 바꾸고 커밋한 뒤 다시 시작하세요.',
+    );
+  }
   const leftLocal = listSessionProjects(hypoDir)
     .filter((slug) => !projectHiddenByHypoignore(hypoDir, slug, patterns))
     .flatMap((slug) => OLD_NAMES.map((name) => `projects/${slug}/${name}`))
@@ -1131,19 +1177,17 @@ export function migrateVaultToSessionEntriesUnlocked(hypoDir, opts = {}) {
       });
     }
     const indexScope = readVisibilityScope(showText(hypoDir, 'HEAD', `projects/${slug}/index.md`));
-    // An update the old scheme already sent to `legacy` with `done` replaced the virtual baseline,
-    // whose id covers the bytes of this moment. The real baseline gets another id when the files
-    // changed since, so it is built folded to keep that `done` effective.
-    const legacy = trackHeads(listSessionEntries(hypoDir, slug).entries).find(
-      (t) => t.trackId === LEGACY_TRACK_ID,
-    );
+    // An update the old scheme already sent to `legacy` (or to a `legacy-*` track split out of the
+    // file) with `done` replaced the virtual baseline, whose id covers the bytes of this moment. The
+    // real baseline gets another id when the files changed since, so each head whose own track was
+    // finished is built folded to keep that `done` effective.
     const built = buildLegacyBaselines({
       hotText,
       stateText,
       date: legacyBaselineDate(hypoDir, slug, [hotText ?? '', stateText ?? '']),
       project: slug,
       scopes: { ...baselineScopes('', hotText, stateText), index: indexScope },
-      legacyDone: legacy?.done === true,
+      legacyDone: doneLegacyTracks(hypoDir, slug),
     });
     for (const b of built) {
       notices.push(...baselineScopeNotices(slug, b, indexScope));

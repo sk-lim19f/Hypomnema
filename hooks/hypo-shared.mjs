@@ -31,6 +31,7 @@ import { isValidSessionId } from './proposal-store.mjs';
 import {
   GITIGNORE_BLOCK,
   LEGACY_TRACK_ID,
+  NEXT_UP_HEADINGS,
   buildLegacyBaselines,
   generatedViewSlug,
   isGeneratedViewPath,
@@ -2575,7 +2576,12 @@ function clearBlockingPaths(hypoDir, targetRev, opts) {
   // for are someone's own writing: keep a copy and say so (`unowned[]`). Bytes that are exactly
   // what HEAD tracks need no copy either: the merge keeps HEAD in the history, so nothing is lost
   // (the first move of a vault has no ownership record yet, and every clean old file reads as
-  // unvouched without this).
+  // unvouched without this). A re-enable range (it removes the off marker) gets no such vouch: the
+  // rollback committed the flat file, so HEAD tracks it and the merge replaces it with the generated
+  // view, and a person's rolled-back writing would be lost without the copy.
+  const reenabling = incoming.some(
+    (c) => c.status === 'D' && c.path === SESSION_ENTRIES_OFF_MARKER,
+  );
   if (incoming.some((c) => c.status === 'D' && c.path === 'hot.md') && !dirty.has('hot.md')) {
     const text = readTextOrNull(join(hypoDir, 'hot.md'));
     if (text !== null) {
@@ -2584,7 +2590,7 @@ function clearBlockingPaths(hypoDir, targetRev, opts) {
       const vouched = [
         readGeneratedViewsRecord(hypoDir).views['hot.md'],
         readRootHotProjectionOwnership(hypoDir).lastHash,
-        inHead === null ? null : sha256Hex(lfText(inHead)),
+        inHead === null || reenabling ? null : sha256Hex(lfText(inHead)),
       ];
       if (!vouched.includes(sha)) {
         cacheGate();
@@ -9101,8 +9107,11 @@ export function readChecklist(today) {
 
 // ── session-state schema ───────────────────────────────────────────────────
 
-/** Accepted heading aliases for the "next task" section in session-state.md. */
-export const SESSION_STATE_NEXT_HEADINGS = ['다음 이어받기', '다음 작업', 'Next Up', 'Next'];
+/**
+ * Accepted heading aliases for the "next task" section in session-state.md. The list lives in
+ * session-entries.mjs (the baseline split reads it too); this is the name lint imports.
+ */
+export const SESSION_STATE_NEXT_HEADINGS = NEXT_UP_HEADINGS;
 
 // ── misc helpers ───────────────────────────────────────────────────────────
 

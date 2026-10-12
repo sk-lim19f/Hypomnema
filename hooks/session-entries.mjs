@@ -84,6 +84,11 @@ export const GITIGNORE_BLOCK = `# Hypomnema: session views generated from projec
 /projects/*/sessions/*.tmp
 `;
 
+// The `log.md merge=union` line is deliberately unanchored: git reads a pattern without a slash at
+// any depth, so it covers every `log.md` in the vault, not only the root one. It stays that way
+// because it is the line people already wrote by hand; an anchored `/log.md` would not match it
+// and would read as a missing block line in their vaults. The comment inside the block is block
+// bytes, so it is not reworded here (an edition change needs an entry in the previous-editions list).
 export const GITATTRIBUTES_BLOCK = `# Hypomnema: session-log shards are append-only, keep both sides on a merge
 projects/*/session-log/*.md merge=union
 # The root log.md is append-only too: two clones closing on the same day both add lines to it
@@ -404,18 +409,31 @@ export function splitLegacyFrontmatter(text) {
   return { frontmatter: text.slice(0, end), body: text.slice(end) };
 }
 
-// The headings that open the "what to do next" part of an old `session-state.md`: the same names
-// `SESSION_STATE_NEXT_HEADINGS` in hypo-shared lists, kept here because hooks/shared files cannot
-// import hypo-shared. `## Next Up` is what the generator renders.
-const NEXT_UP_HEADINGS = ['다음 이어받기', '다음 작업', 'Next Up', 'Next'];
+// The headings that open the "what to do next" part of an old `session-state.md`. The one list:
+// hypo-shared re-exports it as `SESSION_STATE_NEXT_HEADINGS` for lint. `## Next Up` is what the
+// generator renders.
+export const NEXT_UP_HEADINGS = ['다음 이어받기', '다음 작업', 'Next Up', 'Next'];
 
-// `[{level, title, start, end}]` for every `##` and `###` heading line of `text` outside code fences
-// and outside the frontmatter. `start` is the offset of the line, `end` the offset just past its
-// newline (or the text length).
+// Whether an HTML comment is still open after `line`, given whether one was open before it.
+function commentOpenAfter(line, open) {
+  let i = 0;
+  let o = open;
+  for (;;) {
+    const j = line.indexOf(o ? '-->' : '<!--', i);
+    if (j === -1) return o;
+    i = j + (o ? 3 : 4);
+    o = !o;
+  }
+}
+
+// `[{level, title, start, end}]` for every `##` and `###` heading line of `text` outside code fences,
+// HTML comments and the frontmatter. `start` is the offset of the line, `end` the offset just past
+// its newline (or the text length).
 function headingLines(text) {
   const out = [];
   let pos = Math.max(0, frontmatterEnd(text));
   let fence = null; // {char, len} while inside a fenced block
+  let comment = false; // inside an HTML comment that began on an earlier line
   while (pos < text.length) {
     const nl = text.indexOf('\n', pos);
     const end = nl === -1 ? text.length : nl + 1;
@@ -424,15 +442,34 @@ function headingLines(text) {
     if (fence) {
       if (f && f[1][0] === fence.char && f[1].length >= fence.len && f[2].trim() === '')
         fence = null;
+    } else if (comment) {
+      comment = commentOpenAfter(line, true);
     } else if (f) {
       fence = { char: f[1][0], len: f[1].length };
     } else {
       const h = /^(#{2,3})[ \t]+(\S.*?)[ \t]*$/.exec(line);
       if (h) out.push({ level: h[1].length, title: h[2], start: pos, end });
+      else comment = commentOpenAfter(line, false);
     }
     pos = end;
   }
   return out;
+}
+
+// The `##` sections among `after` named by the track list line in the next-up section's preamble
+// (the text from `next` to the heading that follows it, `first`). `[]` when there is no such line.
+function listedTracks(text, next, first, after) {
+  const preamble = text.slice(next.end, first?.start ?? text.length);
+  const line = /^(?:트랙|Tracks):[ \t]*(.+)$/m.exec(preamble);
+  if (!line) return [];
+  const items = line[1]
+    .replace(/\.(?:\s.*)?$/, '')
+    .split(/[·,/]/)
+    .map((i) => i.trim())
+    .filter(Boolean);
+  const named = (title) =>
+    items.some((i) => title.startsWith(i) && !/^[\p{L}\p{N}]/u.test(title.slice(i.length)));
+  return after.filter((h) => h.level === 2 && named(h.title));
 }
 
 /**
@@ -442,7 +479,11 @@ function headingLines(text) {
  * NEXT_UP_HEADINGS):
  *   - that section holds `###` subsections: each `###` section is a track (the generator's own
  *     `## Next Up` and a hand-written one);
- *   - it holds none: each `##` section after it is a track (one `##` section per track).
+ *   - it holds none, but its preamble has a track list line (`트랙:` or `Tracks:`, items separated
+ *     by `·`, `,` or `/`, the list ends at the first sentence end): each `##` section after it whose
+ *     title starts with a listed item is a track. Any other `##` section (notes, "common" parts)
+ *     stays in `rest`. Without a list line nothing is split, so a file that merely has several
+ *     `##` sections is never read as having tracks.
  * A track's `title` is its heading text, `body` the text after the heading line up to the next
  * section boundary. `rest` is every byte outside the track bodies and heading lines, in file order
  * (frontmatter, preamble, the next-up heading itself, sections that are not tracks). Cutting
@@ -459,7 +500,7 @@ export function splitStateTracks(text) {
   const nextTwo = after.findIndex((h) => h.level === 2);
   const inside = nextTwo === -1 ? after : after.slice(0, nextTwo);
   const sub = inside.filter((h) => h.level === 3);
-  const picked = sub.length >= 2 ? sub : after.filter((h) => h.level === 2);
+  const picked = sub.length >= 2 ? sub : listedTracks(text, heads[at], heads[at + 1], after);
   // A track section stops at the next heading of its own or a higher level, else at the text end.
   const tracksFound = picked.map((h) => ({
     ...h,
@@ -508,6 +549,15 @@ function baselineIdOf(kind, content, done, scope) {
   return `baseline-${h16}`;
 }
 
+// The `done` part of a baseline id's input. An unsplit file hashes one flag (is `legacy` done); a
+// split one (`splitIds`: the ids of its split-out tracks) hashes which of its own heads are done,
+// `false` when none is. The writer and `baselineIdMismatch` both go through here.
+function doneKeyOf(splitIds, doneIds) {
+  if (!splitIds) return doneIds.has(LEGACY_TRACK_ID);
+  const done = [LEGACY_TRACK_ID, ...splitIds].filter((id) => doneIds.has(id)).sort();
+  return done.length ? done : false;
+}
+
 /**
  * The entry that stands in for ONE of a project's old files: `kind` `'hot'` is the old `hot.md`
  * (the entry's summary, no tracks), `'state'` the old `session-state.md` (an empty summary and one
@@ -520,22 +570,30 @@ function baselineIdOf(kind, content, done, scope) {
  * endings normalized to LF. A CRLF source would otherwise leave `\r` in a blob that
  * `.gitattributes` (`eol=lf`) rewrites on checkout, so the path would read as modified forever, and
  * a CRLF machine and an LF machine would hash the same content to different paths. Returns
- * `{kind, closeId, fileName, text}`. The id hashes the kind, the text (or its split form),
- * `legacyDone` (state only, applied to every track of the entry) and `visibilityScope`, so two
- * machines with the same inputs write the same path and bytes, the two files of one project never
- * share an id, and inputs that differ in any of those land on different paths instead of colliding.
+ * `{kind, closeId, fileName, text}`. The id hashes the kind, the text (or its split form), which
+ * heads are done (state only: `legacyDone` is `true` for the `legacy` head, or the ids of every
+ * finished `legacy` and `legacy-*` track) and `visibilityScope`, so two machines with the same
+ * inputs write the same path and bytes, the two files of one project never share an id, and inputs
+ * that differ in any of those land on different paths instead of colliding.
  */
 export function buildBaselineEntry({ kind, text, date, visibilityScope, project, legacyDone }) {
   if (kind !== 'hot' && kind !== 'state')
     throw fail('invalid-entry', `invalid baseline kind: ${kind}`);
   const body = (text ?? '').replace(/\r\n/g, '\n');
-  const done = kind === 'state' && Boolean(legacyDone);
   const scope = visibilityScope || null;
   const split = kind === 'state' ? splitStateTracks(body) : null;
+  // `legacyDone` is `true` (the `legacy` track only) or the ids of the old-scheme tracks that were
+  // finished (`legacy` and `legacy-*`). A head is done only when its own id is in the set: finishing
+  // the leftover `legacy` must not finish tracks that were split out of the same file.
+  const doneIds =
+    kind !== 'state' || !legacyDone
+      ? new Set()
+      : new Set(legacyDone === true ? [LEGACY_TRACK_ID] : legacyDone);
+  const isDone = (id) => doneIds.has(id);
   const closeId = baselineIdOf(
     kind,
     split ? [split.rest, split.tracks.map((t) => [t.id, t.title, t.body])] : body,
-    done,
+    doneKeyOf(split ? split.tracks.map((t) => t.id) : null, doneIds),
     scope,
   );
   let tracks = [];
@@ -548,7 +606,7 @@ export function buildBaselineEntry({ kind, text, date, visibilityScope, project,
       id: h.id,
       title: h.title,
       new: true,
-      ...(done ? { done: true } : {}),
+      ...(isDone(h.id) ? { done: true } : {}),
     }));
     bodies = Object.fromEntries(heads.map((h) => [h.id, h.body]));
   }
@@ -615,7 +673,11 @@ export function baselineIdMismatch(fileName, text) {
       ? [own, others.map((t) => [t.id, t.title ?? '', e.bodies[t.id] ?? ''])]
       : own;
   }
-  const expected = baselineIdOf(kind, content, legacy?.done === true, e.visibilityScope || null);
+  const doneIds = new Set(e.tracks.filter((t) => t.done === true).map((t) => t.id));
+  const doneKey = legacy
+    ? doneKeyOf(others.length ? others.map((t) => t.id) : null, doneIds)
+    : false;
+  const expected = baselineIdOf(kind, content, doneKey, e.visibilityScope || null);
   const inName = /-(baseline-[0-9a-f]{16})\.md$/.exec(fileName)?.[1] ?? null;
   if (expected === e.closeId && expected === inName) return null;
   return { expected, inName, inEntry: e.closeId };
