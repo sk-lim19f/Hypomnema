@@ -6311,6 +6311,28 @@ test('re-enabling after a rollback whose marker was recommitted with CRLF bytes 
   });
 });
 
+test('rollback keeps leftover render temp files and old adjacent backups ignored while the flat files are tracked', () => {
+  withRollbackVault(({ dir, shas }) => {
+    const residue = [
+      'projects/p/hot.md.20753.q5rab15x.tmp',
+      'hot.md.20753.q5rab15x.tmp',
+      'projects/p/hot.md.pre-projection-backup-1.md',
+      'projects/p/sessions/2026-10-09-x-0.md.tmp',
+    ];
+    for (const rel of residue) put(dir, rel, 'left by a killed render\n');
+    assert.equal(cgitOk(dir, ['status', '--porcelain']), '', 'ignored before the rollback');
+    const r = rollbackSessionEntries(dir, { at: shas[1] });
+    assert.equal(r.rolledBack, true, r.notices.join('\n'));
+    for (const rel of residue) cgitOk(dir, ['check-ignore', '-q', '--', rel]); // throws unless ignored
+    assert.equal(cgitOk(dir, ['status', '--porcelain']), '', 'nothing left to stage');
+    const tracked = cgitOk(dir, ['ls-files', '--', ...RB_TRACKED])
+      .trim()
+      .split('\n');
+    assert.ok(tracked.includes('projects/p/hot.md'), 'the flat files are tracked');
+    assert.ok(!showHead(dir, '.gitignore').includes('\n/projects/*/hot.md\n'), 'view paths went');
+  });
+});
+
 test('rollback keeps the local views of a project .hypoignore hides out of git: excluded locally, bytes untouched, the committed .gitignore silent', () => {
   withRollbackVault(({ dir, shas }) => {
     put(dir, '.hypoignore', 'projects/h/\n');

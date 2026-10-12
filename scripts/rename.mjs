@@ -444,6 +444,25 @@ function runDirectory(args, fromDirRel, ignorePatterns) {
   if (toDirRel === fromDirRel) {
     fail(args, `--from and --to are the same directory (${toDirRel}) — nothing to rename`);
   }
+  // A project directory with entries cannot move: each entry's `project:` field names the
+  // directory it was written in and is immutable, so the move would leave close recovery and the
+  // missing-predecessor check reading the old name. The display name is the index.md title.
+  if (/^projects\/[^/]+$/.test(fromDirRel)) {
+    let hasEntries = false;
+    try {
+      hasEntries = readdirSync(join(fromAbs, 'sessions')).some((f) => f.endsWith('.md'));
+    } catch {
+      // no sessions/ directory: no entries
+    }
+    if (hasEntries) {
+      fail(
+        args,
+        `--from '${fromDirRel}' has session entries, and each entry records the project directory ` +
+          `it was written in, so the directory cannot be renamed. The project's display name is ` +
+          `the \`title\` in ${fromDirRel}/index.md: change that instead.`,
+      );
+    }
+  }
   // Same top-level segment only. A move that changes the leading scan-dir segment
   // (e.g. journal/x → pages/x) would change the targetability class and the
   // dir-relative form semantics; that is out of scope for this increment.
@@ -836,6 +855,24 @@ function run(args) {
     writeRenameMarker(args, thisMarker);
   }
 
+  // Entries are never rewritten, so the ones that link to the old name keep doing so, and every
+  // render of their views writes that old link back. Count them for the report.
+  let entriesWithOldLink = 0;
+  for (const p of pages) {
+    if (!isSessionEntryPath(p.rel)) continue;
+    try {
+      const { rewrites } = rewriteContent(
+        readFileSync(p.path, 'utf-8'),
+        fromPage,
+        toPage,
+        formIndex,
+      );
+      if (rewrites.length > 0) entriesWithOldLink++;
+    } catch {
+      // unreadable entry: not counted
+    }
+  }
+
   // Rewrite inbound references across every NON-preserved page (skip the moved
   // page itself — self-references are rewritten on its own content separately).
   const fileResults = [];
@@ -914,6 +951,7 @@ function run(args) {
     links_rewritten: totalRewrites,
     rewrites: fileResults,
     ambiguous: ambiguities,
+    session_entries_with_old_link: entriesWithOldLink,
   };
 
   if (args.json) {
@@ -921,6 +959,12 @@ function run(args) {
   } else {
     const mode = args.apply ? 'Renamed' : 'Dry-run (no changes written)';
     console.log(`${mode}: ${fromPage.rel} → ${toRel}`);
+    if (entriesWithOldLink > 0) {
+      console.log(
+        `  ${entriesWithOldLink} session entr${entriesWithOldLink === 1 ? 'y still links' : 'ies still link'} to the old name. ` +
+          `Entries are never rewritten, so their rendered views keep the old link.`,
+      );
+    }
     console.log(`  ${totalRewrites} inbound link(s) across ${fileResults.length} file(s).`);
     for (const f of fileResults) {
       console.log(`  · ${f.file}: ${f.rewrites.map((r) => `${r.from}→${r.to}`).join(', ')}`);

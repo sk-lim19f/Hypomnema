@@ -5,7 +5,7 @@
 
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { tmpdir } from 'node:os';
 import { parseSchemaVocab, appendPendingTags } from '../scripts/lib/schema-vocab.mjs';
@@ -3976,6 +3976,61 @@ test('the three generated views of a project lint with no errors', () => {
     const r = run('lint.mjs', [`--hypo-dir=${dir}`, '--json']);
     const out = JSON.parse(r.stdout);
     assert.deepEqual(out.errors, [], r.stdout);
+    assert.equal(r.status, 0, r.stdout);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('generated views whose entries link a renamed-away page raise no broken-link warning, even under --strict', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'hypo-lint-views-'));
+  try {
+    mkdirSync(join(dir, 'projects', 'p', 'sessions'), { recursive: true });
+    writeFileSync(join(dir, 'projects', 'p', 'index.md'), ENTRY_INDEX);
+    writeFileSync(
+      join(dir, 'projects', 'p', 'sessions', '2026-10-01-s1-0.md'),
+      entryText({ summary: 'see [[pages/old-name]]', bodies: { main: 'and [[pages/old-name]]' } }),
+    );
+    const model = loadSessionModel(dir, 'p', { state: 'migrated' });
+    const views = renderViews([model], { device: 'dev-test' });
+    writeFileSync(join(dir, 'projects', 'p', 'hot.md'), views.projects.p.hot);
+    writeFileSync(join(dir, 'projects', 'p', 'session-state.md'), views.projects.p.sessionState);
+    writeFileSync(join(dir, 'hot.md'), views.root);
+    const viewText = [views.projects.p.hot, views.projects.p.sessionState, views.root].join('\n');
+    assert.ok(viewText.includes('[[pages/old-name]]'), 'the views carry the old link');
+    const r = run('lint.mjs', [`--hypo-dir=${dir}`, '--json', '--strict']);
+    const out = JSON.parse(r.stdout);
+    const broken = [...out.errors, ...out.warns].filter((i) => /Broken wikilink/.test(i.message));
+    assert.deepEqual(broken, [], r.stdout);
+    assert.equal(r.status, 0, r.stdout);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('the generated root hot.md links a project whose views this machine has not rendered yet, and strict lint does not block on it', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'hypo-lint-root-'));
+  try {
+    for (const p of ['p', 'q']) {
+      mkdirSync(join(dir, 'projects', p, 'sessions'), { recursive: true });
+      writeFileSync(join(dir, 'projects', p, 'index.md'), ENTRY_INDEX);
+      writeFileSync(
+        join(dir, 'projects', p, 'sessions', '2026-10-01-s1-0.md'),
+        entryText({ summary: `summary of ${p}`, bodies: { main: 'body' } }),
+      );
+    }
+    const models = ['p', 'q'].map((p) => loadSessionModel(dir, p, { state: 'migrated' }));
+    const views = renderViews(models, { device: 'dev-test' });
+    // Only p's views exist here: q's are written by a later Stop, but the root table already rows it.
+    writeFileSync(join(dir, 'projects', 'p', 'hot.md'), views.projects.p.hot);
+    writeFileSync(join(dir, 'projects', 'p', 'session-state.md'), views.projects.p.sessionState);
+    writeFileSync(join(dir, 'hot.md'), views.root);
+    assert.ok(views.root.includes('[[projects/q/hot]]'), 'the root rows q');
+    assert.ok(!existsSync(join(dir, 'projects', 'q', 'hot.md')), 'q has no view on disk');
+    const r = run('lint.mjs', [`--hypo-dir=${dir}`, '--json', '--strict']);
+    const out = JSON.parse(r.stdout);
+    const broken = [...out.errors, ...out.warns].filter((i) => /Broken wikilink/.test(i.message));
+    assert.deepEqual(broken, [], r.stdout);
     assert.equal(r.status, 0, r.stdout);
   } finally {
     rmSync(dir, { recursive: true, force: true });

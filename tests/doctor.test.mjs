@@ -4329,6 +4329,16 @@ test('doctor-session-entries: close headings without an entry are reported insid
     const c = seCheck(seDoctor(dir), 'Session old-version closes');
     assert.equal(c.status, 'warn', c.detail);
     assert.ok(c.detail.includes('p (2026-10-09)'), c.detail);
+    assert.ok(
+      c.detail.includes(
+        'A past trace leaves this report after 7 days, and upgrading that machine stops new ones',
+      ),
+      c.detail,
+    );
+    assert.ok(
+      !c.detail.includes('upgrade that machine'),
+      `the old remedy text is gone: ${c.detail}`,
+    );
     assert.ok(!c.detail.includes('q ('), `D-9 is outside the window: ${c.detail}`);
     assert.ok(!c.detail.includes('r ('), `a project with its entry is not a trace: ${c.detail}`);
   });

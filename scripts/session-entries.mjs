@@ -71,11 +71,22 @@ const deferred = (reason, detail) => ({
   notices: [`롤백을 미뤘습니다: ${detail ?? reason}`],
 });
 
+// The ignore lines of `GITIGNORE_BLOCK` that cover crash residue (a killed render's `.tmp`
+// sibling, a backup copy left beside a view, a half-written entry), as opposed to the view paths
+// and the cache. They are taken from the block itself so the two cannot drift apart.
+const RESIDUE_IGNORE_HEADER = '# Hypomnema: temporary and backup files left beside session views';
+const RESIDUE_IGNORE_BLOCK = `${RESIDUE_IGNORE_HEADER}\n${GITIGNORE_BLOCK.split('\n')
+  .filter((l) => l.endsWith('.tmp') || l.includes('pre-projection-backup'))
+  .map((l) => `${l}\n`)
+  .join('')}`;
+
 // `text` without the Hypomnema block (the current edition or a known earlier one), or `null` when
 // the block's first line is there but the lines around it were edited, so the block cannot be cut
 // out whole. A user line outside the block stays as it is. The block's `/.cache/` line goes with
 // it, and the backups and records under `.cache/` must stay out of `git add -A`, so an ignore for
-// the cache is put back unless the user's own lines have one.
+// the cache is put back unless the user's own lines have one. The view-path lines go, but the
+// temporary-file and backup lines stay in a block of their own: a render killed before its final
+// rename leaves `<view>.<pid>.<random>.tmp`, and without them a later `git add -A` would publish it.
 function withoutBlock(text) {
   let out = text;
   const found = [GITIGNORE_BLOCK, ...PREVIOUS_GITIGNORE_BLOCKS].find((b) => out.includes(b));
@@ -84,8 +95,12 @@ function withoutBlock(text) {
   const keepsCache = out
     .split('\n')
     .some((l) => ['.cache/', '/.cache/', '.cache'].includes(l.trim()));
-  if (keepsCache) return out;
-  return `${out}${out === '' || out.endsWith('\n') ? '' : '\n'}.cache/\n`;
+  const keep = [
+    ...(keepsCache ? [] : ['.cache/\n']),
+    ...(out.includes(RESIDUE_IGNORE_HEADER) ? [] : [RESIDUE_IGNORE_BLOCK]),
+  ];
+  if (keep.length === 0) return out;
+  return `${out}${out === '' || out.endsWith('\n') ? '' : '\n'}${keep.join('')}`;
 }
 
 /**
