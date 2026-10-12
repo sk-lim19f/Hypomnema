@@ -72,12 +72,21 @@ function insideRelatives(root, filePath) {
       return null;
     }
   };
+  // The real path of the nearest ancestor that exists, with the segments below it put back: a file
+  // that does not exist yet, in a directory that does not either, still resolves. `dirname` reaches
+  // a fixed point at the filesystem root, which ends the walk (`null` when not even that resolves).
+  const realThroughAncestor = (p) => {
+    const rest = [];
+    for (let d = p; ; d = dirname(d)) {
+      const r = real(d);
+      if (r !== null) return join(r, ...rest);
+      if (dirname(d) === d) return null;
+      rest.unshift(basename(d));
+    }
+  };
   const pairs = [[root, filePath]];
   const realRoot = real(root);
-  // A file that does not exist yet (a create) is resolved through its parent directory.
-  const realParent = real(dirname(filePath));
-  const realFile =
-    real(filePath) ?? (realParent === null ? null : join(realParent, basename(filePath)));
+  const realFile = realThroughAncestor(filePath);
   if (realRoot !== null && realFile !== null) pairs.push([realRoot, realFile]);
   return pairs
     .map(([r, f]) => relative(r, f))

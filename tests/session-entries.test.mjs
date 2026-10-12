@@ -86,6 +86,7 @@ import {
 import {
   SESSION_ENTRIES_OFF_MARKER,
   buildCommitInTempIndex,
+  afterFastForward,
   fastForwardTo,
   listSessionEntries,
   listSessionProjects,
@@ -6180,6 +6181,10 @@ test('rollback clears the views of a project made after its point: status is emp
 test('rollback limits say that a project made after the point has no flat file and that mixed machine scopes are left out', () => {
   assert.ok(ROLLBACK_LIMITS.some((l) => l.includes('뒤에 만든 프로젝트')));
   assert.ok(ROLLBACK_LIMITS.some((l) => l.includes('machine:') && l.includes('visibility_scope')));
+  assert.ok(
+    ROLLBACK_LIMITS.some((l) => l.includes('다음 동기화') && l.includes('모든 기계')),
+    'the next sync publishes the rollback to every machine',
+  );
 });
 
 function withScopedRollbackVault(fn) {
@@ -6266,6 +6271,81 @@ test('re-enabling after a rollback and a committed hand edit makes exactly one b
   });
 });
 
+test('re-enabling after a rollback leaves the rolled-back root hot.md to the generator: no backup, no foreign-bytes notice', () => {
+  withRollbackVault(({ dir, shas }) => {
+    assert.equal(rollbackSessionEntries(dir, { at: shas[1] }).rolledBack, true);
+    consumeRootHotHealthNotice(dir);
+    const kept = backupsIn(dir, 'hot.md');
+    const back = migrate(dir, { reenable: true });
+    assert.equal(back.migrated, true, back.notices.join('\n'));
+    assert.deepEqual(back.notices, [], 'the move says nothing about the root hot.md');
+    const w = writeGeneratedViews(dir, WRITE);
+    assert.equal(w.notMigrated, false);
+    assert.ok(w.written.includes('hot.md'), 'the root view is regenerated');
+    assert.deepEqual(w.backedUp, []);
+    assert.deepEqual(
+      backupsIn(dir, 'hot.md'),
+      kept,
+      'no pre-projection copy of the rollback bytes',
+    );
+    assert.equal(consumeRootHotHealthNotice(dir), null, 'no notice about foreign bytes');
+  });
+});
+
+test('re-enabling does not vouch for a root hot.md edited after the rollback: its bytes are backed up and announced', () => {
+  withRollbackVault(({ dir, shas }) => {
+    assert.equal(rollbackSessionEntries(dir, { at: shas[1] }).rolledBack, true);
+    const edit = 'a person edited the root after the rollback\n';
+    put(dir, 'hot.md', edit);
+    commitIn(dir);
+    const kept = backupsIn(dir, 'hot.md');
+    const back = migrate(dir, { reenable: true });
+    assert.equal(back.migrated, true, back.notices.join('\n'));
+    const fresh = backupsIn(dir, 'hot.md').filter((n) => !kept.includes(n));
+    assert.equal(fresh.length, 1, JSON.stringify(back.notices));
+    assert.equal(readRel(dir, fresh[0]), edit);
+    assert.equal(back.notices.length, 1);
+    assert.ok(back.notices[0].includes(fresh[0]), 'the notice names the backup');
+  });
+});
+
+// A machine `b` that pulled the rollback and then pulls the re-enable commit: the same bytes arrive
+// as a tracked file and leave again, and the second pull must not call them someone's own writing.
+test('a clone that pulls the rollback and then the re-enable sets no root hot.md aside as unowned', () => {
+  withOldClones(({ a, b }) => {
+    assert.equal(migrate(a).migrated, true);
+    putEntry(a, 'p', RB_IDS[0], { date: '2026-10-01' });
+    commitIn(a);
+    const point = headOf(a);
+    putEntry(a, 'p', RB_IDS[1], { date: '2026-10-02' });
+    commitIn(a);
+    cgitOk(a, ['push', '-q']);
+    cgitOk(b, ['pull', '-q', '--ff-only']);
+    assert.equal(writeGeneratedViews(b, WRITE).notMigrated, false);
+    assert.equal(writeGeneratedViews(a, WRITE).notMigrated, false);
+    assert.equal(rollbackSessionEntries(a, { at: point }).rolledBack, true);
+    cgitOk(a, ['push', '-q']);
+    cgitOk(b, ['fetch', '-q']);
+    const taken = fastForwardTo(b, '@{u}');
+    assert.equal(taken.ok, true, JSON.stringify(taken));
+    assert.equal(migrationState(b), 'opted-out');
+    assert.equal(migrate(a, { reenable: true }).migrated, true);
+    cgitOk(a, ['push', '-q']);
+    cgitOk(b, ['fetch', '-q']);
+    assert.notEqual(
+      sha(readRel(b, 'hot.md')),
+      readGeneratedViewsRecord(b).views['hot.md'],
+      'precondition: the rolled-back root differs from what b generated',
+    );
+    const r = fastForwardTo(b, '@{u}');
+    assert.equal(r.ok, true, JSON.stringify(r));
+    assert.equal(migrationState(b), 'migrated');
+    assert.deepEqual(r.pre.unowned, []);
+    assert.deepEqual(afterFastForward(b, r.pre).notices, []);
+    assert.equal(backupsIn(b, 'hot.md').length, 0);
+  });
+});
+
 test('a marker written before the hashes (one line) re-enables as it always did: the flat files become baselines', () => {
   withRollbackVault(({ dir, shas }) => {
     assert.equal(rollbackSessionEntries(dir, { at: shas[1] }).rolledBack, true);
@@ -6275,6 +6355,37 @@ test('a marker written before the hashes (one line) re-enables as it always did:
     const back = migrate(dir, { reenable: true });
     assert.equal(back.migrated, true, back.notices.join('\n'));
     assert.equal(back.baselines.length, 2, 'hot.md and session-state.md of p');
+  });
+});
+
+test('a marker removed by hand after a rollback: the move names the generator-written flat files it makes baselines from', () => {
+  withRollbackVault(({ dir, shas }) => {
+    assert.equal(rollbackSessionEntries(dir, { at: shas[1] }).rolledBack, true);
+    cgitOk(dir, ['rm', '-q', RB_MARKER]);
+    cgitOk(dir, ['commit', '-q', '-m', 'drop the marker']);
+    assert.equal(migrationState(dir), 'not-migrated');
+    const back = migrate(dir);
+    assert.equal(back.migrated, true, back.notices.join('\n'));
+    assert.equal(back.baselines.length, 2, 'the doubling the notice warns about');
+    const notice = back.notices.find((n) => n.includes('기준선을 만듭니다')) ?? '';
+    for (const rel of ['projects/p/hot.md', 'projects/p/session-state.md']) {
+      assert.ok(notice.includes(rel), `${rel} is named: ${notice}`);
+    }
+    assert.ok(notice.includes(RB_MARKER), 'the notice names the marker that is likely gone');
+  });
+});
+
+test('the same move with the marker still in HEAD or with hand-written old files adds no generator-output notice', () => {
+  withRollbackVault(({ dir, shas }) => {
+    assert.equal(rollbackSessionEntries(dir, { at: shas[1] }).rolledBack, true);
+    const back = migrate(dir, { reenable: true });
+    assert.ok(!back.notices.some((n) => n.includes('기준선을 만듭니다')), back.notices.join('\n'));
+  });
+  withOldGit((dir) => {
+    const back = migrate(dir);
+    assert.equal(back.migrated, true, back.notices.join('\n'));
+    assert.equal(back.baselines.length, 2);
+    assert.ok(!back.notices.some((n) => n.includes('기준선을 만듭니다')), back.notices.join('\n'));
   });
 });
 

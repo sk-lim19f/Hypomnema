@@ -48,6 +48,7 @@ import {
   loadHypoIgnore,
   markPullArchiveMerged,
   migrationState,
+  offMarkerHashes,
   pathInHead,
   projectHiddenByHypoignore,
   readGeneratedViewsRecord,
@@ -78,6 +79,7 @@ export {
   listSessionProjects,
   listTrackedGeneratedViews,
   migrationState,
+  offMarkerHashes,
 } from './hypo-shared.mjs';
 
 /**
@@ -197,20 +199,6 @@ function oldFileText(views, rel, text, rolledBack = {}) {
 export function offMarkerText(point, date, flat) {
   const lines = flat.map((f) => `${sha256(f.text)}  ${f.relPath}`);
   return `rolled back to ${point} on ${date}\n${lines.map((l) => `${l}\n`).join('')}`;
-}
-
-/**
- * `{relPath: sha256}` read from an off marker's text. A marker written before the hashes existed
- * (one line) has none, and so does a missing or unreadable one: `{}`. Only a line shaped exactly
- * like the ones `offMarkerText` writes counts.
- */
-export function offMarkerHashes(text) {
-  const out = {};
-  for (const line of String(text ?? '').split('\n')) {
-    const m = /^([0-9a-f]{64}) {2}(.+)$/.exec(line);
-    if (m) out[m[2]] = m[1];
-  }
-  return out;
 }
 
 // The in-memory entries that stand for a not-yet-migrated project's old `hot.md` and
@@ -1088,6 +1076,10 @@ export function migrateVaultToSessionEntriesUnlocked(hypoDir, opts = {}) {
       );
     }
   }
+  // Flat files that carry the generator's own header but become baselines: with the off marker gone
+  // nothing tells these bytes from old memory, so the entry text would be doubled. Named below.
+  const markerGone = !pathInHead(hypoDir, SESSION_ENTRIES_OFF_MARKER);
+  const generatorOutput = [];
   for (const slug of slugs) {
     // A hidden project's entries are never committed, so it gets no baseline. The catch-up step
     // keeps a local copy of its old files before the merge removes them.
@@ -1100,6 +1092,13 @@ export function migrateVaultToSessionEntriesUnlocked(hypoDir, opts = {}) {
         ? oldFileText(ownViews, rel, showText(hypoDir, 'HEAD', rel), rolledBack)
         : null;
     });
+    if (markerGone) {
+      OLD_NAMES.forEach((name, i) => {
+        if (frontmatterScalar([hotText, stateText][i] ?? '', 'generated') === 'sessions') {
+          generatorOutput.push(`projects/${slug}/${name}`);
+        }
+      });
+    }
     const indexScope = readVisibilityScope(showText(hypoDir, 'HEAD', `projects/${slug}/index.md`));
     // An update the old scheme already sent to `legacy` with `done` replaced the virtual baseline,
     // whose id covers the bytes of this moment. The real baseline gets another id when the files
@@ -1122,6 +1121,14 @@ export function migrateVaultToSessionEntriesUnlocked(hypoDir, opts = {}) {
       writes.push({ relPath, text: b.text });
       baselines.push(relPath);
     }
+  }
+
+  if (generatorOutput.length) {
+    notices.push(
+      `세션 원본에서 생성한 평면 파일로 보이는 파일에서 기준선을 만듭니다: ${generatorOutput.join(', ')}. ` +
+        `롤백 뒤에 ${SESSION_ENTRIES_OFF_MARKER}를 지웠을 가능성이 큽니다. ` +
+        '이 기준선은 생성기가 쓴 내용을 담아 같은 본문이 원본과 기준선에 겹쳐 보일 수 있습니다.',
+    );
   }
 
   const headText = (rel) => showText(hypoDir, 'HEAD', rel) ?? '';

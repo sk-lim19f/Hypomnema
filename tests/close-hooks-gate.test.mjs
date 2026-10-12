@@ -19,7 +19,7 @@ import {
   realpathSync,
   symlinkSync,
 } from 'node:fs';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { test, suite } from './harness.mjs';
 import { recordGateClosed, resolutionStamp } from '../hooks/close-gate-store.mjs';
@@ -2077,6 +2077,52 @@ test('심볼릭 링크 HYPO_DIR 에 실제 경로로 쓰는 생성 뷰와 원본
         );
         assertDenied(r, reason);
       }
+    } finally {
+      rmSync(link, { force: true });
+    }
+  });
+});
+
+test('심볼릭 링크 HYPO_DIR 에 실제 경로로, 부모 디렉터리도 아직 없는 새 프로젝트의 생성 뷰와 원본도 거부', () => {
+  withWiki(null, (dir) => {
+    const link = `${dir}-link`;
+    symlinkSync(dir, link);
+    try {
+      const real = realpathSync(dir);
+      for (const [rel, reason] of [
+        ['projects/newproj/hot.md', /생성 파일입니다/],
+        ['projects/newproj/sessions/s9-0.md', /close apply만/],
+      ]) {
+        assert.equal(existsSync(join(real, 'projects', 'newproj')), false, 'neither level exists');
+        const r = runHook(
+          'hypo-close-guard.mjs',
+          {
+            session_id: 'sess-guard',
+            tool_name: 'Write',
+            tool_input: { file_path: join(real, rel), content: '# x\n' },
+          },
+          { HYPO_DIR: link },
+        );
+        assertDenied(r, reason);
+      }
+      const elsewhere = runHook(
+        'hypo-close-guard.mjs',
+        {
+          session_id: 'sess-guard',
+          tool_name: 'Write',
+          tool_input: {
+            file_path: join(dirname(real), 'no-such-vault', 'projects', 'newproj', 'hot.md'),
+            content: '# x\n',
+          },
+        },
+        { HYPO_DIR: link },
+      );
+      assert.equal(elsewhere.status, 0, `stderr: ${elsewhere.stderr}`);
+      assert.equal(
+        elsewhere.stdout.trim(),
+        '',
+        `outside the vault stays allowed: ${elsewhere.stdout}`,
+      );
     } finally {
       rmSync(link, { force: true });
     }

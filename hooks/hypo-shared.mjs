@@ -2055,6 +2055,48 @@ export function writeGeneratedViewsRecord(hypoDir, views) {
 }
 
 /**
+ * `{relPath: sha256}` read from an off marker's text. A marker written before the hashes existed
+ * (one line) has none, and so does a missing or unreadable one: `{}`. Only a line shaped exactly
+ * like the ones a rollback writes (`<sha256>  <path>`) counts.
+ */
+export function offMarkerHashes(text) {
+  const out = {};
+  for (const line of String(text ?? '').split('\n')) {
+    const m = /^([0-9a-f]{64}) {2}(.+)$/.exec(line);
+    if (m) out[m[2]] = m[1];
+  }
+  return out;
+}
+
+/**
+ * Re-enabling after a rollback: the flat files the rollback committed are the generator's own
+ * rendering, so the ownership record takes the marker's hash for every path whose bytes in HEAD
+ * still match it. The writer then replaces them without a backup, and the clearing step does not
+ * call the root `hot.md` someone's own writing. Bytes edited after the rollback match no hash and
+ * stay foreign. Called while HEAD still holds the marker, by the one step both the re-enabling
+ * machine and a machine pulling the re-enable commit run. `beforeWrite` runs before the record is
+ * written (the cache-ignored check). Returns the claimed paths.
+ */
+export function claimRolledBackViews(hypoDir, beforeWrite = () => {}) {
+  const marked = offMarkerHashes(gitShowText(hypoDir, 'HEAD', SESSION_ENTRIES_OFF_MARKER));
+  const { views, state } = readGeneratedViewsRecord(hypoDir);
+  const claimed = Object.entries(marked)
+    .filter(([rel, hash]) => {
+      const text = gitShowText(hypoDir, 'HEAD', rel);
+      return text !== null && sha256Hex(text) === hash && views[rel] !== hash;
+    })
+    .map(([rel]) => rel);
+  if (!claimed.length) return claimed;
+  beforeWrite();
+  // A record that does not exist yet starts from the old root projection's hash, as the writer does.
+  const { lastHash } = readRootHotProjectionOwnership(hypoDir);
+  if (state === 'missing' && lastHash) views['hot.md'] ??= lastHash;
+  for (const rel of claimed) views[rel] = marked[rel];
+  writeGeneratedViewsRecord(hypoDir, views);
+  return claimed;
+}
+
+/**
  * Whether the branch's upstream already carries the session-entries `.gitignore` block, read from
  * `@{u}`'s tree (a failed `pull --ff-only` has still fetched it). False without an upstream. It
  * answers "is the remote migrated", not "does the incoming range need the clearing step": a rollback
@@ -2471,6 +2513,12 @@ function clearBlockingPaths(hypoDir, targetRev, opts) {
     if (status !== 'D' || !hidden(path) || dirty.has(path)) continue;
     const text = readTextOrNull(join(hypoDir, path)) ?? gitShowText(hypoDir, 'HEAD', path);
     if (text !== null) localOnly.push(backUp(path, 'worktree', text));
+  }
+
+  // 5a. A range that removes the off marker re-enables the entries: the flat files the rollback
+  // committed are generator bytes (the marker names their hashes), not someone's own writing.
+  if (incoming.some((c) => c.status === 'D' && c.path === SESSION_ENTRIES_OFF_MARKER)) {
+    claimRolledBackViews(hypoDir, cacheGate);
   }
 
   // 5b. The root `hot.md` is a generated path too, and a clean one that `target` deletes goes with
