@@ -93,6 +93,7 @@ import {
   loadSessionModel,
   migrateVaultToSessionEntries,
   migrationState,
+  offMarkerHashes,
   projectEntryScope,
   readObservedHeads,
   recordObservedHeads,
@@ -3480,6 +3481,74 @@ test('(c) a rollback-shaped incoming range counts as touching view tracking, and
   });
 });
 
+// `b` is migrated and holds the views of a project `q` that the rollback commit from `a` knows
+// nothing about. `marked` puts the off marker into that commit; `owned` records q/session-state.md
+// as bytes this machine's generator wrote.
+function withRollbackRange(fn, { marked, owned }) {
+  withCatchUp(({ a, b }) => {
+    cgitOk(b, ['merge', '-q', '--ff-only', '@{u}']);
+    put(b, 'projects/q/index.md', '---\ntitle: q\n---\n');
+    put(b, 'projects/q/hot.md', 'q hot, written by hand\n');
+    put(b, 'projects/q/session-state.md', 'q state, generator bytes\n');
+    if (owned) {
+      put(
+        b,
+        '.cache/generated-views.json',
+        JSON.stringify({
+          views: { 'projects/q/session-state.md': sha('q state, generator bytes\n') },
+        }),
+      );
+    }
+    cgitOk(a, ['pull', '-q']);
+    put(a, '.gitignore', '.cache/\n');
+    put(a, 'projects/p/hot.md', 'rolled back hot\n');
+    const added = ['.gitignore', 'projects/p/hot.md'];
+    if (marked) {
+      put(a, SESSION_ENTRIES_OFF_MARKER, 'rolled back to abc on 2026-10-01\n');
+      added.push(SESSION_ENTRIES_OFF_MARKER);
+    }
+    cgitOk(a, ['add', '-f', ...added]);
+    cgitOk(a, ['commit', '-q', '-m', 'rollback']);
+    cgitOk(a, ['push', '-q']);
+    cgitOk(b, ['fetch', '-q']);
+    fn({ b });
+  });
+}
+
+test('a rollback range clears the views of a project it does not track: owned bytes are dropped, others are backed up first', () => {
+  withRollbackRange(
+    ({ b }) => {
+      const r = clear(b);
+      assert.equal(r.ok, true, JSON.stringify(r));
+      assert.deepEqual(
+        r.cleared.map((c) => c.relPath),
+        ['projects/q/hot.md'],
+        'only the bytes the generator did not write are backed up',
+      );
+      assert.equal(readFileSync(r.cleared[0].backupPath, 'utf-8'), 'q hot, written by hand\n');
+      assert.equal(ffTo(b), 0);
+      assert.equal(existsSync(join(b, 'projects/q/hot.md')), false);
+      assert.equal(existsSync(join(b, 'projects/q/session-state.md')), false);
+      assert.equal(cgitOk(b, ['status', '--porcelain', '-uall']).trim(), '?? projects/q/index.md');
+    },
+    { marked: true, owned: true },
+  );
+});
+
+test('a range without the off marker leaves the views of other projects where they are', () => {
+  withRollbackRange(
+    ({ b }) => {
+      const r = clear(b);
+      assert.equal(r.ok, true, JSON.stringify(r));
+      assert.deepEqual(r.cleared, []);
+      assert.equal(ffTo(b), 0);
+      assert.equal(readRel(b, 'projects/q/hot.md'), 'q hot, written by hand\n');
+      assert.equal(readRel(b, 'projects/q/session-state.md'), 'q state, generator bytes\n');
+    },
+    { marked: false, owned: true },
+  );
+});
+
 test('(c) a migration range counts too, and a range that adds or removes no view path does not', () => {
   withCatchUp(({ a, b }) => {
     assert.equal(
@@ -6023,8 +6092,16 @@ test('rollback writes the off marker into HEAD: the default move makes no commit
     assert.equal(rollbackSessionEntries(dir, { at: shas[1] }).rolledBack, true);
     assert.match(
       showHead(dir, RB_MARKER),
-      new RegExp(`^rolled back to ${shas[1]} on \\d{4}-\\d{2}-\\d{2}\\n$`),
+      new RegExp(`^rolled back to ${shas[1]} on \\d{4}-\\d{2}-\\d{2}\\n`),
+      'the first line stays readable',
     );
+    const marked = offMarkerHashes(showHead(dir, RB_MARKER));
+    assert.deepEqual(Object.keys(marked).sort(), [
+      'hot.md',
+      'projects/p/hot.md',
+      'projects/p/session-state.md',
+    ]);
+    for (const [rel, hash] of Object.entries(marked)) assert.equal(hash, sha(showHead(dir, rel)));
     assert.equal(migrationState(dir), 'opted-out');
     const before = commitCount(dir);
     const again = migrate(dir);
@@ -6065,6 +6142,139 @@ test('rollback defers with the reason and changes nothing: unknown commit, a com
   withOldGit((dir) => {
     const r = rollbackSessionEntries(dir, { at: headOf(dir) });
     assert.equal(r.deferred, 'not-migrated');
+  });
+});
+
+// ── what the rollback leaves behind, what re-enabling keeps, and machine scope ───────────────
+
+test('rollback clears the views of a project made after its point: status is empty, an owned file leaves no backup, an unowned one keeps its bytes', () => {
+  withRollbackVault(({ dir, shas }) => {
+    putEntry(dir, 'q', RB_IDS[0].replace(/-411$/, '-511'), {
+      date: '2026-10-04',
+      visibilityScope: 'machine:devA',
+    });
+    put(dir, 'projects/q/index.md', '---\ntitle: q\nvisibility_scope: machine:devA\n---\n');
+    commitIn(dir);
+    assert.equal(writeGeneratedViews(dir, WRITE).notMigrated, false);
+    for (const rel of ['projects/q/hot.md', 'projects/q/session-state.md']) {
+      assert.equal(existsSync(join(dir, rel)), true, `${rel} is generated first`);
+    }
+    put(dir, 'projects/q/session-state.md', 'a person wrote this in q\n');
+    const r = rollbackSessionEntries(dir, { at: shas[1] });
+    assert.equal(r.rolledBack, true, r.notices.join('\n'));
+    assert.equal(cgitOk(dir, ['status', '--porcelain']), '', 'nothing of q is left to stage');
+    assert.equal(existsSync(join(dir, 'projects/q/hot.md')), false);
+    assert.equal(existsSync(join(dir, 'projects/q/session-state.md')), false);
+    assert.equal(backupsIn(dir, 'projects/q/hot.md').length, 0, 'the generator wrote it: no copy');
+    const kept = backupsIn(dir, 'projects/q/session-state.md');
+    assert.equal(kept.length, 1);
+    assert.equal(readRel(dir, kept[0]), 'a person wrote this in q\n');
+    assert.deepEqual(
+      treeNames(dir).filter((n) => n.startsWith('projects/q/') && !n.includes('/sessions/')),
+      ['projects/q/index.md'],
+      'q has no flat file in the rollback commit',
+    );
+  });
+});
+
+test('rollback limits say that a project made after the point has no flat file and that mixed machine scopes are left out', () => {
+  assert.ok(ROLLBACK_LIMITS.some((l) => l.includes('뒤에 만든 프로젝트')));
+  assert.ok(ROLLBACK_LIMITS.some((l) => l.includes('machine:') && l.includes('visibility_scope')));
+});
+
+function withScopedRollbackVault(fn) {
+  withOldGit((dir) => {
+    assert.equal(migrate(dir).migrated, true);
+    const id = (n) => `2b1c4d5e-aaaa-bbbb-cccc-0123456789ab-${520 + n}`;
+    put(dir, 'projects/s/index.md', '---\ntitle: s\n---\n');
+    put(dir, 'projects/m/index.md', '---\ntitle: m\n---\n');
+    putEntry(dir, 's', id(1), { date: '2026-10-01', visibilityScope: 'machine:devA' });
+    putEntry(dir, 's', id(2), { date: '2026-10-02', visibilityScope: 'machine:devA' });
+    putEntry(dir, 'm', id(3), { date: '2026-10-01' });
+    putEntry(dir, 'm', id(4), { date: '2026-10-02', visibilityScope: 'machine:devA' });
+    putEntry(dir, 'p', id(5), { date: '2026-10-02' });
+    commitIn(dir);
+    const point = headOf(dir);
+    fn({ dir, point, id });
+  });
+}
+
+test('rollback renders a project whose entries all belong to one machine for that machine and tags both files with the scope', () => {
+  withScopedRollbackVault(({ dir, point, id }) => {
+    const r = rollbackSessionEntries(dir, { at: point });
+    assert.equal(r.rolledBack, true, r.notices.join('\n'));
+    for (const rel of ['projects/s/hot.md', 'projects/s/session-state.md']) {
+      const text = showHead(dir, rel);
+      assert.match(text, /^visibility_scope: machine:devA$/m, rel);
+      assert.ok(text.includes(`${id(2)}`), `${rel} holds the machine-scoped entry`);
+    }
+    assert.ok(showHead(dir, 'projects/s/session-state.md').includes(`next for ${id(2)}`));
+    // the line sits inside the frontmatter, so a reader of the file sees it as a scope
+    assert.equal(readVisibilityScope(showHead(dir, 'projects/s/hot.md')), 'machine:devA');
+    for (const rel of ['projects/p/hot.md', 'projects/p/session-state.md']) {
+      assert.ok(!/^visibility_scope:/m.test(showHead(dir, rel)), `${rel} is shared`);
+    }
+    assert.ok(!r.leftOut.some((l) => l.project === 's'), 'nothing of s is left out');
+    assert.equal(cgitOk(dir, ['status', '--porcelain']), '');
+  });
+});
+
+test('rollback leaves the machine-scoped entries of a project that mixes scopes out of its files and reports the project and the count', () => {
+  withScopedRollbackVault(({ dir, point, id }) => {
+    const r = rbRun(dir, ['rollback', `--at=${point}`]);
+    assert.equal(r.status, 0, r.stdout + r.stderr);
+    const state = showHead(dir, 'projects/m/session-state.md');
+    assert.ok(state.includes(`next for ${id(3)}`), 'the shared entry is in');
+    assert.ok(!state.includes(id(4)), 'the machine-scoped one is not');
+    assert.ok(!/^visibility_scope:/m.test(state));
+    assert.ok(r.stdout.includes('기계 범위 항목이 평면 파일에서 빠진 프로젝트: m (1개)'), r.stdout);
+    assert.ok(!r.stdout.includes('s ('), 'a project rendered for its machine is not listed');
+  });
+});
+
+test('re-enabling after a rollback makes no baseline from the files the rollback committed, and the bodies are not doubled', () => {
+  withRollbackVault(({ dir, shas }) => {
+    const baselines = () => listDir(sessionsDir(dir)).filter((n) => n.includes('-baseline-'));
+    const before = baselines();
+    assert.equal(rollbackSessionEntries(dir, { at: shas[1] }).rolledBack, true);
+    const back = migrate(dir, { reenable: true });
+    assert.equal(back.migrated, true, back.notices.join('\n'));
+    assert.deepEqual(back.baselines, []);
+    assert.deepEqual(baselines(), before, 'no baseline entry was added');
+    assert.equal(writeGeneratedViews(dir, WRITE).notMigrated, false);
+    assert.equal(
+      countOf(readRel(dir, 'projects/p/session-state.md'), `next for ${RB_IDS[0]}`),
+      1,
+      'the first original shows once',
+    );
+  });
+});
+
+test('re-enabling after a rollback and a committed hand edit makes exactly one baseline, and it holds the edit', () => {
+  withRollbackVault(({ dir, shas }) => {
+    assert.equal(rollbackSessionEntries(dir, { at: shas[1] }).rolledBack, true);
+    put(
+      dir,
+      'projects/p/session-state.md',
+      `${readRel(dir, 'projects/p/session-state.md')}\nOLD MACHINE EDIT\n`,
+    );
+    commitIn(dir);
+    const back = migrate(dir, { reenable: true });
+    assert.equal(back.migrated, true, back.notices.join('\n'));
+    assert.equal(back.baselines.length, 1, back.baselines.join(', '));
+    assert.ok(readRel(dir, back.baselines[0]).includes('OLD MACHINE EDIT'));
+  });
+});
+
+test('a marker written before the hashes (one line) re-enables as it always did: the flat files become baselines', () => {
+  withRollbackVault(({ dir, shas }) => {
+    assert.equal(rollbackSessionEntries(dir, { at: shas[1] }).rolledBack, true);
+    put(dir, RB_MARKER, `rolled back to ${shas[1]} on 2026-10-01\n`);
+    commitIn(dir);
+    assert.deepEqual(offMarkerHashes(showHead(dir, RB_MARKER)), {});
+    const back = migrate(dir, { reenable: true });
+    assert.equal(back.migrated, true, back.notices.join('\n'));
+    assert.equal(back.baselines.length, 2, 'hot.md and session-state.md of p');
   });
 });
 

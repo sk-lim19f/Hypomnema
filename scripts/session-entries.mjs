@@ -22,6 +22,7 @@ import { realpathSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
 import {
+  entryVisible,
   renderViews,
   GITIGNORE_BLOCK,
   PREVIOUS_GITIGNORE_BLOCKS,
@@ -36,6 +37,7 @@ import {
   loadSessionModel,
   loadSessionModelsAt,
   migrationState,
+  offMarkerText,
 } from '../hooks/session-views.mjs';
 import {
   currentDevice,
@@ -49,6 +51,8 @@ import { expandHome, resolveHypoRoot } from './lib/hypo-root.mjs';
 export const ROLLBACK_LIMITS = [
   '지정한 커밋 뒤에 추가된 원본은 평면 파일에 들어 있지 않습니다.',
   '구버전 Hypomnema는 sessions/를 읽지 못합니다.',
+  '지정한 커밋 뒤에 만든 프로젝트는 평면 파일이 없어서, 구버전 기계에는 그 프로젝트가 보이지 않습니다.',
+  '한 기계의 machine: 범위로만 이뤄진 프로젝트는 그 기계 범위(visibility_scope)를 단 평면 파일이 됩니다. 범위가 섞인 프로젝트는 machine: 범위 항목이 평면 파일에서 빠지고, 빠진 프로젝트와 항목 수를 아래에 출력합니다.',
   `${SESSION_ENTRIES_OFF_MARKER}가 있는 동안 새 버전 기계는 이행 전처럼 동작하므로, 같은 내용이 원본과 평면 파일에 겹쳐 보일 수 있습니다.`,
   '세션 원본을 다시 켜려면 /hypo:upgrade --migrate-sessions를 실행하세요.',
 ];
@@ -83,8 +87,24 @@ function withoutBlock(text) {
 }
 
 /**
+ * The device every entry of `model` is scoped to, when they all share one `machine:<device>` scope
+ * (the project's `entry_scope` stands in for each entry's own, as `entryVisible` reads it);
+ * `null` for an empty project, one with any other scope, or one that mixes scopes.
+ */
+function soleMachineDevice(model) {
+  const scopes = new Set(
+    model.entries.map((e) => String(model.entryScope ?? e.visibilityScope ?? '').trim()),
+  );
+  const [only] = scopes.size === 1 ? scopes : [];
+  const device = only?.startsWith('machine:') ? only.slice('machine:'.length) : '';
+  return device === '' ? null : device;
+}
+
+/**
  * The rollback, for a caller that holds the vault commit lock. `at` is a commit in the history of
- * HEAD whose tree is already on the scheme. Returns `{rolledBack, commit, deferred?, notices[]}`;
+ * HEAD whose tree is already on the scheme. Returns
+ * `{rolledBack, commit, deferred?, notices[], leftOut[]}` (`leftOut` is `{project, count}` per
+ * project whose machine-scoped entries are not in its flat files);
  * a deferred rollback changed nothing (`fastForwardTo` takes back what it moved when the merge
  * does not happen). `testHooks` goes to `buildCommitInTempIndex` and `fastForwardTo`.
  */
@@ -122,24 +142,41 @@ export function rollbackSessionEntriesUnlocked(hypoDir, { at, testHooks, now = n
   } catch (err) {
     return deferred('tree-unreadable', err?.message);
   }
-  // No device: the files are tracked, so every machine gets them, and an entry that only one
-  // machine may see (`machine:` scope) must not be in them.
+  // The files are tracked, so every machine gets them. An entry that only one machine may see
+  // (`machine:` scope) is therefore left out unless the whole project belongs to one machine: its
+  // two files are then rendered for that device and carry the scope, as the files did before the
+  // move. A project that mixes scopes cannot say that in one file-level scope; it is rendered
+  // with no device and the entries left out are counted (`leftOut`).
   const views = renderViews(models, {});
   const writes = [{ relPath: 'hot.md', text: views.root }];
-  for (const { project } of models) {
+  const leftOut = [];
+  for (const model of models) {
+    const { project } = model;
+    const device = soleMachineDevice(model);
+    const own =
+      device === null
+        ? views.projects[project]
+        : renderViews([model], { device, only: [project] }).projects[project];
+    const scoped = (text) =>
+      device === null
+        ? text
+        : text.replace(
+            '\ngenerated: sessions\n',
+            () => `\ngenerated: sessions\nvisibility_scope: machine:${device}\n`,
+          );
     writes.push(
-      { relPath: `projects/${project}/hot.md`, text: views.projects[project].hot },
-      {
-        relPath: `projects/${project}/session-state.md`,
-        text: views.projects[project].sessionState,
-      },
+      { relPath: `projects/${project}/hot.md`, text: scoped(own.hot) },
+      { relPath: `projects/${project}/session-state.md`, text: scoped(own.sessionState) },
     );
+    const hidden = model.entries.filter((e) => !entryVisible(model, e, device ?? undefined)).length;
+    if (hidden > 0) leftOut.push({ project, count: hidden });
   }
+  const flat = [...writes];
   writes.push(
     { relPath: '.gitignore', text: cut },
     {
       relPath: SESSION_ENTRIES_OFF_MARKER,
-      text: `rolled back to ${point} on ${now.toISOString().slice(0, 10)}\n`,
+      text: offMarkerText(point, now.toISOString().slice(0, 10), flat),
     },
   );
   const commit = buildCommitInTempIndex(
@@ -161,7 +198,7 @@ export function rollbackSessionEntriesUnlocked(hypoDir, { at, testHooks, now = n
     return deferred(reason, applied.notice ?? reason);
   }
   const after = afterFastForward(hypoDir, applied.pre);
-  return { rolledBack: true, commit: commit.sha, notices: after.notices };
+  return { rolledBack: true, commit: commit.sha, notices: after.notices, leftOut };
 }
 
 /** `rollbackSessionEntriesUnlocked` under the vault commit lock; a busy lock defers. */
@@ -230,6 +267,10 @@ function main() {
   if (!result.rolledBack) process.exit(1);
   process.stdout.write(`롤백했습니다: ${result.commit}\n`);
   for (const line of ROLLBACK_LIMITS) process.stdout.write(`- ${line}\n`);
+  if (result.leftOut.length) {
+    const list = result.leftOut.map((l) => `${l.project} (${l.count}개)`).join(', ');
+    process.stdout.write(`- 기계 범위 항목이 평면 파일에서 빠진 프로젝트: ${list}\n`);
+  }
 }
 
 function isMain() {
