@@ -2325,7 +2325,7 @@ test('createProject refuses a directory stored in NFD with the rename message an
     for (const name of [ko, ko.normalize('NFD')]) {
       assert.throws(
         () => createProject({ hypoDir: dir, name, workingDir: '/x' }),
-        /Rename projects\/.+ to its NFC spelling.*\/hypo:rename --from=projects\//,
+        /Rename projects\/.+ to its NFC spelling.*\/hypo:rename --from="projects\/[^"]+" --to="projects\//,
       );
     }
     assert.deepEqual(readdirSync(join(dir, 'projects', ko.normalize('NFD'))), []);

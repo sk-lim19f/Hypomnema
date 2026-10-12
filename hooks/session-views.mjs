@@ -35,6 +35,7 @@ import {
   renderViews,
   splitLegacyFrontmatter,
   trackHeads,
+  nfcRenameCommands,
 } from './session-entries.mjs';
 import {
   backUpGeneratedPath,
@@ -1006,11 +1007,10 @@ function renameAdvice(slug, problem) {
     // macOS file systems treat the NFD and NFC spellings as one name, so a direct rename to the NFC
     // spelling is refused as existing; go through a temporary name (the same path as
     // `nonNfcProjectMessage` in hypo-shared).
-    const nfc = slug.normalize('NFC');
-    const tmp = `${nfc}.nfc-tmp`;
+    const [first, second] = nfcRenameCommands(slug);
     return (
       `projects/${slug}: 이름이 NFC 형태가 아니라(macOS에서 만든 분해형 한글 등) git이 보고하는 경로와 맞지 않습니다. ` +
-      `/hypo:rename --from="projects/${slug}" --to="${tmp}" 다음에 /hypo:rename --from="projects/${tmp}" --to="${nfc}" 를 실행하세요.`
+      `${first} 다음에 ${second} 를 실행하세요.`
     );
   }
   const why = '이름에 공백이나 기호가 있습니다';
@@ -1106,16 +1106,31 @@ export function migrateVaultToSessionEntriesUnlocked(hypoDir, opts = {}) {
   // A project directory whose name an entry cannot carry (a space or symbol, or not in NFC) would
   // make the baseline build throw. Nothing is written until the person renames it; the notice names
   // each directory, the reason and the command.
+  // Judged on the name the directory has on disk: git on macOS reports a decomposed directory in
+  // NFC (core.precomposeunicode), so the tracked path alone would pass and the baselines would land
+  // in a directory every later close refuses.
+  let onDiskNames = [];
+  try {
+    onDiskNames = readdirSync(join(hypoDir, 'projects'));
+  } catch {
+    // no projects/ directory: the tracked names are all there is
+  }
+  const onDiskName = (slug) =>
+    onDiskNames.includes(slug)
+      ? slug
+      : (onDiskNames.find((n) => n.normalize('NFC') === slug.normalize('NFC')) ?? slug);
   const badNames = slugs
     .filter((slug) => !projectHiddenByHypoignore(hypoDir, slug, patterns))
-    .map((slug) => [slug, projectNameProblem(slug)])
+    .map((slug) => onDiskName(slug))
+    .map((name) => [name, projectNameProblem(name)])
     .filter(([, problem]) => problem !== null);
   if (badNames.length) {
     return deferredMigration(
       'invalid-project-name',
       '프로젝트 디렉터리 이름을 세션 원본에 쓸 수 없어 아무것도 쓰지 않았습니다. ' +
         `${badNames.map(([slug, problem]) => renameAdvice(slug, problem)).join(' ')} ` +
-        '이름을 바꾸고 커밋한 뒤 다시 시작하세요.',
+        '이름을 바꾸고 커밋한 뒤 다시 시작하세요. ' +
+        '`.hypoignore`로 숨긴 프로젝트는 이 검사에서 빠지지만, 그 프로젝트는 옮겨지지 않고 옛 파일로 남습니다.',
     );
   }
   const leftLocal = listSessionProjects(hypoDir)

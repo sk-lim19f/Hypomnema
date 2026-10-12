@@ -15,6 +15,7 @@ import {
   statSync,
   mkdtempSync,
   rmSync,
+  readdirSync,
 } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { join, basename } from 'node:path';
@@ -28,7 +29,7 @@ import {
   slugForms,
   extractWikilinks,
 } from '../scripts/lib/wikilink.mjs';
-import { formatSessionEntry } from '../hooks/session-entries.mjs';
+import { formatSessionEntry, nfcRenameCommands } from '../hooks/session-entries.mjs';
 import { test, suite } from './harness.mjs';
 import { run, withTmpDir, SCRIPTS, HOOKS, SESSION_TMP_HOME } from './helpers.mjs';
 
@@ -487,6 +488,29 @@ test('crash bracketing the single-file renameSync converges, two paths never coe
       }
     });
   }
+});
+
+// The not-NFC refusals and the migration notice tell a person to run two renames. Run them as
+// written: a command the advice prints but rename refuses leaves the person with no way out.
+test('the two renames the not-NFC advice prints move a decomposed project directory to its NFC name', () => {
+  const nfd = '프로젝트'.normalize('NFD');
+  const nfc = nfd.normalize('NFC');
+  withTmpDir((base) => {
+    const wiki = join(base, 'wiki');
+    mkdirSync(join(wiki, 'projects', nfd), { recursive: true });
+    writeFileSync(join(wiki, 'projects', nfd, 'index.md'), '---\ntitle: p\n---\nbody\n');
+    for (const command of nfcRenameCommands(nfd)) {
+      const args = [...command.matchAll(/--(from|to)="([^"]+)"/g)].map(([, k, v]) => `--${k}=${v}`);
+      assert.equal(args.length, 2, command);
+      const r = run('rename.mjs', [`--hypo-dir=${wiki}`, ...args, '--apply', '--json']);
+      assert.equal(r.status, 0, `${command}: ${r.stdout}${r.stderr}`);
+    }
+    assert.deepEqual(readdirSync(join(wiki, 'projects')), [nfc]);
+    assert.equal(
+      readFileSync(join(wiki, 'projects', nfc, 'index.md'), 'utf-8'),
+      '---\ntitle: p\n---\nbody\n',
+    );
+  });
 });
 
 // Same property, directory mode (BLOCKER: moved-body content used to be written
