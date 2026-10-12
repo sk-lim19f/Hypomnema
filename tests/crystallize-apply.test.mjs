@@ -6229,6 +6229,109 @@ test('legacy payload against a split baseline: the observed legacy-* heads are r
   });
 });
 
+// The old-form close retires only the split heads this session observed. Disabling the check:
+// in planSessionEntry replace the `retired` filter with `const retired = closeIds;`. The heads that
+// were never observed, or that another close published after the observation, are then retired too.
+test('legacy payload against a split baseline: a legacy-* head another close published after the observation stays live', () => {
+  withWiki(null, (dir, today) => {
+    untrackOldStateFiles(dir);
+    const base = 'aaaa1111-1';
+    const splitA = 'legacy-stage-a-111111';
+    const late = 'legacy-late-333333';
+    writeEntryFile(dir, {
+      closeId: base,
+      date: today,
+      summary: '',
+      tracks: [
+        { id: 'legacy', title: '이행 전 기록', new: true },
+        { id: splitA, title: 'Stage A', new: true },
+      ],
+      bodies: { legacy: 'REMAINDER-BODY', [splitA]: 'SPLIT-A-BODY' },
+    });
+    const sid = newPinSession('legacy-split-late');
+    recordObservedHeads(dir, sid, 'test-project', {
+      level: 'full',
+      heads: { legacy: [base], [splitA]: [base] },
+    });
+    // Another close lands after the observation: a new split track, and an update of an observed one.
+    const other = 'bbbb2222-2';
+    writeEntryFile(dir, {
+      closeId: other,
+      date: today,
+      summary: 'later close',
+      tracks: [
+        { id: late, title: 'Late', new: true },
+        { id: splitA, supersedes: [base] },
+      ],
+      bodies: { [late]: 'LATE-BODY', [splitA]: 'SPLIT-A-NEWER' },
+    });
+    const { out } = applyJson(dir, legacyFormatPayload(today, 'legacy split late'), sid);
+    assert.equal(out.ok, true, JSON.stringify(out));
+    const model = loadSessionModel(dir, 'test-project');
+    const tracks = trackHeads(model.entries);
+    const lateTrack = tracks.find((t) => t.trackId === late);
+    assert.deepEqual(
+      lateTrack.heads.map((h) => h.closeId),
+      [other],
+      'the track published after the observation keeps its own head',
+    );
+    assert.notEqual(lateTrack.done, true, 'and is not retired');
+    const aTrack = tracks.find((t) => t.trackId === splitA);
+    assert.ok(
+      aTrack.heads.some((h) => h.closeId === other),
+      `the later update of an observed split track is not retired: ${JSON.stringify(aTrack.heads.map((h) => h.closeId))}`,
+    );
+    const view = renderViews([model], { device: 'dev-test' }).projects['test-project'].sessionState;
+    assert.ok(view.includes('LATE-BODY'), view);
+    assert.ok(view.includes('SPLIT-A-NEWER'), view);
+    assert.ok(!view.includes('REMAINDER-BODY'), 'the observed legacy head is still replaced');
+  });
+});
+
+test('legacy payload against a split baseline: a split track this session never observed stays live', () => {
+  withWiki(null, (dir, today) => {
+    untrackOldStateFiles(dir);
+    const base = 'aaaa1111-1';
+    const seenTrack = 'legacy-stage-a-111111';
+    const unseen = 'legacy-stage-c-444444';
+    writeEntryFile(dir, {
+      closeId: base,
+      date: today,
+      summary: '',
+      tracks: [
+        { id: 'legacy', title: '이행 전 기록', new: true },
+        { id: seenTrack, title: 'Stage A', new: true },
+        { id: unseen, title: 'Stage C', new: true },
+      ],
+      bodies: { legacy: 'REMAINDER-BODY', [seenTrack]: 'SPLIT-A-BODY', [unseen]: 'UNSEEN-BODY' },
+    });
+    const sid = newPinSession('legacy-split-unseen');
+    recordObservedHeads(dir, sid, 'test-project', {
+      level: 'full',
+      heads: { legacy: [base], [seenTrack]: [base] },
+    });
+    const { out } = applyJson(dir, legacyFormatPayload(today, 'legacy split unseen'), sid);
+    assert.equal(out.ok, true, JSON.stringify(out));
+    const model = loadSessionModel(dir, 'test-project');
+    const tracks = trackHeads(model.entries);
+    const t = tracks.find((x) => x.trackId === unseen);
+    assert.deepEqual(
+      t.heads.map((h) => h.closeId),
+      [base],
+      'the unobserved split head is left as it was',
+    );
+    assert.notEqual(t.done, true);
+    assert.equal(
+      tracks.find((x) => x.trackId === seenTrack).done,
+      true,
+      'the observed one is retired',
+    );
+    const view = renderViews([model], { device: 'dev-test' }).projects['test-project'].sessionState;
+    assert.ok(view.includes('UNSEEN-BODY'), view);
+    assert.ok(!view.includes('SPLIT-A-BODY'), view);
+  });
+});
+
 test('legacy payload: a payload mixing either old field with summary or tracks fails and writes nothing', () => {
   const mixes = [
     { summary: 'x' },
@@ -6458,6 +6561,123 @@ test('unmerged paths without a MERGE_HEAD refuse the close the same way', () => 
     assert.deepEqual(sessionFilesOf(dir), []);
   });
 });
+
+// Disabling the check: in vaultOperationInProgress (hooks/hypo-shared.mjs) make the `am` branch
+// unreachable (`if (false && gitPathExists('rebase-apply/applying'))`). The am state then reads as a
+// rebase and the advice names `git rebase`, which refuses while an am is in progress.
+test('a failed git am is reported as an am, not a rebase; git am --abort lets the close succeed', () => {
+  withWiki(null, (dir, today) => {
+    const env = { ...process.env, HOME: SESSION_TMP_HOME };
+    const git = (...a) => spawnSync('git', a, { cwd: dir, env, encoding: 'utf-8' });
+    const base = git('rev-parse', '--abbrev-ref', 'HEAD').stdout.trim();
+    writeFileSync(join(dir, 'am-probe.txt'), 'one\n');
+    git('add', 'am-probe.txt');
+    git('commit', '-qm', 'probe');
+    git('checkout', '-q', '-b', 'side');
+    writeFileSync(join(dir, 'am-probe.txt'), 'two\n');
+    git('commit', '-qam', 'side');
+    const patchDir = mkdtempSync(join(tmpdir(), 'hypo-am-patch-'));
+    try {
+      git('format-patch', '-1', '-o', patchDir);
+      git('checkout', '-q', base);
+      writeFileSync(join(dir, 'am-probe.txt'), 'three\n');
+      git('commit', '-qam', 'main');
+      const am = git('am', join(patchDir, readdirSync(patchDir)[0]));
+      assert.notEqual(am.status, 0, `the fixture must stop in git am: ${am.stdout}`);
+      assert.ok(
+        existsSync(join(dir, '.git', 'rebase-apply', 'applying')),
+        'fixture: an am is open',
+      );
+      assert.notEqual(git('rebase', '--abort').status, 0, 'premise: git rebase cannot end an am');
+
+      const sid = newPinSession('mid-am');
+      const refused = applyJson(dir, v2Payload(today), sid);
+      assert.equal(refused.out.ok, false, JSON.stringify(refused.out));
+      assert.equal(refused.out.stage, 'vault-operation-in-progress');
+      assert.equal(refused.out.blocker.state, 'am');
+      assert.match(refused.out.error, /git am --continue/);
+      assert.match(refused.out.error, /git am --abort/);
+      assert.doesNotMatch(refused.out.error, /git rebase/);
+      assert.deepEqual(sessionFilesOf(dir), [], 'refused before any write');
+
+      assert.equal(git('am', '--abort').status, 0);
+      const closed = applyJson(dir, v2Payload(today), sid);
+      assert.equal(closed.out.ok, true, JSON.stringify(closed.out));
+      assert.equal(closed.out.committed, true);
+    } finally {
+      rmSync(patchDir, { recursive: true, force: true });
+    }
+  });
+});
+
+// Disabling the check: in applySessionClose make the lock callback return the stale `busy`
+// (`() => busy`). The close then reports the merge another session had just finished.
+await testAsync(
+  'a close that waits for the vault commit lock proceeds when the merge finishes meanwhile',
+  async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'hypo-wiki-'));
+    const today = todayLocal();
+    try {
+      buildCleanWikiTree(dir, today);
+      const gitInit = (...a) => spawnSync('git', a, { cwd: dir, encoding: 'utf-8' });
+      gitInit('init');
+      gitInit('config', 'user.email', 'test@test.com');
+      gitInit('config', 'user.name', 'Test');
+      gitInit('add', '-A');
+      gitInit('commit', '-m', 'init');
+      const git = openConflictingMerge(dir);
+      const lock = join(dir, '.cache', 'vault-commit.lock');
+      mkdirSync(join(dir, '.cache'), { recursive: true });
+      // This process is alive and the lock is fresh, so the close waits for it.
+      writeFileSync(lock, String(process.pid));
+      const sid = newPinSession('merge-finishes');
+      const cleanup = seedCloseTranscript(sid);
+      const payloadPath = join(tmpdir(), `hypo-payload-${sid}.json`);
+      writeFileSync(payloadPath, JSON.stringify(v2Payload(today)));
+      const child = spawn(
+        process.execPath,
+        [
+          join(REPO, 'scripts', 'crystallize.mjs'),
+          `--hypo-dir=${dir}`,
+          '--apply-session-close',
+          `--payload=${payloadPath}`,
+          `--session-id=${sid}`,
+          '--json',
+        ],
+        { env: { ...process.env, HYPO_DIR: '', HOME: SESSION_TMP_HOME } },
+      );
+      let stdout = '';
+      let stderr = '';
+      child.stdout.on('data', (d) => (stdout += d));
+      child.stderr.on('data', (d) => (stderr += d));
+      const exited = new Promise((resolve) => child.on('exit', (code) => resolve(code)));
+      try {
+        // The waiter stages its own lock file before it polls, so that file shows it is waiting.
+        const waiting = () =>
+          readdirSync(join(dir, '.cache')).some((f) => /^vault-commit\.lock\..+\.tmp$/.test(f));
+        for (let i = 0; i < 100 && !waiting(); i++) await sleep(50);
+        assert.ok(waiting(), `fixture: the close is waiting for the lock\n${stdout}\n${stderr}`);
+        // The merge finishes while the close waits, then the lock is released.
+        writeFileSync(join(dir, 'log.md'), 'resolved\n');
+        git('add', 'log.md');
+        const done = git('commit', '--no-edit');
+        assert.equal(done.status, 0, `fixture: the merge finishes: ${done.stderr}`);
+        rmSync(lock);
+        const code = await exited;
+        const out = JSON.parse(stdout);
+        assert.equal(out.ok, true, `${stdout}\n${stderr}`);
+        assert.equal(code, 0, stdout);
+        assert.equal(out.committed, true, stdout);
+      } finally {
+        child.kill();
+        cleanup();
+        rmSync(payloadPath, { force: true });
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  },
+);
 
 test('a commit that fails after the writes is ok:false at stage commit-failed, with no marker or receipt, and names the entry it left; the retry closes', () => {
   withWiki(null, (dir, today) => {
