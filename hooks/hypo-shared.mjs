@@ -1783,6 +1783,29 @@ export function listTrackedGeneratedViews(hypoDir, { source = 'index' } = {}) {
   return r.stdout.split('\0').filter((p) => isGeneratedViewPath(p));
 }
 
+/**
+ * The generated views HEAD tracks in a vault that counts as migrated: what a push must not hand to
+ * other machines, and what `doctor` reports with the `git rm --cached` remedy. "Migrated" is either
+ * the upstream carrying the `.gitignore` block with HEAD having taken it in (`@{u}` is an ancestor
+ * of HEAD, so a copy that has not pulled yet is not judged), or HEAD's own `.gitignore` holding the
+ * whole block (the only reading a vault with no remote has). The off marker in HEAD is a rollback
+ * on purpose, where tracking the flat files is the intended state: it is judged by presence only,
+ * its content is never read. Throws when git cannot list the tracked paths. `[]` means nothing to
+ * report.
+ */
+export function listRetrackedViews(hypoDir) {
+  if (pathInHead(hypoDir, SESSION_ENTRIES_OFF_MARKER)) return [];
+  const caughtUp =
+    upstreamIsMigrated(hypoDir) &&
+    vaultGit(hypoDir, ['merge-base', '--is-ancestor', '@{u}', 'HEAD']).status === 0;
+  if (!caughtUp) {
+    const shown = vaultGit(hypoDir, ['show', revPathArg('HEAD', '.gitignore')]);
+    const missing = shown.status === 0 ? missingBlockLines(shown.stdout, GITIGNORE_BLOCK) : null;
+    if (!missing || missing.length) return [];
+  }
+  return listTrackedGeneratedViews(hypoDir, { source: 'head' });
+}
+
 // A `.git` in `dir` or a parent, a directory or the file a linked worktree or submodule has. Both
 // the path as given and its real path are walked: a vault reached through a symlink to a
 // subdirectory of a repository has its `.git` above the real path, not above the link.

@@ -41,6 +41,7 @@ import {
   isUsablePkgRootLocal,
   selfLocationPkgRootFrom,
   listSessionProjects,
+  listRetrackedViews,
   listTrackedGeneratedViews,
   migrationState,
   upstreamIsMigrated,
@@ -54,6 +55,7 @@ import {
   baselineIdMismatch,
   parseSessionEntry,
   isGeneratedViewPath,
+  isSessionEntryPath,
 } from '../hooks/session-entries.mjs';
 import { projectEntryScope } from '../hooks/session-views.mjs';
 import { classifyProposals } from './proposal.mjs';
@@ -836,6 +838,9 @@ function checkBrokenLinks(hypoDir, ignorePatterns = []) {
   const broken = [];
 
   for (const file of mdFiles) {
+    // An entry is an immutable source record, and lint leaves its links alone for that reason
+    // (nothing may repair them). It stays in slugSet: the generated views link to it.
+    if (isSessionEntryPath(relative(hypoDir, file).split(sep).join('/'))) continue;
     const raw = readFileSync(file, 'utf-8');
     const content = raw.replace(/<!--[\s\S]*?-->/g, '').replace(/`[^`\n]+`/g, '');
     const links = [...content.matchAll(/\[\[([^\]|#\n]+?)(?:[|#][^\]]*?)?\]\]/g)].map((m) =>
@@ -1443,6 +1448,22 @@ function countFilesUnder(dir) {
 function checkSessionEntries(hypoDir) {
   const state = migrationState(hypoDir);
   const remedy = '/hypo:upgrade --migrate-sessions';
+  // A commit that tracks the generated views again makes migrationState read 'not-migrated', which
+  // would otherwise be reported as "migrates at the next session start". Judged by the same helper
+  // the Stop push guard uses, so both name one state and one remedy, ahead of the state branch.
+  let retracked = [];
+  try {
+    retracked = listRetrackedViews(hypoDir);
+  } catch {
+    // no git to ask (a vault without one tracks nothing)
+  }
+  if (retracked.length > 0) {
+    const list = retracked.map((p) => `'${p}'`).join(' ');
+    warn(
+      'Session views re-tracked',
+      `${retracked.length} generated view(s) are tracked in a commit of this vault again: ${retracked.slice(0, 5).join(', ')}${retracked.length > 5 ? ` (+${retracked.length - 5} more)` : ''}. Stop does not push while they are. Run git -C ${hypoDir} rm --cached -- ${list} and record that removal, so they stay generated`,
+    );
+  }
   if (state === 'migrated') {
     pass('Session entries', 'migrated: the session views are generated from projects/*/sessions/');
   } else if (state === 'opted-out') {
@@ -1455,6 +1476,8 @@ function checkSessionEntries(hypoDir) {
       'Session entries',
       'the .gitignore or .gitattributes block of Hypomnema is incomplete in HEAD, so the vault is not treated as migrated. Restore the whole block and commit it',
     );
+  } else if (retracked.length > 0) {
+    // reported above with its own remedy
   } else if (upstreamIsMigrated(hypoDir)) {
     warn(
       'Session entries',

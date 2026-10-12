@@ -4132,6 +4132,91 @@ test('doctor-session-entries: a generated view tracked again after the migration
   });
 });
 
+test('doctor-session-entries: a re-track that is committed is reported with the git rm --cached remedy, not as "not migrated"', () => {
+  withTmpDir((dir) => {
+    seVault(dir);
+    seWrite(dir, 'projects/p/hot.md', '# hot\n');
+    seGit(dir, 'add', '-f', 'projects/p/hot.md');
+    seGit(dir, 'commit', '-qm', 're-track');
+    const out = seDoctor(dir);
+    const c = seCheck(out, 'Session views re-tracked');
+    assert.equal(c.status, 'warn', c.detail);
+    assert.ok(c.detail.includes('projects/p/hot.md'), c.detail);
+    assert.match(c.detail, /rm --cached -- 'projects\/p\/hot\.md'/);
+    assert.equal(
+      seCheck(out, 'Session entries'),
+      undefined,
+      'the vault is not described as one that migrates at the next session start',
+    );
+  });
+});
+
+test('doctor-session-entries: a committed re-track under the rollback marker is the rollback itself, not a re-track', () => {
+  withTmpDir((dir) => {
+    seVault(dir);
+    seWrite(dir, 'projects/p/hot.md', '# hot\n');
+    seWrite(dir, '.hypo-session-entries-off', 'rolled back\n');
+    seGit(dir, 'add', '-f', 'projects/p/hot.md', '.hypo-session-entries-off');
+    seGit(dir, 'commit', '-qm', 'rollback');
+    const out = seDoctor(dir);
+    assert.equal(seCheck(out, 'Session views re-tracked'), undefined);
+    const c = seCheck(out, 'Session entries');
+    assert.equal(c.status, 'warn', c.detail);
+    assert.match(c.detail, /rolled back/);
+  });
+});
+
+test('doctor-session-entries: a copy that has not pulled the migrated remote is "not caught up", not re-tracked', () => {
+  withTmpDir((root) => {
+    const origin = join(root, 'origin.git');
+    const a = join(root, 'a');
+    const b = join(root, 'b');
+    seGit(root, 'init', '-q', '--bare', origin);
+    seGit(root, 'clone', '-q', origin, a);
+    seGit(a, 'config', 'user.email', 't@example.com');
+    seGit(a, 'config', 'user.name', 't');
+    seWrite(a, 'hypo-config.md', '# config');
+    seWrite(a, '.gitignore', '.cache/\n');
+    seWrite(a, 'projects/p/index.md', '---\ntitle: P\n---\n');
+    seWrite(a, 'projects/p/hot.md', '# hot\n');
+    seGit(a, 'add', '-A');
+    seGit(a, 'commit', '-qm', 'old state');
+    seGit(a, 'push', '-q', '-u', 'origin', 'HEAD');
+    seGit(root, 'clone', '-q', origin, b);
+    seGit(a, 'rm', '-q', 'projects/p/hot.md');
+    seWrite(a, '.gitignore', `.cache/\n${GITIGNORE_BLOCK}`);
+    seGit(a, 'add', '-A');
+    seGit(a, 'commit', '-qm', 'migrated');
+    seGit(a, 'push', '-q');
+    seGit(b, 'fetch', '-q');
+    const out = seDoctor(b);
+    assert.equal(seCheck(out, 'Session views re-tracked'), undefined);
+    const c = seCheck(out, 'Session entries');
+    assert.equal(c.status, 'warn', c.detail);
+    assert.match(c.detail, /has not caught up/);
+  });
+});
+
+test('doctor broken links: a link inside a session entry is not reported, the same link in a page is, and an entry is still a target', () => {
+  withTmpDir((dir) => {
+    seVault(dir);
+    seWrite(
+      dir,
+      'projects/p/sessions/2026-10-01-aaaa.md',
+      '---\ntitle: e\n---\nsee [[gone-page]]\n',
+    );
+    seWrite(dir, 'pages/target.md', '---\ntitle: t\n---\nlinks [[2026-10-01-aaaa]]\n');
+    const c = seCheck(seDoctor(dir), 'Broken wiki links');
+    assert.equal(c.status, 'pass', `the entry's own broken link is skipped: ${c.detail}`);
+    seWrite(dir, 'pages/page.md', '---\ntitle: pg\n---\nsee [[gone-page]]\n');
+    const d = seCheck(seDoctor(dir), 'Broken wiki links');
+    assert.equal(d.status, 'warn', d.detail);
+    assert.ok(d.detail.includes('1 broken'), d.detail);
+    assert.ok(d.detail.includes('pages/page.md'), d.detail);
+    assert.ok(!d.detail.includes('sessions/'), d.detail);
+  });
+});
+
 test('doctor-session-entries: backup files under .cache/backups are counted', () => {
   withTmpDir((dir) => {
     seVault(dir);
