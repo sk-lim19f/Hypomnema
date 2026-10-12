@@ -1026,13 +1026,22 @@ function suggestedProjectName(slug) {
 // One directory's line of the invalid-name notice: why, and the `/hypo:rename` command to a valid name.
 function renameAdvice(slug, problem) {
   if (problem === 'not-nfc') {
-    // macOS file systems treat the NFD and NFC spellings as one name, so a direct rename to the NFC
-    // spelling is refused as existing; go through a temporary name (the same path as
-    // `nonNfcProjectMessage` in hypo-shared).
-    const [first, second] = nfcRenameCommands(slug);
+    // The NFC respelling is one move (rename accepts a destination that is the source itself and a
+    // project that has entries); the same command as `nonNfcProjectMessage` in hypo-shared.
+    const [command] = nfcRenameCommands(slug);
     return (
       `projects/${slug}: 이름이 NFC 형태가 아니라(macOS에서 만든 분해형 한글 등) git이 보고하는 경로와 맞지 않습니다. ` +
-      `${first} 다음에 ${second} 를 실행하세요.`
+      `${command} 를 실행하세요.`
+    );
+  }
+  // A quote, `$`, backtick or backslash cannot go inside the quoted `--from="..."` of a command
+  // (the quote ends early, the shell expands `$` and the backtick, rename reads `\` as a separator),
+  // so no command is printed for such a name.
+  if (/["$`\\]/.test(slug)) {
+    return (
+      `projects/${slug}: 이름에 따옴표, $, 백틱, 역슬래시 중 하나가 있어 rename 명령으로는 옮길 수 없습니다. ` +
+      `파일 관리자나 git mv로 디렉터리 이름을 직접 바꾸세요(경로는 쉘에 맞게 따옴표로 감쌉니다). ` +
+      `새 이름은 문자, 숫자, ., _, - 로만 만든 뒤 다시 시작하세요. 이 방법은 그 프로젝트를 가리키는 위키링크를 고쳐 주지 않습니다.`
     );
   }
   const why = '이름에 공백이나 기호가 있습니다';

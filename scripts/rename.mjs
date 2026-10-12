@@ -51,7 +51,7 @@ import {
 import { join, basename, dirname, normalize, isAbsolute } from 'path';
 import { resolveHypoRoot, expandHome } from './lib/hypo-root.mjs';
 import { loadHypoIgnore } from './lib/hypo-ignore.mjs';
-import { isSessionEntryPath } from '../hooks/session-entries.mjs';
+import { isSessionEntryPath, parseSessionEntry } from '../hooks/session-entries.mjs';
 import { collectPagesRename } from './lib/wikilink.mjs';
 import { RENAME_MARKER_REL, renameMarkerPath, readRenameMarker } from './lib/rename-marker.mjs';
 import {
@@ -444,23 +444,53 @@ function runDirectory(args, fromDirRel, ignorePatterns) {
   if (toDirRel === fromDirRel) {
     fail(args, `--from and --to are the same directory (${toDirRel}) — nothing to rename`);
   }
+  // A move that only respells the path in NFC (a decomposed directory name to its precomposed
+  // one). The two spellings are one name on APFS, so this is a single renameSync, not a move to a
+  // new place, and entries written under the NFC name stay correct (see below).
+  const normalizationOnly =
+    toDirRel === toDirRel.normalize('NFC') && toDirRel === fromDirRel.normalize('NFC');
   // A project directory with entries cannot move: each entry's `project:` field names the
   // directory it was written in and is immutable, so the move would leave close recovery and the
   // missing-predecessor check reading the old name. The display name is the index.md title.
+  // The exception is the NFC respelling: project directories were never accepted in NFD, so every
+  // entry already names the NFC project, and the respelled directory is the name it points at.
   if (/^projects\/[^/]+$/.test(fromDirRel)) {
-    let hasEntries = false;
+    let entryFiles = [];
     try {
-      hasEntries = readdirSync(join(fromAbs, 'sessions')).some((f) => f.endsWith('.md'));
+      entryFiles = readdirSync(join(fromAbs, 'sessions')).filter((f) => f.endsWith('.md'));
     } catch {
       // no sessions/ directory: no entries
     }
-    if (hasEntries) {
-      fail(
-        args,
-        `--from '${fromDirRel}' has session entries, and each entry records the project directory ` +
-          `it was written in, so the directory cannot be renamed. The project's display name is ` +
-          `the \`title\` in ${fromDirRel}/index.md: change that instead.`,
-      );
+    if (entryFiles.length > 0) {
+      if (!normalizationOnly) {
+        fail(
+          args,
+          `--from '${fromDirRel}' has session entries, and each entry records the project directory ` +
+            `it was written in, so the directory cannot be renamed. The project's display name is ` +
+            `the \`title\` in ${fromDirRel}/index.md: change that instead.`,
+        );
+      }
+      const fromName = fromDirRel.slice('projects/'.length);
+      const nfcName = fromName.normalize('NFC');
+      const stranger = entryFiles.find((f) => {
+        let parsed;
+        try {
+          parsed = parseSessionEntry(readFileSync(join(fromAbs, 'sessions', f), 'utf-8'));
+        } catch {
+          return true;
+        }
+        return (
+          !parsed.ok || (parsed.entry.project !== nfcName && parsed.entry.project !== fromName)
+        );
+      });
+      if (stranger !== undefined) {
+        fail(
+          args,
+          `--from '${fromDirRel}' has session entry '${stranger}' that does not name project ` +
+            `'${nfcName}' (or cannot be read as an entry), so respelling the directory could ` +
+            `leave it pointing at the wrong project. Check that entry first.`,
+        );
+      }
     }
   }
   // Same top-level segment only. A move that changes the leading scan-dir segment
@@ -535,7 +565,22 @@ function runDirectory(args, fromDirRel, ignorePatterns) {
   // Renumber / merge report: a destination that already exists means this is not a
   // clean 1:1 move. Rather than a terse hard-fail, report exactly which destination
   // paths collide and refuse --apply, leaving the merge/renumber for manual handling.
-  if (existsSync(toAbs)) {
+  // The exception is a normalization-only respelling whose destination is the source itself: on a
+  // file system that folds the two spellings (APFS) both names open the same directory, which is
+  // not a collision. Where they are different names (Linux) the destination only exists if
+  // something else is there, and that still refuses.
+  const destinationIsSource =
+    normalizationOnly &&
+    (() => {
+      try {
+        const a = statSync(fromAbs);
+        const b = statSync(toAbs);
+        return a.ino === b.ino && a.dev === b.dev;
+      } catch {
+        return false;
+      }
+    })();
+  if (existsSync(toAbs) && !destinationIsSource) {
     const collisions = [];
     for (const { toPage } of movedByRel.values()) {
       if (existsSync(toPage.path)) collisions.push(toPage.rel);

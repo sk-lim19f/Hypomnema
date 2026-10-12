@@ -58,19 +58,17 @@ export function projectNameProblem(name) {
 }
 
 /**
- * The two `/hypo:rename` commands that move a project directory spelled in NFD to its NFC name.
- * macOS file systems treat both spellings as one name, so a direct rename is refused as existing:
- * the move goes through a temporary name. Both paths carry `projects/`, which rename needs to stay
- * in the same top-level area. Each directory ends with `/`: rename strips a trailing `.md` before it
- * resolves a path, so a project named `x.md` is only reached as a directory by that slash.
+ * The one `/hypo:rename` command that moves a project directory spelled in NFD to its NFC name, as
+ * an array of one command so a caller can still join the list. macOS file systems treat both
+ * spellings as one name, and `rename` does the respelling as a single move (it accepts the
+ * destination that is the source itself, and a project that has entries). Both paths carry
+ * `projects/`, which rename needs to stay in the same top-level area. Each directory ends with `/`:
+ * rename strips a trailing `.md` before it resolves a path, so a project named `x.md` is only
+ * reached as a directory by that slash.
  */
 export function nfcRenameCommands(onDisk) {
   const nfc = onDisk.normalize('NFC');
-  const tmp = `${nfc}.nfc-tmp`;
-  return [
-    `/hypo:rename --from="projects/${onDisk}/" --to="projects/${tmp}/"`,
-    `/hypo:rename --from="projects/${tmp}/" --to="projects/${nfc}/"`,
-  ];
+  return [`/hypo:rename --from="projects/${onDisk}/" --to="projects/${nfc}/"`];
 }
 // `scalar` and the parser take anything with `.test`, so the project rule slots in beside the regexes.
 const PROJECT_RE = { test: isValidProjectName };

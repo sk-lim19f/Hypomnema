@@ -2720,15 +2720,15 @@ test('a vault with no git leaves a decomposed-name project alone, moves the vali
       false,
       JSON.stringify(r.written),
     );
-    const [first, second] = nfcRenameCommands(nfd);
+    const [command, ...rest] = nfcRenameCommands(nfd);
+    assert.deepEqual(rest, [], 'one command');
     const notice = consumeRootHotHealthNotice(dir) ?? '';
-    assert.ok(notice.includes(`${first} 다음에 ${second}`), notice);
+    assert.ok(notice.includes(`${command} 를 실행`), notice);
     // a second run keeps it blocked, then the rename lets it move
     writeGeneratedViews(dir, WRITE);
     assert.equal(readRel(dir, `projects/${nfd}/hot.md`), OLD_HOT_FILE, 'still untouched');
     const projects = join(dir, 'projects');
-    renameSync(join(projects, nfd), join(projects, `${nfc}.nfc-tmp`));
-    renameSync(join(projects, `${nfc}.nfc-tmp`), join(projects, nfc));
+    renameSync(join(projects, nfd), join(projects, nfc));
     assert.ok(readdirSync(projects).includes(nfc), 'precondition: renamed to NFC');
     writeGeneratedViews(dir, WRITE);
     assert.equal(gitlessBaselines(dir, nfc).length, 2, 'moved after the rename');
@@ -6522,6 +6522,27 @@ test('a tracked project directory whose name cannot be an entry project defers t
   );
 });
 
+// A name with a quote, `$`, a backtick or a backslash cannot be written into the quoted `--from="..."`
+// of a command: the quote ends early, the shell expands the `$`, rename turns `\` into a separator.
+// The notice sends the person to rename the directory by hand and prints no rename command.
+// Disable: in hooks/session-views.mjs renameAdvice, change the regex `/["$`\\]/` to `/(?!)/`.
+test('a project name with a quote, $ or backslash gets manual rename advice and no rename command', () => {
+  const bad = ['my"project', '${HOME}', 'my\\project'];
+  withOldGit(
+    (dir) => {
+      const r = migrate(dir);
+      assert.equal(r.migrated, false);
+      assert.equal(r.deferred, 'invalid-project-name', JSON.stringify(r));
+      const notice = r.notices.join('\n');
+      for (const name of bad) assert.ok(notice.includes(`projects/${name}:`), `${name} is named`);
+      assert.doesNotMatch(notice, /\/hypo:rename/, notice);
+      assert.match(notice, /git mv/);
+      assert.match(notice, /위키링크를 고쳐 주지 않습니다/);
+    },
+    Object.assign({}, ...bad.map(oldProjectFiles)),
+  );
+});
+
 test('a tracked project directory that is not in NFC defers the move and names the NFC spelling', () => {
   const nfd = '프로젝트'.normalize('NFD');
   const nfc = nfd.normalize('NFC');
@@ -6548,13 +6569,10 @@ test('a tracked project directory that is not in NFC defers the move and names t
       assert.equal(r.migrated, false);
       assert.equal(r.deferred, 'invalid-project-name', JSON.stringify(r));
       const notice = r.notices.join('\n');
-      const [first, second] = nfcRenameCommands(nfd);
-      assert.equal(first, `/hypo:rename --from="projects/${nfd}/" --to="projects/${nfc}.nfc-tmp/"`);
-      assert.equal(
-        second,
-        `/hypo:rename --from="projects/${nfc}.nfc-tmp/" --to="projects/${nfc}/"`,
-      );
-      assert.ok(notice.includes(`${first} 다음에 ${second}`), notice);
+      assert.deepEqual(nfcRenameCommands(nfd), [
+        `/hypo:rename --from="projects/${nfd}/" --to="projects/${nfc}/"`,
+      ]);
+      assert.ok(notice.includes(`${nfcRenameCommands(nfd)[0]} 를 실행`), notice);
       assert.ok(notice.includes('.hypoignore'), notice);
       assert.match(notice, /NFC/);
       assert.doesNotMatch(notice, /projects\/ok:/);
@@ -6589,8 +6607,8 @@ test('a decomposed project directory defers the move even when git reports its p
       const r = migrate(dir);
       assert.equal(r.migrated, false, JSON.stringify(r));
       assert.equal(r.deferred, 'invalid-project-name', JSON.stringify(r));
-      const [first, second] = nfcRenameCommands(nfd);
-      assert.ok(r.notices.join('\n').includes(`${first} 다음에 ${second}`), r.notices.join('\n'));
+      const [command] = nfcRenameCommands(nfd);
+      assert.ok(r.notices.join('\n').includes(`${command} 를 실행`), r.notices.join('\n'));
       assert.equal(headOf(dir), head, 'nothing committed');
       assert.equal(existsSync(join(dir, 'projects', nfc, 'sessions')), false, 'no entries written');
     }),
