@@ -874,6 +874,30 @@ export function buildCommitInTempIndex(hypoDir, edits, { testHooks } = {}) {
   }
 }
 
+// A merge can fail after git installed the new index and working tree: the ref update is its last
+// step, and a held `HEAD.lock` stops it there. HEAD is then where it was while the index and disk
+// hold the target layout, a state no later run reads as "nothing moved". When HEAD is unchanged and
+// the index equals the target on every path the move changes, a two-tree `read-tree` goes back from
+// the target to HEAD: it touches those paths only and refuses to overwrite a changed file. Returns
+// `{ok, notice?}`; `ok: false` means the state is still stranded and `notice` (also written to the
+// pending notices for the next SessionStart) names it and the git command that recovers it.
+function returnStrandedIndex(hypoDir, sha, headBefore) {
+  const headNow = gitRun(hypoDir, ['rev-parse', '--verify', '--quiet', 'HEAD']).stdout.trim();
+  if (!headBefore || headNow !== headBefore) return { ok: true };
+  const changed = gitRun(hypoDir, ['diff', '--name-only', '-z', '--relative', headBefore, sha]);
+  const paths = String(changed.stdout).split('\0').filter(Boolean);
+  if (changed.status !== 0 || !paths.length) return { ok: true };
+  const specs = paths.map((p) => `:(literal)${p}`);
+  // 0 when the index holds the target's bytes on every one of those paths.
+  if (gitRun(hypoDir, ['diff', '--cached', '--quiet', sha, '--', ...specs]).status !== 0) {
+    return { ok: true };
+  }
+  if (gitRun(hypoDir, ['read-tree', '-m', '-u', sha, headBefore]).status === 0) return { ok: true };
+  const notice = `이행 커밋 적용이 HEAD 갱신에서 멈췄고 인덱스와 작업 트리가 새 구성에 남았습니다. 되돌리려면 이 명령을 실행하세요: git -C '${hypoDir}' read-tree -m -u ${sha} ${headBefore}`;
+  writeRootHotHealthNotice(hypoDir, notice);
+  return { ok: false, notice };
+}
+
 /**
  * Bring HEAD, the real index and the working tree to `sha` (a descendant of HEAD) in one git
  * motion. First `clearGeneratedPathsBlockingPull` sets aside what would block the merge, then
@@ -896,17 +920,23 @@ export function fastForwardTo(hypoDir, sha, { testHooks } = {}) {
       pre.localOnly.length +
       pre.unowned.length +
       pre.cleared.length +
-      pre.gitignoreSaved.length >
+      pre.gitignoreSaved.length +
+      pre.ownedRemoved.length >
     0;
   if (!pre.ok) {
     const undone = moved ? undoClearedPaths(hypoDir, pre).notices : [];
     const notice = [pre.notice, ...undone].filter(Boolean).join('\n') || undefined;
     return { ok: false, pre, deferred: pre.deferred, reason: pre.reason, notice };
   }
+  const headBefore = gitRun(hypoDir, ['rev-parse', '--verify', '--quiet', 'HEAD']).stdout.trim();
   const merged = gitRun(hypoDir, ['merge', '--ff-only', sha]);
   if (merged.status !== 0) {
     const stderr = String(merged.stderr).trim();
-    const undone = moved ? undoClearedPaths(hypoDir, pre).notices : [];
+    const stranded = returnStrandedIndex(hypoDir, sha, headBefore);
+    const undone =
+      moved && stranded.ok
+        ? undoClearedPaths(hypoDir, pre).notices
+        : [stranded.notice].filter(Boolean);
     return {
       ok: false,
       pre,
