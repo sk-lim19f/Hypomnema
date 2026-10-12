@@ -3143,10 +3143,17 @@ export function shareLegacyBytes(hypoDir, archived) {
         // A baseline made before the split held both files in one entry, so the section of this
         // kind is what is compared, not the whole entry.
         const scope = scopeKey(mine.visibilityScope);
+        // An earlier build wrote a state file whole, as one `legacy` body, even when it has track
+        // sections. The same bytes are the same memory: a split copy beside it would bring back
+        // the tracks that were finished there.
+        const unsplitBody = (stateText ?? '').replace(/\r\n/g, '\n');
         const same =
           built.kind === 'hot'
             ? (e) => e.scope === scope && e.summary === mine.summary
-            : (e) => e.scope === scope && e.bodies === JSON.stringify(mine.bodies);
+            : (e) =>
+                e.scope === scope &&
+                (e.bodies === JSON.stringify(mine.bodies) ||
+                  e.bodies === JSON.stringify({ [LEGACY_TRACK_ID]: unsplitBody }));
         if (existing.some(same)) {
           skipped.push(rel);
           continue;

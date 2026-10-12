@@ -520,6 +520,8 @@ const VIEW_NAMES = ['hot.md', 'session-state.md'];
  * claiming the old file on its word would let the generator replace the only copy of it: the
  * project is `blocked` (nothing written, nothing claimed, the old files untouched), a notice names
  * the path, and the caller leaves the project's views alone until the clash is resolved.
+ * A project whose directory name `projectNameProblem` rejects (not in NFC, say) is `blocked` the
+ * same way, with a notice carrying the rename advice, and moves on the run after the rename.
  */
 export function moveLegacyFilesToEntriesUnlocked(hypoDir, own) {
   const created = [];
@@ -557,6 +559,22 @@ export function moveLegacyFilesToEntriesUnlocked(hypoDir, own) {
     }
     if (projectHiddenByHypoignore(hypoDir, slug, patterns)) {
       pending.add(slug);
+      continue;
+    }
+    // Every later close refuses a directory whose on-disk name is not a usable project name (a
+    // decomposed Hangul name, say), so baselines written into it would sit where no close reads
+    // them while the views replaced the old files. It stays as it is until it is renamed. The NFC
+    // spelling is listed too: after the rename the directory has that name, and the list is how the
+    // project is found again.
+    const nameProblem = projectNameProblem(slug);
+    if (nameProblem !== null) {
+      pending.add(slug);
+      pending.add(slug.normalize('NFC'));
+      blocked.push(slug);
+      notices.push(
+        `프로젝트 ${slug}: 이름 때문에 옛 hot.md와 session-state.md를 옮기지 않았습니다. 옛 파일은 그대로 두었고 이 프로젝트의 현황 파일은 갱신하지 않습니다. ` +
+          `${renameAdvice(slug, nameProblem)} 이름을 바꾼 뒤 다시 시작하세요.`,
+      );
       continue;
     }
     const indexText = lenientRead(join(base, 'index.md'));
@@ -599,6 +617,10 @@ export function moveLegacyFilesToEntriesUnlocked(hypoDir, own) {
       if (text !== null) own.views[`projects/${slug}/${name}`] = sha256(text);
       claimed ||= text !== null;
     }
+  }
+  // A spelling that is no longer on disk and is not NFC is a name that was renamed away.
+  for (const slug of pending) {
+    if (slug !== slug.normalize('NFC') && !names.includes(slug)) pending.delete(slug);
   }
   // The list goes first: a run that dies before the record is saved still knows who is waiting.
   if (pending.size !== pendingBefore.size || [...pending].some((x) => !pendingBefore.has(x)))

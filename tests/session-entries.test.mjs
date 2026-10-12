@@ -17,6 +17,7 @@ import {
   mkdtempSync,
   readFileSync,
   readdirSync,
+  renameSync,
   statSync,
   symlinkSync,
   unlinkSync,
@@ -2695,6 +2696,52 @@ test('a stale pending slug for a project whose move completed neither baselines 
   });
 });
 
+// Disabling the defense: in `moveLegacyFilesToEntriesUnlocked` (hooks/session-views.mjs) change
+// `if (nameProblem !== null) {` to `if (false) {`. The decomposed project's old files are then
+// moved into baselines and replaced by views, and the first test goes red.
+test('a vault with no git leaves a decomposed-name project alone, moves the valid ones, and moves it after the rename', () => {
+  const nfd = '프로젝트'.normalize('NFD');
+  const nfc = nfd.normalize('NFC');
+  assert.notEqual(nfd, nfc, 'precondition: the two spellings differ');
+  withTmpDir((dir) => {
+    gitlessLegacyVault(dir);
+    put(dir, `projects/${nfd}/index.md`, '---\ntitle: x\n---\n');
+    put(dir, `projects/${nfd}/hot.md`, OLD_HOT_FILE);
+    put(dir, `projects/${nfd}/session-state.md`, OLD_STATE_FILE);
+    assert.ok(readdirSync(join(dir, 'projects')).includes(nfd), 'precondition: decomposed on disk');
+    const r = writeGeneratedViews(dir, WRITE);
+    assert.equal(gitlessBaselines(dir, 'p').length, 2, 'the valid project moved');
+    assert.match(readRel(dir, 'projects/p/hot.md'), /generated: sessions/);
+    assert.deepEqual(gitlessBaselines(dir, nfd), [], 'no baseline in the decomposed directory');
+    assert.equal(readRel(dir, `projects/${nfd}/hot.md`), OLD_HOT_FILE);
+    assert.equal(readRel(dir, `projects/${nfd}/session-state.md`), OLD_STATE_FILE);
+    assert.equal(
+      r.written.some((rel) => rel.startsWith('projects/프로젝트')),
+      false,
+      JSON.stringify(r.written),
+    );
+    const [first, second] = nfcRenameCommands(nfd);
+    const notice = consumeRootHotHealthNotice(dir) ?? '';
+    assert.ok(notice.includes(`${first} 다음에 ${second}`), notice);
+    // a second run keeps it blocked, then the rename lets it move
+    writeGeneratedViews(dir, WRITE);
+    assert.equal(readRel(dir, `projects/${nfd}/hot.md`), OLD_HOT_FILE, 'still untouched');
+    const projects = join(dir, 'projects');
+    renameSync(join(projects, nfd), join(projects, `${nfc}.nfc-tmp`));
+    renameSync(join(projects, `${nfc}.nfc-tmp`), join(projects, nfc));
+    assert.ok(readdirSync(projects).includes(nfc), 'precondition: renamed to NFC');
+    writeGeneratedViews(dir, WRITE);
+    assert.equal(gitlessBaselines(dir, nfc).length, 2, 'moved after the rename');
+    assert.match(readRel(dir, `projects/${nfc}/hot.md`), /generated: sessions/);
+    assert.equal(gitlessBaselines(dir, 'p').length, 2, 'the valid project is not moved twice');
+    assert.equal(
+      existsSync(join(dir, '.cache', 'legacy-move-pending.json')),
+      false,
+      'nothing is left waiting',
+    );
+  });
+});
+
 test('a file edited after the move in a vault with no git is backed up like any foreign bytes, not turned into a baseline', () => {
   withTmpDir((dir) => {
     gitlessLegacyVault(dir);
@@ -4268,6 +4315,49 @@ test('(g) a committed split baseline does not swallow a copy whose remainder mat
       'the edited track reaches a baseline',
     );
   });
+});
+
+// Disabling the defense: in `shareLegacyBytes` (hooks/hypo-shared.mjs) change the second operand
+// `e.bodies === JSON.stringify({ [LEGACY_TRACK_ID]: unsplitBody })` to `false`. The identical bytes
+// then publish a split baseline and the finished tracks come back as heads.
+test('(g) a state baseline an earlier build wrote unsplit and finished is the same memory as a split copy of its bytes', () => {
+  const unsplitId = `baseline-${createHash('sha256')
+    .update(JSON.stringify(['state', MULTI_STATE, true, null]))
+    .digest('hex')
+    .slice(0, 16)}`;
+  const unsplit = formatSessionEntry({
+    project: 'p',
+    closeId: unsplitId,
+    date: '2026-09-25',
+    visibilityScope: null,
+    tracks: [{ id: LEGACY_TRACK_ID, title: '이행 전 기록', new: true, done: true }],
+    summary: '',
+    bodies: { [LEGACY_TRACK_ID]: MULTI_STATE },
+  });
+  assert.ok(splitBaseline(MULTI_STATE).entry.tracks.length > 1, 'precondition: the file splits');
+  withCatchUp(
+    ({ b, remote }) => {
+      put(b, 'projects/p/session-state.md', MULTI_STATE);
+      const pre = catchUpAndMerge(b);
+      assert.equal(baselinesOf(b).length, remote.length + 1, 'precondition: the unsplit one is in');
+      const before = commitCount(b);
+      const shared = shareLegacyBytes(b, pre.archived);
+      assert.deepEqual(shared.created, [], JSON.stringify(shared));
+      assert.equal(commitCount(b), before, 'no commit');
+      assert.equal(baselinesOf(b).length, remote.length + 1, 'no new baseline');
+      const heads = trackHeads(loadSessionModel(b, 'p', { state: 'migrated' }).entries);
+      assert.deepEqual(
+        heads.filter((t) => t.trackId.startsWith('legacy-') && t.heads.length > 0),
+        [],
+        'no split track came back as a head',
+      );
+    },
+    {
+      migrate: {
+        touch: { [`projects/p/sessions/${entryFileName('2026-09-25', unsplitId)}`]: unsplit },
+      },
+    },
+  );
 });
 
 test('(g) only the file this machine set aside becomes a baseline: a stale companion in the other file makes none', () => {
