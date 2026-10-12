@@ -62,6 +62,7 @@ import {
   verifyEntriesInCommit,
 } from '../hooks/close-receipt.mjs';
 import { createProject, TEMPLATE_DIR } from '../scripts/lib/project-create.mjs';
+import { deriveTouchedProject } from '../scripts/lib/crystallize-close-gate.mjs';
 import { loadSessionModel } from '../hooks/session-views.mjs';
 import {
   GITIGNORE_BLOCK,
@@ -623,6 +624,49 @@ test('--project: an NFD spelling finds the NFC directory and the scope carries t
     const out = JSON.parse(r.stdout);
     assert.equal(out.scope, 'project', r.stdout);
     assert.equal(out.scoped_project, KO_PROJECT, 'NFC, the directory spelling, not the typed NFD');
+  });
+});
+
+// git on macOS reports precomposed (NFC) paths, so a project directory stored decomposed (NFD)
+// never matches a path git prints. The resolver refuses it and the gates say how to fix it.
+// Disabling the check: in resolveProjectDirName (hooks/hypo-shared.mjs) return `hit` without the
+// projectNameProblem test.
+test('--project: a directory stored in NFD is refused with the rename message, not resolved', () => {
+  withCleanWiki((dir) => {
+    mkdirSync(join(dir, 'projects', KO_PROJECT_NFD), { recursive: true });
+    for (const typed of [KO_PROJECT, KO_PROJECT_NFD]) {
+      const r = run('crystallize.mjs', [
+        `--hypo-dir=${dir}`,
+        '--check-session-close',
+        `--project=${typed}`,
+        '--json',
+      ]);
+      assert.equal(r.status, 1, r.stdout);
+      const err = JSON.parse(r.stdout).error;
+      assert.match(err, /Rename projects\/.+ to its NFC spelling/, err);
+      assert.ok(err.includes(`/hypo:rename --from=projects/${KO_PROJECT_NFD}`), err);
+      assert.doesNotMatch(err, /does not exist/);
+    }
+  });
+});
+
+test('resolveGateProjectOverride: a directory stored in NFD resolves to nothing, whichever spelling is typed', () => {
+  withClosePartitionWiki([{ slug: KO_PROJECT_NFD, date: todayLocal() }], [], (dir) => {
+    assert.equal(resolveGateProjectOverride(dir, { project: KO_PROJECT }), null);
+    assert.equal(resolveGateProjectOverride(dir, { project: KO_PROJECT_NFD }), null);
+  });
+});
+
+test('deriveTouchedProject: an NFC project directory is found, an NFD one is not a project', () => {
+  withCleanWiki((dir) => {
+    mkdirSync(join(dir, 'projects', KO_PROJECT), { recursive: true });
+    const nfc = toolUseTranscript(dir, [`projects/${KO_PROJECT}/session-log/x.md`]);
+    assert.equal(deriveTouchedProject(dir, nfc), KO_PROJECT);
+  });
+  withCleanWiki((dir) => {
+    mkdirSync(join(dir, 'projects', KO_PROJECT_NFD), { recursive: true });
+    const nfd = toolUseTranscript(dir, [`projects/${KO_PROJECT_NFD}/session-log/x.md`]);
+    assert.equal(deriveTouchedProject(dir, nfd), null);
   });
 });
 

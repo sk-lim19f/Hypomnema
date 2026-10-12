@@ -2542,6 +2542,25 @@ test('apply: a Korean project name passes the name gate, and an NFD spelling fin
   });
 });
 
+// Disabling the check: in resolveProjectDirName (hooks/hypo-shared.mjs) return `hit` without the
+// projectNameProblem test; apply then resolves the NFD directory and writes under that spelling.
+test('apply: a project directory stored in NFD is refused with the rename message, whichever spelling the payload types', () => {
+  const ko = '인수인계-runbook';
+  withWiki(null, (dir, today) => {
+    mkdirSync(join(dir, 'projects', ko.normalize('NFD')), { recursive: true });
+    for (const typed of [ko, ko.normalize('NFD')]) {
+      const payload = payloadForCleanWiki(dir, today);
+      payload.project = typed;
+      const r = runApply(dir, payload);
+      assert.equal(r.status, 1, r.stdout + r.stderr);
+      const err = JSON.parse(r.stdout).error;
+      assert.match(err, /Rename projects\/.+ to its NFC spelling/, err);
+      assert.ok(err.includes(`/hypo:rename --from=projects/${ko.normalize('NFD')}`), err);
+      assert.doesNotMatch(err, /does not exist|not a valid project name/);
+    }
+  });
+});
+
 test('apply: payload.project does not exist on disk → exit 1 (B-3)', () => {
   // A well-formed slug with no projects/<slug>/ directory: abort rather than create.
   withWiki(null, (dir, today) => {

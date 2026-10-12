@@ -2317,6 +2317,21 @@ test('createProject takes a Korean name, and an NFD spelling reuses the NFC dire
   });
 });
 
+test('createProject refuses a directory stored in NFD with the rename message and scaffolds nothing', () => {
+  const ko = '인수인계-runbook';
+  withTmpDir((dir) => {
+    writeFileSync(join(dir, 'log.md'), '# Log\n');
+    mkdirSync(join(dir, 'projects', ko.normalize('NFD')), { recursive: true });
+    for (const name of [ko, ko.normalize('NFD')]) {
+      assert.throws(
+        () => createProject({ hypoDir: dir, name, workingDir: '/x' }),
+        /Rename projects\/.+ to its NFC spelling.*\/hypo:rename --from=projects\//,
+      );
+    }
+    assert.deepEqual(readdirSync(join(dir, 'projects', ko.normalize('NFD'))), []);
+  });
+});
+
 test('createProject still rejects whitespace, separator and control-character names', () => {
   withGrowthWiki((dir) => {
     for (const bad of ['a b', 'a/b', 'a\\b', '', 'a\u0001b', 'a\u0000b', '인수 인계']) {
