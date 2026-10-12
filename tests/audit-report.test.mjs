@@ -401,9 +401,25 @@ test('40 session entries on disk leave the report bytes unchanged', () => {
           );
         }
       }
+      // A real session record in the requested week: two reports that load nothing would match too.
+      const cacheDir = join(dir, '.cache', 'sessions');
+      mkdirSync(cacheDir, { recursive: true });
+      const transcriptPath = join(cacheDir, 'real.jsonl');
+      writeFileSync(transcriptPath, JSON.stringify({ type: 'tool_use', name: 'Grep' }) + '\n');
+      writeFileSync(
+        join(cacheDir, 'index.jsonl'),
+        JSON.stringify({
+          session_id: 'real',
+          transcript_path: transcriptPath,
+          recorded_at: '2026-05-06T12:00:00Z',
+          cwd: dir,
+        }) + '\n',
+      );
       const r = run('weekly-report.mjs', [`--hypo-dir=${dir}`, '--week=2026-W19', '--json']);
       assert.equal(r.status, 0, r.stderr);
-      assert.equal(JSON.parse(r.stdout).week, '2026-W19', 'a real report, not a refusal');
+      const report = JSON.parse(r.stdout);
+      assert.equal(report.week, '2026-W19', 'a real report, not a refusal');
+      assert.equal(report.count, 1, 'the seeded session is counted, with or without entries');
       out.push(r.stdout);
     });
   }

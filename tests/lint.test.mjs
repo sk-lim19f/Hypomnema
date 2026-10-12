@@ -3888,7 +3888,24 @@ test('a supersedes id that names no entry of the project warns; a real one does 
     tracks: [{ id: 'main', supersedes: ['s1-0', 'ghost-9'] }],
     bodies: {},
   });
-  const { r, out } = lintEntries({ '2026-10-01-s1-0.md': first, '2026-10-02-s2-0.md': second });
+  // `ghost-9` is a valid entry of another project: a vault-wide id pool would resolve it.
+  const { r, out } = lintEntries(
+    { '2026-10-01-s1-0.md': first, '2026-10-02-s2-0.md': second },
+    {
+      extra: {
+        'projects/q/index.md': ENTRY_INDEX.replace('title: P', 'title: Q'),
+        'projects/q/sessions/2026-10-01-ghost-9.md': entryText({
+          project: 'q',
+          closeId: 'ghost-9',
+        }),
+      },
+    },
+  );
+  assert.deepEqual(
+    out.warns.filter((i) => i.file === 'projects/q/sessions/2026-10-01-ghost-9.md'),
+    [],
+    'the foreign entry itself is valid',
+  );
   assert.equal(r.status, 0, 'a warning does not fail lint');
   const w = out.warns.filter((i) => i.file === 'projects/p/sessions/2026-10-02-s2-0.md');
   assert.equal(w.length, 1, JSON.stringify(out.warns));
@@ -3977,6 +3994,22 @@ test('the three generated views of a project lint with no errors', () => {
     const out = JSON.parse(r.stdout);
     assert.deepEqual(out.errors, [], r.stdout);
     assert.equal(r.status, 0, r.stdout);
+    // "No errors" also holds for a view that lost its frontmatter (lint stops at W1 before the
+    // required-field checks), so the structure is asserted on its own.
+    const viewFiles = ['hot.md', 'projects/p/hot.md', 'projects/p/session-state.md'];
+    for (const rel of viewFiles) {
+      const text = readFileSync(join(dir, rel), 'utf-8');
+      const fm = (text.match(/^---\n([\s\S]*?)\n---\n/) ?? [])[1] ?? '';
+      const fields = rel === 'hot.md' ? ['type', 'title'] : ['type', 'title', 'generated'];
+      for (const field of fields) {
+        assert.match(fm, new RegExp(`^${field}: .+$`, 'm'), `${rel} carries ${field}: ${text}`);
+      }
+      assert.deepEqual(
+        out.warns.filter((i) => i.file === rel && ['W1', 'W2', 'W9'].includes(i.id)),
+        [],
+        `${rel} has well-formed frontmatter: ${r.stdout}`,
+      );
+    }
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

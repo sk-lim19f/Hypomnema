@@ -6056,6 +6056,18 @@ const rbRun = (dir, args) =>
 test('rollback at the second original renders the flat files from that commit only, tracks the three paths and keeps sessions/', () => {
   withRollbackVault(({ dir, shas }) => {
     const sessionsBefore = listDir(sessionsDir(dir));
+    // Names alone would pass a rollback that rewrote the originals: compare their bytes and the
+    // committed blobs too.
+    const originalBytes = () =>
+      sessionsBefore.map((n) => [n, readFileSync(join(sessionsDir(dir), n), 'utf-8')]);
+    const originalBlobs = () =>
+      cgitOk(dir, ['ls-tree', '-r', 'HEAD'])
+        .split('\n')
+        .filter((l) => l.includes('/sessions/'))
+        .join('\n');
+    const bytesBefore = originalBytes();
+    const blobsBefore = originalBlobs();
+    assert.ok(bytesBefore.length >= 3, 'the originals are there to compare');
     const before = commitCount(dir);
     const r = rollbackSessionEntries(dir, { at: shas[1] });
     assert.equal(r.rolledBack, true, r.notices.join('\n'));
@@ -6073,6 +6085,12 @@ test('rollback at the second original renders the flat files from that commit on
     assert.ok(flat.includes(`summary ${RB_IDS[1]}`), 'the second original is in the flat files');
     assert.ok(!flat.includes(RB_IDS[2]), 'the original added after the rollback point is not');
     assert.deepEqual(listDir(sessionsDir(dir)), sessionsBefore, 'sessions/ is left as it is');
+    assert.deepEqual(originalBytes(), bytesBefore, 'the originals keep their bytes');
+    assert.equal(
+      originalBlobs(),
+      blobsBefore,
+      'the rollback commit leaves the original blobs as they were',
+    );
     assert.ok(!showHead(dir, '.gitignore').includes(GITIGNORE_BLOCK));
     assert.ok(showHead(dir, '.gitignore').includes('.cache/'), 'the cache stays ignored');
   });
@@ -6437,6 +6455,7 @@ test('the same move with the marker still in HEAD or with hand-written old files
   withRollbackVault(({ dir, shas }) => {
     assert.equal(rollbackSessionEntries(dir, { at: shas[1] }).rolledBack, true);
     const back = migrate(dir, { reenable: true });
+    assert.equal(back.migrated, true, back.notices.join('\n')); // not the opted-out skip, which is silent too
     assert.ok(!back.notices.some((n) => n.includes('기준선을 만듭니다')), back.notices.join('\n'));
   });
   withOldGit((dir) => {
@@ -6472,18 +6491,52 @@ test('rollback command: exit 0 with the limits printed and the commit made, 1 wh
     assert.equal(ok.status, 0, ok.stdout + ok.stderr);
     assert.ok(ok.stdout.includes(`롤백했습니다: ${headOf(dir)}`));
     for (const line of ROLLBACK_LIMITS) assert.ok(ok.stdout.includes(line), line);
+    // The loop above passes when a line leaves the list, so the meanings that must be said are
+    // pinned here, written out apart from the module.
+    for (const phrase of [
+      '지정한 커밋 뒤에 추가된 원본은 평면 파일에 들어 있지 않습니다',
+      '구버전 Hypomnema는 sessions/를 읽지 못합니다',
+      '지정한 커밋 뒤에 만든 프로젝트',
+      'visibility_scope',
+      '다음 동기화가 이 롤백을 원격에 올리므로',
+      '구버전 기계는 롤백을 받을 때 로컬의 hot.md와 session-state.md를 덮어씁니다',
+      '/hypo:upgrade --migrate-sessions',
+    ]) {
+      assert.ok(ok.stdout.includes(phrase), `the rollback output says: ${phrase}`);
+    }
     assert.equal(migrationState(dir), 'opted-out');
   });
 });
 
 test('render command prints both views of the project to stdout and writes nothing', () => {
   withRollbackVault(({ dir }) => {
+    // The views and the ownership record are git-ignored, so an empty status cannot see a write
+    // to them: compare their bytes (and the project view's presence) around the call.
+    const watched = [
+      'hot.md',
+      'projects/p/hot.md',
+      'projects/p/session-state.md',
+      '.cache/generated-views.json',
+    ];
+    const snapshot = () =>
+      watched.map((rel) => [rel, existsSync(join(dir, rel)) ? readRel(dir, rel) : null]);
+    const watchedBefore = snapshot();
+    assert.ok(
+      watchedBefore.every(([, text]) => text !== null),
+      'the views and the ownership record exist to be compared',
+    );
     const r = rbRun(dir, ['render', '--project=p']);
     assert.equal(r.status, 0, r.stderr);
     assert.ok(r.stdout.includes('==> projects/p/hot.md <=='));
     assert.ok(r.stdout.includes('==> projects/p/session-state.md <=='));
     assert.ok(r.stdout.includes(`summary ${RB_IDS[2]}`));
     assert.equal(cgitOk(dir, ['status', '--porcelain']), '');
+    assert.deepEqual(
+      snapshot(),
+      watchedBefore,
+      'render left the views and the ownership record alone',
+    );
     assert.equal(rbRun(dir, ['render', '--project=nope']).status, 1);
+    assert.deepEqual(snapshot(), watchedBefore, 'a refused render did not touch them either');
   });
 });
