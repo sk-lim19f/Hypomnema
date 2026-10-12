@@ -4866,6 +4866,54 @@ function unmergedEntries(hypoDir) {
 }
 
 /**
+ * Is the vault repo in the middle of a git operation a person has to finish first?
+ * Returns `null` when it is not (or git cannot answer), else `{state, detail}` where `state` is
+ * `merge`, `rebase`, `cherry-pick`, `revert` or `unmerged` and `detail` is a plain sentence naming
+ * what to do. A commit that names paths (`--only`) fails during any of these, so a writer that
+ * commits has to refuse before it writes.
+ */
+export function vaultOperationInProgress(hypoDir) {
+  const gitPathExists = (name) => {
+    const r = vaultGit(hypoDir, ['rev-parse', '--git-path', name]);
+    const p = r.status === 0 ? r.stdout.replace(/\r?\n$/, '') : '';
+    return p ? existsSync(resolvePath(hypoDir, p)) : false;
+  };
+  const refExists = (name) => vaultGit(hypoDir, ['rev-parse', '-q', '--verify', name]).status === 0;
+  const unfinished = (what, finish, abort) =>
+    `${what} is unfinished: finish it (${finish}) or abort it (${abort})`;
+  if (refExists('MERGE_HEAD')) {
+    return { state: 'merge', detail: unfinished('a merge', 'git commit', 'git merge --abort') };
+  }
+  if (gitPathExists('rebase-merge') || gitPathExists('rebase-apply')) {
+    return {
+      state: 'rebase',
+      detail: unfinished('a rebase', 'git rebase --continue', 'git rebase --abort'),
+    };
+  }
+  if (refExists('CHERRY_PICK_HEAD')) {
+    return {
+      state: 'cherry-pick',
+      detail: unfinished('a cherry-pick', 'git cherry-pick --continue', 'git cherry-pick --abort'),
+    };
+  }
+  if (refExists('REVERT_HEAD')) {
+    return {
+      state: 'revert',
+      detail: unfinished('a revert', 'git revert --continue', 'git revert --abort'),
+    };
+  }
+  const unmerged = unmergedEntries(hypoDir);
+  if (unmerged && unmerged.size > 0) {
+    const first = [...unmerged.keys()].slice(0, 3).join(', ');
+    return {
+      state: 'unmerged',
+      detail: `${unmerged.size} path(s) have unresolved conflicts (${first}): resolve and stage them, or abort the operation that left them`,
+    };
+  }
+  return null;
+}
+
+/**
  * Settle the open conflict when every unmerged path is one of the two kinds Hypomnema resolves:
  * (a) a generated view path that one side modified and the other deleted (stages 1+2 or 1+3), or
  * (b) `.gitignore` with all three stages where `mergeAdditiveGitignore(:1, :2, :3)` is `ok`.
