@@ -50,6 +50,8 @@ export const GITIGNORE_BLOCK = `# Hypomnema: session views generated from projec
 
 export const GITATTRIBUTES_BLOCK = `# Hypomnema: session-log shards are append-only, keep both sides on a merge
 projects/*/session-log/*.md merge=union
+# The root log.md is append-only too: two clones closing on the same day both add lines to it
+log.md merge=union
 # Session entries are parsed byte-exact: keep LF in the working tree even where autocrlf is on
 projects/*/sessions/*.md text eol=lf
 `;
@@ -73,6 +75,13 @@ export const PREVIOUS_GITIGNORE_BLOCKS = [
 `,
 ];
 export const PREVIOUS_GITATTRIBUTES_BLOCKS = [
+  // Longest edition first: the swap takes the first one found inside the file, and a shorter
+  // edition is a prefix of the longer one.
+  `# Hypomnema: session-log shards are append-only, keep both sides on a merge
+projects/*/session-log/*.md merge=union
+# Session entries are parsed byte-exact: keep LF in the working tree even where autocrlf is on
+projects/*/sessions/*.md text eol=lf
+`,
   `# Hypomnema: session-log shards are append-only, keep both sides on a merge
 projects/*/session-log/*.md merge=union
 `,

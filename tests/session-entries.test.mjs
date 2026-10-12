@@ -767,17 +767,18 @@ test('isSessionEntryPath is depth-fixed and sessionViewPathsOf maps an entry to 
   ]);
 });
 
-test('GITATTRIBUTES_BLOCK sets merge=union on a depth-1 session-log shard and nothing else', () => {
+test('GITATTRIBUTES_BLOCK sets merge=union on a depth-1 session-log shard and on log.md, nothing else', () => {
   withVault({ '.gitattributes': GITATTRIBUTES_BLOCK }, (dir) => {
     const attr = (rel) => git(dir, ['check-attr', 'merge', '--', rel]).stdout.trim();
     assert.equal(
       attr('projects/p/session-log/2026-10-01.md'),
       'projects/p/session-log/2026-10-01.md: merge: union',
     );
+    // the root log.md is append-only too
+    assert.equal(attr('log.md'), 'log.md: merge: union');
     for (const rel of [
       'projects/p/platform/session-log/2026-10-01.md',
       'projects/p/hot.md',
-      'log.md',
       'projects/p/sessions/x.md',
     ]) {
       assert.equal(attr(rel), `${rel}: merge: unspecified`, rel);
@@ -3351,13 +3352,15 @@ test('(a) the notices of the generator and of the root hot.md name the backup un
       'hot.md',
       join(dir, '.cache/backups/hot.md.pre-projection-backup.md'),
     );
-    assert.ok(rootSentence.startsWith('생성 파일 hot.md에 '), rootSentence);
+    assert.ok(rootSentence.startsWith('생성 파일 `hot.md`에 '), rootSentence);
+    assert.match(rootSentence, /`projects\/<프로젝트>\/notes\.md`/);
     assert.match(rootSentence, /\.cache\/backups\/hot\.md\.pre-projection-backup\.md/);
     seedProjects(dir);
     put(dir, VIEW, 'hand written\n');
     writeGeneratedViews(dir, WRITE);
     const notice = consumeRootHotHealthNotice(dir) ?? '';
-    assert.ok(notice.startsWith(`생성 파일 ${VIEW}에 `), notice);
+    assert.ok(notice.startsWith(`생성 파일 \`${VIEW}\`에 `), notice);
+    assert.match(notice, /`projects\/p\/notes\.md`/);
     assert.match(notice, /\.cache\/backups\/projects\/p\/hot\.md\.pre-projection-backup\.md/);
   });
 });
@@ -3729,7 +3732,7 @@ test('(g) the root hot.md is never turned into a baseline, and its backup is nam
     assert.ok(
       shared.notices.some(
         (n) =>
-          n.startsWith('생성 파일 hot.md에 ') &&
+          n.startsWith('생성 파일 `hot.md`에 ') &&
           n === rootHotBackupRecoveryNotice('hot.md', backupPath),
       ),
       JSON.stringify(shared.notices),
@@ -4066,6 +4069,22 @@ test('the move untracks the generated views, adds one baseline per old file and 
       assert.equal(existsSync(join(dir, gone)), false, `${gone} left the working tree`);
     }
     assert.equal(cgitOk(dir, ['status', '--porcelain']), '');
+  });
+});
+
+test('the first move of a vault whose root hot.md is as HEAD has it sets nothing aside: no backup, no notice', () => {
+  withOldGit((dir) => {
+    assert.equal(readRel(dir, 'hot.md'), showHead(dir, 'hot.md'), 'precondition: untouched');
+    assert.equal(existsSync(join(dir, '.cache/generated-views.json')), false, 'no record yet');
+    const r = migrate(dir);
+    assert.equal(r.migrated, true);
+    assert.deepEqual(backupsIn(dir, 'hot.md'), []);
+    assert.equal(
+      r.notices.some((n) => n.includes('생성기가 쓰지 않은 내용')),
+      false,
+      r.notices.join('\n'),
+    );
+    assert.equal(existsSync(join(dir, '.cache/root-hot-projection-notice.json')), false);
   });
 });
 
@@ -4761,17 +4780,31 @@ test('a clean CRLF root hot.md that the generator vouches for gets no backup in 
     assert.equal(r.ok, true, JSON.stringify(r));
     assert.deepEqual(r.unowned, []);
     assert.deepEqual(backupsIn(b, 'hot.md'), []);
-    // bytes nobody vouches for still get their copy, whatever the line ending
+    // with no record at all the bytes HEAD tracks are still safe: the merge keeps HEAD in history
     put(b, '.cache/generated-views.json', JSON.stringify({ views: {} }));
+    const unrecorded = clear(b);
+    assert.equal(unrecorded.ok, true, JSON.stringify(unrecorded));
+    assert.deepEqual(unrecorded.unowned, []);
+    assert.deepEqual(backupsIn(b, 'hot.md'), []);
+    // bytes that are neither vouched for nor what HEAD tracks get their copy, whatever the line
+    // ending (git is told to ignore the edit, so it still reads the file as clean)
+    cgitOk(b, ['update-index', '--assume-unchanged', 'hot.md']);
+    put(b, 'hot.md', 'an old machine wrote this\r\n');
     const other = clear(b);
-    assert.equal(other.unowned.length, 1);
-    assert.equal(readFileSync(other.unowned[0].backupPath, 'utf-8'), 'root hot\r\n');
+    assert.equal(other.unowned.length, 1, JSON.stringify(other));
+    assert.equal(
+      readFileSync(other.unowned[0].backupPath, 'utf-8'),
+      'an old machine wrote this\r\n',
+    );
   });
 });
 
 test('a stop that comes after the backups reports everything it moved, and the move is undone', () => {
   withCatchUp(({ b }) => {
     put(b, 'projects/p/hot.md', W1);
+    // root hot.md bytes HEAD does not track, which git is told to ignore (so the file reads as clean)
+    cgitOk(b, ['update-index', '--assume-unchanged', 'hot.md']);
+    put(b, 'hot.md', 'an old machine wrote this\n');
     // The backup directories exist and `.cache` itself is read-only: the backups are written, the
     // archive record (a new file in `.cache`) cannot be.
     mkdirSync(join(b, '.cache/backups/projects/p'), { recursive: true });
@@ -4790,7 +4823,7 @@ test('a stop that comes after the backups reports everything it moved, and the m
     assert.equal(existsSync(r.pre.backups[0]), false, 'the backup is taken back');
     assert.equal(existsSync(r.pre.unowned[0].backupPath), false);
     assert.equal(readRel(b, 'projects/p/hot.md'), W1);
-    assert.equal(readRel(b, 'hot.md'), 'root hot\n');
+    assert.equal(readRel(b, 'hot.md'), 'an old machine wrote this\n');
   });
 });
 
@@ -4901,12 +4934,17 @@ test('a rule hiding the sessions/ of any visible project defers the move, and th
 
 test('the root hot.md the merge deletes: hand-written bytes get a backup and a notice, bytes this machine wrote do not', () => {
   withOldGit((dir) => {
+    put(dir, 'hot.md', 'an old machine wrote this\n'); // not what HEAD tracks
     const r = migrate(dir);
     assert.equal(r.migrated, true);
     const [backup] = backupsIn(dir, 'hot.md');
-    assert.equal(readRel(dir, backup), 'root hot\n', 'the same bytes the file had');
+    assert.equal(
+      readRel(dir, backup),
+      'an old machine wrote this\n',
+      'the same bytes the file had',
+    );
     assert.ok(
-      r.notices.some((n) => n.includes(backup)),
+      r.notices.some((n) => n.includes('생성기가 쓰지 않은 내용') && n.includes(`\`${backup}\``)),
       JSON.stringify(r.notices),
     );
     assert.equal(existsSync(join(dir, 'hot.md')), false);
@@ -5309,6 +5347,9 @@ test('the archive record keeps local-only and unowned backups, and a resume name
   withCatchUp(
     ({ b }) => {
       put(b, '.hypoignore', 'projects/secret/hot.md\n');
+      // bytes HEAD does not track, which git is told to ignore (so the file reads as clean)
+      cgitOk(b, ['update-index', '--assume-unchanged', 'hot.md']);
+      put(b, 'hot.md', 'an old machine wrote this\n');
       const r = clear(b);
       assert.equal(r.ok, true, JSON.stringify(r));
       assert.equal(r.localOnly.length, 2, 'precondition: two local-only files');
@@ -5322,6 +5363,9 @@ test('the archive record keeps local-only and unowned backups, and a resume name
         record.unowned.map((v) => v.backupPath),
         r.unowned.map((v) => v.backupPath),
       );
+      // the merge needs the file as HEAD has it; the copy in .cache/backups/ holds the other bytes
+      put(b, 'hot.md', 'root hot\n');
+      cgitOk(b, ['update-index', '--no-assume-unchanged', 'hot.md']);
       assert.equal(ffTo(b), 0);
       const resumed = resumePullArchive(b);
       const text = resumed.notices.join('\n');
@@ -5606,12 +5650,8 @@ test('a vault whose own .gitignore leaves .cache/ out is not moved: the backup o
 test('the writer leaves .cache/ alone while a later rule un-ignores it, and says so', () => {
   withOldGit((dir) => {
     assert.equal(migrate(dir).migrated, true, 'precondition: the vault is migrated');
-    // The move backed up the old hand-kept files and stored a notice naming the backups first.
-    assert.match(
-      consumeRootHotHealthNotice(dir) ?? '',
-      /\.cache\/backups\//,
-      'the move names its backups',
-    );
+    // The old files were as HEAD had them, so the move set nothing aside and left no notice.
+    assert.equal(consumeRootHotHealthNotice(dir), null, 'the move names no backup');
     put(dir, '.gitignore', `${showHead(dir, '.gitignore')}!/.cache/\n`);
     commitIn(dir);
     assert.equal(migrationState(dir), 'migrated', 'precondition: the block itself is whole');
@@ -5971,12 +6011,8 @@ test('an archive record of the old shape (views without run) with two versions o
 test('a migrated vault whose HEAD .gitignore later loses a view pattern renders nothing and leaves a notice naming the missing lines', () => {
   withOldGit((dir) => {
     assert.equal(migrate(dir).migrated, true, 'precondition: the vault is migrated');
-    // The move backed up the old hand-kept files and stored a notice naming the backups first.
-    assert.match(
-      consumeRootHotHealthNotice(dir) ?? '',
-      /\.cache\/backups\//,
-      'the move names its backups',
-    );
+    // The old files were as HEAD had them, so the move set nothing aside and left no notice.
+    assert.equal(consumeRootHotHealthNotice(dir), null, 'the move names no backup');
     const healthy = writeGeneratedViews(dir, WRITE);
     assert.equal(healthy.state, 'migrated');
     assert.equal(healthy.missingBlockLines, undefined);
@@ -6406,8 +6442,7 @@ test('re-enabling does not vouch for a root hot.md edited after the rollback: it
   withRollbackVault(({ dir, shas }) => {
     assert.equal(rollbackSessionEntries(dir, { at: shas[1] }).rolledBack, true);
     const edit = 'a person edited the root after the rollback\n';
-    put(dir, 'hot.md', edit);
-    commitIn(dir);
+    put(dir, 'hot.md', edit); // saved, not committed: bytes HEAD does not hold
     const kept = backupsIn(dir, 'hot.md');
     const back = migrate(dir, { reenable: true });
     assert.equal(back.migrated, true, back.notices.join('\n'));

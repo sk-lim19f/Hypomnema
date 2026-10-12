@@ -2871,6 +2871,9 @@ test('a new vault gets .gitattributes with the block once, and a second init lea
       'projects/p/session-log/2026-10-01.md',
     );
     assert.equal(attr.stdout.trim().split(': ').pop(), 'union', attr.stdout + attr.stderr);
+    // the root log.md is append-only too
+    const rootLog = gitIn(hypoDir, 'check-attr', 'merge', '--', 'log.md');
+    assert.equal(rootLog.stdout.trim().split(': ').pop(), 'union', rootLog.stdout + rootLog.stderr);
   });
 });
 

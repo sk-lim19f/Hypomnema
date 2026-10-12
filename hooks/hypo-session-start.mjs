@@ -1150,7 +1150,17 @@ process.stdin.on('end', () => {
     if (pkgNullLine) process.stderr.write(`\n\x1b[33m${pkgNullLine}\x1b[0m\n`);
 
     // A notice the user must see (systemMessage) and the model should know (additionalContext).
-    const surface = (msg) => {
+    // A line already shown this start is not shown again: the migration's own notices and the
+    // pending health notice name the same backup.
+    const shownLines = new Set();
+    const surface = (text) => {
+      const msg = text
+        .split('\n')
+        .filter((l) => l.trim() === '' || !shownLines.has(l))
+        .join('\n')
+        .trim();
+      for (const l of text.split('\n')) shownLines.add(l);
+      if (!msg) return;
       notices.push(msg);
       noticePrefix = `${notices.join('\n\n')}\n\n`;
       outExtra = {

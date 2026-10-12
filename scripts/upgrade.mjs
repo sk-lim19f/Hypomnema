@@ -1338,7 +1338,21 @@ function migrateSessionsCommand(hypoDir) {
 // ── main ─────────────────────────────────────────────────────────────────────
 
 const args = parseArgs(process.argv);
-if (args.migrateSessions) process.exit(migrateSessionsCommand(args.hypoDir));
+if (args.migrateSessions) {
+  let rc;
+  try {
+    rc = migrateSessionsCommand(args.hypoDir);
+  } catch (err) {
+    // Nothing the command does is committed before its last step, so a throw leaves the vault as it
+    // was; running the command again starts from the vault's state at that moment.
+    const cause = String(err?.message ?? err).split('\n')[0];
+    console.error(
+      `✗ the migration stopped on an unexpected error (${err?.code ? `${err.code}: ` : ''}${cause}). Fix that cause and run the command again.`,
+    );
+    rc = 1;
+  }
+  process.exit(rc);
+}
 
 // Target paths. Claude is always checked; codex is checked only when --codex is set
 // so users without codex installed see no false drift.
