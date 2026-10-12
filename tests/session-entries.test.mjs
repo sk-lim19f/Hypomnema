@@ -632,6 +632,188 @@ test('baselineIdMismatch: a baseline names its content, and an edit merged into 
   );
 });
 
+// An old session-state.md shaped like the security-backoffice one: a preamble, a `## 다음 이어받기`
+// section with no subsections, then one `##` section per track. A fenced block holds a `##` line.
+const MULTI_STATE = [
+  '---',
+  'type: session-state',
+  'updated: 2026-10-12',
+  '---',
+  '',
+  '## 다음 이어받기',
+  '',
+  '트랙: squid 콘솔 · flow · review',
+  '',
+  '```',
+  '## not a heading',
+  '```',
+  '',
+  '## squid 콘솔 (257차, 2026-10-12)',
+  '',
+  'SQUID_BODY',
+  '',
+  '```',
+  '## also not a heading',
+  '```',
+  '',
+  '## flow',
+  '',
+  'FLOW_BODY',
+  '',
+  '## review',
+  '',
+  'REVIEW_BODY',
+  '',
+].join('\n');
+
+// The same shape the generator renders: `## Next Up` with `###` tracks, then sections that are not tracks.
+const NEXT_UP_STATE = [
+  '# State',
+  '',
+  '## Next Up',
+  '',
+  '### Alpha (alpha) · 2026-10-01 · c1',
+  'ALPHA_BODY',
+  '',
+  '### Beta (beta) · 2026-10-01 · c2',
+  'BETA_BODY',
+  '',
+  '## Notes',
+  '',
+  'NOTES_TEXT',
+  '',
+].join('\n');
+
+const splitBaseline = (stateText, over) => {
+  const built = baselineOf('state', { stateText, ...over });
+  return { built, entry: parseSessionEntry(built.text).entry };
+};
+
+// The source with every track's heading line and body cut out must equal the remainder: no byte
+// of the old file is lost except the `##`/`###` marker run of a track heading.
+function cutTracks(source, entry, marks) {
+  let rest = source;
+  for (const t of entry.tracks.filter((x) => x.id !== 'legacy')) {
+    const piece = `${marks} ${t.title}\n${entry.bodies[t.id]}`;
+    assert.ok(rest.includes(piece), `${t.id}: heading and body are in the source`);
+    rest = rest.replace(piece, '');
+  }
+  return rest;
+}
+
+test('an old state file with a section per track becomes one head per track and loses no byte', () => {
+  const { entry } = splitBaseline(MULTI_STATE);
+  assert.deepEqual(
+    entry.tracks.map((t) => t.title),
+    ['이행 전 기록', 'squid 콘솔 (257차, 2026-10-12)', 'flow', 'review'],
+  );
+  assert.equal(new Set(entry.tracks.map((t) => t.id)).size, 4, 'every track has its own id');
+  assert.ok(entry.tracks.every((t) => t.new === true));
+  assert.ok(entry.tracks.slice(1).every((t) => /^legacy-/.test(t.id)));
+  const [, squid, flow, review] = entry.tracks;
+  assert.ok(entry.bodies[squid.id].includes('SQUID_BODY'));
+  assert.ok(entry.bodies[squid.id].includes('## also not a heading'), 'a fenced ## is body text');
+  assert.equal(entry.bodies[flow.id], '\nFLOW_BODY\n\n');
+  assert.equal(entry.bodies[review.id], '\nREVIEW_BODY\n');
+  assert.ok(squid.id.startsWith('legacy-'));
+  const rest = entry.bodies.legacy;
+  assert.ok(rest.startsWith('---\ntype: session-state') && rest.includes('트랙: squid 콘솔'));
+  assert.ok(
+    rest.includes('## not a heading'),
+    'the fenced ## of the preamble stays in the remainder',
+  );
+  assert.equal(cutTracks(MULTI_STATE, entry, '##'), rest);
+});
+
+test('a generator-shaped ## Next Up with ### tracks splits, and what follows stays in the remainder', () => {
+  const { entry } = splitBaseline(NEXT_UP_STATE);
+  assert.deepEqual(
+    entry.tracks.map((t) => t.title),
+    ['이행 전 기록', 'Alpha (alpha) · 2026-10-01 · c1', 'Beta (beta) · 2026-10-01 · c2'],
+  );
+  assert.ok(entry.tracks[1].id.startsWith('legacy-alpha-alpha-2026-10-01-c1-'));
+  const rest = entry.bodies.legacy;
+  assert.ok(
+    rest.includes('## Next Up') && rest.includes('## Notes') && rest.includes('NOTES_TEXT'),
+  );
+  assert.ok(!rest.includes('ALPHA_BODY') && !rest.includes('BETA_BODY'));
+  assert.equal(cutTracks(NEXT_UP_STATE, entry, '###'), rest);
+});
+
+test('text that cannot be cut into tracks stays one whole legacy head', () => {
+  const cases = {
+    'no next-up heading': '## squid\n\nA\n\n## flow\n\nB\n',
+    'one track only': '## Next Up\n\n### only\nA\n',
+    'next-up heading but no sections after it': '## Next Up\n\nfree text\n',
+    'headings inside a fence': '## Next Up\n\n```\n### a\n### b\n```\n',
+    'plain text': 'just a note\n',
+  };
+  for (const [name, text] of Object.entries(cases)) {
+    const { entry } = splitBaseline(text);
+    assert.deepEqual(
+      entry.tracks,
+      [{ id: 'legacy', title: '이행 전 기록', new: true }],
+      `${name}: one head`,
+    );
+    assert.equal(entry.bodies.legacy, text, `${name}: whole text`);
+  }
+});
+
+test('split baseline ids are deterministic: same bytes (also CRLF) give the same entry file', () => {
+  const a = splitBaseline(MULTI_STATE).built;
+  const b = splitBaseline(MULTI_STATE).built;
+  const crlf = splitBaseline(MULTI_STATE.replace(/\n/g, '\r\n')).built;
+  assert.equal(a.text, b.text);
+  assert.equal(a.fileName, b.fileName);
+  assert.equal(crlf.text, a.text);
+  assert.notEqual(a.closeId, splitBaseline(`${MULTI_STATE}x`).built.closeId);
+  const twin = splitBaseline('## Next Up\n\n### same\nA\n\n### same\nB\n').entry;
+  assert.equal(new Set(twin.tracks.map((t) => t.id)).size, 3, 'two sections with one title differ');
+  // Moving a track section does not rename it.
+  const moved = splitBaseline(
+    NEXT_UP_STATE.replace('### Alpha', '### Zero (zero)\nZ\n\n### Alpha'),
+  ).entry;
+  const ids = (e) => Object.fromEntries(e.tracks.map((t) => [t.title, t.id]));
+  assert.equal(
+    ids(moved)['Alpha (alpha) · 2026-10-01 · c1'],
+    ids(splitBaseline(NEXT_UP_STATE).entry)['Alpha (alpha) · 2026-10-01 · c1'],
+  );
+});
+
+test('baselineIdMismatch accepts a split baseline and flags an edit of one track body', () => {
+  const { built } = splitBaseline(MULTI_STATE);
+  assert.equal(baselineIdMismatch(built.fileName, built.text), null);
+  const edited = baselineIdMismatch(built.fileName, built.text.replace('FLOW_BODY', 'EDITED'));
+  assert.ok(edited, 'an edited track body is reported');
+  assert.equal(edited.inName, built.closeId);
+  const done = splitBaseline(MULTI_STATE, { legacyDone: true });
+  assert.equal(baselineIdMismatch(done.built.fileName, done.built.text), null);
+  assert.ok(
+    done.entry.tracks.every((t) => t.done === true),
+    'legacyDone marks every head',
+  );
+  assert.notEqual(done.built.closeId, built.closeId);
+});
+
+test('a newer close that replaces one split track leaves the other tracks in the injection', () => {
+  const { entry: base } = splitBaseline(MULTI_STATE);
+  const flow = base.tracks.find((t) => t.title === 'flow');
+  const newer = E('c9', {
+    date: '2026-10-13',
+    closedAt: '2026-10-13T01:00:00.000Z',
+    tracks: [{ id: flow.id, supersedes: [base.closeId] }],
+    bodies: { [flow.id]: 'FLOW_REPLACED' },
+  });
+  const { text, observed } = buildInjection(M([base, newer]), 20000);
+  for (const keep of ['SQUID_BODY', 'REVIEW_BODY', '트랙: squid 콘솔']) {
+    assert.ok(text.includes(keep), `${keep} still in the injection`);
+  }
+  assert.ok(text.includes('FLOW_REPLACED') && !text.includes('FLOW_BODY'));
+  const squid = base.tracks.find((t) => t.title.startsWith('squid')).id;
+  assert.deepEqual(observed.heads[squid], [base.closeId]);
+  assert.deepEqual(observed.heads[flow.id], ['c9']);
+});
+
 // ── path predicates and the byte-fixed blocks ────────────────────────────────
 
 suite('session entries: path predicates agree with the .gitignore block');
@@ -999,6 +1181,66 @@ test('same day and same depth are ordered by close id, whatever the input order'
 
 test('close ids are compared by code unit, not by locale', () => {
   assert.deepEqual(ids(sortEntries([E('a'), E('B'), E('_x')])), ['B', '_x', 'a']);
+});
+
+const at = (ms) => new Date(Date.UTC(2026, 9, 1, 4, 0, 0, ms)).toISOString();
+
+test('a same-day close sorts by its closed_at, whatever the supersede depth', () => {
+  // x1..x6 is a chain of depth 6; z9 is a later close of another track with depth 1.
+  const chain = ['x1', 'x2', 'x3', 'x4', 'x5', 'x6'].map((id, i, all) =>
+    E(id, {
+      closedAt: at(i * 1000),
+      tracks: [{ id: 'x', ...(i ? { supersedes: [all[i - 1]] } : {}) }],
+    }),
+  );
+  const last = E('z9', { closedAt: at(60000), tracks: [{ id: 't', done: true }], bodies: {} });
+  for (const input of [[...chain, last], reversed([...chain, last]), rotated([...chain, last])]) {
+    assert.deepEqual(ids(sortEntries(input)), ['z9', 'x6', 'x5', 'x4', 'x3', 'x2', 'x1']);
+  }
+});
+
+test('an entry with closed_at sorts before a same-day entry without one', () => {
+  const dated = E('z1', { closedAt: at(0) });
+  const bare = E('a1');
+  // The bare one is first by close id and would win a depth or id tie.
+  assert.deepEqual(ids(sortEntries([bare, dated])), ['z1', 'a1']);
+  assert.deepEqual(ids(sortEntries([dated, bare])), ['z1', 'a1']);
+  assert.equal(
+    ids(sortEntries([E('b', { date: '2026-10-02' }), dated]))[0],
+    'b',
+    'the date still ranks above closed_at',
+  );
+});
+
+test('closed_at is compared as an instant, not as text', () => {
+  // As text `...07Z` sorts after `...07.123Z` ('Z' > '.'), as instants it is earlier.
+  const whole = E('a1', { closedAt: '2026-10-01T04:00:07Z' });
+  const fraction = E('b1', { closedAt: '2026-10-01T04:00:07.123Z' });
+  assert.deepEqual(ids(sortEntries([whole, fraction])), ['b1', 'a1']);
+});
+
+test('the same closed_at falls back to supersede depth, then to close id', () => {
+  const t = at(0);
+  const a1 = E('a1', { closedAt: t });
+  const b1 = E('b1', { closedAt: t, tracks: [{ id: 'masking', supersedes: ['a1'] }] });
+  const c1 = E('c1', { closedAt: t, tracks: [{ id: 'flow' }] });
+  assert.deepEqual(ids(sortEntries([a1, b1, c1])), ['b1', 'a1', 'c1']);
+  assert.deepEqual(ids(sortEntries([c1, a1, b1])), ['b1', 'a1', 'c1']);
+});
+
+test('closed_at round-trips through format and parse; an entry without it still parses', () => {
+  const closedAt = '2026-10-12T04:31:07.123Z';
+  const text = formatSessionEntry(sample({ closedAt }));
+  assert.ok(text.includes(`\nclosed_at: ${closedAt}\n`));
+  assert.equal(parseSessionEntry(text).entry.closedAt, closedAt);
+  const bare = formatSessionEntry(sample());
+  assert.ok(!bare.includes('closed_at'));
+  assert.equal(parseSessionEntry(bare).entry.closedAt, undefined);
+  for (const bad of ['2026-10-12', '2026-10-12T04:31:07+09:00', '2026-13-45T25:61:61Z', 7]) {
+    assert.throws(() => formatSessionEntry(sample({ closedAt: bad })), { code: 'invalid-entry' });
+  }
+  const forged = text.replace(closedAt, '2026-10-12 04:31');
+  assert.deepEqual(parseSessionEntry(forged), { ok: false, reason: 'bad-closed_at' });
 });
 
 test('a superseded update is not a head; one nobody supersedes is', () => {
@@ -1483,6 +1725,33 @@ test('21 active heads: 20 pointer lines and "외 1개" even with no room, the 21
   assert.deepEqual(observed.heads, {});
   assert.equal(observed.pointer.t21, undefined);
   assert.equal(observed.pointer.t20.length, 1);
+});
+
+test('a done-only close of one track still reaches the injection as the latest session', () => {
+  // The QA repro: a deep chain on track x, then a later close that only finishes track t.
+  const chain = ['x1', 'x2', 'x3', 'x4', 'x5', 'x6'].map((id, i, all) =>
+    E(id, {
+      closedAt: at(i * 1000),
+      tracks: [{ id: 'x', title: 'X', ...(i ? { supersedes: [all[i - 1]] } : {}) }],
+      bodies: { x: `body of ${id}` },
+      summary: `summary of ${id}`,
+    }),
+  );
+  const t0 = E('t0', { closedAt: at(100), tracks: [{ id: 't', title: 'T' }], bodies: { t: 'T0' } });
+  const last = E('last', {
+    closedAt: at(60000),
+    tracks: [{ id: 't', done: true, supersedes: ['t0'] }],
+    bodies: {},
+    summary: 'summary of last',
+  });
+  const { text } = buildInjection(M([...chain, t0, last]), 4000);
+  const latest = text.split('## Latest session')[1].split('\n## ')[0];
+  assert.ok(
+    latest.includes('### 2026-10-01 · last'),
+    `latest session is the newest close: ${latest}`,
+  );
+  assert.ok(text.includes('summary of last'));
+  assert.ok(text.includes('body of x6'));
 });
 
 test('the pointer target follows migration: entry file before, session-state.md after, baseline always session-state.md', () => {
@@ -3674,6 +3943,23 @@ test('(g) a session-state.md that differs from the remote baseline becomes a sec
     assert.equal(made.summary, '');
     assert.equal(baselinesOf(b).length, remote.length + 1);
     assert.equal(legacyHeads(b).length, 2);
+  });
+});
+
+test('(g) a session-state.md with a section per track becomes one split baseline, and sharing it again makes none', () => {
+  withCatchUp(({ b }) => {
+    put(b, 'projects/p/session-state.md', MULTI_STATE);
+    const pre = catchUpAndMerge(b);
+    const shared = shareLegacyBytes(b, pre.archived);
+    assert.equal(shared.created.length, 1, JSON.stringify(shared));
+    const made = parseSessionEntry(readRel(b, shared.created[0])).entry;
+    assert.deepEqual(
+      made.tracks.map((t) => t.title),
+      ['이행 전 기록', 'squid 콘솔 (257차, 2026-10-12)', 'flow', 'review'],
+    );
+    const again = shareLegacyBytes(b, pre.archived);
+    assert.deepEqual(again.created, []);
+    assert.deepEqual(again.skipped, shared.created);
   });
 });
 

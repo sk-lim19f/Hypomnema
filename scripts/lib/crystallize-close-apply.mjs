@@ -68,6 +68,7 @@ import {
   closeIdFor,
   entryFileName,
   formatSessionEntry,
+  parseSessionEntry,
   resolveSupersedesPrefix,
   splitLegacyFrontmatter,
 } from '../../hooks/session-entries.mjs';
@@ -2447,6 +2448,14 @@ function planSessionEntry(args, payload, project, entryPath, closeId, legacyForm
 
   const pin = readClosePin(args.hypoDir, args.sessionId);
   const { relPath, date: entryDate } = entryPath;
+  // The write time orders this entry among the day's closes. A retry keeps the time its earlier
+  // attempt wrote, like it keeps the date, so the bytes of a retried close stay the same.
+  const earlier = readTarget(join(args.hypoDir, relPath));
+  const earlierEntry = typeof earlier === 'string' ? parseSessionEntry(earlier) : null;
+  const closedAt =
+    earlierEntry?.ok && earlierEntry.entry.closedAt
+      ? earlierEntry.entry.closedAt
+      : new Date().toISOString();
   let text;
   try {
     text = formatSessionEntry({
@@ -2454,6 +2463,7 @@ function planSessionEntry(args, payload, project, entryPath, closeId, legacyForm
       closeId,
       sessionId: args.sessionId,
       date: entryDate,
+      closedAt,
       visibilityScope: projectEntryScope(args.hypoDir, project, model),
       tracks: entryTracks,
       summary: payload.summary,

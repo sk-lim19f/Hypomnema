@@ -3984,6 +3984,10 @@ test('a failed receipt after the commit (journal cleared) retries under the same
       const id = closeIdFor(sessionId, 0);
       assert.equal(readClosePin(dir, sessionId).pending.closeId, id);
       assert.deepEqual(sessionFilesOf(dir), [`${today}-${id}.md`], 'the entry is under that id');
+      // The close stamped its write time; a retry must keep it, or the bytes of a close change.
+      const firstClosedAt = entryAt(dir, `${today}-${id}.md`).closedAt;
+      assert.match(firstClosedAt ?? '', /^\d{4}-\d{2}-\d{2}T[\d:.]+Z$/);
+      assert.ok(Math.abs(Date.now() - Date.parse(firstClosedAt)) < 120000, firstClosedAt);
       assert.equal(
         pinProofId(dir, sessionId),
         id,
@@ -4001,6 +4005,11 @@ test('a failed receipt after the commit (journal cleared) retries under the same
         sessionFilesOf(dir),
         [`${today}-${id}.md`],
         'the retry adopted the same entry file, it did not write a second one',
+      );
+      assert.equal(
+        entryAt(dir, `${today}-${id}.md`).closedAt,
+        firstClosedAt,
+        'the retry keeps closed_at',
       );
 
       // Resolved, no open signal: the finished close vouches for itself.
