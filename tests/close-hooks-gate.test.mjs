@@ -2197,8 +2197,8 @@ test('a marker withheld by a real vault-commit failure leaves the close signal u
     // to fail, independent of everything this apply itself verifies: a
     // pre-commit hook that always rejects. This is a REAL git failure, not a
     // simulated one — the payload writes and verification already happened
-    // before this runs, so `ok` must still read true; only the marker (which
-    // additionally requires a clean commit) should be withheld.
+    // before this runs. The close did not publish anything, so `ok` reads false at
+    // stage commit-failed; the marker stays withheld and the close signal unspent.
     const hooksDir = join(wiki, '.git', 'hooks');
     mkdirSync(hooksDir, { recursive: true });
     const hookPath = join(hooksDir, 'pre-commit');
@@ -2227,9 +2227,10 @@ test('a marker withheld by a real vault-commit failure leaves the close signal u
     const out = JSON.parse(r.stdout);
     assert.equal(
       out.ok,
-      true,
-      `apply must still succeed on a vault-commit failure: ${r.stdout}\n${r.stderr}`,
+      false,
+      `a vault-commit failure is not a finished close: ${r.stdout}\n${r.stderr}`,
     );
+    assert.equal(out.stage, 'commit-failed');
     assert.equal(out.markerWritten, false, 'the marker must be withheld on a real commit failure');
     assert.ok(
       /^commit-failed:/.test(out.markerSkipReason || ''),
@@ -2258,6 +2259,7 @@ test('a marker withheld by a real vault-commit failure leaves the close signal u
     const r2 = runApply(wiki, payload, { sessionId });
     const out2 = JSON.parse(r2.stdout);
     assert.equal(out2.ok, true, `the retry must be authorized: ${r2.stdout}\n${r2.stderr}`);
+    assert.equal(out2.stage, null);
     assert.equal(out2.markerWritten, true, 'the retry must land the marker it was denied');
 
     // And the run that lands the marker is the one that spends the signal.
@@ -2356,9 +2358,10 @@ test('a SCHEMA.md pending-tag registration a failed commit left behind is restag
       const out1 = JSON.parse(r1.stdout);
       assert.equal(
         out1.ok,
-        true,
-        `attempt 1 must still report ok (only the marker/commit is withheld): ${r1.stdout}\n${r1.stderr}`,
+        false,
+        `attempt 1 did not commit, so it is not ok: ${r1.stdout}\n${r1.stderr}`,
       );
+      assert.equal(out1.stage, 'commit-failed');
       assert.ok(
         /^commit-failed:/.test(out1.markerSkipReason || ''),
         `expected a commit-failed skip on attempt 1: ${JSON.stringify(out1.markerSkipReason)}`,
@@ -2475,7 +2478,12 @@ test('an index.md side effect whose bytes changed since the failed commit is NOT
     const r1 = runApply(dir, payload, { sessionId });
     cleanup();
     const out1 = JSON.parse(r1.stdout);
-    assert.equal(out1.ok, true, `attempt 1 must still report ok: ${r1.stdout}\n${r1.stderr}`);
+    assert.equal(
+      out1.ok,
+      false,
+      `attempt 1 did not commit, so it is not ok: ${r1.stdout}\n${r1.stderr}`,
+    );
+    assert.equal(out1.stage, 'commit-failed');
     assert.ok(
       (out1.applied || []).some((a) => a.startsWith('projectIndex (')),
       `precondition: attempt 1 must seed a new project index.md, uncommitted: ${r1.stdout}`,
@@ -2650,8 +2658,8 @@ test('A) verifyCloseAuthority: a resolved close refuses a re-run with no fresh s
 test('C) runMarkSessionClosed stays on isCloseGateOpen: a commit-failed marker still recovers with NO new close signal', () => {
   withCleanWiki((wiki) => {
     // Same commit-failure fixture as the T3 suite above: force the vault's
-    // own commit to fail, so apply succeeds (ok:true, resolution recorded by
-    // its own success) but the marker is withheld (commit-failed).
+    // own commit to fail: apply reports ok:false at stage commit-failed and the marker
+    // is withheld.
     const hooksDir = join(wiki, '.git', 'hooks');
     mkdirSync(hooksDir, { recursive: true });
     const hookPath = join(hooksDir, 'pre-commit');
@@ -2675,9 +2683,10 @@ test('C) runMarkSessionClosed stays on isCloseGateOpen: a commit-failed marker s
       const applyOut = JSON.parse(applyResult.stdout);
       assert.equal(
         applyOut.ok,
-        true,
-        `apply must still succeed on a commit failure: ${applyResult.stdout}\n${applyResult.stderr}`,
+        false,
+        `a commit failure is not a finished close: ${applyResult.stdout}\n${applyResult.stderr}`,
       );
+      assert.equal(applyOut.stage, 'commit-failed');
       assert.equal(
         applyOut.markerWritten,
         false,

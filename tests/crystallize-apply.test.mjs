@@ -2018,12 +2018,12 @@ test('a real section-loss trip parks whether or not restructure:true is set: the
 // failure as ok:true / exit 0. The same failure landing on two different
 // exit codes depending on which command hit it. The fix is scoped to that one
 // failure mode (`marker-did-not-land`): the OTHER skip reasons
-// (compact-gate-not-ok, no-user-close-signal, transcript-unresolved,
-// commit-failed) are conditions this session can clear and retry, and stay
-// ok:true by design (see "a marker withheld by a real vault-commit failure
-// leaves the close signal unspent for a retry" in tests/close-hooks-gate.test.mjs
-// and the ISSUE-140 test in tests/close-global.test.mjs, both of which pin
-// that ok:true must survive those).
+// (compact-gate-not-ok, no-user-close-signal, transcript-unresolved) are policy
+// withholds this session can clear and retry, and they stay ok:true by
+// design (see the ISSUE-140 test in tests/close-global.test.mjs). commit-failed is
+// not one of them any more: nothing was published, so it is ok:false at stage
+// commit-failed (see "a marker withheld by a real vault-commit failure leaves the
+// close signal unspent for a retry" in tests/close-hooks-gate.test.mjs).
 
 suite('ISSUE-153: a marker write that genuinely fails must not exit 0');
 
@@ -6305,6 +6305,121 @@ test('a commit failure then a retry with a fixed summary replaces the uncommitte
     assert.equal(entryAt(dir, sessionFilesOf(dir)[0]).summary, 'fixed summary');
     const blob = spawnSync('git', ['show', `HEAD:${rel}`], { cwd: dir, encoding: 'utf-8' }).stdout;
     assert.ok(blob.includes('fixed summary'), 'the committed bytes are the fixed ones');
+  });
+});
+
+// Leave the vault repo with a conflicting merge open: MERGE_HEAD present, `log.md` unmerged.
+function openConflictingMerge(dir) {
+  const env = { ...process.env, HOME: SESSION_TMP_HOME };
+  const git = (...a) => spawnSync('git', a, { cwd: dir, env, encoding: 'utf-8' });
+  const base = git('rev-parse', '--abbrev-ref', 'HEAD').stdout.trim();
+  git('checkout', '-q', '-b', 'side');
+  appendFileSync(join(dir, 'log.md'), 'side change\n');
+  git('commit', '-qam', 'side');
+  git('checkout', '-q', base);
+  appendFileSync(join(dir, 'log.md'), 'main change\n');
+  git('commit', '-qam', 'main');
+  const merged = git('merge', 'side');
+  assert.equal(merged.status, 1, `the fixture must stop on a conflict: ${merged.stdout}`);
+  assert.match(git('status', '--porcelain').stdout, /^UU log\.md$/m);
+  return git;
+}
+
+// Disabling the check: in applySessionClose drop the `vaultOperationInProgress` refusal.
+// The close then writes its entry, the commit fails, and the entry file is left behind.
+test('a close in a vault stopped mid-merge is refused before any write: ok:false, the stage and the blocker name the merge, exit 1', () => {
+  withWiki(null, (dir, today) => {
+    const sid = newPinSession('mid-merge');
+    openConflictingMerge(dir);
+    const logBefore = readFileSync(join(dir, 'log.md'), 'utf-8');
+    const first = applyJson(dir, v2Payload(today), sid);
+    assert.equal(first.r.status, 1, first.r.stdout);
+    assert.equal(first.out.ok, false, JSON.stringify(first.out));
+    assert.equal(first.out.stage, 'vault-operation-in-progress');
+    assert.equal(first.out.blocker.state, 'merge');
+    assert.match(first.out.error, /git merge --abort/);
+    assert.equal(first.out.committed, null);
+    assert.deepEqual(sessionFilesOf(dir), [], 'no entry file was written');
+    assert.equal(
+      existsSync(join(dir, 'projects', 'test-project', 'session-log', `${today}.md`)),
+      false,
+      'no session-log shard was written',
+    );
+    assert.equal(readFileSync(join(dir, 'log.md'), 'utf-8'), logBefore, 'log.md is untouched');
+    assert.equal(existsSync(join(dir, '.cache', `session-closed-${sid}.marker`)), false);
+    assert.equal(existsSync(join(dir, '.cache', 'sessions', sid, 'close-receipt.json')), false);
+    assert.equal(existsSync(join(dir, '.cache', 'close-intent')), false, 'no intent record');
+
+    // Control: the same payload closes once the person aborts the merge, so the refusal
+    // above was about the merge and not about the payload.
+    spawnSync('git', ['merge', '--abort'], {
+      cwd: dir,
+      env: { ...process.env, HOME: SESSION_TMP_HOME },
+    });
+    const retry = applyJson(dir, v2Payload(today), sid);
+    assert.equal(retry.out.ok, true, JSON.stringify(retry.out));
+    assert.equal(retry.out.committed, true);
+    assert.equal(sessionFilesOf(dir).length, 1);
+  });
+});
+
+test('unmerged paths without a MERGE_HEAD refuse the close the same way', () => {
+  withWiki(null, (dir, today) => {
+    const git = openConflictingMerge(dir);
+    rmSync(join(dir, '.git', 'MERGE_HEAD'));
+    assert.equal(git('rev-parse', '-q', '--verify', 'MERGE_HEAD').status, 1);
+    const r = applyJson(dir, v2Payload(today), newPinSession('unmerged'));
+    assert.equal(r.out.ok, false, JSON.stringify(r.out));
+    assert.equal(r.out.stage, 'vault-operation-in-progress');
+    assert.equal(r.out.blocker.state, 'unmerged');
+    assert.match(r.out.error, /log\.md/);
+    assert.deepEqual(sessionFilesOf(dir), []);
+  });
+});
+
+test('a commit that fails after the writes is ok:false at stage commit-failed, with no marker or receipt, and names the entry it left; the retry closes', () => {
+  withWiki(null, (dir, today) => {
+    const sid = newPinSession('commit-fail-stage');
+    const unblock = blockCommits(dir);
+    const first = applyJson(dir, v2Payload(today, { summary: 'first summary' }), sid);
+    assert.equal(first.r.status, 1, first.r.stdout);
+    assert.equal(first.out.ok, false, JSON.stringify(first.out));
+    assert.equal(first.out.stage, 'commit-failed');
+    assert.equal(first.out.committed, false);
+    assert.equal(first.out.markerWritten, false);
+    assert.match(first.out.markerSkipReason, /^commit-failed:/);
+    assert.match(first.out.commitFailure, /blocked by test|pre-commit|hook/i);
+    const file = sessionFilesOf(dir)[0];
+    const rel = join('projects', 'test-project', 'sessions', file);
+    assert.ok(file, 'the entry file stays on disk for the retry to find');
+    assert.ok(
+      first.out.appliedUncommitted.some((a) => a.includes(rel)),
+      `the result names the entry it left: ${JSON.stringify(first.out.appliedUncommitted)}`,
+    );
+    assert.equal(existsSync(join(dir, '.cache', `session-closed-${sid}.marker`)), false);
+    assert.equal(existsSync(join(dir, '.cache', 'sessions', sid, 'close-receipt.json')), false);
+
+    unblock();
+    const retry = applyJson(dir, v2Payload(today, { summary: 'first summary' }), sid);
+    assert.equal(retry.out.ok, true, JSON.stringify(retry.out));
+    assert.equal(retry.out.stage, null);
+    assert.equal(retry.out.committed, true);
+    assert.equal(retry.out.markerWritten, true);
+    assert.equal(retry.out.appliedUncommitted, undefined);
+    assert.equal(sessionFilesOf(dir).length, 1, 'the retry reuses the entry, no second file');
+  });
+});
+
+test('a normal close is ok:true, committed, no stage, and the entry is in HEAD', () => {
+  withWiki(null, (dir, today) => {
+    const r = applyJson(dir, v2Payload(today), newPinSession('normal-close'));
+    assert.equal(r.r.status, 0, r.r.stdout);
+    assert.equal(r.out.ok, true, JSON.stringify(r.out));
+    assert.equal(r.out.stage, null);
+    assert.equal(r.out.committed, true);
+    const rel = join('projects', 'test-project', 'sessions', sessionFilesOf(dir)[0]);
+    const inHead = spawnSync('git', ['cat-file', '-e', `HEAD:${rel}`], { cwd: dir });
+    assert.equal(inHead.status, 0, 'the entry is committed');
   });
 });
 

@@ -60,6 +60,7 @@ import {
   isExcludedFromCommit,
   isIgnoredByGit,
   headBlob,
+  vaultOperationInProgress,
 } from '../../hooks/hypo-shared.mjs';
 import {
   TRACK_ID_RE,
@@ -4659,18 +4660,27 @@ function runMarkerPhase(args, project, appliedPaths, ok, hostTagWarning, receipt
 // a tree this apply declined to finish writing, so naming them would point the
 // reader at the wrong repair. A proposal-STORE failure outranks even that: the
 // withheld bytes never reached an artifact, so it is the most urgent repair.
-function resolveCloseStage({ ok, proposalStoreFailed, conflicts, verificationOk, postLintOk }) {
+function resolveCloseStage({
+  ok,
+  proposalStoreFailed,
+  conflicts,
+  commitFailed,
+  verificationOk,
+  postLintOk,
+}) {
   return ok
     ? null
     : proposalStoreFailed
       ? 'proposal-store-failed'
       : conflicts.length > 0
         ? 'proposal-pending'
-        : !verificationOk && !postLintOk
-          ? 'post-apply-verification+lint'
-          : !verificationOk
-            ? 'post-apply-verification'
-            : 'post-apply-lint';
+        : commitFailed
+          ? 'commit-failed'
+          : !verificationOk && !postLintOk
+            ? 'post-apply-verification+lint'
+            : !verificationOk
+              ? 'post-apply-verification'
+              : 'post-apply-lint';
 }
 
 // The stdout JSON contract of a payload-bearing apply. Takes one bag because it
@@ -4774,6 +4784,13 @@ function buildCloseResult({
     // (overwrite or append), not overwrites alone.
     ...(applied.length > 0 && conflicts.length > 0
       ? { partialConflict: true, appliedUncommitted: [...applied] }
+      : {}),
+    // The commit ran and failed (`stage: 'commit-failed'`): what this close wrote and
+    // kept stays on disk uncommitted. The session-log and log.md appends were taken
+    // back; the session entry was not, because the retry finds it again by the close
+    // id and replaces or adopts it. Naming it here is what tells the reader it is there.
+    ...(commitOutcome?.committed === false
+      ? { appliedUncommitted: [...applied], commitFailure: commitOutcome.reason ?? null }
       : {}),
     verification,
     // Surface the marker outcome instead of skipping silently, so the
@@ -5023,8 +5040,12 @@ function printCloseReport({
     // opposite: one is about what is committed, the other about writing under
     // .cache/. Neither is the policy withhold the fallback text below describes,
     // and neither is the gate refusal (compact-gate-not-ok), which stays ok:true.
-    const receiptFailure =
-      markerSkipReason === 'receipt-proof-mismatch'
+    const receiptFailure = markerSkipReason?.startsWith('commit-failed:')
+      ? `    The close files were written but the commit failed, so nothing of this\n` +
+        `    close is published. This run reports ok:false and exits 1. The session\n` +
+        `    is NOT closed. To fix: clear the git problem named above, then re-run\n` +
+        `    the same close. No fresh close phrase is needed.\n`
+      : markerSkipReason === 'receipt-proof-mismatch'
         ? `    The close files were applied, but the close checkpoint receipt\n` +
           `    could not prove them against the commit (see mismatches[] in --json\n` +
           `    output). This run reports ok:false and exits 1. The session is NOT closed.\n` +
@@ -5221,6 +5242,27 @@ export function applySessionClose(args, testHooks = null) {
     }
     // gate not ok → fall through to readPayload, which surfaces
     // "payload is required" with the same error shape as before.
+  }
+
+  // A commit that names paths fails while a merge, rebase, cherry-pick or revert is open or
+  // paths are unmerged, and the close would have written its entry by then. Refuse before
+  // the first byte. It runs ahead of the authority check, which invalidates this
+  // session's earlier marker and receipt as soon as a new close is authorized.
+  const busy = vaultOperationInProgress(args.hypoDir);
+  if (busy) {
+    const error =
+      `session-close apply refused: the vault repo is mid-operation (${busy.state}): ${busy.detail}. ` +
+      `A close cannot be committed until then. Nothing was written; re-run the close afterwards.`;
+    const out = {
+      ok: false,
+      stage: 'vault-operation-in-progress',
+      error,
+      blocker: busy,
+      applied: [],
+      committed: null,
+    };
+    console.log(args.json ? JSON.stringify(out, null, 2) : `✗ ${error}`);
+    process.exit(1);
   }
 
   const { hostTagWarning, closeId, closeOpen, resolvedAtIndex, openedAtIndex } =
@@ -5519,7 +5561,11 @@ export function applySessionClose(args, testHooks = null) {
   const verificationOk = !verificationCounts || verification.ok;
   // `let` (not const): the close-result invariant self-check below may flip this
   // to false when the settled close result is internally contradictory.
-  let ok = preCommitOk && verificationOk;
+  // A commit that ran and failed leaves the entry and the appends unpublished, so the
+  // close did not happen. The marker phase has already withheld the marker and receipt
+  // (planMarkerDecision), and the retry is authorized by the same close signal.
+  const commitFailed = commitOutcome?.committed === false;
+  let ok = preCommitOk && verificationOk && !commitFailed;
   // Only a landed commit retires the close-intent record. Everything before
   // this point (the appends, a withheld conflict, a lint or commit failure)
   // leaves it in place: see closeIntentPath's doc comment for why an ok:false
@@ -5548,6 +5594,7 @@ export function applySessionClose(args, testHooks = null) {
     ok,
     proposalStoreFailed,
     conflicts,
+    commitFailed,
     verificationOk,
     postLintOk,
   });
