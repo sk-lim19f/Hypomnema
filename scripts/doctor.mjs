@@ -1581,7 +1581,7 @@ function checkSessionEntries(hypoDir) {
   if (traces.length > 0) {
     warn(
       'Session old-version closes',
-      `${traces.length} close(s) in the last ${OLD_VERSION_WINDOW_DAYS} days have a session-log heading but no entry: ${traces.slice(0, 5).join(', ')}${traces.length > 5 ? ` (+${traces.length - 5} more)` : ''}. An older Hypomnema or a hand-written close; upgrade that machine`,
+      `${traces.length} close(s) in the last ${OLD_VERSION_WINDOW_DAYS} days have a session-log heading but no entry: ${traces.slice(0, 5).join(', ')}${traces.length > 5 ? ` (+${traces.length - 5} more)` : ''}. An older Hypomnema or a hand-written close. A past trace leaves this report after ${OLD_VERSION_WINDOW_DAYS} days, and upgrading that machine stops new ones`,
     );
   } else if (projects.length > 0) {
     pass('Session old-version closes', `none in the last ${OLD_VERSION_WINDOW_DAYS} days`);

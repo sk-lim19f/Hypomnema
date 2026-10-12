@@ -44,7 +44,12 @@ import {
 } from './lib/frontmatter.mjs';
 import { buildSlugMap } from './lib/slug-resolver.mjs';
 import { parseStrictDate } from './lib/time.mjs';
-import { isBaselineId, isSessionEntryPath, parseSessionEntry } from '../hooks/session-entries.mjs';
+import {
+  generatedViewSlug,
+  isBaselineId,
+  isSessionEntryPath,
+  parseSessionEntry,
+} from '../hooks/session-entries.mjs';
 
 // ── arg parsing ──────────────────────────────────────────────────────────────
 
@@ -449,6 +454,23 @@ function lintSessionEntry(content, rel, fm) {
   });
 }
 
+// A view is rendered from entries only where entries exist: its links are then the entries' links,
+// which a page rename cannot repair (the next render writes the old name back), so they are not
+// reported. A view with no entries behind it (a vault not yet moved to entries) is a hand-kept
+// page and its links are checked like any other. Only the link check consults this; the
+// frontmatter and field checks run on every view.
+let projectsWithEntries; // slugs, built on first use from the collected pages
+function viewLinksComeFromEntries(rel) {
+  projectsWithEntries ??= new Set(
+    pages
+      .filter((p) => isSessionEntryPath(p.rel.replace(/\\/g, '/')))
+      .map((p) => p.rel.split(/[\\/]/)[1]),
+  );
+  if (rel === 'hot.md') return projectsWithEntries.size > 0;
+  const slug = generatedViewSlug(rel);
+  return slug !== null && projectsWithEntries.has(slug);
+}
+
 function lintPage({ path, rel }, slugMap, tagVocab, pageDirs, validTypes) {
   // Directory whitelist: a content page under pages/<subdir>/ must live in a
   // SCHEMA-defined directory. Catches typo'd dirs (e.g. pages/learning/ vs the
@@ -685,6 +707,8 @@ function lintPage({ path, rel }, slugMap, tagVocab, pageDirs, validTypes) {
     return;
   }
 
+  if (viewLinksComeFromEntries(rel.replace(/\\/g, '/'))) return;
+
   for (const link of extractWikilinks(content)) {
     if (!slugMap.has(link)) {
       issue('warn', rel, `Broken wikilink: [[${link}]]`, null, 'W4');
@@ -832,6 +856,7 @@ for (const rel of closeRootTargets) {
       issue('warn', rel, `Invalid YAML frontmatter: ${reason}`, null, 'W9');
     }
   }
+  if (viewLinksComeFromEntries(rel)) continue;
   for (const link of extractWikilinks(content)) {
     if (!slugMap.has(link)) {
       issue('warn', rel, `Broken wikilink: [[${link}]]`, null, 'W4');
