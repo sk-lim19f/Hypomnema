@@ -42,6 +42,7 @@ import {
   missingBlockLines,
   narrowestVisibilityScope,
   parseSessionEntry,
+  projectNameProblem,
   scopeVisible,
   sessionViewPathsOf,
 } from './session-entries.mjs';
@@ -1307,9 +1308,12 @@ export function collectProjectWorkingDirs(hypoDir) {
 // need it. The grammar is session-entries' isValidProjectName, the one rule every gate shares.
 // Names are compared in NFC: a payload name typed in NFD finds a directory stored in NFC (and the
 // reverse) even on a filesystem that compares bytes. The returned name is the one on disk, so
-// callers join paths and compare slugs with the spelling the directory really has. Exported for
-// scripts/, which resolves its own payload and --project names through it.
-export function resolveProjectDirName(hypoDir, slug) {
+// callers join paths and compare slugs with the spelling the directory really has. A directory
+// whose on-disk spelling is not NFC resolves to null: git on macOS reports NFC paths, so every
+// supplied-path match, entry project and gate slug built from that name would miss. Callers that
+// can say why ask nonNfcProjectDir. Exported for scripts/, which resolves its own payload and
+// --project names through it.
+function findProjectDir(hypoDir, slug) {
   if (!isValidProjectName(slug)) return null;
   const want = slug.normalize('NFC');
   try {
@@ -1319,6 +1323,32 @@ export function resolveProjectDirName(hypoDir, slug) {
   } catch {
     return null;
   }
+}
+
+export function resolveProjectDirName(hypoDir, slug) {
+  const hit = findProjectDir(hypoDir, slug);
+  return hit !== null && projectNameProblem(hit) === null ? hit : null;
+}
+
+// The on-disk name when `slug` finds a project directory spelled in a non-NFC form, else null.
+// This is the reason resolveProjectDirName returned null for a name that does exist.
+export function nonNfcProjectDir(hypoDir, slug) {
+  const hit = findProjectDir(hypoDir, slug);
+  return hit !== null && projectNameProblem(hit) === 'not-nfc' ? hit : null;
+}
+
+// The refusal text for a non-NFC project directory, with the commands that fix it. APFS treats the
+// NFC and NFD spellings as one name, so a direct rename is refused as "already exists": the move
+// goes through a temporary name.
+export function nonNfcProjectMessage(onDisk) {
+  const nfc = onDisk.normalize('NFC');
+  const tmp = `${nfc}.nfc-tmp`;
+  return (
+    `projects/${onDisk} is spelled in decomposed (NFD) Unicode, and git reports project paths ` +
+    `precomposed (NFC), so the close cannot match its files. Rename projects/${onDisk} to its NFC ` +
+    `spelling first: /hypo:rename --from=projects/${onDisk} --to=${tmp}, then ` +
+    `/hypo:rename --from=projects/${tmp} --to=${nfc}`
+  );
 }
 
 // session-close-scope-boundary spec §2: the one place that turns a caller-

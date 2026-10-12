@@ -60,6 +60,8 @@ import {
   isExcludedFromCommit,
   isIgnoredByGit,
   headBlob,
+  nonNfcProjectDir,
+  nonNfcProjectMessage,
   resolveProjectDirName,
   vaultOperationInProgress,
 } from '../../hooks/hypo-shared.mjs';
@@ -323,9 +325,11 @@ function trackAppend(target, held, append) {
  * bytes added later by hand would pass as this close's own.
  *
  * @param {{hypoDir: string, sessionId: string|null, closeId: string|null}} ctx
+ * @returns {string[]} the vault-relative paths whose appended bytes were taken back
  */
 export function withdrawUnlandedAppends(ctx, targets, notices) {
   const patterns = loadHypoIgnore(ctx.hypoDir);
+  const withdrawn = [];
   for (const t of targets) {
     if (t.before === undefined || t.after === undefined) continue;
     if (t.before === t.after || (t.before && t.after && t.before.equals(t.after))) continue;
@@ -351,6 +355,7 @@ export function withdrawUnlandedAppends(ctx, targets, notices) {
       );
       continue;
     }
+    withdrawn.push(t.rel);
     notices.push(
       `커밋이 끝나지 않아 이번 close가 ${t.rel}에 추가한 내용을 되돌렸습니다. close를 다시 실행하세요.`,
     );
@@ -374,6 +379,7 @@ export function withdrawUnlandedAppends(ctx, targets, notices) {
       );
     }
   }
+  return withdrawn;
 }
 
 // atomicWrite is now the shared hooks/atomic-write.mjs implementation
@@ -1621,13 +1627,12 @@ export function closeResultContradiction({ ok, markerWritten, markerSkipReason }
 
 // A withheld marker with a legitimate reason is not, by itself, a
 // reason to fail the apply. Most of planMarkerDecision's skip branches
-// (compact-gate-not-ok, no-user-close-signal, transcript-unresolved,
-// commit-failed) name a condition THIS SAME SESSION can clear and retry,
-// see the "a marker withheld by a real vault-commit failure leaves the close
-// signal unspent for a retry" test, whose whole point is that ok stays true
-// there and the close signal is not burned. Forcing ok:false on every one of
-// those would resurrect that exact regression's failure mode from the other
-// direction.
+// (compact-gate-not-ok, no-user-close-signal, transcript-unresolved)
+// name a condition THIS SAME SESSION can clear and retry; ok stays true and
+// the close signal is not burned. Forcing ok:false on every one of those
+// would resurrect that regression's failure mode from the other direction.
+// A commit failure is not on this list: it is ok:false with stage
+// 'commit-failed', and its retry is authorized by the same unspent signal.
 //
 // 'marker-did-not-land' is not one of those. runMarkerPhase only reaches it
 // after `planMarkerDecision` has already returned `write: true`, meaning the
@@ -2138,7 +2143,11 @@ function resolveCloseProject(args, payload) {
   // here on is the spelling the directory has on disk.
   const project = resolveProjectDirName(args.hypoDir, payload.project);
   if (project === null) {
-    const msg = `payload.project "${payload.project}" does not exist as a directory (no projects/${payload.project}/ directory)`;
+    const decomposed = nonNfcProjectDir(args.hypoDir, payload.project);
+    const msg =
+      decomposed !== null
+        ? `payload.project "${payload.project}": ${nonNfcProjectMessage(decomposed)}`
+        : `payload.project "${payload.project}" does not exist as a directory (no projects/${payload.project}/ directory)`;
     console.log(args.json ? JSON.stringify({ ok: false, error: msg }, null, 2) : `✗ ${msg}`);
     process.exit(1);
   }
@@ -2397,6 +2406,7 @@ function planSessionEntry(args, payload, project, entryPath, closeId, legacyForm
   }
   const observed = readObservedHeads(args.hypoDir, args.sessionId, project);
   const entryTracks = [];
+  const legacySplitRetired = [];
   const bodies = {};
   for (const t of tracks) {
     const isNew = t.new === true || (legacyFormat && t.id === 'legacy' && !registered.has(t.id));
@@ -2445,7 +2455,21 @@ function planSessionEntry(args, payload, project, entryPath, closeId, legacyForm
       ...(t.done === true ? { done: true } : {}),
     });
     if (typeof t.next === 'string') bodies[t.id] = t.next;
+    // The old payload form writes the whole new session-state into `legacy`, so it also retires the
+    // heads a migration split that state into (`legacy-*`). An update replaces only heads of its
+    // own track, so each one the session observed gets a bodyless `done` update that supersedes it.
+    // Left live, the split heads would sit beside a full copy of the same text.
+    if (legacyFormat && t.id === 'legacy') {
+      for (const [id, closeIds] of updates) {
+        if (!id.startsWith('legacy-') || seen.has(id)) continue;
+        const retired = [
+          ...new Set([...(observed.full[id] ?? []), ...(observed.pointer[id] ?? [])]),
+        ].filter((c) => closeIds.includes(c));
+        if (retired.length) legacySplitRetired.push({ id, supersedes: retired, done: true });
+      }
+    }
   }
+  entryTracks.push(...legacySplitRetired);
 
   const pin = readClosePin(args.hypoDir, args.sessionId);
   const { relPath, date: entryDate } = entryPath;
@@ -4705,6 +4729,7 @@ function buildCloseResult({
   project,
   date,
   applied,
+  withdrawnAppends,
   skipped,
   commitOutcome,
   conflicts,
@@ -4731,6 +4756,11 @@ function buildCloseResult({
   obsoleteNotices,
   hostTagWarning,
 }) {
+  // `applied` names every write this run made; the session-log and log.md appends that were taken
+  // back are not on disk any more, so they are not listed as uncommitted work.
+  const stillOnDisk = applied.filter(
+    (a) => !withdrawnAppends.some((rel) => a.includes(`(${rel})`) || a.includes(`(${rel},`)),
+  );
   return {
     ok,
     stage,
@@ -4796,14 +4826,14 @@ function buildCloseResult({
     // re-runs. Named honestly: `appliedUncommitted` covers every write that landed
     // (overwrite or append), not overwrites alone.
     ...(applied.length > 0 && conflicts.length > 0
-      ? { partialConflict: true, appliedUncommitted: [...applied] }
+      ? { partialConflict: true, appliedUncommitted: stillOnDisk }
       : {}),
     // The commit ran and failed (`stage: 'commit-failed'`): what this close wrote and
     // kept stays on disk uncommitted. The session-log and log.md appends were taken
     // back; the session entry was not, because the retry finds it again by the close
     // id and replaces or adopts it. Naming it here is what tells the reader it is there.
     ...(commitOutcome?.committed === false
-      ? { appliedUncommitted: [...applied], commitFailure: commitOutcome.reason ?? null }
+      ? { appliedUncommitted: stillOnDisk, commitFailure: commitOutcome.reason ?? null }
       : {}),
     verification,
     // Surface the marker outcome instead of skipping silently, so the
@@ -5261,7 +5291,36 @@ export function applySessionClose(args, testHooks = null) {
   // paths are unmerged, and the close would have written its entry by then. Refuse before
   // the first byte. It runs ahead of the authority check, which invalidates this
   // session's earlier marker and receipt as soon as a new close is authorized.
-  const busy = vaultOperationInProgress(args.hypoDir);
+  //
+  // A state found open is judged again under the vault commit lock. Another session's Stop sync
+  // holds that lock for the whole of its merge, so an open MERGE_HEAD seen from outside the lock
+  // may be that merge in flight, not a stuck one, and advising `git merge --abort` would abort a
+  // healthy sync. A clean vault never takes the lock here: a close may start while another session
+  // commits, and it waits for the lock at its own commit.
+  let busy = vaultOperationInProgress(args.hypoDir);
+  try {
+    if (busy) {
+      busy = withFileLock(
+        vaultCommitLockTarget(args.hypoDir),
+        () => vaultOperationInProgress(args.hypoDir),
+        { timeoutMs: 3000 },
+      );
+    }
+  } catch (err) {
+    if (err?.code !== 'ELOCKTIMEOUT') throw err;
+    const error =
+      'session-close apply refused: another session is syncing the vault; run the close again in a moment. ' +
+      'Nothing was written.';
+    const out = {
+      ok: false,
+      stage: 'vault-locked',
+      error,
+      applied: [],
+      committed: null,
+    };
+    console.log(args.json ? JSON.stringify(out, null, 2) : `✗ ${error}`);
+    process.exit(1);
+  }
   if (busy) {
     const error =
       `session-close apply refused: the vault repo is mid-operation (${busy.state}): ${busy.detail}. ` +
@@ -5413,6 +5472,7 @@ export function applySessionClose(args, testHooks = null) {
     appendTarget(join('projects', project, 'session-log', `${date}.md`), shardTarget),
     appendTarget('log.md', join(args.hypoDir, 'log.md')),
   ];
+  let withdrawnAppends = [];
   const held = runHoldingAppendLocks(shardTarget, join(args.hypoDir, 'log.md'), (locks) => {
     // Appended text no commit holds is taken back before the locks release
     // (withdrawUnlandedAppends), or the next close would commit it as its own.
@@ -5524,7 +5584,7 @@ export function applySessionClose(args, testHooks = null) {
         commit,
       };
     } finally {
-      withdrawUnlandedAppends(
+      withdrawnAppends = withdrawUnlandedAppends(
         { hypoDir: args.hypoDir, sessionId: args.sessionId, closeId },
         appendTargets,
         notices,
@@ -5650,6 +5710,7 @@ export function applySessionClose(args, testHooks = null) {
     project,
     date,
     applied,
+    withdrawnAppends,
     skipped,
     commitOutcome,
     conflicts,

@@ -32,7 +32,12 @@ import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync } from 
 import { join, dirname, resolve, sep } from 'path';
 import { fileURLToPath } from 'url';
 import { resolveHypoRoot, expandHome } from './hypo-root.mjs';
-import { resolveProjectDirName, rootHotBackupRecoveryNotice } from '../../hooks/hypo-shared.mjs';
+import {
+  nonNfcProjectDir,
+  nonNfcProjectMessage,
+  resolveProjectDirName,
+  rootHotBackupRecoveryNotice,
+} from '../../hooks/hypo-shared.mjs';
 import { writeGeneratedViews } from '../../hooks/session-views.mjs';
 import { isValidProjectName } from '../../hooks/session-entries.mjs';
 
@@ -95,6 +100,8 @@ export function createProject(opts) {
   const hypoDir = opts.hypoDir || resolveHypoRoot();
   // NFC is the stored form; an existing directory keeps the spelling it has on disk, so an NFD
   // name never scaffolds a second directory beside an NFC one.
+  const decomposed = nonNfcProjectDir(hypoDir, opts.name);
+  if (decomposed !== null) throw new Error(nonNfcProjectMessage(decomposed));
   const name = resolveProjectDirName(hypoDir, opts.name) ?? opts.name.normalize('NFC');
   const today = opts.today || todayISO();
   const started = opts.started || today;

@@ -6178,6 +6178,57 @@ test('legacy payload: the same session closing in the old format twice leaves on
   });
 });
 
+// A migration splits the old session-state into one head per track. The old payload form writes the
+// whole new session-state into `legacy`, so the split heads this session saw must go with it.
+// Disabling the check: in planSessionEntry drop the `legacyFormat && t.id === 'legacy'` block that
+// fills legacySplitRetired. The split bodies then stay live next to the full copy.
+test('legacy payload against a split baseline: the observed legacy-* heads are retired and the new text appears once', () => {
+  withWiki(null, (dir, today) => {
+    untrackOldStateFiles(dir);
+    const base = 'aaaa1111-1';
+    const splitA = 'legacy-stage-a-111111';
+    const splitB = 'legacy-stage-b-222222';
+    writeEntryFile(dir, {
+      closeId: base,
+      date: today,
+      summary: '',
+      tracks: [
+        { id: 'legacy', title: '이행 전 기록', new: true },
+        { id: splitA, title: 'Stage A', new: true },
+        { id: splitB, title: 'Stage B', new: true },
+      ],
+      bodies: { legacy: 'REMAINDER-BODY', [splitA]: 'SPLIT-A-BODY', [splitB]: 'SPLIT-B-BODY' },
+    });
+    const sid = newPinSession('legacy-split');
+    recordObservedHeads(dir, sid, 'test-project', {
+      level: 'full',
+      heads: { legacy: [base], [splitA]: [base], [splitB]: [base] },
+    });
+    const { out } = applyJson(dir, legacyFormatPayload(today, 'legacy split'), sid);
+    assert.equal(out.ok, true, JSON.stringify(out));
+    const mine = closeIdFor(sid, 0);
+    const model = loadSessionModel(dir, 'test-project');
+    const tracks = trackHeads(model.entries);
+    assert.deepEqual(
+      tracks.find((t) => t.trackId === 'legacy').heads.map((h) => h.closeId),
+      [mine],
+    );
+    for (const id of [splitA, splitB]) {
+      const t = tracks.find((x) => x.trackId === id);
+      assert.deepEqual(
+        t.heads.map((h) => h.closeId),
+        [mine],
+        `the baseline head of ${id} is replaced by this close's retiring update`,
+      );
+      assert.equal(t.done, true, `${id} is retired, not live`);
+    }
+    const view = renderViews([model], { device: 'dev-test' }).projects['test-project'].sessionState;
+    assert.ok(!view.includes('SPLIT-A-BODY') && !view.includes('SPLIT-B-BODY'), view);
+    assert.ok(!view.includes('REMAINDER-BODY'), 'the old remainder is replaced too');
+    assert.equal(view.split('legacy-state-line').length - 1, 1, 'the new text appears once');
+  });
+});
+
 test('legacy payload: a payload mixing either old field with summary or tracks fails and writes nothing', () => {
   const mixes = [
     { summary: 'x' },
@@ -6372,6 +6423,28 @@ test('a close in a vault stopped mid-merge is refused before any write: ok:false
   });
 });
 
+// Disabling the check: in applySessionClose call vaultOperationInProgress directly again, without
+// the vault commit lock. A merge another session is finishing then reads as a stuck one.
+test('a close that finds the vault commit lock held mid-merge says another session is syncing, with no abort advice', () => {
+  withWiki(null, (dir, today) => {
+    openConflictingMerge(dir);
+    mkdirSync(join(dir, '.cache'), { recursive: true });
+    // This test process is alive and the lock is fresh, so withFileLock neither steals nor frees it.
+    writeFileSync(join(dir, '.cache', 'vault-commit.lock'), String(process.pid));
+    const r = applyJson(dir, v2Payload(today), newPinSession('merge-locked'));
+    assert.equal(r.r.status, 1, r.r.stdout);
+    assert.equal(r.out.ok, false, JSON.stringify(r.out));
+    assert.equal(r.out.stage, 'vault-locked');
+    assert.match(
+      r.out.error,
+      /another session is syncing the vault; run the close again in a moment/,
+    );
+    assert.doesNotMatch(r.out.error, /abort/);
+    assert.equal(r.out.blocker, undefined);
+    assert.deepEqual(sessionFilesOf(dir), [], 'no entry file was written');
+  });
+});
+
 test('unmerged paths without a MERGE_HEAD refuse the close the same way', () => {
   withWiki(null, (dir, today) => {
     const git = openConflictingMerge(dir);
@@ -6416,6 +6489,36 @@ test('a commit that fails after the writes is ok:false at stage commit-failed, w
     assert.equal(retry.out.markerWritten, true);
     assert.equal(retry.out.appliedUncommitted, undefined);
     assert.equal(sessionFilesOf(dir).length, 1, 'the retry reuses the entry, no second file');
+  });
+});
+
+// Disabling the check: in buildCloseResult make `stillOnDisk` equal `applied`. The withdrawn
+// session-log and log.md appends are then listed as work left on disk.
+test('a commit failure lists only what is still on disk: the withdrawn session-log and log.md appends are not in appliedUncommitted', () => {
+  withWiki(null, (dir, today) => {
+    const sid = newPinSession('commit-fail-withdrawn');
+    const unblock = blockCommits(dir);
+    const first = applyJson(dir, v2Payload(today, { summary: 'first summary' }), sid);
+    assert.equal(first.out.stage, 'commit-failed', JSON.stringify(first.out));
+    assert.ok(
+      first.out.applied.some((a) => a.startsWith('sessionLog (')) &&
+        first.out.applied.some((a) => a.startsWith('log (')),
+      `fixture: the close did append to both: ${JSON.stringify(first.out.applied)}`,
+    );
+    assert.ok(
+      (first.out.notices ?? []).some((n) => /추가한 내용을 되돌렸습니다/.test(n)),
+      `fixture: the appends were taken back: ${JSON.stringify(first.out.notices)}`,
+    );
+    assert.ok(
+      first.out.appliedUncommitted.some((a) => a.startsWith('sessionEntry (')),
+      JSON.stringify(first.out.appliedUncommitted),
+    );
+    assert.deepEqual(
+      first.out.appliedUncommitted.filter((a) => /sessionLog|log \(/.test(a)),
+      [],
+      `the withdrawn appends are not listed: ${JSON.stringify(first.out.appliedUncommitted)}`,
+    );
+    unblock();
   });
 });
 

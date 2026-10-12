@@ -1,7 +1,7 @@
-import { existsSync } from 'fs';
-import { join } from 'path';
 import {
   extractTouchedWikiFilesWithTrust,
+  nonNfcProjectDir,
+  nonNfcProjectMessage,
   resolveProjectDirName,
 } from '../../hooks/hypo-shared.mjs';
 
@@ -27,7 +27,11 @@ export function requireProjectDir(args, slug) {
   // every later join and slug comparison uses that spelling.
   const onDisk = resolveProjectDirName(args.hypoDir, slug);
   if (onDisk === null) {
-    const msg = `--project "${slug}" does not exist as a directory (no projects/${slug}/ directory)`;
+    const decomposed = nonNfcProjectDir(args.hypoDir, slug);
+    const msg =
+      decomposed !== null
+        ? `--project "${slug}": ${nonNfcProjectMessage(decomposed)}`
+        : `--project "${slug}" does not exist as a directory (no projects/${slug}/ directory)`;
     console.log(args.json ? JSON.stringify({ ok: false, error: msg }, null, 2) : `✗ ${msg}`);
     process.exit(1);
   }
@@ -58,7 +62,10 @@ export function deriveTouchedProject(hypoDir, transcriptPath) {
   const slugs = new Set();
   for (const f of files) {
     const m = /^projects\/([^/]+)\//.exec(f);
-    if (m && existsSync(join(hypoDir, 'projects', m[1]))) slugs.add(m[1]);
+    // Through the resolver, so a file path in a non-project directory or a decomposed spelling
+    // never counts as a project, and the slug is the on-disk NFC name.
+    const slug = m && resolveProjectDirName(hypoDir, m[1]);
+    if (slug) slugs.add(slug);
   }
   return slugs.size === 1 ? [...slugs][0] : null;
 }
