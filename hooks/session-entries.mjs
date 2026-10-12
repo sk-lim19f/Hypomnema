@@ -441,14 +441,19 @@ function commentOpenAfter(line, open) {
   }
 }
 
-// `[{level, title, start, end}]` for every `##` and `###` heading line of `text` outside code fences,
-// HTML comments and the frontmatter. `start` is the offset of the line, `end` the offset just past
-// its newline (or the text length).
+// `{heads, lists}` for `text`, scanning outside code fences, HTML comments and the frontmatter.
+// `heads` is `[{level, title, start, end}]` for every ATX heading of level 1 to 3 (up to three
+// leading spaces, as CommonMark has it) and for every Setext heading (`setext: true`, level 1 for
+// `===`, 2 for `---`; the title is the text line). `lists` is `[{items, start}]` for every
+// `트랙:` or `Tracks:` line at column 0. `start` is the offset of the line, `end` the offset just
+// past its newline (or the text length).
 function headingLines(text) {
-  const out = [];
+  const heads = [];
+  const lists = [];
   let pos = Math.max(0, frontmatterEnd(text));
   let fence = null; // {char, len} while inside a fenced block
   let comment = false; // inside an HTML comment that began on an earlier line
+  let para = null; // the previous line when it is plain paragraph text, a Setext title candidate
   while (pos < text.length) {
     const nl = text.indexOf('\n', pos);
     const end = nl === -1 ? text.length : nl + 1;
@@ -457,27 +462,49 @@ function headingLines(text) {
     if (fence) {
       if (f && f[1][0] === fence.char && f[1].length >= fence.len && f[2].trim() === '')
         fence = null;
+      para = null;
     } else if (comment) {
       comment = commentOpenAfter(line, true);
+      para = null;
     } else if (f) {
       fence = { char: f[1][0], len: f[1].length };
+      para = null;
     } else {
-      const h = /^(#{2,3})[ \t]+(\S.*?)[ \t]*$/.exec(line);
-      if (h) out.push({ level: h[1].length, title: h[2], start: pos, end });
-      else comment = commentOpenAfter(line, false);
+      const h = /^ {0,3}(#{1,3})[ \t]+(\S.*?)[ \t]*$/.exec(line);
+      const under = para && /^ {0,3}(=+|-+)[ \t]*$/.exec(line);
+      const l = /^(?:트랙|Tracks):[ \t]*(.+)$/.exec(line);
+      if (h) {
+        heads.push({ level: h[1].length, title: h[2], start: pos, end });
+        para = null;
+      } else if (under) {
+        heads.push({
+          level: under[1][0] === '=' ? 1 : 2,
+          title: para.title,
+          start: para.start,
+          end,
+          setext: true,
+        });
+        para = null;
+      } else {
+        if (l) lists.push({ items: l[1], start: pos });
+        comment = commentOpenAfter(line, false);
+        // A list item, a quote or an indented code line is not a Setext title.
+        const plain = line.trim() !== '' && !/^(?: {4}|\t|[-*+] |\d+[.)] |>)/.test(line);
+        para = plain && !comment ? { title: line.trim(), start: pos } : null;
+      }
     }
     pos = end;
   }
-  return out;
+  return { heads, lists };
 }
 
 // The `##` sections among `after` named by the track list line in the next-up section's preamble
 // (the text from `next` to the heading that follows it, `first`). `[]` when there is no such line.
-function listedTracks(text, next, first, after) {
-  const preamble = text.slice(next.end, first?.start ?? text.length);
-  const line = /^(?:트랙|Tracks):[ \t]*(.+)$/m.exec(preamble);
+// `lists` comes from headingLines, so a list line in a fence or a comment is not one.
+function listedTracks(lists, next, first, after) {
+  const line = lists.find((l) => l.start >= next.end && l.start < (first?.start ?? Infinity));
   if (!line) return [];
-  const items = line[1]
+  const items = line.items
     .replace(/\.(?:\s.*)?$/, '')
     .split(/[·,/]/)
     .map((i) => i.trim())
@@ -499,6 +526,9 @@ function listedTracks(text, next, first, after) {
  *     title starts with a listed item is a track. Any other `##` section (notes, "common" parts)
  *     stays in `rest`. Without a list line nothing is split, so a file that merely has several
  *     `##` sections is never read as having tracks.
+ * Headings are CommonMark ATX headings with up to three leading spaces. A level-one heading is a
+ * boundary only: it ends the next-up part and any track, and is never a track. A Setext heading
+ * after the next-up heading is not supported as a boundary, so the file then stays one whole head.
  * A track's `title` is its heading text, `body` the text after the heading line up to the next
  * section boundary. `rest` is every byte outside the track bodies and heading lines, in file order
  * (frontmatter, preamble, the next-up heading itself, sections that are not tracks). Cutting
@@ -508,14 +538,22 @@ function listedTracks(text, next, first, after) {
  * machine and no id depends on a section's position.
  */
 export function splitStateTracks(text) {
-  const heads = headingLines(text);
-  const at = heads.findIndex((h) => h.level === 2 && NEXT_UP_HEADINGS.includes(h.title));
+  const { heads, lists } = headingLines(text);
+  const at = heads.findIndex(
+    (h) => h.level === 2 && !h.setext && NEXT_UP_HEADINGS.includes(h.title),
+  );
   if (at === -1) return null;
   const after = heads.slice(at + 1);
-  const nextTwo = after.findIndex((h) => h.level === 2);
+  // A Setext heading is not read as a boundary, so where one follows the next-up heading the
+  // sections cannot be told apart: the file stays one whole head rather than a guess.
+  if (after.some((h) => h.setext)) return null;
+  const nextTwo = after.findIndex((h) => h.level <= 2);
   const inside = nextTwo === -1 ? after : after.slice(0, nextTwo);
   const sub = inside.filter((h) => h.level === 3);
-  const picked = sub.length >= 2 ? sub : listedTracks(text, heads[at], heads[at + 1], after);
+  // A level-one heading ends the next-up part, so `##` sections below it are never listed tracks.
+  const topEnd = after.findIndex((h) => h.level === 1);
+  const listable = topEnd === -1 ? after : after.slice(0, topEnd);
+  const picked = sub.length >= 2 ? sub : listedTracks(lists, heads[at], heads[at + 1], listable);
   // A track section stops at the next heading of its own or a higher level, else at the text end.
   const tracksFound = picked.map((h) => ({
     ...h,
