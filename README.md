@@ -254,7 +254,7 @@ Nine commands cover the full capture → retrieval → consolidation cycle.
 
 | Hook | Event | Role |
 |---|---|---|
-| `hypo-close-guard.mjs` | `PreToolUse` | When a Write/Edit/MultiEdit looks like a session-close write and the transcript carries no close signal from you, ask before it lands |
+| `hypo-close-guard.mjs` | `PreToolUse` | Denies a direct Write/Edit/MultiEdit to a generated session view (root `hot.md`, a project's `hot.md` or `session-state.md`) or to a session entry (`projects/<p>/sessions/*.md`) |
 | `hypo-session-start.mjs` | `SessionStart` | `git pull --ff-only`, rebuild the generated session views (root `hot.md`, and each project's `hot.md` and `session-state.md`) from `projects/*/sessions/`, inject them |
 | `hypo-first-prompt.mjs` | `UserPromptSubmit` | Marker-based one-shot request for a resume line on the first prompt (10-min TTL). It does not re-read `hot.md` |
 | `hypo-lookup.mjs` | `UserPromptSubmit` | BM25 top-3 HIT inject / MISS → closest-slug signal |

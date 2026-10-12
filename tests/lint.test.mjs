@@ -11,7 +11,7 @@ import { tmpdir } from 'node:os';
 import { parseSchemaVocab, appendPendingTags } from '../scripts/lib/schema-vocab.mjs';
 import { fencedLineMask, maskNonProse, retiredLineMask } from '../scripts/lib/code-fence.mjs';
 import { parseFrontmatter as libParseFrontmatter } from '../scripts/lib/frontmatter.mjs';
-import { formatSessionEntry, renderViews } from '../hooks/session-entries.mjs';
+import { GITIGNORE_BLOCK, formatSessionEntry, renderViews } from '../hooks/session-entries.mjs';
 import { loadSessionModel } from '../hooks/session-views.mjs';
 import { test, suite } from './harness.mjs';
 import {
@@ -3748,7 +3748,7 @@ function entryText(over = {}) {
 
 // A vault with project p, its index, and the given entries ({name: text}). `schema` is
 // written as SCHEMA.md when given. Returns the lint result and runs `after(dir)` before cleanup.
-function lintEntries(entries, { schema, args = [], extra = {}, after } = {}) {
+function lintEntries(entries, { schema, args = [], extra = {}, after, setup } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'hypo-lint-entry-'));
   try {
     mkdirSync(join(dir, 'projects', 'p', 'sessions'), { recursive: true });
@@ -3761,6 +3761,7 @@ function lintEntries(entries, { schema, args = [], extra = {}, after } = {}) {
       mkdirSync(dirname(join(dir, rel)), { recursive: true });
       writeFileSync(join(dir, rel), text);
     }
+    setup?.(dir);
     const r = run('lint.mjs', [`--hypo-dir=${dir}`, '--json', ...args]);
     const out = JSON.parse(r.stdout);
     return { r, out, after: after?.(dir) };
@@ -3869,6 +3870,49 @@ test('a supersedes id that names no entry of the project warns; a real one does 
   const w = out.warns.filter((i) => i.file === 'projects/p/sessions/2026-10-02-s2-0.md');
   assert.equal(w.length, 1, JSON.stringify(out.warns));
   assert.ok(w[0].message.includes('"ghost-9"'), w[0].message);
+});
+
+// A close that updates the `legacy` track supersedes the virtual baseline's id. Before the move to
+// session entries no entry file carries that id (the reader builds it from the old flat files), so
+// W20 stays quiet; once the vault has moved, the same dangling id is a real finding again.
+function baselineSupersedeVault(migrated) {
+  const baselineId = 'baseline-0123456789abcdef';
+  const entry = entryText({
+    closeId: 's2-0',
+    date: '2026-10-02',
+    tracks: [{ id: 'legacy', supersedes: [baselineId] }],
+    bodies: {},
+  });
+  const git = (dir, ...a) =>
+    spawnSync('git', ['-c', 'user.email=t@t.test', '-c', 'user.name=t', ...a], {
+      cwd: dir,
+      env: { ...process.env, HOME: SESSION_TMP_HOME },
+      encoding: 'utf-8',
+    });
+  const { out } = lintEntries(
+    { '2026-10-02-s2-0.md': entry },
+    {
+      setup: (dir) => {
+        git(dir, 'init', '-q');
+        if (migrated) {
+          writeFileSync(join(dir, '.gitignore'), `.cache/\n${GITIGNORE_BLOCK}`);
+          git(dir, 'add', '.gitignore');
+          git(dir, 'commit', '-q', '-m', 'migrate');
+        }
+      },
+    },
+  );
+  return out.warns.filter((i) => i.file === 'projects/p/sessions/2026-10-02-s2-0.md');
+}
+
+test('W20 skips a baseline id while the vault has not moved to session entries', () => {
+  assert.deepEqual(baselineSupersedeVault(false), []);
+});
+
+test('W20 still warns about a dangling baseline id once the vault has moved', () => {
+  const w = baselineSupersedeVault(true);
+  assert.equal(w.length, 1, JSON.stringify(w));
+  assert.ok(w[0].message.includes('"baseline-0123456789abcdef"'), w[0].message);
 });
 
 test('lint --fix leaves an entry without updated byte for byte, and still fixes an ordinary page', () => {

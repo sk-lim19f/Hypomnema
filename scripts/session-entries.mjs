@@ -237,7 +237,10 @@ function parseArgs(argv) {
   const args = { command, hypoDir: null, [own]: null };
   for (const arg of rest) {
     if (arg.startsWith('--hypo-dir=')) args.hypoDir = expandHome(arg.slice('--hypo-dir='.length));
-    else if (arg.startsWith(`--${own}=`)) args[own] = arg.slice(own.length + 3);
+    // Literal per-command flags: the prompt-surface sweep reads parsed flags from the source text.
+    else if (command === 'rollback' && arg.startsWith('--at=')) args.at = arg.slice('--at='.length);
+    else if (command === 'render' && arg.startsWith('--project='))
+      args.project = arg.slice('--project='.length);
     else usageError(`unknown option for ${command}: ${arg}`);
   }
   if (!args[own]) usageError(`${command} needs --${own}=<value>`);

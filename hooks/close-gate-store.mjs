@@ -345,10 +345,9 @@ export function readResolution(hypoDir, sessionId, rawTranscript) {
  * NOT every `isCloseGateOpen` caller should switch to this. Writing bytes is
  * not the test: `--mark-session-closed` writes a file too (the marker), and
  * it still belongs on `isCloseGateOpen`. The real criterion is which close
- * event a call is transacting FOR. `verifyCloseAuthority` and
- * `hypo-close-guard.mjs` each gate a NEW authorization request: a write
- * that has not happened yet, standing on whatever close signal the
- * transcript currently carries — so a resolution recorded by an EARLIER
+ * event a call is transacting FOR. `verifyCloseAuthority` gates a NEW
+ * authorization request: a write that has not happened yet, standing on
+ * whatever close signal the transcript currently carries, so a resolution recorded by an EARLIER
  * close must retire that old signal before a new one is trusted again.
  * `runMarkSessionClosed` (crystallize.mjs's standalone
  * `--mark-session-closed`) is different in kind: it is the FOLLOW-UP
@@ -366,13 +365,11 @@ export function readResolution(hypoDir, sessionId, rawTranscript) {
  * the commit by hand with NO new close signal, and asserts the recovery run
  * still succeeds; swapping that call to `closeGateStatus` turns that test
  * red.
- * As of this writing the two callers that gate a NEW request are
- * `verifyCloseAuthority` (crystallize.mjs, before any wiki byte is written)
- * and `hypo-close-guard.mjs`'s PreToolUse intercept (before a
- * Write/Edit/MultiEdit on a close-artifact file lands); every path that
- * recovers or reports on an ALREADY-recorded close (`runMarkSessionClosed`,
- * and the post-apply diagnostic that reports whether the transcript carried
- * a signal) reads `isCloseGateOpen` directly, on purpose, and should keep
+ * As of this writing the one caller that gates a NEW request is
+ * `verifyCloseAuthority` (crystallize.mjs, before any wiki byte is written);
+ * every path that recovers or reports on an ALREADY-recorded close
+ * (`runMarkSessionClosed`, and the post-apply diagnostic that reports whether
+ * the transcript carried a signal) reads `isCloseGateOpen` directly, on purpose, and should keep
  * doing so.
  *
  * @param {{transcriptPath: string|null, hypoDir: string, sessionId: string|null}} args

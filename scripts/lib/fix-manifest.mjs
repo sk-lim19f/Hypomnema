@@ -50,7 +50,7 @@ export const FIX_MANIFEST = [
     fixId: 17,
     testNames: [
       '5 mandatory memory files fresh → suppressOutput:true',
-      'project hot.md not updated today → block, reason names the file',
+      'project hot.md not updated today → no advisory (a generated view proves nothing)',
       'open-questions.md absent/stale → still passes (conditional, not gated)',
     ],
     adrPath: 'decisions/0022-session-close-ux-automation.md',

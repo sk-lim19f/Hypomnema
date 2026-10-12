@@ -16,6 +16,8 @@ import {
   chmodSync,
   appendFileSync,
   readdirSync,
+  realpathSync,
+  symlinkSync,
 } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -1280,7 +1282,7 @@ test('clean wiki → suppressOutput:true', () => {
 suite('hypo-personal-check.mjs — strict session-close gate (#17)');
 
 // @fix #17: 5 mandatory memory files fresh → suppressOutput:true
-// @fix #17: project hot.md not updated today → block, reason names the file
+// @fix #17: project hot.md not updated today → no advisory (a generated view proves nothing)
 // @fix #17: open-questions.md absent/stale → still passes (conditional, not gated)
 
 test('5 mandatory memory files fresh → suppressOutput:true', () => {
@@ -2016,6 +2018,70 @@ test('sessions/ 아래 더 깊은 경로는 원본이 아니라 통과', () => {
 });
 
 suite('hypo-close-guard.mjs — pass-through and bypass');
+
+test('HYPO_DIR 끝에 슬래시가 있어도 생성 뷰와 원본은 거부, vault 밖 경로는 통과', () => {
+  withWiki(null, (dir) => {
+    mkdirSync(join(dir, 'projects', 'test-project', 'sessions'), { recursive: true });
+    const slashed = { HYPO_DIR: `${dir}/` };
+    assertDenied(
+      guardRun(dir, 'Write', 'projects/test-project/hot.md', { content: '# x\n' }, slashed),
+      /생성 파일입니다/,
+    );
+    assertDenied(
+      guardRun(
+        dir,
+        'Write',
+        'projects/test-project/sessions/s9-0.md',
+        { content: '# e\n' },
+        slashed,
+      ),
+      /close apply만/,
+    );
+    const outside = runHook(
+      'hypo-close-guard.mjs',
+      {
+        session_id: 'sess-guard',
+        tool_name: 'Write',
+        tool_input: { file_path: `${dir}-elsewhere/projects/p/hot.md`, content: '# x\n' },
+      },
+      slashed,
+    );
+    assert.equal(outside.status, 0, `stderr: ${outside.stderr}`);
+    assert.equal(
+      outside.stdout.trim(),
+      '',
+      `a sibling of the vault is not in it: ${outside.stdout}`,
+    );
+  });
+});
+
+test('심볼릭 링크 HYPO_DIR 에 실제 경로로 쓰는 생성 뷰와 원본도 거부', () => {
+  withWiki(null, (dir) => {
+    mkdirSync(join(dir, 'projects', 'test-project', 'sessions'), { recursive: true });
+    const link = `${dir}-link`;
+    symlinkSync(dir, link);
+    try {
+      const real = realpathSync(dir);
+      for (const [rel, reason] of [
+        ['projects/test-project/hot.md', /생성 파일입니다/],
+        ['projects/test-project/sessions/s9-0.md', /close apply만/],
+      ]) {
+        const r = runHook(
+          'hypo-close-guard.mjs',
+          {
+            session_id: 'sess-guard',
+            tool_name: 'Write',
+            tool_input: { file_path: join(real, rel), content: '# x\n' },
+          },
+          { HYPO_DIR: link },
+        );
+        assertDenied(r, reason);
+      }
+    } finally {
+      rmSync(link, { force: true });
+    }
+  });
+});
 
 test('HYPO_SKIP_GATE=1 은 생성 경로 거부도 우회한다', () => {
   withWiki(null, (dir) => {
