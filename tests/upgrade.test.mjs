@@ -18,6 +18,7 @@ import {
   lstatSync,
   symlinkSync,
   unlinkSync,
+  chmodSync,
 } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -3172,6 +3173,54 @@ test('migrate-sessions: a vault moved with an older block edition is brought to 
   );
 });
 
+// The edition before the root log.md line: the entry eol line was already there.
+const MS_OLD_GITATTRIBUTES_BLOCK_EOL = `${MS_OLD_GITATTRIBUTES_BLOCK}# Session entries are parsed byte-exact: keep LF in the working tree even where autocrlf is on
+projects/*/sessions/*.md text eol=lf
+`;
+
+test('migrate-sessions: a vault moved with the edition that lacks the root log.md line gets it once, with no line doubled', () => {
+  withMsPair(
+    ({ a }) => {
+      assert.equal(msText(a, ['show', 'HEAD:.gitattributes']), MS_OLD_GITATTRIBUTES_BLOCK_EOL);
+      const r = msRun(a);
+      assert.equal(r.status, 0, `${r.stdout}${r.stderr}`);
+      assert.match(r.stdout, /Updated \.gitattributes to the current block/);
+      assert.equal(msText(a, ['show', 'HEAD:.gitattributes']), GITATTRIBUTES_BLOCK);
+      assert.equal(msGit(a, ['check-attr', 'merge', '--', 'log.md']).split(': ').pop(), 'union');
+    },
+    {
+      '.gitignore': `.cache/\n${GITIGNORE_BLOCK}`,
+      '.gitattributes': MS_OLD_GITATTRIBUTES_BLOCK_EOL,
+      'projects/p/index.md': '---\ntitle: p\n---\n',
+    },
+  );
+});
+
+test('migrate-sessions: an exception from the migration prints one line naming the cause, exits 1, and leaves the vault as it was', () => {
+  if (process.getuid?.() === 0) return; // root reads a mode 000 directory
+  withMsPair(({ a }) => {
+    const head = msGit(a, ['rev-parse', 'HEAD']);
+    const status = msGit(a, ['status', '--porcelain']);
+    const gitignore = readFileSync(join(a, '.gitignore'), 'utf-8');
+    chmodSync(join(a, 'projects'), 0o000);
+    let r;
+    try {
+      r = msRun(a);
+    } finally {
+      chmodSync(join(a, 'projects'), 0o755);
+    }
+    assert.equal(r.status, 1, `${r.stdout}${r.stderr}`);
+    assert.doesNotMatch(r.stderr, /\n\s+at /, `no stack trace: ${r.stderr}`);
+    const lines = r.stderr.split('\n').filter(Boolean);
+    assert.equal(lines.length, 1, r.stderr);
+    assert.match(lines[0], /EACCES/, 'names the cause');
+    assert.match(lines[0], /run (the command|it) again/, 'says what to do');
+    assert.equal(msGit(a, ['rev-parse', 'HEAD']), head, 'no commit');
+    assert.equal(msGit(a, ['status', '--porcelain']), status, 'working tree as it was');
+    assert.equal(readFileSync(join(a, '.gitignore'), 'utf-8'), gitignore);
+  });
+});
+
 test('migrate-sessions: a remote whose block lost a line is not called migrated, and nothing is repaired', () => {
   const lines = GITIGNORE_BLOCK.split('\n').filter((l) => l !== '/projects/*/session-state.md');
   withMsPair(
@@ -3200,7 +3249,7 @@ test('migrate-sessions: the two blocks are pinned, so an edit of either cannot s
     [
       'GITATTRIBUTES_BLOCK',
       GITATTRIBUTES_BLOCK,
-      '5924078f8b9e575df7f2a6efef63769eae5eb0a8bc86008a9c54eefd0636d0bf',
+      'dd7e25e0bc970ef00c8e31af8682657cdf81f9f4ccac965d9dff4e9aefc430d4',
     ],
   ];
   for (const [name, block, expected] of pinned) {
@@ -3236,6 +3285,7 @@ test('migrate-sessions: every edition of the two blocks that ever shipped is cur
       [
         'b215a98b587951d684fa739649b9b57c2a43b90e66317bb1dd3c5f57268c4544',
         '5924078f8b9e575df7f2a6efef63769eae5eb0a8bc86008a9c54eefd0636d0bf',
+        'dd7e25e0bc970ef00c8e31af8682657cdf81f9f4ccac965d9dff4e9aefc430d4',
       ],
     ],
   ];

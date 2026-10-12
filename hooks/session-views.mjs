@@ -84,10 +84,11 @@ export {
 
 /**
  * How long into a SessionStart the hook may still begin moving a vault to the scheme. Past this the
- * move waits for the next session; a move that has begun always runs to its end. A first value
- * without a measurement behind it.
+ * move waits for the next session; a move that has begun always runs to its end. Measured on a
+ * 17-project vault: the migration stage took 7.0s and rendering 0.6s, so a start at 15s ends well
+ * inside the 30s SessionStart timeout (a start at 20s left 2.4s).
  */
-export const MIGRATION_START_DEADLINE_MS = 20000;
+export const MIGRATION_START_DEADLINE_MS = 15000;
 
 // `entry_scope` has the grammar of `visibility_scope`; anything else closes the project.
 const ENTRY_SCOPE_RE = /^(shared|machine:\S*|agent:\S+)$/;
@@ -1075,7 +1076,7 @@ export function migrateVaultToSessionEntriesUnlocked(hypoDir, opts = {}) {
     notices.push(
       `git이 추적하지 않는 옛 파일은 세션 원본으로 옮기지 않았습니다: ${leftLocal.join(', ')}. ` +
         '다음 생성 때 .cache/backups/ 아래에 보관하고 그 위치를 알립니다. ' +
-        '남길 내용은 다음 close의 요약이나 projects/<p>/notes.md로 옮기세요.',
+        '남길 내용은 다음 close의 요약이나 `projects/<프로젝트>/notes.md`로 옮기세요.',
     );
   }
   // A rule of the user's own `.gitignore` (or an exclude file) that covers an entry directory would

@@ -1526,10 +1526,13 @@ export const ROOT_HOT_BACKUP_SUFFIX = '.pre-projection-backup.md';
  * @returns {string}
  */
 export function rootHotBackupRecoveryNotice(viewRelPath, backupPath) {
+  // A project view names its own project; the root `hot.md` has none to name, so the placeholder
+  // is written to be read as one.
+  const project = generatedViewSlug(viewRelPath) ?? '<프로젝트>';
   return (
-    `생성 파일 ${viewRelPath}에 생성기가 쓰지 않은 내용이 있어 ${backupPathForNotice(backupPath)}에 보관했습니다. ` +
+    `생성 파일 \`${viewRelPath}\`에 생성기가 쓰지 않은 내용이 있어 \`${backupPathForNotice(backupPath)}\`에 보관했습니다. ` +
     '구버전 Hypomnema(같은 기계의 다른 설치일 수 있습니다)나 사람이 쓴 내용으로 보입니다. 자동으로 합치지 않았습니다. ' +
-    '남길 내용은 다음 close의 요약이나 projects/<p>/notes.md로 옮기세요.'
+    `남길 내용은 다음 close의 요약이나 \`projects/${project}/notes.md\`로 옮기세요.`
   );
 }
 
@@ -2569,14 +2572,19 @@ function clearBlockingPaths(hypoDir, targetRev, opts) {
 
   // 5b. The root `hot.md` is a generated path too, and a clean one that `target` deletes goes with
   // the merge. Bytes that neither the generator record nor the old root projection state vouches
-  // for are someone's own writing: keep a copy and say so (`unowned[]`).
+  // for are someone's own writing: keep a copy and say so (`unowned[]`). Bytes that are exactly
+  // what HEAD tracks need no copy either: the merge keeps HEAD in the history, so nothing is lost
+  // (the first move of a vault has no ownership record yet, and every clean old file reads as
+  // unvouched without this).
   if (incoming.some((c) => c.status === 'D' && c.path === 'hot.md') && !dirty.has('hot.md')) {
     const text = readTextOrNull(join(hypoDir, 'hot.md'));
     if (text !== null) {
       const sha = sha256Hex(lfText(text));
+      const inHead = gitShowText(hypoDir, 'HEAD', 'hot.md');
       const vouched = [
         readGeneratedViewsRecord(hypoDir).views['hot.md'],
         readRootHotProjectionOwnership(hypoDir).lastHash,
+        inHead === null ? null : sha256Hex(lfText(inHead)),
       ];
       if (!vouched.includes(sha)) {
         cacheGate();

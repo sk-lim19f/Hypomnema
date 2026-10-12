@@ -2946,6 +2946,57 @@ test('syncRemote aborts a conflicting merge and leaves the tree clean (no marker
   });
 });
 
+// Two machines close on the same day: each appends its own line at the end of the root log.md. A
+// plain text merge calls that a conflict, the Stop sync aborts it, and no session entry reaches
+// the other machine. The `.gitattributes` that `init` writes carries the union driver for it.
+test('two clones of an init vault that both append to log.md and sync on the same day merge without a conflict', () => {
+  withTmpDir((base) => {
+    const remote = join(base, 'remote.git');
+    const a = join(base, 'a');
+    const b = join(base, 'b');
+    const gitq = (dir, ...args) => spawnSync('git', ['-C', dir, ...args], { encoding: 'utf-8' });
+    const gitOk = (dir, ...args) => {
+      const r = gitq(dir, ...args);
+      assert.equal(r.status, 0, `git ${args.join(' ')}: ${r.stderr}`);
+      return r.stdout;
+    };
+    spawnSync('git', ['init', '--bare', '-q', remote]);
+    spawnSync('git', ['init', '-q', a]);
+    gitq(a, 'config', 'user.email', 'a@test.com');
+    gitq(a, 'config', 'user.name', 'A');
+    const init = run('init.mjs', [`--hypo-dir=${a}`, '--no-hooks', '--no-git-init']);
+    assert.equal(init.status, 0, init.stderr);
+    assert.match(readFileSync(join(a, '.gitattributes'), 'utf-8'), /^log\.md merge=union$/m);
+    gitOk(a, 'add', '-A');
+    gitOk(a, 'commit', '-q', '-m', 'init');
+    gitOk(a, 'remote', 'add', 'origin', remote);
+    gitOk(a, 'push', '-q', '-u', 'origin', 'HEAD');
+    spawnSync('git', ['clone', '-q', remote, b]);
+    gitq(b, 'config', 'user.email', 'b@test.com');
+    gitq(b, 'config', 'user.name', 'B');
+
+    const append = (dir, line) => {
+      const log = join(dir, 'log.md');
+      writeFileSync(log, `${readFileSync(log, 'utf-8').replace(/\n*$/, '\n')}${line}\n`);
+      gitOk(dir, 'add', '-A');
+      gitOk(dir, 'commit', '-q', '-m', `close ${line}`);
+    };
+    append(a, '- 2026-10-12 close from A');
+    gitOk(a, 'push', '-q');
+    append(b, '- 2026-10-12 close from B');
+
+    const res = syncRemote(b);
+    assert.equal(res.conflict, false, JSON.stringify(res));
+    assert.equal(res.pulled, true, JSON.stringify(res));
+    assert.equal(res.pushed, true, JSON.stringify(res));
+    assert.equal(gitq(b, 'ls-files', '-u').stdout.trim(), '');
+    const log = readFileSync(join(b, 'log.md'), 'utf-8');
+    assert.ok(log.includes('close from A') && log.includes('close from B'), log);
+    assert.ok(!log.includes('<<<<<<<'), log);
+    assert.equal(gitOk(remote, 'rev-parse', 'HEAD'), gitOk(b, 'rev-parse', 'HEAD'));
+  });
+});
+
 test('session-start surfaces a conflict entry with manual-merge guidance', () => {
   withGrowthWiki((dir) => {
     mkdirSync(join(dir, '.cache'), { recursive: true });
@@ -7597,6 +7648,43 @@ test('(8) a SessionStart past the start deadline defers the move; inside it the 
     const inTime = ssStart(dir, work, { env: { ...SS_DAY_ONE, HYPO_TEST_NOW_STEP_MS: '1000' } });
     assert.equal(ssMigrationCommits(dir), 1, 'the same vault moves when time is left');
     assert.match(inTime.sys, /옮겼습니다/);
+  });
+});
+
+test('(8b) the start deadline is 15 seconds: a start 16s in is deferred, one 14s in moves', () => {
+  withStartVault({}, ({ dir, work }) => {
+    const head = ssHead(dir);
+    const late = ssStart(dir, work, { env: { ...SS_DAY_ONE, HYPO_TEST_NOW_STEP_MS: '16000' } });
+    assert.equal(ssHead(dir), head, 'no migration commit 16s in');
+    assert.match(late.sys, /시간이 부족해/);
+    const inTime = ssStart(dir, work, { env: { ...SS_DAY_TWO, HYPO_TEST_NOW_STEP_MS: '14000' } });
+    assert.equal(ssMigrationCommits(dir), 1, 'the same vault moves 14s in');
+    assert.match(inTime.sys, /옮겼습니다/);
+  });
+});
+
+test('(8c) the first move of a vault whose files are as HEAD has them sets nothing aside: no backup, no notice', () => {
+  withStartVault({}, ({ dir, work }) => {
+    const { r, sys } = ssStart(dir, work, { env: SS_DAY_ONE });
+    assert.equal(ssMigrationCommits(dir), 1, 'precondition: the vault moved');
+    assert.equal(
+      existsSync(join(dir, '.cache', 'backups', 'hot.md.pre-projection-backup.md')),
+      false,
+    );
+    assert.doesNotMatch(sys, /생성기가 쓰지 않은 내용/);
+    assert.doesNotMatch(r.stderr, /생성기가 쓰지 않은 내용/);
+  });
+});
+
+test('(8d) a backup notice that both the move and the pending health notice carry shows once in the message and once on stderr', () => {
+  withStartVault({}, ({ dir, work }) => {
+    ssPut(dir, 'hot.md', 'an old machine wrote this\n'); // not what HEAD tracks
+    const { r, sys } = ssStart(dir, work, { env: SS_DAY_ONE });
+    assert.equal(ssMigrationCommits(dir), 1, 'precondition: the vault moved');
+    const count = (text) => text.split('생성기가 쓰지 않은 내용').length - 1;
+    assert.equal(count(sys), 1, sys);
+    assert.equal(count(r.stderr), 1, r.stderr);
+    assert.match(sys, /`\.cache\/backups\/hot\.md\.pre-projection-backup\.md`/);
   });
 });
 
