@@ -18,7 +18,7 @@ import { randomBytes, createHash } from 'crypto';
 import { expandHome } from './hypo-root.mjs';
 import { parseStrictDate } from './time.mjs';
 import { maskNonProse } from './code-fence.mjs';
-import { isValidProjectName, substituteTokens, TEMPLATE_DIR } from './project-create.mjs';
+import { substituteTokens, TEMPLATE_DIR } from './project-create.mjs';
 import { appendPendingTags, checkForbidden } from './schema-vocab.mjs';
 import { atomicWrite } from '../../hooks/atomic-write.mjs';
 import {
@@ -60,8 +60,10 @@ import {
   isExcludedFromCommit,
   isIgnoredByGit,
   headBlob,
+  resolveProjectDirName,
 } from '../../hooks/hypo-shared.mjs';
 import {
+  isValidProjectName,
   TRACK_ID_RE,
   closeIdFor,
   entryFileName,
@@ -2112,7 +2114,7 @@ function loadValidatedPayload(args) {
 //                    never reaches a path builder (traversal guard — order is
 //                    the guard). isValidProjectName is SHARED with createProject
 //                    so apply accepts exactly the namespace the repo can
-//                    scaffold (A-Za-z0-9._-, single segment) — no narrower.
+//                    scaffold (Unicode letters/marks/numbers plus ._-, single segment) — no narrower.
 //   - non-existent → projects/<slug>/ absent; abort rather than create.
 // A payload.project that merely DIFFERS from the inferred active project is NOT an
 // error — it is surfaced as a stderr note below and the close proceeds.
@@ -2123,20 +2125,21 @@ function resolveCloseProject(args, payload) {
     process.exit(1);
   }
   if (!isValidProjectName(payload.project)) {
-    const msg = `payload.project ${JSON.stringify(payload.project)} is not a valid project name (single segment, charset A-Za-z0-9._-, ≥1 alnum, not "."/"..")`;
+    const msg = `payload.project ${JSON.stringify(payload.project)} is not a valid project name (single segment of letters, marks, numbers, ".", "_" or "-" with at least one letter or number, not "."/"..")`;
     console.log(args.json ? JSON.stringify({ ok: false, error: msg }, null, 2) : `✗ ${msg}`);
     process.exit(1);
   }
   // existsSync alone is not enough: a regular FILE at projects/<slug> would pass,
   // then apply would build child paths under it and fail with an unstructured
   // filesystem error (codex re-review). Require it to be a directory.
-  const projectDir = join(args.hypoDir, 'projects', payload.project);
-  if (!existsSync(projectDir) || !statSync(projectDir).isDirectory()) {
+  // Looked up in NFC, so a payload typed in NFD still finds an NFC directory; the name used from
+  // here on is the spelling the directory has on disk.
+  const project = resolveProjectDirName(args.hypoDir, payload.project);
+  if (project === null) {
     const msg = `payload.project "${payload.project}" does not exist as a directory (no projects/${payload.project}/ directory)`;
     console.log(args.json ? JSON.stringify({ ok: false, error: msg }, null, 2) : `✗ ${msg}`);
     process.exit(1);
   }
-  const project = payload.project;
   // probe (the recency-inferred active project) is now consulted ONLY to surface a
   // divergence note — never to resolve the target. Computed AFTER validation so a
   // malformed/missing payload.project fails fast without a pointer-table read.
@@ -2151,10 +2154,10 @@ function resolveCloseProject(args, payload) {
   // (probe.project), that divergence used to be silent, so an operator couldn't tell
   // which project the close actually verified. Surface it on stderr (the stdout JSON
   // contract is untouched) so the verified/closed project is always explicit.
-  if (probe.project && probe.project !== payload.project) {
+  if (probe.project && probe.project !== project) {
     process.stderr.write(
       `note: payload.project="${payload.project}" differs from the inferred active ` +
-        `project "${probe.project}"; verifying and closing "${payload.project}".\n`,
+        `project "${probe.project}"; verifying and closing "${project}".\n`,
     );
   }
   return project;

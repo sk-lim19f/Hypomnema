@@ -44,6 +44,7 @@ import {
   isGeneratedViewPath,
   isSessionEntryPath,
   isSessionProjectDir,
+  isValidProjectName as isValidProjectNameHook,
   mergeAdditiveGitignore,
   narrowestVisibilityScope,
   nextUpItems,
@@ -236,14 +237,14 @@ test('section text is written as the LF text that was checked: no CR reaches the
 });
 
 test('a project must be a vault slug: a space or # in it is refused by the writer and the parser', () => {
-  for (const project of ['foo #bar', 'a b', '..', '.', '#x', 'a/b', 'a"b', '-', '', '한글']) {
+  for (const project of ['foo #bar', 'a b', '..', '.', '#x', 'a/b', 'a"b', '-', '']) {
     assert.throws(
       () => formatSessionEntry(sample({ project })),
       (err) => err.code === 'invalid-entry',
       JSON.stringify(project),
     );
   }
-  for (const project of ['my-proj.v2', 'p', 'A_b-1', '.hidden', '1', 'a..b']) {
+  for (const project of ['my-proj.v2', 'p', 'A_b-1', '.hidden', '1', 'a..b', '한글']) {
     const text = formatSessionEntry(sample({ project }));
     assert.equal(parseSessionEntry(text).entry.project, project);
   }
@@ -1129,6 +1130,62 @@ test('isSessionProjectDir wants index.md or sessions/ and refuses _template', ()
     isSessionProjectDir({ slug: '_template', hasIndex: true, hasSessions: true }),
     false,
   );
+});
+
+test('isValidProjectName takes any script and rejects whitespace, separators, dot-only, empty and control characters', () => {
+  const NFD = '인수인계-runbook'.normalize('NFD');
+  for (const ok of [
+    'p',
+    'my-proj.v2',
+    'A_b-1',
+    '.hidden',
+    '인수인계-runbook',
+    NFD,
+    '日本語',
+    'né_é',
+    'x1',
+    '7',
+  ]) {
+    assert.equal(isValidProjectNameHook(ok), true, JSON.stringify(ok));
+  }
+  const bad = [
+    '',
+    '.',
+    '..',
+    '...',
+    '-',
+    '_-_',
+    'a/b',
+    'a\\b',
+    'a b',
+    '인수 인계',
+    'a\tb',
+    'a\nb',
+    'a\u0000b',
+    'a\u0001b',
+    'a\u007fb',
+    'a\u200bb',
+    'a#b',
+    '../x',
+  ];
+  for (const name of bad) assert.equal(isValidProjectNameHook(name), false, JSON.stringify(name));
+  for (const notString of [undefined, null, 42, {}, ['p']]) {
+    assert.equal(isValidProjectNameHook(notString), false, String(notString));
+  }
+});
+
+test('a Korean project name round-trips through formatSessionEntry and parseSessionEntry', () => {
+  for (const project of ['인수인계-runbook', '인수인계-runbook'.normalize('NFD'), '日本語.v2']) {
+    const text = formatSessionEntry(sample({ project }));
+    assert.ok(text.includes(`\nproject: ${project}\n`), 'written unquoted');
+    const r = parseSessionEntry(text);
+    assert.equal(r.ok, true, JSON.stringify(r));
+    assert.equal(r.entry.project, project);
+  }
+  assert.throws(() => formatSessionEntry(sample({ project: '인수 인계' })), /invalid project/);
+  const forged = formatSessionEntry(sample()).replace('\nproject: p\n', '\nproject: 인수 인계\n');
+  assert.deepEqual(parseSessionEntry(forged), { ok: false, reason: 'bad-project' });
+  assert.equal(isSessionProjectDir({ slug: '인수인계-runbook', hasIndex: true }), true);
 });
 
 test('isSessionProjectDir takes the slugs the other project rules take: no space, #, slash or all-dot name', () => {
@@ -4067,6 +4124,30 @@ test('the move untracks the generated views, adds one baseline per old file and 
     }
     assert.equal(cgitOk(dir, ['status', '--porcelain']), '');
   });
+});
+
+test('a vault with a Korean project (hot.md and session-state.md) migrates instead of throwing', () => {
+  const ko = '인수인계-runbook';
+  withOldGit(
+    (dir) => {
+      const r = migrate(dir);
+      assert.equal(r.migrated, true, JSON.stringify(r));
+      assert.equal(r.skipped, null);
+      const koBaselines = r.baselines.filter((rel) => rel.startsWith(`projects/${ko}/sessions/`));
+      assert.equal(koBaselines.length, 2, `one baseline per old file: ${r.baselines.join(', ')}`);
+      for (const rel of koBaselines) {
+        assert.equal(entryOf(dir, rel).project, ko);
+        assert.equal(parseSessionEntry(showHead(dir, rel)).entry.project, ko, 'committed in HEAD');
+      }
+      assert.equal(migrationState(dir), 'migrated');
+      assert.deepEqual(listTrackedGeneratedViews(dir, { source: 'head' }), []);
+    },
+    {
+      [`projects/${ko}/index.md`]: '---\ntitle: runbook\n---\n',
+      [`projects/${ko}/hot.md`]: RICH_HOT,
+      [`projects/${ko}/session-state.md`]: OLD_STATE_FILE,
+    },
+  );
 });
 
 test('the baselines hold both old files whole: a fenced track heading, machine_note and tags survive', () => {

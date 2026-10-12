@@ -36,6 +36,7 @@ import {
   isGeneratedViewPath,
   isSessionEntryPath,
   isSessionProjectDir,
+  isValidProjectName,
   mergeAdditiveGitignore,
   missingBlockLines,
   narrowestVisibilityScope,
@@ -1299,19 +1300,23 @@ export function collectProjectWorkingDirs(hypoDir) {
   return out;
 }
 
-// One place that answers "is this string a slug naming a real project directory?".
-// Both resolveGateProjectOverride (a caller-supplied --project) and the gate's
-// mustEvaluate filter (slugs arriving from a transcript or a marker) need it, and
-// having the grammar in two inline copies is the duplication this release spent a
-// codex round removing elsewhere. Not exported: scripts/ has its own validator,
-// and importing that here would invert the one-way hooks/ <- scripts/ dependency.
-function isProjectSlugDirectory(hypoDir, slug) {
-  if (typeof slug !== 'string' || !/^[A-Za-z0-9._-]+$/.test(slug)) return false;
-  if (/^\.+$/.test(slug) || !/[A-Za-z0-9]/.test(slug)) return false;
+// One place that answers "is this string a slug naming a real project directory?" and, if so,
+// which directory name it is on disk. Both resolveGateProjectOverride (a caller-supplied
+// --project) and the gate's mustEvaluate filter (slugs arriving from a transcript or a marker)
+// need it. The grammar is session-entries' isValidProjectName, the one rule every gate shares.
+// Names are compared in NFC: a payload name typed in NFD finds a directory stored in NFC (and the
+// reverse) even on a filesystem that compares bytes. The returned name is the one on disk, so
+// callers join paths and compare slugs with the spelling the directory really has. Exported for
+// scripts/, which resolves its own payload and --project names through it.
+export function resolveProjectDirName(hypoDir, slug) {
+  if (!isValidProjectName(slug)) return null;
+  const want = slug.normalize('NFC');
   try {
-    return statSync(join(hypoDir, 'projects', slug)).isDirectory();
+    const names = readdirSync(join(hypoDir, 'projects'));
+    const hit = names.includes(slug) ? slug : names.find((n) => n.normalize('NFC') === want);
+    return hit !== undefined && statSync(join(hypoDir, 'projects', hit)).isDirectory() ? hit : null;
   } catch {
-    return false;
+    return null;
   }
 }
 
@@ -1326,8 +1331,8 @@ function isProjectSlugDirectory(hypoDir, slug) {
 // CLI itself parses it (parseArgs + requireProjectDir); a value that arrives
 // via a hook payload or apply's JSON body never passes through that. So this
 // re-validates from scratch — same charset rule as project-create.mjs's
-// isValidProjectName, duplicated rather than imported because hooks/ cannot
-// import scripts/ (dependency direction is one-way) — plus a directory
+// isValidProjectName, imported from session-entries.mjs, the one place that
+// owns the rule — plus a directory
 // existence check. Either failure returns null, the same as "no project was
 // given": a garbage slug must never narrow the gate's scope, only a real one
 // may (spec success criterion: "opts.projectOverride 가 없는 slug 이면 게이트가
@@ -1349,7 +1354,7 @@ function isProjectSlugDirectory(hypoDir, slug) {
 // @returns {string|null}
 export function resolveGateProjectOverride(hypoDir, { project = null, sessionCwd = null } = {}) {
   if (project) {
-    return isProjectSlugDirectory(hypoDir, project) ? project : null;
+    return resolveProjectDirName(hypoDir, project);
   }
   return pickProjectByCwd(collectProjectWorkingDirs(hypoDir), sessionCwd, {
     rejectAmbiguous: true,
@@ -4073,9 +4078,9 @@ export function sessionCloseGlobalStatus(hypoDir, opts = {}) {
   // existsSync alone would admit a file, or a traversal like '..', from a
   // malformed marker or transcript slug and turn it into a surprise blocker.
   // Same slug grammar the CLI and resolveGateProjectOverride validate against.
-  const mustEvaluate = [...(opts.mustEvaluate || [])].filter((p) =>
-    isProjectSlugDirectory(hypoDir, p),
-  );
+  const mustEvaluate = [...(opts.mustEvaluate || [])]
+    .map((p) => resolveProjectDirName(hypoDir, p))
+    .filter((p) => p !== null);
   // The fallback decision reads REAL today activity only. Letting mustEvaluate
   // populate it would mean an attributed slug suppresses the "this session closed
   // nothing at all" branch, and that branch is a fail-closed guard the partition

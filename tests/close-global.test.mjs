@@ -575,6 +575,57 @@ test('--check-session-close --project=<absent> → exit 1 (does not exist as a d
   });
 });
 
+const KO_PROJECT = '인수인계-runbook';
+// Same name, decomposed (NFD): Hangul syllables split into jamo.
+const KO_PROJECT_NFD = KO_PROJECT.normalize('NFD');
+
+test('--project: a Korean name passes the syntax gate; a missing directory is the only complaint', () => {
+  assert.notEqual(KO_PROJECT_NFD, KO_PROJECT, 'fixture: the two spellings differ in bytes');
+  withTmpDir((dir) => {
+    mkdirSync(join(dir, 'projects'), { recursive: true });
+    const r = run('crystallize.mjs', [
+      `--hypo-dir=${dir}`,
+      '--check-session-close',
+      `--project=${KO_PROJECT}`,
+      '--json',
+    ]);
+    assert.equal(r.status, 1, r.stdout);
+    const err = JSON.parse(r.stdout).error;
+    assert.match(err, /does not exist as a directory/);
+    assert.doesNotMatch(err, /not a valid project name/);
+  });
+});
+
+test('--project: whitespace, separators, dot-only, empty and control-character names are still rejected', () => {
+  withTmpDir((dir) => {
+    for (const bad of ['..', '.', 'a/b', 'a b', '', 'a\u0001b']) {
+      const r = run('crystallize.mjs', [
+        `--hypo-dir=${dir}`,
+        '--check-session-close',
+        `--project=${bad}`,
+        '--json',
+      ]);
+      assert.equal(r.status, 1, `${JSON.stringify(bad)}: ${r.stdout}${r.stderr}`);
+      assert.match(JSON.parse(r.stdout).error, /not a valid project name/, JSON.stringify(bad));
+    }
+  });
+});
+
+test('--project: an NFD spelling finds the NFC directory and the scope carries the on-disk spelling', () => {
+  withCleanWiki((dir) => {
+    mkdirSync(join(dir, 'projects', KO_PROJECT), { recursive: true });
+    const r = run('crystallize.mjs', [
+      `--hypo-dir=${dir}`,
+      '--check-session-close',
+      `--project=${KO_PROJECT_NFD}`,
+      '--json',
+    ]);
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.scope, 'project', r.stdout);
+    assert.equal(out.scoped_project, KO_PROJECT, 'NFC, the directory spelling, not the typed NFD');
+  });
+});
+
 test('--check-session-close --project=<real>: JSON carries scope:project + scoped_project', () => {
   withCleanWiki((dir) => {
     const r = run('crystallize.mjs', [
@@ -6213,6 +6264,16 @@ test('a syntactically invalid project name is rejected, never narrows the gate',
   withClosePartitionWiki([{ slug: 'mine', date: todayLocal() }], [], (dir) => {
     assert.equal(resolveGateProjectOverride(dir, { project: '../etc' }), null);
     assert.equal(resolveGateProjectOverride(dir, { project: '..' }), null);
+  });
+});
+
+test('a Korean project resolves to itself, and an NFD spelling resolves to the NFC directory name', () => {
+  const ko = '인수인계-runbook';
+  withClosePartitionWiki([{ slug: ko, date: todayLocal() }], [], (dir) => {
+    assert.equal(resolveGateProjectOverride(dir, { project: ko }), ko);
+    const viaNfd = resolveGateProjectOverride(dir, { project: ko.normalize('NFD') });
+    assert.equal(viaNfd, ko, 'the on-disk (NFC) spelling, so later slug comparisons agree');
+    assert.equal(resolveGateProjectOverride(dir, { project: 'a b' }), null);
   });
 });
 

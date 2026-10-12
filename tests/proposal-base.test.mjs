@@ -2513,6 +2513,35 @@ test('apply: wide-charset valid name (A-Z/_/.) not rejected as malformed (B-3 na
   }
 });
 
+test('apply: payload.project with a control character, empty or whitespace name → exit 1', () => {
+  for (const bad of ['', 'a\u0001b', 'a\u0000b', 'tab\tname', '인수 인계']) {
+    withWiki(null, (dir, today) => {
+      const payload = payloadForCleanWiki(dir, today);
+      payload.project = bad;
+      const r = runApply(dir, payload);
+      assert.equal(r.status, 1, `${JSON.stringify(bad)} must hard-fail: ${r.stdout}\n${r.stderr}`);
+      assert.match(JSON.parse(r.stdout).error, /not a valid project name/, JSON.stringify(bad));
+    });
+  }
+});
+
+test('apply: a Korean project name passes the name gate, and an NFD spelling finds the NFC directory', () => {
+  const ko = '인수인계-runbook';
+  withWiki(null, (dir, today) => {
+    const payload = payloadForCleanWiki(dir, today);
+    payload.project = ko;
+    const missing = JSON.parse(runApply(dir, payload).stdout).error;
+    assert.match(missing, /does not exist/, 'valid name, absent directory');
+    assert.doesNotMatch(missing, /not a valid project name/);
+
+    mkdirSync(join(dir, 'projects', ko), { recursive: true });
+    payload.project = ko.normalize('NFD');
+    const r = runApply(dir, payload);
+    const err = r.stdout.includes('"error"') ? JSON.parse(r.stdout).error : '';
+    assert.doesNotMatch(err, /does not exist|not a valid project name/, r.stdout + r.stderr);
+  });
+});
+
 test('apply: payload.project does not exist on disk → exit 1 (B-3)', () => {
   // A well-formed slug with no projects/<slug>/ directory: abort rather than create.
   withWiki(null, (dir, today) => {
