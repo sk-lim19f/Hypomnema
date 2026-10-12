@@ -98,6 +98,7 @@ import {
   listTrackedGeneratedViews,
   loadSessionModel,
   migrateVaultToSessionEntries,
+  recoverInterruptedMove,
   migrationState,
   offMarkerHashes,
   projectEntryScope,
@@ -5317,6 +5318,98 @@ test('stopping once the commit object exists changes nothing, leaves no temporar
   });
 });
 
+// A kill between git installing the migration tree and the ref update: HEAD.lock makes the ref update
+// fail, and `afterMergeAttempt` throws before the in-process cleanup (`returnStrandedIndex`) can run,
+// which is the state a dead process leaves.
+const MOVE_RECORD = '.cache/migration-move.json';
+function killDuringRefUpdate(dir) {
+  put(dir, '.git/HEAD.lock', '');
+  assert.throws(
+    () =>
+      migrate(dir, {
+        testHooks: {
+          afterMergeAttempt: () => {
+            throw new Error('killed');
+          },
+        },
+      }),
+    /killed/,
+  );
+  unlinkSync(join(dir, '.git/HEAD.lock'));
+}
+
+test('a move killed before the ref update is finished by the next migration call: HEAD at the move commit, no other-dirty deferral, record gone', () => {
+  withOldGit((dir) => {
+    const old = headOf(dir);
+    const count = commitCount(dir);
+    killDuringRefUpdate(dir);
+    assert.equal(headOf(dir), old, 'HEAD did not move');
+    assert.notEqual(
+      cgitOk(dir, ['diff', '--cached', '--name-only']).trim(),
+      '',
+      'index holds the move',
+    );
+    const rec = JSON.parse(readRel(dir, MOVE_RECORD));
+    assert.equal(rec.oldHead, old);
+    assert.ok(rec.paths.includes('hot.md') && rec.paths.includes('.gitattributes'));
+    const r = migrate(dir);
+    assert.equal(r.deferred, undefined, JSON.stringify(r));
+    assert.equal(r.migrated, true, JSON.stringify(r));
+    assert.equal(r.commit, rec.target);
+    assert.equal(headOf(dir), rec.target, 'HEAD is the move commit');
+    assert.equal(commitCount(dir), count + 1);
+    assert.equal(migrationState(dir), 'migrated');
+    assert.equal(cgitOk(dir, ['status', '--porcelain']), '');
+    assert.equal(existsSync(join(dir, MOVE_RECORD)), false, 'record removed');
+    assert.equal(existsSync(join(dir, 'projects/p/hot.md')), false);
+  });
+});
+
+test('a killed move whose working tree no longer matches goes back to the old layout, then the move runs again', () => {
+  withOldGit((dir) => {
+    const old = headOf(dir);
+    killDuringRefUpdate(dir);
+    const rec = JSON.parse(readRel(dir, MOVE_RECORD));
+    const baseline = rec.paths.find((p) => p.includes('/sessions/'));
+    unlinkSync(join(dir, baseline));
+    const r = migrate(dir);
+    assert.equal(r.migrated, true, JSON.stringify(r));
+    assert.notEqual(r.commit, rec.target, 'a new move commit, the old target was given up');
+    assert.equal(cgitOk(dir, ['rev-parse', 'HEAD^']).trim(), old);
+    assert.ok(
+      r.notices.some((n) => n.includes('되돌렸습니다')),
+      r.notices.join('\n'),
+    );
+    assert.equal(existsSync(join(dir, MOVE_RECORD)), false);
+    assert.equal(cgitOk(dir, ['status', '--porcelain']), '');
+  });
+});
+
+test('a move record whose old head is no longer HEAD is dropped with a notice and nothing is rewritten', () => {
+  withOldGit((dir) => {
+    const old = headOf(dir);
+    put(dir, 'pages/y.md', 'y\n');
+    commitIn(dir);
+    put(dir, 'projects/p/hot.md', 'my edit\n');
+    put(
+      dir,
+      MOVE_RECORD,
+      JSON.stringify({ v: 1, oldHead: old, target: old, paths: ['projects/p/hot.md'] }),
+    );
+    const out = recoverInterruptedMove(dir);
+    assert.equal(out.state, 'dropped');
+    assert.equal(out.ok, true);
+    assert.match(out.notices.join('\n'), /HEAD가 움직여/);
+    assert.equal(existsSync(join(dir, MOVE_RECORD)), false);
+    assert.equal(
+      readRel(dir, 'projects/p/hot.md'),
+      'my edit\n',
+      'the working tree was not rewritten',
+    );
+    assert.equal(cgitOk(dir, ['diff', '--cached', '--name-only']).trim(), '');
+  });
+});
+
 test('fastForwardTo applies nothing when HEAD moved after the commit was built', () => {
   withOldGit((dir) => {
     const built = buildCommitInTempIndex(dir, {
@@ -6564,6 +6657,17 @@ test('a tracked project directory that is not in NFC defers the move and names t
   );
 });
 
+// The project directory names `git ls-files` reports (git's spelling), for the premise checks below.
+const trackedProjectDirs = (dir) => [
+  ...new Set(
+    cgitOk(dir, ['ls-files', '-z'])
+      .split('\0')
+      .filter((rel) => rel.startsWith('projects/'))
+      .map((rel) => rel.split('/')[1])
+      .filter((n) => n !== 'ok'),
+  ),
+];
+
 test('a decomposed project directory defers the move even when git reports its path precomposed', () => {
   const nfd = '프로젝트'.normalize('NFD');
   const nfc = nfd.normalize('NFC');
@@ -6585,6 +6689,14 @@ test('a decomposed project directory defers the move even when git reports its p
         readdirSync(join(dir, 'projects')).includes(nfd),
         'precondition: the directory is decomposed on disk',
       );
+      // The premise, stated by the branch this run exercised: macOS git reports the NFC spelling for
+      // a decomposed directory, other systems report the bytes as they are.
+      const reported = trackedProjectDirs(dir);
+      if (process.platform === 'darwin') {
+        assert.ok(reported.includes(nfc) && !reported.includes(nfd), `darwin: ${reported}`);
+      } else {
+        assert.ok(reported.includes(nfd) && !reported.includes(nfc), `not darwin: ${reported}`);
+      }
       const head = headOf(dir);
       const r = migrate(dir);
       assert.equal(r.migrated, false, JSON.stringify(r));
@@ -6593,6 +6705,37 @@ test('a decomposed project directory defers the move even when git reports its p
       assert.ok(r.notices.join('\n').includes(`${first} 다음에 ${second}`), r.notices.join('\n'));
       assert.equal(headOf(dir), head, 'nothing committed');
       assert.equal(existsSync(join(dir, 'projects', nfc, 'sessions')), false, 'no entries written');
+    }),
+  );
+});
+
+test('tracked and on-disk spellings set apart (NFC committed, then renamed to NFD on disk) defer the move on every system', () => {
+  const nfd = '프로젝트'.normalize('NFD');
+  const nfc = nfd.normalize('NFC');
+  inCatchUpEnv(() =>
+    withTmpDir((dir) => {
+      cgitOk(dir, ['init', '-q']);
+      cgitOk(dir, ['config', 'core.precomposeunicode', 'false']);
+      for (const [rel, text] of Object.entries({
+        '.gitignore': '.cache/\n',
+        ...oldProjectFiles(nfc),
+        ...oldProjectFiles('ok'),
+      })) {
+        put(dir, rel, text);
+      }
+      commitIn(dir);
+      renameSync(join(dir, 'projects', nfc), join(dir, 'projects', nfd));
+      // premise: HEAD tracks the NFC spelling while the directory on disk is NFD
+      assert.deepEqual(trackedProjectDirs(dir), [nfc]);
+      const names = readdirSync(join(dir, 'projects'));
+      assert.ok(names.includes(nfd) && !names.includes(nfc), `on disk: ${names}`);
+      const head = headOf(dir);
+      const r = migrate(dir);
+      assert.equal(r.migrated, false, JSON.stringify(r));
+      assert.equal(r.deferred, 'invalid-project-name', JSON.stringify(r));
+      assert.match(r.notices.join('\n'), /NFC/);
+      assert.equal(headOf(dir), head, 'nothing committed');
+      assert.equal(migrationState(dir), 'not-migrated');
     }),
   );
 });
