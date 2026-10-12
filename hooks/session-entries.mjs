@@ -28,6 +28,11 @@ const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 // `project:`, so a space or `#` would read differently in a generic frontmatter reader.
 const PROJECT_RE = /^(?!\.+$)(?=.*[A-Za-z0-9])[A-Za-z0-9._-]+$/;
 const BASELINE_TITLE = '이행 전 기록';
+// `closed_at`: the close's write time, ISO 8601 UTC with `Z` (what `Date#toISOString` prints), the
+// fraction optional. Unquoted in the frontmatter, so no space or offset may appear.
+const CLOSED_AT_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?Z$/;
+const validClosedAt = (v) =>
+  typeof v === 'string' && CLOSED_AT_RE.test(v) && !Number.isNaN(Date.parse(v));
 
 // Byte-fixed blocks. Two machines that append them independently must produce the same change.
 // `atomicWrite` leaves a killed write as `<view>.<pid>.<random>.tmp` beside the view (the pid is
@@ -187,8 +192,10 @@ function validateTracks(tracks) {
 }
 
 /**
- * Entry object to file text. `obj`: `{project, closeId, sessionId?, date, visibilityScope?,
- * tracks: [{id, title?, supersedes?, new?, done?}], summary, bodies?: {trackId: text}}`.
+ * Entry object to file text. `obj`: `{project, closeId, sessionId?, date, closedAt?,
+ * visibilityScope?, tracks: [{id, title?, supersedes?, new?, done?}], summary, bodies?: {trackId:
+ * text}}`. `closedAt` (ISO 8601 UTC ending in `Z`) is when the close wrote the entry; it orders
+ * entries of one day (see sortEntries) and may be left out (older entries have none).
  * `title:` and `updated:` are derived (lint wants both). Throws on a malformed object or on a
  * body that holds a marker line of this close id.
  */
@@ -217,6 +224,12 @@ export function formatSessionEntry(obj) {
   head.push(`entry_schema: ${ENTRY_SCHEMA}`, `project: ${project}`, `close_id: ${closeId}`);
   if (obj.sessionId) head.push(`session_id: ${scalar('sessionId', obj.sessionId, CLOSE_ID_RE)}`);
   head.push(`date: ${date}`, `updated: ${date}`);
+  if (obj.closedAt !== undefined && obj.closedAt !== null) {
+    if (!validClosedAt(obj.closedAt)) {
+      throw fail('invalid-entry', `invalid closedAt: ${JSON.stringify(obj.closedAt)}`);
+    }
+    head.push(`closed_at: ${obj.closedAt}`);
+  }
   if (obj.visibilityScope) {
     head.push(`visibility_scope: ${scalar('visibilityScope', obj.visibilityScope, /^[^\r\n]+$/)}`);
   }
@@ -252,7 +265,8 @@ function frontmatterEnd(text) {
 }
 
 /**
- * Entry file text to `{ok: true, entry}` (same shape formatSessionEntry takes, plus `updated`)
+ * Entry file text to `{ok: true, entry}` (same shape formatSessionEntry takes, plus `updated`;
+ * `closedAt` is there only when the file has `closed_at`)
  * or `{ok: false, reason}`. The body is cut only at marker lines of the close id the
  * frontmatter names, so headings, fences and other entries' markers inside a section are text.
  */
@@ -278,6 +292,7 @@ export function parseSessionEntry(text) {
     if (!re.test(fm[key])) return bad(`bad-${key}`);
   }
   if (fm.session_id !== undefined && !CLOSE_ID_RE.test(fm.session_id)) return bad('bad-session_id');
+  if (fm.closed_at !== undefined && !validClosedAt(fm.closed_at)) return bad('bad-closed_at');
   if (fm.tracks === undefined) return bad('missing-tracks');
   let tracks;
   try {
@@ -327,6 +342,7 @@ export function parseSessionEntry(text) {
       sessionId: fm.session_id ?? null,
       date: fm.date,
       updated: fm.updated ?? fm.date,
+      ...(fm.closed_at === undefined ? {} : { closedAt: fm.closed_at }),
       visibilityScope: fm.visibility_scope ?? null,
       tracks,
       summary,
@@ -348,19 +364,126 @@ export function splitLegacyFrontmatter(text) {
   return { frontmatter: text.slice(0, end), body: text.slice(end) };
 }
 
+// The headings that open the "what to do next" part of an old `session-state.md`: the same names
+// `SESSION_STATE_NEXT_HEADINGS` in hypo-shared lists, kept here because hooks/shared files cannot
+// import hypo-shared. `## Next Up` is what the generator renders.
+const NEXT_UP_HEADINGS = ['다음 이어받기', '다음 작업', 'Next Up', 'Next'];
+
+// `[{level, title, start, end}]` for every `##` and `###` heading line of `text` outside code fences
+// and outside the frontmatter. `start` is the offset of the line, `end` the offset just past its
+// newline (or the text length).
+function headingLines(text) {
+  const out = [];
+  let pos = Math.max(0, frontmatterEnd(text));
+  let fence = null; // {char, len} while inside a fenced block
+  while (pos < text.length) {
+    const nl = text.indexOf('\n', pos);
+    const end = nl === -1 ? text.length : nl + 1;
+    const line = text.slice(pos, nl === -1 ? text.length : nl);
+    const f = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(line);
+    if (fence) {
+      if (f && f[1][0] === fence.char && f[1].length >= fence.len && f[2].trim() === '')
+        fence = null;
+    } else if (f) {
+      fence = { char: f[1][0], len: f[1].length };
+    } else {
+      const h = /^(#{2,3})[ \t]+(\S.*?)[ \t]*$/.exec(line);
+      if (h) out.push({ level: h[1].length, title: h[2], start: pos, end });
+    }
+    pos = end;
+  }
+  return out;
+}
+
+/**
+ * Cut the track sections out of an old `session-state.md` (LF text): `{rest, tracks: [{id, title,
+ * body}]}`, or `null` when no recognizable set of at least two tracks is there (the file then stays
+ * one whole `legacy` head). Two shapes are recognized, both after a `## <next-up heading>` (see
+ * NEXT_UP_HEADINGS):
+ *   - that section holds `###` subsections: each `###` section is a track (the generator's own
+ *     `## Next Up` and a hand-written one);
+ *   - it holds none: each `##` section after it is a track (one `##` section per track).
+ * A track's `title` is its heading text, `body` the text after the heading line up to the next
+ * section boundary. `rest` is every byte outside the track bodies and heading lines, in file order
+ * (frontmatter, preamble, the next-up heading itself, sections that are not tracks). Cutting
+ * removes only the `##`/`###` marker run of each track heading, which the title does not repeat.
+ * Ids are `legacy-<slug>-<h6>`: the slug is the ASCII part of the title, the hash covers the title
+ * and its occurrence number (two sections with one title), so equal bytes give equal ids on any
+ * machine and no id depends on a section's position.
+ */
+export function splitStateTracks(text) {
+  const heads = headingLines(text);
+  const at = heads.findIndex((h) => h.level === 2 && NEXT_UP_HEADINGS.includes(h.title));
+  if (at === -1) return null;
+  const after = heads.slice(at + 1);
+  const nextTwo = after.findIndex((h) => h.level === 2);
+  const inside = nextTwo === -1 ? after : after.slice(0, nextTwo);
+  const sub = inside.filter((h) => h.level === 3);
+  const picked = sub.length >= 2 ? sub : after.filter((h) => h.level === 2);
+  // A track section stops at the next heading of its own or a higher level, else at the text end.
+  const tracksFound = picked.map((h) => ({
+    ...h,
+    stop: heads.find((n) => n.start > h.start && n.level <= h.level)?.start ?? text.length,
+  }));
+  if (tracksFound.length < 2) return null;
+  const seen = new Map();
+  const tracks = tracksFound.map((h) => {
+    const n = seen.get(h.title) ?? 0;
+    seen.set(h.title, n + 1);
+    const hash = createHash('sha256')
+      .update(JSON.stringify([h.title, n]))
+      .digest('hex')
+      .slice(0, 6);
+    const slug = h.title
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, '-')
+      .replace(/^-+|-+$/g, '')
+      .slice(0, 30)
+      .replace(/-+$/g, '');
+    return {
+      id: `legacy-${slug ? `${slug}-` : ''}${hash}`,
+      title: h.title,
+      body: text.slice(h.end, h.stop),
+      cut: [h.start, h.stop],
+    };
+  });
+  let rest = '';
+  let from = 0;
+  for (const t of tracks) {
+    rest += text.slice(from, t.cut[0]);
+    from = t.cut[1];
+  }
+  rest += text.slice(from);
+  return { rest, tracks: tracks.map(({ cut, ...t }) => t) };
+}
+
+// The id of a baseline: a hash of what it holds, so two machines with the same inputs write the same
+// path and bytes. `content` is the old file's text (one `legacy` head) or, for a split file,
+// `[rest, [[id, title, body]...]]`; the text form hashes exactly as it did before the split existed.
+function baselineIdOf(kind, content, done, scope) {
+  const h16 = createHash('sha256')
+    .update(JSON.stringify([kind, content, done, scope]))
+    .digest('hex')
+    .slice(0, 16);
+  return `baseline-${h16}`;
+}
+
 /**
  * The entry that stands in for ONE of a project's old files: `kind` `'hot'` is the old `hot.md`
  * (the entry's summary, no tracks), `'state'` the old `session-state.md` (an empty summary and one
- * `legacy` track whose body is the file). Each file is its own entry so it carries its own
+ * `legacy` track whose body is the file; when the file has recognizable per-track sections, see
+ * splitStateTracks, the `legacy` track keeps the text outside them and each track section is a
+ * track of its own with its own id, so a close that replaces one track leaves the rest as heads).
+ * Each file is its own entry so it carries its own
  * `visibilityScope`: a machine-scoped `hot.md` must not hide a shared `session-state.md`. The text
  * goes in whole, frontmatter included (`tags`, `related`, `machine_note` survive), with line
  * endings normalized to LF. A CRLF source would otherwise leave `\r` in a blob that
  * `.gitattributes` (`eol=lf`) rewrites on checkout, so the path would read as modified forever, and
  * a CRLF machine and an LF machine would hash the same content to different paths. Returns
- * `{kind, closeId, fileName, text}`. The id hashes the kind, the text, `legacyDone` (state only)
- * and `visibilityScope`, so two machines with the same inputs write the same path and bytes, the
- * two files of one project never share an id, and inputs that differ in any of those land on
- * different paths instead of colliding.
+ * `{kind, closeId, fileName, text}`. The id hashes the kind, the text (or its split form),
+ * `legacyDone` (state only, applied to every track of the entry) and `visibilityScope`, so two
+ * machines with the same inputs write the same path and bytes, the two files of one project never
+ * share an id, and inputs that differ in any of those land on different paths instead of colliding.
  */
 export function buildBaselineEntry({ kind, text, date, visibilityScope, project, legacyDone }) {
   if (kind !== 'hot' && kind !== 'state')
@@ -368,15 +491,26 @@ export function buildBaselineEntry({ kind, text, date, visibilityScope, project,
   const body = (text ?? '').replace(/\r\n/g, '\n');
   const done = kind === 'state' && Boolean(legacyDone);
   const scope = visibilityScope || null;
-  const h16 = createHash('sha256')
-    .update(JSON.stringify([kind, body, done, scope]))
-    .digest('hex')
-    .slice(0, 16);
-  const closeId = `baseline-${h16}`;
+  const split = kind === 'state' ? splitStateTracks(body) : null;
+  const closeId = baselineIdOf(
+    kind,
+    split ? [split.rest, split.tracks.map((t) => [t.id, t.title, t.body])] : body,
+    done,
+    scope,
+  );
   let tracks = [];
+  let bodies = {};
   if (kind === 'state') {
-    tracks = [{ id: LEGACY_TRACK_ID, title: BASELINE_TITLE, new: true }];
-    if (done) tracks[0].done = true;
+    const heads = split
+      ? [{ id: LEGACY_TRACK_ID, title: BASELINE_TITLE, body: split.rest }, ...split.tracks]
+      : [{ id: LEGACY_TRACK_ID, title: BASELINE_TITLE, body }];
+    tracks = heads.map((h) => ({
+      id: h.id,
+      title: h.title,
+      new: true,
+      ...(done ? { done: true } : {}),
+    }));
+    bodies = Object.fromEntries(heads.map((h) => [h.id, h.body]));
   }
   const entry = formatSessionEntry({
     project,
@@ -385,7 +519,7 @@ export function buildBaselineEntry({ kind, text, date, visibilityScope, project,
     visibilityScope: scope,
     tracks,
     summary: kind === 'hot' ? body : '',
-    bodies: kind === 'state' ? { [LEGACY_TRACK_ID]: body } : {},
+    bodies,
   });
   return { kind, closeId, fileName: entryFileName(date, closeId), text: entry };
 }
@@ -421,8 +555,8 @@ export function buildLegacyBaselines({ hotText, stateText, date, project, scopes
 
 /**
  * Whether a baseline entry file still names its own content. `fileName` is the file's base name
- * and `text` its bytes. The id in a baseline's name is a hash of the kind, body, `done` flag and
- * scope, so a baseline whose bytes changed after it was written (git pairs it with the old file it
+ * and `text` its bytes. The id in a baseline's name is a hash of the kind, body (a split state
+ * file hashes its parts, see splitStateTracks), `done` flag and scope, so a baseline whose bytes changed after it was written (git pairs it with the old file it
  * was cut from as a rename and merges a later edit of that file into it) no longer matches its
  * name. Returns `null` when the name and the entry's own id both equal the hash of the content (or
  * the file is not a readable baseline), else `{expected, inName, inEntry}` (the ids as `baseline-<h16>`).
@@ -432,18 +566,19 @@ export function baselineIdMismatch(fileName, text) {
   if (!parsed.ok || !isBaselineId(parsed.entry.closeId)) return null;
   const e = parsed.entry;
   const legacy = e.tracks.find((t) => t.id === LEGACY_TRACK_ID);
+  const others = e.tracks.filter((t) => t.id !== LEGACY_TRACK_ID);
   const kind = legacy ? 'state' : 'hot';
-  const rebuilt = buildBaselineEntry({
-    kind,
-    text: kind === 'hot' ? e.summary : (e.bodies[LEGACY_TRACK_ID] ?? ''),
-    date: e.date,
-    visibilityScope: e.visibilityScope,
-    project: e.project,
-    legacyDone: legacy?.done === true,
-  });
+  let content = e.summary;
+  if (legacy) {
+    const own = e.bodies[LEGACY_TRACK_ID] ?? '';
+    content = others.length
+      ? [own, others.map((t) => [t.id, t.title ?? '', e.bodies[t.id] ?? ''])]
+      : own;
+  }
+  const expected = baselineIdOf(kind, content, legacy?.done === true, e.visibilityScope || null);
   const inName = /-(baseline-[0-9a-f]{16})\.md$/.exec(fileName)?.[1] ?? null;
-  if (rebuilt.closeId === e.closeId && rebuilt.closeId === inName) return null;
-  return { expected: rebuilt.closeId, inName, inEntry: e.closeId };
+  if (expected === e.closeId && expected === inName) return null;
+  return { expected, inName, inEntry: e.closeId };
 }
 
 // ── ids and file names ───────────────────────────────────────────────────────
@@ -606,9 +741,12 @@ const hasSummary = (entry) => !isBaselineId(entry.closeId) || entry.summary !== 
 const supersededIdsOf = (entry) => entry.tracks.flatMap((t) => t.supersedes ?? []);
 
 /**
- * Entries newest first: `date` descending, then supersede depth descending (1 + the deepest entry
- * it replaces, so a same-day replacement sorts before what it replaced), then close id ascending.
- * A new array; never reads the clock.
+ * Entries newest first: `date` descending, then `closedAt` descending (the close's write time; an
+ * entry with one sorts before an entry of the same day without one, since only older entries and
+ * baselines lack it), then supersede depth descending (1 + the deepest entry it replaces, so a
+ * same-day replacement sorts before what it replaced), then close id ascending. Depth only breaks
+ * ties now: ranked first it kept a deep chain of one track ahead of a later close of another. A new
+ * array; never reads the clock.
  */
 export function sortEntries(entries) {
   const byId = new Map(entries.map((e) => [e.closeId, e]));
@@ -626,8 +764,25 @@ export function sortEntries(entries) {
     depths.set(entry.closeId, deepest + 1);
     return deepest + 1;
   };
+  // Parsed once per entry; `null` sorts after every real time. Compared as instants, not strings:
+  // `...07Z` and `...07.123Z` differ in length, so the text order is not the time order.
+  const closedMs = new Map(
+    entries.map((e) => [e.closeId, e.closedAt ? Date.parse(e.closedAt) : null]),
+  );
+  const byClosedAt = (a, b) => {
+    const x = closedMs.get(a.closeId);
+    const y = closedMs.get(b.closeId);
+    if (x === y) return 0;
+    if (x === null) return 1;
+    if (y === null) return -1;
+    return y - x;
+  };
   return [...entries].sort(
-    (a, b) => cmp(b.date, a.date) || depthOf(b) - depthOf(a) || cmp(a.closeId, b.closeId),
+    (a, b) =>
+      cmp(b.date, a.date) ||
+      byClosedAt(a, b) ||
+      depthOf(b) - depthOf(a) ||
+      cmp(a.closeId, b.closeId),
   );
 }
 

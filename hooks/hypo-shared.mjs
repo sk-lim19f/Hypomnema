@@ -2956,6 +2956,7 @@ function committedBaselines(hypoDir, slug) {
       found.push({
         summary: parsed.entry.summary,
         legacy: parsed.entry.bodies[LEGACY_TRACK_ID],
+        bodies: JSON.stringify(parsed.entry.bodies),
         scope: scopeKey(parsed.entry.visibilityScope),
       });
     }
@@ -2973,7 +2974,8 @@ function committedBaselines(hypoDir, slug) {
  * once for every distinct version of a path within one, so a path archived in two runs with
  * different bytes yields a baseline for each; the side that was not archived comes from
  * `companionRev`'s tree. A pair is not made when HEAD already has a baseline whose summary
- * and `legacy` sections are byte-equal to it and the same scope (frontmatter included, so a changed
+ * and state sections (the `legacy` body, or every body of a split state file) are byte-equal to it
+ * and the same scope (frontmatter included, so a changed
  * `machine_note` is a different memory, and the same text under another scope is another baseline).
  * The scope of an entry is the narrowest of the old file's, HEAD's `index.md` and the working
  * tree's, so an uncommitted edit of `index.md` can narrow what is committed but never widen it.
@@ -3096,7 +3098,7 @@ export function shareLegacyBytes(hypoDir, archived) {
         const same =
           built.kind === 'hot'
             ? (e) => e.scope === scope && e.summary === mine.summary
-            : (e) => e.scope === scope && e.legacy === mine.bodies[LEGACY_TRACK_ID];
+            : (e) => e.scope === scope && e.bodies === JSON.stringify(mine.bodies);
         if (existing.some(same)) {
           skipped.push(rel);
           continue;
@@ -3117,6 +3119,7 @@ export function shareLegacyBytes(hypoDir, archived) {
         existing.push({
           summary: mine.summary,
           legacy: mine.bodies[LEGACY_TRACK_ID],
+          bodies: JSON.stringify(mine.bodies),
           scope,
         });
         notices.push(
