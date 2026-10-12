@@ -3030,7 +3030,7 @@ test('migrate-sessions: a project directory with a space in its name exits 1 wit
       assert.equal(r.status, 1, `${r.stdout}${r.stderr}`);
       assert.match(r.stdout, /projects\/my project:/);
       assert.ok(
-        r.stdout.includes('/hypo:rename --from="projects/my project" --to="projects/my-project"'),
+        r.stdout.includes('/hypo:rename --from="projects/my project/" --to="projects/my-project/"'),
         r.stdout,
       );
       assert.match(r.stderr, /migration did not run \(invalid-project-name\)/);

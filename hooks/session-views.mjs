@@ -1038,7 +1038,7 @@ function renameAdvice(slug, problem) {
   const why = '이름에 공백이나 기호가 있습니다';
   return (
     `projects/${slug}: ${why}. ` +
-    `/hypo:rename --from="projects/${slug}" --to="projects/${suggestedProjectName(slug)}" (--to는 예시이고, 쓸 수 있는 글자는 문자, 숫자, ., _, - 입니다).`
+    `/hypo:rename --from="projects/${slug}/" --to="projects/${suggestedProjectName(slug)}/" (--to는 예시이고, 쓸 수 있는 글자는 문자, 숫자, ., _, - 입니다).`
   );
 }
 

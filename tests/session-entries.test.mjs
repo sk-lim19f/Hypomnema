@@ -6494,7 +6494,7 @@ test('a tracked project directory whose name cannot be an entry project defers t
       bad.forEach((name, i) => {
         assert.ok(notice.includes(`projects/${name}:`), `${name} is named`);
         assert.ok(
-          notice.includes(`/hypo:rename --from="projects/${name}" --to="projects/${fixes[i]}"`),
+          notice.includes(`/hypo:rename --from="projects/${name}/" --to="projects/${fixes[i]}/"`),
           `${name}: the exact command, ${notice}`,
         );
       });

@@ -518,6 +518,25 @@ test('the two renames the not-NFC advice prints move a decomposed project direct
   }
 });
 
+// The invalid-name advice has the same shape (`--from="projects/<x>/" --to="projects/<y>/"`); the
+// trailing slash is what keeps a name ending in `.md` a directory.
+test('the slash-ended directory form the invalid-name advice prints renames a project named like a page', () => {
+  withTmpDir((base) => {
+    const wiki = join(base, 'wiki');
+    mkdirSync(join(wiki, 'projects', 'my notes.md'), { recursive: true });
+    writeFileSync(join(wiki, 'projects', 'my notes.md', 'index.md'), '---\ntitle: p\n---\nbody\n');
+    const r = run('rename.mjs', [
+      `--hypo-dir=${wiki}`,
+      '--from=projects/my notes.md/',
+      '--to=projects/my-notes.md/',
+      '--apply',
+      '--json',
+    ]);
+    assert.equal(r.status, 0, `${r.stdout}${r.stderr}`);
+    assert.deepEqual(readdirSync(join(wiki, 'projects')), ['my-notes.md']);
+  });
+});
+
 // Same property, directory mode (BLOCKER: moved-body content used to be written
 // AFTER renameSync, so a crash between them left the relocated subtree's own
 // internal links pointing at the pre-move prefix forever — --from no longer
