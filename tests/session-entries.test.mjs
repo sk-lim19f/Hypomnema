@@ -6185,6 +6185,10 @@ test('rollback limits say that a project made after the point has no flat file a
     ROLLBACK_LIMITS.some((l) => l.includes('다음 동기화') && l.includes('모든 기계')),
     'the next sync publishes the rollback to every machine',
   );
+  assert.ok(
+    ROLLBACK_LIMITS.some((l) => l.includes('구버전') && l.includes('hot.md') && l.includes('복사')),
+    'a machine on an older version overwrites its local flat files when it pulls the rollback',
+  );
 });
 
 function withScopedRollbackVault(fn) {
@@ -6268,6 +6272,60 @@ test('re-enabling after a rollback and a committed hand edit makes exactly one b
     assert.equal(back.migrated, true, back.notices.join('\n'));
     assert.equal(back.baselines.length, 1, back.baselines.join(', '));
     assert.ok(readRel(dir, back.baselines[0]).includes('OLD MACHINE EDIT'));
+  });
+});
+
+test('re-enabling after a rollback whose marker was recommitted with CRLF bytes still makes no baseline and does not double the bodies', () => {
+  withRollbackVault(({ dir, shas }) => {
+    const baselines = () => listDir(sessionsDir(dir)).filter((n) => n.includes('-baseline-'));
+    const before = baselines();
+    assert.equal(rollbackSessionEntries(dir, { at: shas[1] }).rolledBack, true);
+    cgitOk(dir, ['config', 'core.autocrlf', 'false']);
+    const marker = readRel(dir, RB_MARKER);
+    assert.ok(marker.split('\n').filter((l) => /^[0-9a-f]{64} {2}/.test(l)).length >= 2);
+    put(dir, RB_MARKER, marker.replaceAll('\n', '\r\n'));
+    commitIn(dir);
+    assert.ok(showHead(dir, RB_MARKER).includes('\r\n'), 'HEAD holds the CRLF marker');
+    const back = migrate(dir, { reenable: true });
+    assert.equal(back.migrated, true, back.notices.join('\n'));
+    assert.deepEqual(back.baselines, []);
+    assert.deepEqual(baselines(), before, 'no baseline entry was added');
+    assert.equal(writeGeneratedViews(dir, WRITE).notMigrated, false);
+    assert.equal(
+      countOf(readRel(dir, 'projects/p/session-state.md'), `next for ${RB_IDS[0]}`),
+      1,
+      'the first original shows once',
+    );
+  });
+});
+
+test('rollback keeps the local views of a project .hypoignore hides out of git: excluded locally, bytes untouched, the committed .gitignore silent', () => {
+  withRollbackVault(({ dir, shas }) => {
+    put(dir, '.hypoignore', 'projects/h/\n');
+    put(dir, 'projects/h/index.md', '---\ntitle: h\n---\n');
+    commitIn(dir);
+    const views = ['projects/h/hot.md', 'projects/h/session-state.md'];
+    for (const rel of views) put(dir, rel, `PRIVATE LOCAL CONTENT ${rel}\n`);
+    assert.equal(cgitOk(dir, ['status', '--porcelain']), '', 'ignored before the rollback');
+    const r = rollbackSessionEntries(dir, { at: shas[1] });
+    assert.equal(r.rolledBack, true, r.notices.join('\n'));
+    for (const rel of views) {
+      assert.equal(readRel(dir, rel), `PRIVATE LOCAL CONTENT ${rel}\n`, `${rel} is untouched`);
+      cgitOk(dir, ['check-ignore', '-q', '--', rel]); // throws unless ignored
+    }
+    assert.equal(cgitOk(dir, ['status', '--porcelain']), '');
+    assert.ok(
+      !showHead(dir, '.gitignore').includes('projects/h'),
+      'the project name stays private',
+    );
+    assert.ok(!readRel(dir, '.gitignore').includes('projects/h'));
+    const exclude = cgitOk(dir, ['rev-parse', '--git-path', 'info/exclude']).trim();
+    const lines = readFileSync(join(dir, exclude), 'utf-8').split('\n');
+    assert.deepEqual(
+      views.map((v) => lines.filter((l) => l === `/${v}`).length),
+      [1, 1],
+      'each view is listed once',
+    );
   });
 });
 
