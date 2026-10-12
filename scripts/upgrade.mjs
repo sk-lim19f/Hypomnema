@@ -1343,8 +1343,9 @@ if (args.migrateSessions) {
   try {
     rc = migrateSessionsCommand(args.hypoDir);
   } catch (err) {
-    // Nothing the command does is committed before its last step, so a throw leaves the vault as it
-    // was; running the command again starts from the vault's state at that moment.
+    // Commits made before the error stay: a remote merge or a block update is already a local commit
+    // and is not pushed, and the migration commit lands before the pull and push. A throw does not
+    // undo them, and running the command again continues from the vault's state at that moment.
     const cause = String(err?.message ?? err).split('\n')[0];
     console.error(
       `✗ the migration stopped on an unexpected error (${err?.code ? `${err.code}: ` : ''}${cause}). Fix that cause and run the command again.`,

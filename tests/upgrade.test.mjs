@@ -3021,6 +3021,38 @@ test('migrate-sessions: a vault with the rollback marker is moved and the marker
   );
 });
 
+test('migrate-sessions: a project directory with a space in its name exits 1 with the rename command, writes and pushes nothing', () => {
+  const state = MS_SEED['projects/p/session-state.md'];
+  withMsPair(
+    ({ a, origin }) => {
+      const before = msGit(origin, ['rev-parse', 'main']);
+      const r = msRun(a);
+      assert.equal(r.status, 1, `${r.stdout}${r.stderr}`);
+      assert.match(r.stdout, /projects\/my project:/);
+      assert.ok(
+        r.stdout.includes('/hypo:rename --from="projects/my project" --to="projects/my-project"'),
+        r.stdout,
+      );
+      assert.match(r.stderr, /migration did not run \(invalid-project-name\)/);
+      assert.equal(msGit(a, ['rev-parse', 'HEAD']), before, 'no commit on a');
+      assert.equal(msGit(origin, ['rev-parse', 'main']), before, 'nothing pushed');
+      assert.equal(msGit(a, ['status', '--porcelain']), '', 'nothing written');
+      // The pair: renamed and committed, the command goes through.
+      msGit(a, ['mv', 'projects/my project', 'projects/my-project']);
+      msGit(a, ['commit', '-q', '-m', 'rename']);
+      const again = msRun(a);
+      assert.equal(again.status, 0, `${again.stdout}${again.stderr}`);
+      assert.match(again.stdout, /Migrated: commit [0-9a-f]{8}, 4 baseline entries/);
+    },
+    {
+      ...MS_SEED,
+      'projects/my project/index.md': '---\ntitle: m\n---\n',
+      'projects/my project/hot.md': '---\ntitle: m\n---\nhot\n',
+      'projects/my project/session-state.md': state,
+    },
+  );
+});
+
 test('migrate-sessions: upgrade --apply alone does not put the session block in .gitignore', () => {
   withTmpHome((home) => {
     withTmpDir((dir) => {

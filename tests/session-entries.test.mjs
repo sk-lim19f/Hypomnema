@@ -29,6 +29,7 @@ import {
   GITATTRIBUTES_BLOCK,
   GITIGNORE_BLOCK,
   LEGACY_TRACK_ID,
+  NEXT_UP_HEADINGS,
   TRACK_ID_RE,
   assertNoEntryMarkers,
   baselineIdMismatch,
@@ -72,6 +73,7 @@ import {
   resolveActiveProject,
   restoreGitignoreLines,
   resumePullArchive,
+  SESSION_STATE_NEXT_HEADINGS,
   setAsideNotices,
   revPathArg,
   rootHotBackupRecoveryNotice,
@@ -788,11 +790,183 @@ test('baselineIdMismatch accepts a split baseline and flags an edit of one track
   assert.equal(edited.inName, built.closeId);
   const done = splitBaseline(MULTI_STATE, { legacyDone: true });
   assert.equal(baselineIdMismatch(done.built.fileName, done.built.text), null);
-  assert.ok(
-    done.entry.tracks.every((t) => t.done === true),
-    'legacyDone marks every head',
+  assert.deepEqual(
+    done.entry.tracks.filter((t) => t.done === true).map((t) => t.id),
+    [LEGACY_TRACK_ID],
+    'legacyDone: true marks the leftover legacy head only, not the tracks split out of the file',
   );
   assert.notEqual(done.built.closeId, built.closeId);
+});
+
+test('done is decided per track id: a split track marked done stays alone, and the id covers which heads are done', () => {
+  const ids = splitBaseline(MULTI_STATE).entry.tracks.map((t) => t.id);
+  const [, squid, flow] = ids;
+  const some = splitBaseline(MULTI_STATE, { legacyDone: [flow] });
+  assert.deepEqual(
+    some.entry.tracks.filter((t) => t.done === true).map((t) => t.id),
+    [flow],
+    'only the head whose own id is in the set is done',
+  );
+  assert.equal(baselineIdMismatch(some.built.fileName, some.built.text), null);
+  const other = splitBaseline(MULTI_STATE, { legacyDone: [squid] });
+  const both = splitBaseline(MULTI_STATE, { legacyDone: [LEGACY_TRACK_ID, flow] });
+  const closeIds = [
+    splitBaseline(MULTI_STATE).built.closeId,
+    some.built.closeId,
+    other.built.closeId,
+    both.built.closeId,
+    splitBaseline(MULTI_STATE, { legacyDone: true }).built.closeId,
+  ];
+  assert.equal(new Set(closeIds).size, closeIds.length, 'each done set gets its own id');
+  assert.equal(baselineIdMismatch(both.built.fileName, both.built.text), null);
+  // A non-state baseline ignores the set.
+  assert.deepEqual(baselineOf('hot', { legacyDone: [flow] }).closeId, baselineOf('hot').closeId);
+});
+
+test('the next-up heading list has one definition', () => {
+  assert.strictEqual(SESSION_STATE_NEXT_HEADINGS, NEXT_UP_HEADINGS);
+  assert.ok(NEXT_UP_HEADINGS.includes('Next Up') && NEXT_UP_HEADINGS.includes('다음 이어받기'));
+});
+
+// The shapes of real old session-state files (read from the maintainer's vault): which ones are
+// cut into tracks and which stay one head.
+const tenTracks = [
+  'squid 콘솔',
+  'NWFW 콘솔 승인 창구',
+  'firewall 룰 정본과 인프라',
+  'flow',
+  '반출과 DB 회신',
+  'platform 공통',
+  '검토자 슬랙 알림 배포',
+  'review',
+  'masking',
+  'UX 문구',
+];
+const BACKOFFICE_STATE = [
+  '---',
+  'type: session-state',
+  '---',
+  '',
+  '## 다음 이어받기',
+  '',
+  `트랙: ${tenTracks.join(' · ')}. 각 트랙은 아래 \`##\` 절이다.`,
+  '',
+  ...tenTracks.flatMap((t, i) => [
+    `## ${t}${i === 0 ? ' (257차, 2026-10-12)' : i === 9 ? ' (ux-writing)' : ''}`,
+    '',
+    `BODY_${i}`,
+    '',
+  ]),
+].join('\n');
+
+test('a track list line makes the ## sections it names tracks, all ten of a security-backoffice shaped file', () => {
+  const { entry } = splitBaseline(BACKOFFICE_STATE);
+  assert.equal(entry.tracks.length, 11, 'the remainder plus ten tracks');
+  assert.deepEqual(
+    entry.tracks.slice(1).map((t) => entry.bodies[t.id]),
+    tenTracks.map((_, i) => (i === 9 ? `\nBODY_9\n` : `\nBODY_${i}\n\n`)),
+  );
+  assert.equal(
+    entry.tracks[10].title,
+    'UX 문구 (ux-writing)',
+    'the last item ends at the sentence',
+  );
+});
+
+test('a ## section the list does not name stays in the remainder, a section whose title only starts with an item word does not count', () => {
+  const text = [
+    '## Next Up',
+    '',
+    'Tracks: alpha, beta / gamma',
+    '',
+    '## alpha (1)',
+    'A',
+    '',
+    '## 공통: notes',
+    'NOTE_TEXT',
+    '',
+    '## beta',
+    'B',
+    '',
+    '## betamax',
+    'NOT_A_TRACK',
+    '',
+    '## code state',
+    'CODE_STATE',
+    '',
+  ].join('\n');
+  const { entry } = splitBaseline(text);
+  assert.deepEqual(
+    entry.tracks.map((t) => t.title),
+    ['이행 전 기록', 'alpha (1)', 'beta'],
+  );
+  const rest = entry.bodies[LEGACY_TRACK_ID];
+  for (const kept of ['NOTE_TEXT', 'NOT_A_TRACK', 'CODE_STATE', '## 공통: notes']) {
+    assert.ok(rest.includes(kept), `${kept} stays in the remainder`);
+  }
+});
+
+test('a harness-shaped file (numbered ## tracks, ## 공통 notes, no list line) and a csv-decrypt-tool shaped one stay one head', () => {
+  const harness = [
+    '## 다음 이어받기',
+    '',
+    'Pick the track by number.',
+    '',
+    '## 1. codex-recurrence (축): 활성',
+    'ONE',
+    '',
+    '## 2. sub-agent (위임): 대기',
+    'TWO',
+    '',
+    '## 공통: 다섯이 같은 표면을 만진다',
+    'COMMON',
+    '',
+    '## 공통: 정본 위치',
+    'WHERE',
+    '',
+  ].join('\n');
+  const csv = [
+    '## 다음 이어받기',
+    '',
+    '1. 먼저 할 일',
+    '',
+    '## 버킷정책 형태(되돌리지 말 것)',
+    'BUCKET',
+    '',
+    '## 코드 상태',
+    'CODE',
+    '',
+  ].join('\n');
+  for (const [name, text] of Object.entries({ harness, csv })) {
+    const { entry } = splitBaseline(text);
+    assert.deepEqual(
+      entry.tracks,
+      [{ id: 'legacy', title: '이행 전 기록', new: true }],
+      `${name}: one head`,
+    );
+    assert.equal(entry.bodies.legacy, text, `${name}: whole text`);
+  }
+});
+
+test('a heading inside an HTML comment is not a track: one line or several', () => {
+  const oneLine = NEXT_UP_STATE.replace(
+    'ALPHA_BODY\n',
+    'ALPHA_BODY\n<!-- ### x\nstill the comment -->\n<!-- ### y -->\n',
+  );
+  const { entry } = splitBaseline(oneLine);
+  assert.deepEqual(
+    entry.tracks.map((t) => t.title),
+    ['이행 전 기록', 'Alpha (alpha) · 2026-10-01 · c1', 'Beta (beta) · 2026-10-01 · c2'],
+  );
+  assert.ok(entry.bodies[entry.tracks[1].id].includes('<!-- ### x'), 'the comment is body text');
+  // Without the comment the same lines would be a third and fourth track.
+  const bare = splitBaseline(NEXT_UP_STATE.replace('ALPHA_BODY\n', 'ALPHA_BODY\n### x\nX\n'));
+  assert.equal(bare.entry.tracks.length, 4);
+  // A comment after the closing marker does not swallow the next heading.
+  const after = splitBaseline(
+    NEXT_UP_STATE.replace('ALPHA_BODY\n', 'ALPHA_BODY\n<!-- note --> trailing\n'),
+  );
+  assert.equal(after.entry.tracks.length, 3);
 });
 
 test('a newer close that replaces one split track leaves the other tracks in the injection', () => {
@@ -6112,6 +6286,116 @@ test('the writer skips a view that a later rule un-ignores, writes the others, a
   });
 });
 
+// A project directory with an index and both old files, as the migration reads them.
+const oldProjectFiles = (slug) => ({
+  [`projects/${slug}/index.md`]: `---\ntitle: x\n---\n`,
+  [`projects/${slug}/hot.md`]: OLD_HOT_FILE,
+  [`projects/${slug}/session-state.md`]: OLD_STATE_FILE,
+});
+
+test('a tracked project directory whose name cannot be an entry project defers the whole move, names each directory with its rename command, and writes nothing', () => {
+  const bad = ['my project', 'c++', 'foo(bar)', '프로젝트 A'];
+  const fixes = ['my-project', 'c', 'foo-bar', '프로젝트-A'];
+  withOldGit(
+    (dir) => {
+      const head = headOf(dir);
+      const r = migrate(dir);
+      assert.equal(r.migrated, false);
+      assert.equal(r.deferred, 'invalid-project-name', JSON.stringify(r));
+      const notice = r.notices.join('\n');
+      bad.forEach((name, i) => {
+        assert.ok(notice.includes(`projects/${name}:`), `${name} is named`);
+        assert.ok(
+          notice.includes(`/hypo:rename --from="projects/${name}" --to="projects/${fixes[i]}"`),
+          `${name}: the exact command, ${notice}`,
+        );
+      });
+      assert.match(notice, /공백이나 기호/);
+      assert.doesNotMatch(notice, /projects\/p:/, 'the valid project is not named');
+      assert.equal(headOf(dir), head, 'no commit');
+      assert.equal(migrationState(dir), 'not-migrated');
+      assert.equal(cgitOk(dir, ['status', '--porcelain']), '', 'nothing written');
+      assert.deepEqual(listDir(sessionsDir(dir)), [], 'the valid project got no baseline either');
+      // The pair: renamed to the names the notice suggests, the same vault moves.
+      bad.forEach((name, i) => {
+        cgitOk(dir, ['mv', `projects/${name}`, `projects/${fixes[i]}`]);
+      });
+      commitIn(dir);
+      const again = migrate(dir);
+      assert.equal(again.migrated, true, JSON.stringify(again));
+      for (const fix of fixes) {
+        assert.ok(
+          again.baselines.some((b) => b.startsWith(`projects/${fix}/sessions/`)),
+          `${fix} has its baselines`,
+        );
+      }
+    },
+    Object.assign({}, ...bad.map(oldProjectFiles)),
+  );
+});
+
+test('a tracked project directory that is not in NFC defers the move and names the NFC spelling', () => {
+  const nfd = '프로젝트'.normalize('NFD');
+  const nfc = nfd.normalize('NFC');
+  assert.notEqual(nfd, nfc, 'precondition: the two spellings differ');
+  inCatchUpEnv(() =>
+    withTmpDir((dir) => {
+      cgitOk(dir, ['init', '-q']);
+      cgitOk(dir, ['config', 'core.precomposeunicode', 'false']);
+      for (const [rel, text] of Object.entries({
+        '.gitignore': '.cache/\n',
+        ...oldProjectFiles(nfd),
+        ...oldProjectFiles('ok'),
+      })) {
+        put(dir, rel, text);
+      }
+      commitIn(dir);
+      const tracked = listTrackedGeneratedViews(dir, { source: 'head' });
+      assert.ok(
+        tracked.some((rel) => rel.startsWith(`projects/${nfd}/`)),
+        'precondition: HEAD holds the decomposed spelling',
+      );
+      const head = headOf(dir);
+      const r = migrate(dir);
+      assert.equal(r.migrated, false);
+      assert.equal(r.deferred, 'invalid-project-name', JSON.stringify(r));
+      const notice = r.notices.join('\n');
+      assert.ok(notice.includes(`/hypo:rename --from="projects/${nfd}" --to="projects/${nfc}"`));
+      assert.match(notice, /NFC/);
+      assert.doesNotMatch(notice, /projects\/ok:/);
+      assert.equal(headOf(dir), head);
+      assert.equal(migrationState(dir), 'not-migrated');
+    }),
+  );
+});
+
+test('a split track the old scheme finished stays finished after the move, and its siblings stay live', () => {
+  const split = splitBaseline(MULTI_STATE).entry.tracks;
+  const flow = split.find((t) => t.title === 'flow').id;
+  const squid = split.find((t) => t.title.startsWith('squid')).id;
+  withOldGit(
+    (dir) => {
+      // Closed under the old scheme: the entry finishes `flow` only. The file then changes
+      // (another track's body), so the real baseline gets another id than the virtual one had.
+      putEntry(dir, 'p', 'finish-flow-0', {
+        tracks: [{ id: flow, title: 'flow', new: true, done: true }],
+        bodies: { [flow]: 'FLOW_FINISHED\n' },
+        summary: 'finished flow\n',
+      });
+      put(dir, 'projects/p/session-state.md', MULTI_STATE.replace('SQUID_BODY', 'SQUID_EDITED'));
+      commitIn(dir);
+      const r = migrate(dir);
+      assert.equal(r.migrated, true, JSON.stringify(r));
+      const heads = trackHeads(listSessionEntries(dir, 'p').entries);
+      const by = (id) => heads.find((t) => t.trackId === id);
+      assert.equal(by(flow)?.done, true, 'the finished track is not live again');
+      assert.equal(by(squid)?.done, false, 'a sibling that was never finished is live');
+      assert.equal(by(LEGACY_TRACK_ID)?.done, false, 'the remainder is live');
+    },
+    { 'projects/p/session-state.md': MULTI_STATE },
+  );
+});
+
 test('a generated view staged by hand but not in HEAD stops the move before it writes anything, and the move goes on once it is committed', () => {
   withOldGit((dir) => {
     put(dir, 'projects/p2/hot.md', RICH_HOT);
@@ -6841,7 +7125,8 @@ test('re-enabling does not vouch for a root hot.md edited after the rollback: it
   withRollbackVault(({ dir, shas }) => {
     assert.equal(rollbackSessionEntries(dir, { at: shas[1] }).rolledBack, true);
     const edit = 'a person edited the root after the rollback\n';
-    put(dir, 'hot.md', edit); // saved, not committed: bytes HEAD does not hold
+    put(dir, 'hot.md', edit);
+    commitIn(dir); // committed: HEAD holds these bytes, and the re-enable still must not vouch for them
     const kept = backupsIn(dir, 'hot.md');
     const back = migrate(dir, { reenable: true });
     assert.equal(back.migrated, true, back.notices.join('\n'));
