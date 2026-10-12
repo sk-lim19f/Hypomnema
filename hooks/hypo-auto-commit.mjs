@@ -40,8 +40,7 @@ import {
   commitWikiChanges,
   commitTouchedPaths,
   finishOwnedMerge,
-  listTrackedGeneratedViews,
-  upstreamIsMigrated,
+  listRetrackedViews,
   vaultCommitLockTarget,
   withFileLock,
   writeRootHotHealthNotice,
@@ -83,22 +82,23 @@ function renderViewsIfHeadMoved(before) {
   }
 }
 
-// Under a migrated upstream the generated views stay untracked. An old-version machine can push a
+// In a migrated vault the generated views stay untracked. An old-version machine can push a
 // commit that tracks them again; once a pull has merged it in, a push would hand that state to
-// every machine and switch the session views off for them. Returns the reason to withhold the
-// push, or null. Fails closed: when git cannot list the tracked paths the push is withheld too.
-function trackedViewsUnderMigratedUpstream() {
-  if (!upstreamIsMigrated(HYPO_DIR)) return null;
+// every machine and switch the session views off for them. A rollback on purpose (the off marker
+// in HEAD) tracks them by design and is exempt, or its commit could never be pushed. Returns the
+// reason to withhold the push, or null. Fails closed: when git cannot list the tracked paths the
+// push is withheld too.
+function retrackedViewsToWithhold() {
   let tracked;
   try {
-    tracked = listTrackedGeneratedViews(HYPO_DIR, { source: 'head' });
+    tracked = listRetrackedViews(HYPO_DIR);
   } catch (err) {
     return `세션 현황 파일의 추적 여부를 확인하지 못해 push하지 않았습니다 (${err?.message ?? err}).`;
   }
   if (!tracked.length) return null;
   const list = tracked.map((p) => `'${p}'`).join(' ');
   return (
-    `원격은 이미 세션 항목 방식으로 옮겨졌는데 이 브랜치가 생성 파일을 추적합니다: ${tracked.join(', ')}. ` +
+    `이 볼트는 이미 세션 항목 방식으로 옮겨졌는데 이 브랜치가 생성 파일을 추적합니다: ${tracked.join(', ')}. ` +
     '이대로 push하면 모든 기계에서 세션 현황이 꺼지므로 push하지 않았습니다. ' +
     `git -C ${HYPO_DIR} rm --cached -- ${list} 를 커밋한 뒤 다시 시도하세요 (파일은 디스크에 남고 무시됩니다).`
   );
@@ -217,7 +217,7 @@ try {
         // push attempt would add a second failure on top of it (a rejected push) that
         // SessionStart would show instead of the conflict guidance.
         if (pulled.pulled) {
-          const blocked = trackedViewsUnderMigratedUpstream();
+          const blocked = retrackedViewsToWithhold();
           if (blocked) writeRootHotHealthNotice(HYPO_DIR, blocked);
           else pushTarget = resolvePushTarget(HYPO_DIR);
         }

@@ -8507,6 +8507,7 @@ import {
   clearGeneratedPathsBlockingPull,
 } from '../hooks/hypo-shared.mjs';
 import { buildLegacyBaselines } from '../hooks/session-entries.mjs';
+import { rollbackSessionEntries } from '../scripts/session-entries.mjs';
 
 const SYNC_CONFIG = () => {
   const path = join(SESSION_TMP_HOME, 'gitconfig-sync-resolve');
@@ -9839,5 +9840,39 @@ test('under a migrated upstream, Stop pushes a tree that tracks no generated vie
       /projects\/p\/hot\.md/,
     );
     assert.doesNotMatch(syHealthNotice(b), /push하지 않았습니다/);
+  });
+});
+
+// A rollback on purpose tracks the flat files in HEAD while the remote still carries the block, which
+// is the same tree shape the guard withholds. The off marker in HEAD is what tells them apart.
+test('after a rollback, the next Stop pushes it: the remote head is the rollback commit', () => {
+  withSyncClones(({ a, origin }) => {
+    syMigrate(a);
+    sgitOk(a, ['push', '-q']);
+    const migrated = syHead(a);
+    const rb = rollbackSessionEntries(a, { at: migrated });
+    assert.equal(rb.rolledBack, true, JSON.stringify(rb));
+    assert.equal(syHead(a), rb.commit);
+    assert.match(sgitOk(a, ['ls-tree', '-r', '--name-only', 'HEAD']), /projects\/p\/hot\.md/);
+    assert.equal(syRemoteHead(origin), migrated, 'precondition: only this clone has the rollback');
+    const r = syStop(a, 'sess-rollback');
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    assert.equal(syRemoteHead(origin), rb.commit, 'the rollback reached the remote');
+    assert.doesNotMatch(syHealthNotice(a), /rm --cached/, 'no re-track notice');
+  });
+});
+
+test('a re-track without the rollback marker is still withheld, with the repair in the notice', () => {
+  withSyncClones(({ a, origin }) => {
+    syMigrate(a);
+    sgitOk(a, ['push', '-q']);
+    const migrated = syHead(a);
+    syPut(a, 'projects/p/hot.md', SY_W1);
+    sgitOk(a, ['add', '-f', 'projects/p/hot.md']);
+    sgitOk(a, ['commit', '-q', '-m', 'track the view again']);
+    const r = syStop(a, 'sess-retrack');
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    assert.equal(syRemoteHead(origin), migrated, 'nothing pushed');
+    assert.match(syHealthNotice(a), /rm --cached -- 'projects\/p\/hot\.md'/);
   });
 });
