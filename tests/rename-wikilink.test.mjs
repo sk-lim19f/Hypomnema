@@ -1433,3 +1433,80 @@ test('renaming a directory never rewrites a session entry that links into it', (
     assert.equal(readFileSync(entryPath, 'utf-8'), entry, 'entry bytes unchanged');
   });
 });
+
+// The readers key an entry's project by its directory, so a move out of
+// projects/<slug>/sessions/ silently drops the entry from the session history.
+function renameEntryVault(dir) {
+  mkdirSync(join(dir, 'pages'), { recursive: true });
+  mkdirSync(join(dir, 'projects', 'p', 'sessions'), { recursive: true });
+  writeFileSync(join(dir, 'projects', 'p', 'index.md'), '---\ntitle: P\n---\n');
+  const entryPath = join(dir, 'projects', 'p', 'sessions', '2026-10-01-s1-0.md');
+  const entry = entryLinking('foo');
+  writeFileSync(entryPath, entry);
+  return { entryPath, entry };
+}
+
+test('renaming a single session entry is refused and nothing changes on disk', () => {
+  withTmpDir((dir) => {
+    const { entryPath, entry } = renameEntryVault(dir);
+    const r = run('rename.mjs', [
+      `--hypo-dir=${dir}`,
+      '--from=projects/p/sessions/2026-10-01-s1-0',
+      '--to=pages/moved',
+      '--apply',
+      '--json',
+    ]);
+    assert.equal(r.status, 1, `${r.stdout}${r.stderr}`);
+    assert.match(JSON.parse(r.stdout).error, /is a session entry/);
+    assert.equal(readFileSync(entryPath, 'utf-8'), entry, 'entry bytes unchanged');
+    assert.ok(!existsSync(join(dir, 'pages', 'moved.md')), 'nothing was written');
+  });
+});
+
+test('a directory rename that moves entries off the entry path is refused with nothing written', () => {
+  withTmpDir((dir) => {
+    const { entryPath, entry } = renameEntryVault(dir);
+    // Across areas the existing area guard refuses already; the within-area case is the new one.
+    const r = run('rename.mjs', [
+      `--hypo-dir=${dir}`,
+      '--from=projects/p/sessions',
+      '--to=projects/p/old-sessions',
+      '--apply',
+      '--json',
+    ]);
+    assert.equal(r.status, 1, `${r.stdout}${r.stderr}`);
+    assert.match(JSON.parse(r.stdout).error, /no longer a session entry path/);
+    assert.equal(readFileSync(entryPath, 'utf-8'), entry, 'entry bytes unchanged');
+    assert.ok(!existsSync(join(dir, 'projects', 'p', 'old-sessions')), 'nothing was written');
+    const r2 = run('rename.mjs', [
+      `--hypo-dir=${dir}`,
+      '--from=projects/p/sessions',
+      '--to=pages/x',
+      '--apply',
+      '--json',
+    ]);
+    assert.equal(r2.status, 1, `${r2.stdout}${r2.stderr}`);
+    assert.equal(readFileSync(entryPath, 'utf-8'), entry, 'entry bytes unchanged');
+    assert.ok(!existsSync(join(dir, 'pages', 'x')), 'nothing was written');
+  });
+});
+
+test('renaming a whole project directory keeps its entries as entries and resume for the new name shows one', () => {
+  withTmpDir((dir) => {
+    const { entry } = renameEntryVault(dir);
+    const r = run('rename.mjs', [
+      `--hypo-dir=${dir}`,
+      '--from=projects/p',
+      '--to=projects/q',
+      '--apply',
+      '--json',
+    ]);
+    assert.equal(r.status, 0, `${r.stdout}${r.stderr}`);
+    const moved = join(dir, 'projects', 'q', 'sessions', '2026-10-01-s1-0.md');
+    assert.equal(readFileSync(moved, 'utf-8'), entry, 'entry bytes moved intact');
+    assert.ok(!existsSync(join(dir, 'projects', 'p')), 'the old directory is gone');
+    const res = run('resume.mjs', [`--hypo-dir=${dir}`, '--project=q']);
+    assert.equal(res.status, 0, `${res.stdout}${res.stderr}`);
+    assert.ok(res.stdout.includes('see [[foo]]'), `the entry shows for q: ${res.stdout}`);
+  });
+});

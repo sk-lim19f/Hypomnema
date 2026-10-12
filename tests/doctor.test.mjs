@@ -36,7 +36,8 @@ import {
   withTmpHome,
 } from './helpers.mjs';
 import { PROVENANCE_FILENAME, EXPECTED_PKG_NAME } from '../scripts/lib/pkg-provenance.mjs';
-import { buildBaselineEntry, GITIGNORE_BLOCK } from '../hooks/session-entries.mjs';
+import { buildBaselineEntry, GITIGNORE_BLOCK, renderViews } from '../hooks/session-entries.mjs';
+import { loadSessionModel } from '../hooks/session-views.mjs';
 import {
   RECEIPT_SCHEMA_VERSION,
   CERT_CHECKPOINT,
@@ -4250,6 +4251,68 @@ test('doctor-session-entries: only a project whose entry scope is an empty "mach
     assert.ok(c, 'the hidden-project check ran');
     assert.equal(c.status, 'warn', c.detail);
     assert.deepEqual(c.detail.split(':')[0].split(', ').sort(), ['a', 'c'], c.detail);
+  });
+});
+
+test('doctor-session-entries: the hidden-scope remedy names entry_scope and following it makes the next run quiet', () => {
+  withTmpDir((dir) => {
+    seVault(dir);
+    seWrite(dir, 'projects/c/index.md', '---\ntitle: T\nvisibility_scope: shared\n---\n');
+    const built = buildBaselineEntry({
+      kind: 'state',
+      text: '## Next Up\nold state\n',
+      date: '2026-09-25',
+      visibilityScope: 'machine:',
+      project: 'c',
+      legacyDone: false,
+    });
+    seWrite(dir, `projects/c/sessions/${built.fileName}`, built.text);
+    const c = seCheck(seDoctor(dir), 'Session projects hidden by scope');
+    assert.equal(c.status, 'warn', c.detail);
+    assert.match(
+      c.detail,
+      /Set entry_scope in projects\/<name>\/index\.md to shared or machine:<device>/,
+    );
+    assert.match(c.detail, /shows entries that were limited to one machine/);
+    // The old advice (the index's visibility_scope: shared) is already in place and changes nothing.
+    seWrite(
+      dir,
+      'projects/c/index.md',
+      '---\ntitle: T\nvisibility_scope: shared\nentry_scope: shared\n---\n',
+    );
+    assert.equal(
+      seCheck(seDoctor(dir), 'Session projects hidden by scope'),
+      undefined,
+      'entry_scope: shared unhides the project',
+    );
+  });
+});
+
+test('doctor-session-entries: a view equal to a fresh render is no close artifact even when the ownership record lacks it', () => {
+  withTmpDir((dir) => {
+    seVault(dir);
+    const built = buildBaselineEntry({
+      kind: 'state',
+      text: `> **${'2026-10-11'} 마감(1번째 세션).** 옛 상태.\n`,
+      date: '2026-10-11',
+      visibilityScope: 'shared',
+      project: 'p',
+      legacyDone: false,
+    });
+    seWrite(dir, `projects/p/sessions/${built.fileName}`, built.text);
+    const rendered = renderViews([loadSessionModel(dir, 'p')], {
+      device: 'any',
+      only: ['p'],
+    }).projects.p.sessionState;
+    assert.match(rendered, /마감/, 'the fixture view carries a close heading');
+    seWrite(dir, 'projects/p/session-state.md', rendered);
+    assert.ok(!existsSync(join(dir, '.cache', 'generated-views.json')), 'no ownership record');
+    const quiet = seCheck(seDoctor(dir), 'Session-close artifacts');
+    assert.equal(quiet.status, 'pass', quiet.detail);
+    // The same file with one hand-added line is not the generator's bytes: it is scanned again.
+    seWrite(dir, 'projects/p/session-state.md', `${rendered}\nhand note\n`);
+    const loud = seCheck(seDoctor(dir), 'Session-close artifacts');
+    assert.equal(loud.status, 'warn', loud.detail);
   });
 });
 

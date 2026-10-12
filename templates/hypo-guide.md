@@ -60,8 +60,8 @@ Over time, new sources *update* pages more than they *create* them — that's wh
 ### Session Start
 
 1. Read root `hot.md` → identify active project
-2. If `cwd` matches `projects/<name>/index.md`'s `working_dir:` field → read `projects/<name>/session-state.md` first
-3. Read `projects/<name>/hot.md` for background context
+2. If `cwd` matches `projects/<name>/index.md`'s `working_dir:` field → run `/hypo:resume` for that project. It reads the session entries and renders `session-state.md` and `hot.md` from them (resume cost grows with the entry count; it is not a read of two files). Do not read `projects/<name>/session-state.md` directly: before the move to session entries the flat file on disk can lag newer closes that `/hypo:resume` includes
+3. Use the `hot.md` that `/hypo:resume` renders for background context
 4. **Your first response must lead with the resume**: a one-line summary of last session + the concrete next task(s) from `session-state.md`, then "Continuing [X] — shall we pick up?". Do not wait for the user to ask; this is mandatory whenever a project matched (not a soft offer).
 
 ### Session Close

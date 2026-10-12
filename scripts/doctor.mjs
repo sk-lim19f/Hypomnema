@@ -49,6 +49,7 @@ import {
   sessionLogReadCandidates,
   datedEntryPaths,
   readGeneratedViewsRecord,
+  currentDevice,
   VIEW_BACKUP_DIR_REL,
 } from '../hooks/hypo-shared.mjs';
 import {
@@ -56,8 +57,9 @@ import {
   parseSessionEntry,
   isGeneratedViewPath,
   isSessionEntryPath,
+  renderViews,
 } from '../hooks/session-entries.mjs';
-import { projectEntryScope } from '../hooks/session-views.mjs';
+import { loadSessionModel, projectEntryScope } from '../hooks/session-views.mjs';
 import { classifyProposals } from './proposal.mjs';
 import { listProposalsChecked, orphanTmpTargetName } from '../hooks/proposal-store.mjs';
 import {
@@ -1121,6 +1123,28 @@ function checkSessionCloseArtifacts(hypoDir) {
   const artifacts = [];
   const ownedViews = readGeneratedViewsRecord(hypoDir).views;
 
+  // The text the generator would write at a project view path now, or null.
+  // Only a migrated vault has generated views; before that the file is the hand-kept original.
+  const migrated = migrationState(hypoDir) === 'migrated';
+  const freshCache = new Map();
+  const freshProjectView = (rel) => {
+    const m = /^projects\/([^/]+)\/(hot|session-state)\.md$/.exec(rel);
+    if (!m || !migrated) return null;
+    const slug = m[1];
+    if (!freshCache.has(slug)) {
+      try {
+        const rendered = renderViews([loadSessionModel(hypoDir, slug)], {
+          device: currentDevice(),
+          only: [slug],
+        }).projects[slug];
+        freshCache.set(slug, { hot: rendered.hot, 'session-state': rendered.sessionState });
+      } catch {
+        freshCache.set(slug, null);
+      }
+    }
+    return freshCache.get(slug)?.[m[2]] ?? null;
+  };
+
   const scanFile = (path, scope) => {
     if (!existsSync(path)) return;
     let content;
@@ -1134,6 +1158,9 @@ function checkSessionCloseArtifacts(hypoDir) {
     // in the same file has other bytes and is still scanned.
     const rel = relative(hypoDir, path).split(sep).join('/');
     if (isGeneratedViewPath(rel) && ownedViews[rel] === sha256(content)) return;
+    // The ownership record can lack a view that is genuine (a record lost with .cache/): the same
+    // bytes a fresh render of this project would write are still no evidence of a hand-made close.
+    if (freshProjectView(rel) === content) return;
     const result = detectSessionCloseArtifact({ path, content });
     if (result.matched) {
       artifacts.push({ date: result.date, scope, where: relative(hypoDir, path) });
@@ -1505,7 +1532,7 @@ function checkSessionEntries(hypoDir) {
   if (hidden.length > 0) {
     warn(
       'Session projects hidden by scope',
-      `${hidden.join(', ')}: visibility scope is an empty "machine:", so no machine shows ${hidden.length === 1 ? 'it' : 'them'}. Set visibility_scope in projects/<name>/index.md to shared or machine:<device>`,
+      `${hidden.join(', ')}: visibility scope is an empty "machine:", so no machine shows ${hidden.length === 1 ? 'it' : 'them'}. Set entry_scope in projects/<name>/index.md to shared or machine:<device> (an entry_scope wins over visibility_scope and the old session-state.md scope). Choosing shared shows entries that were limited to one machine`,
     );
   }
 
