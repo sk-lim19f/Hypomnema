@@ -490,9 +490,15 @@ test('crash bracketing the single-file renameSync converges, two paths never coe
   }
 });
 
-// The not-NFC refusals and the migration notice tell a person to run two renames. Run them as
-// written: a command the advice prints but rename refuses leaves the person with no way out.
-test('the two renames the not-NFC advice prints move a decomposed project directory to its NFC name', () => {
+// The not-NFC refusals and the migration notice tell a person to run one rename. Run it as written:
+// a command the advice prints but rename refuses leaves the person with no way out.
+const runAdvised = (wiki, command, extra = []) => {
+  const args = [...command.matchAll(/--(from|to)="([^"]+)"/g)].map(([, k, v]) => `--${k}=${v}`);
+  assert.equal(args.length, 2, command);
+  return run('rename.mjs', [`--hypo-dir=${wiki}`, ...args, ...extra, '--json']);
+};
+
+test('the one rename the not-NFC advice prints moves a decomposed project directory to its NFC name', () => {
   // `프로젝트.md` is the case a bare path breaks: rename strips a trailing `.md` before it resolves.
   for (const name of ['프로젝트', '프로젝트.md']) {
     const nfd = name.normalize('NFD');
@@ -501,14 +507,13 @@ test('the two renames the not-NFC advice prints move a decomposed project direct
       const wiki = join(base, 'wiki');
       mkdirSync(join(wiki, 'projects', nfd), { recursive: true });
       writeFileSync(join(wiki, 'projects', nfd, 'index.md'), '---\ntitle: p\n---\nbody\n');
-      for (const command of nfcRenameCommands(nfd)) {
-        const args = [...command.matchAll(/--(from|to)="([^"]+)"/g)].map(
-          ([, k, v]) => `--${k}=${v}`,
-        );
-        assert.equal(args.length, 2, command);
-        const r = run('rename.mjs', [`--hypo-dir=${wiki}`, ...args, '--apply', '--json']);
-        assert.equal(r.status, 0, `${command}: ${r.stdout}${r.stderr}`);
-      }
+      const commands = nfcRenameCommands(nfd);
+      assert.equal(commands.length, 1, 'one command, not a pair through a temporary name');
+      const r = runAdvised(wiki, commands[0], ['--apply']);
+      assert.equal(r.status, 0, `${commands[0]}: ${r.stdout}${r.stderr}`);
+      const out = JSON.parse(r.stdout);
+      assert.equal(out.ok, true);
+      assert.equal(out.moved, true);
       assert.deepEqual(readdirSync(join(wiki, 'projects')), [nfc]);
       assert.equal(
         readFileSync(join(wiki, 'projects', nfc, 'index.md'), 'utf-8'),
@@ -516,6 +521,74 @@ test('the two renames the not-NFC advice prints move a decomposed project direct
       );
     });
   }
+});
+
+// A project that already has entries could never be respelled (rename refused any project with
+// entries), so the close refusal looped. The entries name the NFC project, so the respelling keeps
+// them correct; an entry that names another project stops it.
+const decomposedEntryVault = (wiki, entryProject) => {
+  const nfd = '프로젝트'.normalize('NFD');
+  const sessions = join(wiki, 'projects', nfd, 'sessions');
+  mkdirSync(sessions, { recursive: true });
+  writeFileSync(join(wiki, 'projects', nfd, 'index.md'), '---\ntitle: P\n---\n');
+  const entry = formatSessionEntry({
+    project: entryProject,
+    closeId: 's1-0',
+    date: '2026-10-01',
+    tracks: [{ id: 'main', new: true }],
+    summary: 'done\n',
+    bodies: { main: 'body' },
+  });
+  const entryPath = join(sessions, '2026-10-01-s1-0.md');
+  writeFileSync(entryPath, entry);
+  return { nfd, entry, entryRel: join('sessions', '2026-10-01-s1-0.md') };
+};
+
+test('the advised NFC rename moves a decomposed project directory that has entries naming the NFC project', () => {
+  withTmpDir((base) => {
+    const wiki = join(base, 'wiki');
+    const nfc = '프로젝트'.normalize('NFC');
+    const { nfd, entry, entryRel } = decomposedEntryVault(wiki, nfc);
+    const r = runAdvised(wiki, nfcRenameCommands(nfd)[0], ['--apply']);
+    assert.equal(r.status, 0, `${r.stdout}${r.stderr}`);
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.ok, true, r.stdout);
+    assert.equal(out.moved, true);
+    assert.deepEqual(readdirSync(join(wiki, 'projects')), [nfc]);
+    assert.equal(readFileSync(join(wiki, 'projects', nfc, entryRel), 'utf-8'), entry);
+  });
+});
+
+test('an NFC respelling whose entries name a different project is refused and the directory stays', () => {
+  withTmpDir((base) => {
+    const wiki = join(base, 'wiki');
+    const { nfd, entry, entryRel } = decomposedEntryVault(wiki, 'other');
+    const r = runAdvised(wiki, nfcRenameCommands(nfd)[0], ['--apply']);
+    assert.equal(r.status, 1, `${r.stdout}${r.stderr}`);
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.ok, false);
+    assert.match(out.error, /does not name project/);
+    assert.deepEqual(readdirSync(join(wiki, 'projects')), [nfd]);
+    assert.equal(readFileSync(join(wiki, 'projects', nfd, entryRel), 'utf-8'), entry);
+  });
+});
+
+test('a move to a different name still refuses a decomposed project that has entries (only the NFC respelling is allowed)', () => {
+  withTmpDir((base) => {
+    const wiki = join(base, 'wiki');
+    const { nfd, entryRel } = decomposedEntryVault(wiki, '프로젝트'.normalize('NFC'));
+    const r = run('rename.mjs', [
+      `--hypo-dir=${wiki}`,
+      `--from=projects/${nfd}/`,
+      '--to=projects/renamed/',
+      '--apply',
+      '--json',
+    ]);
+    assert.equal(r.status, 1, `${r.stdout}${r.stderr}`);
+    assert.match(JSON.parse(r.stdout).error, /has session entries/);
+    assert.ok(existsSync(join(wiki, 'projects', nfd, entryRel)));
+    assert.ok(!existsSync(join(wiki, 'projects', 'renamed')));
+  });
 });
 
 // The invalid-name advice has the same shape (`--from="projects/<x>/" --to="projects/<y>/"`); the

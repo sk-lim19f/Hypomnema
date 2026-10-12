@@ -1338,15 +1338,14 @@ export function nonNfcProjectDir(hypoDir, slug) {
   return hit !== null && projectNameProblem(hit) === 'not-nfc' ? hit : null;
 }
 
-// The refusal text for a non-NFC project directory, with the commands that fix it. APFS treats the
-// NFC and NFD spellings as one name, so a direct rename is refused as "already exists": the move
-// goes through a temporary name.
+// The refusal text for a non-NFC project directory, with the command that fixes it. APFS treats the
+// NFC and NFD spellings as one name, and rename respells the directory in one move.
 export function nonNfcProjectMessage(onDisk) {
-  const [first, second] = nfcRenameCommands(onDisk);
+  const [command] = nfcRenameCommands(onDisk);
   return (
     `projects/${onDisk} is spelled in decomposed (NFD) Unicode, and git reports project paths ` +
     `precomposed (NFC), so the close cannot match its files. Rename projects/${onDisk} to its NFC ` +
-    `spelling first: ${first}, then ${second}`
+    `spelling first: ${command}`
   );
 }
 
