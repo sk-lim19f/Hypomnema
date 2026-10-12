@@ -6459,10 +6459,10 @@ test('project-create backs up a hand-written project view and gives the shared r
     );
     assert.equal(readFileSync(backup, 'utf-8'), 'my own notes\n');
     const sentence = rootHotBackupRecoveryNotice('projects/new/hot.md', backup);
-    const head = '생성 파일 projects/new/hot.md에 ';
+    const head = '생성 파일 `projects/new/hot.md`에 ';
     assert.ok(sentence.startsWith(head), sentence);
     assert.ok(r.warnings[0]?.startsWith(head), JSON.stringify(r.warnings));
-    assert.ok(sentence.includes('notes.md'), sentence);
+    assert.ok(sentence.includes('`projects/new/notes.md`'), sentence);
     assert.ok(!sentence.includes('루트'), 'not the root hot.md wording');
     assert.deepEqual(r.warnings, [sentence]);
     assert.equal(consumeRootHotHealthNotice(dir), sentence, 'the generator says the same words');

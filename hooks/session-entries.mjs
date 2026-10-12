@@ -45,6 +45,17 @@ export function isValidProjectName(name) {
     /[\p{L}\p{N}]/u.test(name)
   );
 }
+
+/**
+ * Why a project directory name cannot be used, or `null` when it can. `'invalid'` when
+ * `isValidProjectName` rejects it, `'not-nfc'` when it is valid but not in NFC: git on macOS reports
+ * precomposed paths, so a decomposed directory name never matches the paths git prints.
+ */
+export function projectNameProblem(name) {
+  if (!isValidProjectName(name)) return 'invalid';
+  if (name !== name.normalize('NFC')) return 'not-nfc';
+  return null;
+}
 // `scalar` and the parser take anything with `.test`, so the project rule slots in beside the regexes.
 const PROJECT_RE = { test: isValidProjectName };
 const BASELINE_TITLE = '이행 전 기록';
