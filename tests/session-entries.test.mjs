@@ -3966,6 +3966,38 @@ test('(g) a session-state.md with a section per track becomes one split baseline
   });
 });
 
+test('(g) a committed split baseline does not swallow a copy whose remainder matches but one track body differs', () => {
+  withCatchUp(({ b }) => {
+    put(b, 'projects/p/session-state.md', MULTI_STATE);
+    const pre = catchUpAndMerge(b);
+    const first = shareLegacyBytes(b, pre.archived);
+    assert.equal(first.created.length, 1);
+    assert.ok(
+      cgitOk(b, ['ls-tree', '--name-only', 'HEAD', first.created[0]]).trim(),
+      'precondition: the split baseline is committed',
+    );
+    const edited = MULTI_STATE.replace('FLOW_BODY', 'FLOW_BODY edited on this machine');
+    assert.notEqual(edited, MULTI_STATE, 'precondition: one track body differs');
+    const backup = join(b, 'held-state.txt');
+    writeFileSync(backup, edited);
+    const held = [
+      {
+        relPath: 'projects/p/session-state.md',
+        kind: 'worktree',
+        backupPath: backup,
+        sha256: sha(edited),
+      },
+    ];
+    const shared = shareLegacyBytes(b, held);
+    assert.equal(shared.created.length, 1, JSON.stringify(shared));
+    const made = parseSessionEntry(readRel(b, shared.created[0])).entry;
+    assert.ok(
+      Object.values(made.bodies).some((body) => body.includes('FLOW_BODY edited on this machine')),
+      'the edited track reaches a baseline',
+    );
+  });
+});
+
 test('(g) only the file this machine set aside becomes a baseline: a stale companion in the other file makes none', () => {
   withCatchUp(({ b, remote }) => {
     // a revision whose session-state.md is not any baseline: what the companion read finds
