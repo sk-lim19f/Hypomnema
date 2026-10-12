@@ -21,7 +21,11 @@
 import { existsSync, readFileSync, writeFileSync, readdirSync, statSync } from 'fs';
 import { join, extname, basename } from 'path';
 import { resolveHypoRootInfo, checkVaultOrExit, expandHome } from './lib/hypo-root.mjs';
-import { SESSION_STATE_NEXT_HEADINGS, closeFileTargetsGlobal } from '../hooks/hypo-shared.mjs';
+import {
+  SESSION_STATE_NEXT_HEADINGS,
+  closeFileTargetsGlobal,
+  migrationState,
+} from '../hooks/hypo-shared.mjs';
 import { loadHypoIgnore, isScanIgnored } from './lib/hypo-ignore.mjs';
 import {
   parseSchemaVocab,
@@ -40,7 +44,7 @@ import {
 } from './lib/frontmatter.mjs';
 import { buildSlugMap } from './lib/slug-resolver.mjs';
 import { parseStrictDate } from './lib/time.mjs';
-import { isSessionEntryPath, parseSessionEntry } from '../hooks/session-entries.mjs';
+import { isBaselineId, isSessionEntryPath, parseSessionEntry } from '../hooks/session-entries.mjs';
 
 // ── arg parsing ──────────────────────────────────────────────────────────────
 
@@ -727,7 +731,10 @@ for (const page of pages) lintPage(page, slugMap, tagVocab, pageDirs, validTypes
 
 // W20: a `supersedes` id that names no entry of the same project. The reader ignores such an
 // id (it only matches an exact close id), so the track it was meant to replace stays a head.
+// A baseline id is the exception while the vault has not moved to session entries: the reader
+// builds that baseline virtually from the old flat files, so no entry file carries the id yet.
 {
+  let notMigrated; // asked at most once, and only when a baseline id is actually missing
   const idsByProject = new Map();
   for (const e of sessionEntries) {
     if (!idsByProject.has(e.project)) idsByProject.set(e.project, new Set());
@@ -736,6 +743,10 @@ for (const page of pages) lintPage(page, slugMap, tagVocab, pageDirs, validTypes
   for (const e of sessionEntries) {
     for (const id of e.supersedes) {
       if (!idsByProject.get(e.project).has(id)) {
+        if (isBaselineId(id)) {
+          notMigrated ??= migrationState(args.hypoDir) !== 'migrated';
+          if (notMigrated) continue;
+        }
         issue(
           'warn',
           e.rel,

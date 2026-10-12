@@ -49,7 +49,8 @@
  * before anything else runs.
  */
 
-import { relative } from 'path';
+import { realpathSync } from 'fs';
+import { basename, dirname, isAbsolute, join, relative, sep } from 'path';
 import { HYPO_DIR, isGateSkipped } from './hypo-shared.mjs';
 import { isGeneratedViewPath, isSessionEntryPath } from './session-entries.mjs';
 
@@ -59,6 +60,30 @@ const WRITE_TOOLS = new Set(['Write', 'Edit', 'MultiEdit']);
 const GENERATED_DENY =
   '생성 파일입니다. close payload의 summary/tracks로 기록하세요 (직접 쓰면 다음 close가 덮어씁니다).';
 const ENTRY_DENY = '원본 항목은 close apply만 만들고 고치지 않습니다.';
+
+// The vault-relative spellings of `filePath` that are inside `root`: the path as given and, when
+// the files exist, their real paths (a symlinked vault written through its real path). A string
+// prefix test is not used: a trailing separator on HYPO_DIR or a symlink would switch it off.
+function insideRelatives(root, filePath) {
+  const real = (p) => {
+    try {
+      return realpathSync(p);
+    } catch {
+      return null;
+    }
+  };
+  const pairs = [[root, filePath]];
+  const realRoot = real(root);
+  // A file that does not exist yet (a create) is resolved through its parent directory.
+  const realParent = real(dirname(filePath));
+  const realFile =
+    real(filePath) ?? (realParent === null ? null : join(realParent, basename(filePath)));
+  if (realRoot !== null && realFile !== null) pairs.push([realRoot, realFile]);
+  return pairs
+    .map(([r, f]) => relative(r, f))
+    .filter((rel) => rel !== '' && rel.split(sep)[0] !== '..' && !isAbsolute(rel))
+    .map((rel) => rel.replace(/\\/g, '/'));
+}
 
 let input = {};
 try {
@@ -81,17 +106,23 @@ try {
   }
 
   const filePath = input.tool_input?.file_path ?? '';
-  if (!filePath || !(filePath === HYPO_DIR || filePath.startsWith(HYPO_DIR + '/'))) {
-    process.exit(0);
-  }
+  if (!filePath || !isAbsolute(filePath)) process.exit(0);
 
-  const rel = relative(HYPO_DIR, filePath).replace(/\\/g, '/');
-  const folded = rel.toLowerCase();
-  const reason = [rel, folded].some(isGeneratedViewPath)
-    ? GENERATED_DENY
-    : [rel, folded].some(isSessionEntryPath)
-      ? ENTRY_DENY
-      : null;
+  const root = HYPO_DIR.replace(/[\\/]+$/, '') || HYPO_DIR;
+  let rel = null;
+  let reason = null;
+  for (const candidate of insideRelatives(root, filePath)) {
+    const spellings = [candidate, candidate.toLowerCase()];
+    reason = spellings.some(isGeneratedViewPath)
+      ? GENERATED_DENY
+      : spellings.some(isSessionEntryPath)
+        ? ENTRY_DENY
+        : null;
+    if (reason !== null) {
+      rel = candidate;
+      break;
+    }
+  }
   if (reason === null) process.exit(0);
 
   console.log(

@@ -258,7 +258,7 @@ Hypomnema는 청크가 아니라 페이지를 지식 단위로 봅니다. 새 �
 
 | 훅 | 이벤트 | 역할 |
 |---|---|---|
-| `hypo-close-guard.mjs` | `PreToolUse` | Write/Edit/MultiEdit가 세션 마무리 쓰기로 보이는데 트랜스크립트에 사용자의 마무리 신호가 없으면, 파일이 바뀌기 전에 확인을 받음 |
+| `hypo-close-guard.mjs` | `PreToolUse` | 생성되는 세션 뷰(루트 `hot.md`, 프로젝트의 `hot.md`와 `session-state.md`)나 세션 항목(`projects/<p>/sessions/*.md`)에 대한 직접 Write/Edit/MultiEdit를 거부함 |
 | `hypo-session-start.mjs` | `SessionStart` | `git pull --ff-only`, `projects/*/sessions/`에서 세션 현황 파일(루트 `hot.md`, 프로젝트별 `hot.md`와 `session-state.md`) 재생성, 그 파일들 주입 |
 | `hypo-first-prompt.mjs` | `UserPromptSubmit` | 마커 기반으로 첫 프롬프트에 재개 한 줄을 요구한다(10분 TTL). `hot.md`를 다시 읽지는 않는다 |
 | `hypo-lookup.mjs` | `UserPromptSubmit` | BM25 top-3 HIT 주입 / MISS면 가까운 슬러그 신호 |

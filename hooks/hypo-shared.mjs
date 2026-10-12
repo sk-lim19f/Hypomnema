@@ -5461,8 +5461,8 @@ function mergeIncomingTouchedPaths(hypoDir, sessionId, incoming, hashFor) {
  * touched-paths set live: `{ "<vault-relative path>": "<sha256 hex>" | null }`,
  * `null` meaning the file did not exist when it was recorded. A separate file
  * rather than a new shape for touched-paths.json, so every reader of that
- * array (hypo-close-guard.mjs parses it itself) keeps working unchanged, and a
- * set written before hashes existed simply has no entry here.
+ * array keeps working unchanged, and a set written before hashes existed
+ * simply has no entry here.
  *
  * What the hash is for: the set records that this session wrote a path, not
  * which bytes. When a clear after a successful commit fails, the stale claim

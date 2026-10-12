@@ -10,7 +10,7 @@
  */
 
 import { readFileSync, existsSync, readdirSync, statSync } from 'fs';
-import { join, basename, sep } from 'path';
+import { join, basename, relative, sep } from 'path';
 import {
   HYPO_DIR,
   buildOutput,
@@ -49,10 +49,8 @@ function buildPageMap(dir, root = dir, map = {}, ignorePatterns = [], hypoDir = 
       buildPageMap(full, root, map, ignorePatterns, hypoDir);
     } else if (entry.endsWith('.md')) {
       // Session entries are source records of the generated views, not pages: never a lookup hit.
-      const fromVault = full
-        .slice(hypoDir.length + 1)
-        .split(sep)
-        .join('/');
+      // relative(), not a slice by length: HYPO_DIR may end in a separator, `full` never does.
+      const fromVault = relative(hypoDir, full).split(sep).join('/');
       if (isSessionEntryPath(fromVault)) continue;
       const rel = full.slice(root.length + 1).replace(/\.md$/, '');
       map[rel] = full;

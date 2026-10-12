@@ -18,7 +18,7 @@ All 12 hooks registered in `hooks/hooks.json` are listed below, in registration 
 
 | Hook | Event | Purpose |
 |------|-------|---------|
-| `hypo-close-guard.mjs` | `PreToolUse` | Blocks a direct Write/Edit/MultiEdit bypass of the session-close approval flow |
+| `hypo-close-guard.mjs` | `PreToolUse` | Denies a direct Write/Edit/MultiEdit to a generated session view (root `hot.md`, a project's `hot.md` or `session-state.md`) or to a session entry (`projects/<p>/sessions/*.md`) |
 | `hypo-session-start.mjs` | `SessionStart` | Rebuilds the generated session views (root `hot.md`, and each project's `hot.md` and `session-state.md`, built from `projects/*/sessions/`), then injects them into context on session start. A vault with a git remote that has not moved to session entries yet is not rewritten: it gets a notice to run `/hypo:upgrade --migrate-sessions` |
 | `hypo-session-end.mjs` | `SessionEnd` | Records the dying session's identity so a `/clear` can be detected and recovered from on the next start |
 | `hypo-first-prompt.mjs` | `UserPromptSubmit` | Injects a one-line resume summary on the first prompt after a session start or cwd change |

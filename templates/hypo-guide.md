@@ -167,7 +167,9 @@ Two sessions that close at the same time no longer overwrite each other: each wr
 
 **A machine that skipped the upgrade.** After it pulls the move, the three files disappear from its working tree and its session start has nothing to inject. Its closes write files that git ignores, so they are never recorded and the close receipt fails. It cannot read `sessions/`. An unpushed change there that edits `hot.md` or `session-state.md` stops that machine's sync. Upgrade it, then run `/hypo:doctor` to see what is left.
 
-**Rolling back.** `node ${CLAUDE_PLUGIN_ROOT}/scripts/session-entries.mjs rollback --at=<commit>` writes flat `hot.md` and `session-state.md` files rendered from the entries as they were at that commit, tracks them again, and adds the marker `.hypo-session-entries-off`, all in one new commit. Nothing under `sessions/` is deleted. Entries added after that commit are not in the flat files, and old-version machines still cannot read `sessions/`. While the marker is there no hook moves the vault again, and the same text may show up both in an entry and in a flat file. To turn the entries back on, run `/hypo:upgrade --migrate-sessions`.
+**Rolling back.** `node ${CLAUDE_PLUGIN_ROOT}/scripts/session-entries.mjs rollback --at=<commit>` writes flat `hot.md` and `session-state.md` files rendered from the entries as they were at that commit, tracks them again, and adds the marker `.hypo-session-entries-off`, all in one new commit. Nothing under `sessions/` is deleted. Entries added after that commit are not in the flat files, and old-version machines still cannot read `sessions/`. While the marker is there no hook moves the vault again, and the same text may show up both in an entry and in a flat file.
+
+To turn the entries back on, run `/hypo:upgrade --migrate-sessions`.
 
 ### Ingest (external source → wiki)
 
