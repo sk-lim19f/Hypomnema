@@ -2274,6 +2274,17 @@ export function clearGeneratedPathsBlockingPull(hypoDir, targetRev, opts = {}) {
   }
 }
 
+// The generated view paths that exist as files in the working tree: the root `hot.md` and the two
+// views of every session project. Tracked or not; the caller judges.
+function generatedViewPathsOnDisk(hypoDir) {
+  return [
+    'hot.md',
+    ...listSessionProjects(hypoDir).flatMap((slug) =>
+      ['hot.md', 'session-state.md'].map((n) => `projects/${slug}/${n}`),
+    ),
+  ].filter((rel) => isGeneratedViewPath(rel) && statIs(join(hypoDir, rel), 'file'));
+}
+
 // Thrown by `clearBlockingPaths` (carrying its stop result) at the first write under `.cache/` when
 // no ignore rule covers it, so a vault with nothing to set aside never meets the check.
 const CACHE_NOT_IGNORED = 'cache-not-ignored';
@@ -2491,10 +2502,22 @@ function clearBlockingPaths(hypoDir, targetRev, opts) {
   // 6b. A path `target` adds as tracked, held here as an untracked file: git overwrites it without a
   // word (rollback commits do this to every view), so it is moved out below. Its bytes are backed up
   // now, with everything else, so the record written next knows them before anything is removed.
+  // A range that brings the off marker is a rollback: its commit tracks the flat files of the
+  // projects that existed at its point only. The generated views of any other project (one made
+  // since) stay on disk, untracked and no longer ignored once the block is gone, and a `git add -A`
+  // would publish them. They are cleared with the rest: dropped when they hold what this machine's
+  // generator wrote, backed up first otherwise. A path a person staged is left alone.
   const owned = readGeneratedViewsRecord(hypoDir).views;
+  const rollsBack = incoming.some((c) => c.status === 'A' && c.path === SESSION_ENTRIES_OFF_MARKER);
+  const added = incoming.filter((c) => c.status === 'A').map((c) => c.path);
+  const sweep = rollsBack
+    ? generatedViewPathsOnDisk(hypoDir).filter(
+        (p) => !added.includes(p) && !hidden(p) && gitShowText(hypoDir, ':0', p) === null,
+      )
+    : [];
   const untracked = [];
-  for (const { status, path } of incoming) {
-    if (status !== 'A' || !isGeneratedViewPath(path) || blocked.includes(path)) continue;
+  for (const path of [...added.filter(isGeneratedViewPath), ...sweep]) {
+    if (blocked.includes(path)) continue;
     if (pathInHead(hypoDir, path)) continue;
     const text = readTextOrNull(join(hypoDir, path));
     if (text === null) continue;
