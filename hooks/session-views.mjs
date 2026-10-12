@@ -1002,10 +1002,18 @@ function suggestedProjectName(slug) {
 
 // One directory's line of the invalid-name notice: why, and the `/hypo:rename` command to a valid name.
 function renameAdvice(slug, problem) {
-  const why =
-    problem === 'not-nfc'
-      ? '이름이 NFC 형태가 아니라(macOS에서 만든 분해형 한글 등) git이 보고하는 경로와 맞지 않습니다'
-      : '이름에 공백이나 기호가 있습니다';
+  if (problem === 'not-nfc') {
+    // macOS file systems treat the NFD and NFC spellings as one name, so a direct rename to the NFC
+    // spelling is refused as existing; go through a temporary name (the same path as
+    // `nonNfcProjectMessage` in hypo-shared).
+    const nfc = slug.normalize('NFC');
+    const tmp = `${nfc}.nfc-tmp`;
+    return (
+      `projects/${slug}: 이름이 NFC 형태가 아니라(macOS에서 만든 분해형 한글 등) git이 보고하는 경로와 맞지 않습니다. ` +
+      `/hypo:rename --from="projects/${slug}" --to="${tmp}" 다음에 /hypo:rename --from="projects/${tmp}" --to="${nfc}" 를 실행하세요.`
+    );
+  }
+  const why = '이름에 공백이나 기호가 있습니다';
   return (
     `projects/${slug}: ${why}. ` +
     `/hypo:rename --from="projects/${slug}" --to="projects/${suggestedProjectName(slug)}" (--to는 예시이고, 쓸 수 있는 글자는 문자, 숫자, ., _, - 입니다).`
