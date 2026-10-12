@@ -4917,7 +4917,7 @@ function unmergedEntries(hypoDir) {
 /**
  * Is the vault repo in the middle of a git operation a person has to finish first?
  * Returns `null` when it is not (or git cannot answer), else `{state, detail}` where `state` is
- * `merge`, `rebase`, `cherry-pick`, `revert` or `unmerged` and `detail` is a plain sentence naming
+ * `merge`, `rebase`, `am`, `cherry-pick`, `revert` or `unmerged` and `detail` is a plain sentence naming
  * what to do. A commit that names paths (`--only`) fails during any of these, so a writer that
  * commits has to refuse before it writes.
  */
@@ -4932,6 +4932,14 @@ export function vaultOperationInProgress(hypoDir) {
     `${what} is unfinished: finish it (${finish}) or abort it (${abort})`;
   if (refExists('MERGE_HEAD')) {
     return { state: 'merge', detail: unfinished('a merge', 'git commit', 'git merge --abort') };
+  }
+  // `git am` keeps its state in `rebase-apply/` too; only its `applying` file tells it from a rebase,
+  // and `git rebase --continue` refuses while an am is in progress.
+  if (gitPathExists('rebase-apply/applying')) {
+    return {
+      state: 'am',
+      detail: unfinished('a git am', 'git am --continue', 'git am --abort'),
+    };
   }
   if (gitPathExists('rebase-merge') || gitPathExists('rebase-apply')) {
     return {

@@ -2525,21 +2525,66 @@ test('apply: payload.project with a control character, empty or whitespace name 
   }
 });
 
-test('apply: a Korean project name passes the name gate, and an NFD spelling finds the NFC directory', () => {
+// Disabling the check: in resolveCloseProject (scripts/lib/crystallize-close-apply.mjs) return
+// `payload.project` instead of the resolved `project`. The NFD payload then writes an entry whose
+// `project:` is the typed NFD spelling.
+test('apply: a Korean project name passes the name gate, and an NFD spelling finds the NFC directory and closes under the NFC name', () => {
   const ko = '인수인계-runbook';
+  const koDir = (dir) => join(dir, 'projects', ko);
   withWiki(null, (dir, today) => {
     const payload = payloadForCleanWiki(dir, today);
     payload.project = ko;
     const missing = JSON.parse(runApply(dir, payload).stdout).error;
     assert.match(missing, /does not exist/, 'valid name, absent directory');
     assert.doesNotMatch(missing, /not a valid project name/);
-
-    mkdirSync(join(dir, 'projects', ko), { recursive: true });
-    payload.project = ko.normalize('NFD');
-    const r = runApply(dir, payload);
-    const err = r.stdout.includes('"error"') ? JSON.parse(r.stdout).error : '';
-    assert.doesNotMatch(err, /does not exist|not a valid project name/, r.stdout + r.stderr);
   });
+  for (const typed of [ko, ko.normalize('NFD')]) {
+    const label = typed === ko ? 'NFC' : 'NFD';
+    withWiki(
+      (dir, today) => {
+        // The clean fixture's three files again, under the Korean project, with the log heading
+        // naming it: the pre-apply check wants the heading to name the project being closed.
+        const from = join(dir, 'projects', 'test-project');
+        mkdirSync(join(koDir(dir), 'session-log'), { recursive: true });
+        for (const f of [
+          'session-state.md',
+          'hot.md',
+          join('session-log', `${today.slice(0, 7)}.md`),
+        ]) {
+          writeFileSync(join(koDir(dir), f), readFileSync(join(from, f), 'utf-8'));
+        }
+      },
+      (dir, today) => {
+        const payload = payloadForCleanWiki(dir, today);
+        payload.project = typed;
+        payload.log.entry = `## [${today}] session | ${ko} — re-applied\n`;
+        const r = runApply(dir, payload);
+        const out = JSON.parse(r.stdout);
+        assert.equal(r.status, 0, `${label}: ${r.stdout}\n${r.stderr}`);
+        assert.equal(out.ok, true, `${label}: ${r.stdout}`);
+        assert.equal(out.project, ko, `${label}: the result names the NFC project`);
+        assert.equal(out.committed, true, `${label}: ${r.stdout}`);
+        const sessions = join(koDir(dir), 'sessions');
+        const files = existsSync(sessions) ? readdirSync(sessions) : [];
+        assert.equal(files.length, 1, `${label}: one entry under the NFC project: ${r.stdout}`);
+        const text = readFileSync(join(sessions, files[0]), 'utf-8');
+        const project = /^project: (.*)$/m.exec(text)?.[1]?.replace(/^"|"$/g, '');
+        assert.equal(project, ko, `${label}: the entry's project field is the NFC name`);
+        const inHead = spawnSync(
+          'git',
+          ['-c', 'core.quotepath=false', 'ls-tree', '-r', '--name-only', 'HEAD', '--', 'projects'],
+          {
+            cwd: dir,
+            encoding: 'utf-8',
+          },
+        );
+        assert.ok(
+          inHead.stdout.normalize('NFC').includes(`projects/${ko}/sessions/${files[0]}`),
+          `${label}: the entry is in HEAD: ${inHead.stdout}`,
+        );
+      },
+    );
+  }
 });
 
 // Disabling the check: in resolveProjectDirName (hooks/hypo-shared.mjs) return `hit` without the

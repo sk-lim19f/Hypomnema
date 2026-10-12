@@ -2397,6 +2397,50 @@ test('a SCHEMA.md pending-tag registration a failed commit left behind is restag
   );
 });
 
+// Disabling the check: in buildCloseResult make the flatMap return `named` instead of
+// `named.length ? named : [rel]`. A path with no display string (the SCHEMA.md registration) is then
+// dropped from the list.
+test('a failed commit lists the SCHEMA.md pending-tag write and the entry in appliedUncommitted', () => {
+  withWiki(
+    (dir) => {
+      writeFileSync(
+        join(dir, 'SCHEMA.md'),
+        '---\ntitle: SCHEMA\ntype: schema\n---\n# Schema\n\n## 4. Tag Vocabulary\n\n' +
+          '**Meta**: `wiki`, `concept`\n\n## 5. Next\n',
+      );
+      mkdirSync(join(dir, 'pages'), { recursive: true });
+      writeFileSync(
+        join(dir, 'pages', 'note.md'),
+        '---\ntitle: N\ntype: concept\nupdated: 2026-06-27\ntags: [brand-new-tag-3]\n---\nbody\n',
+      );
+    },
+    (dir, today) => {
+      const hookPath = join(dir, '.git', 'hooks', 'pre-commit');
+      mkdirSync(dirname(hookPath), { recursive: true });
+      writeFileSync(hookPath, '#!/bin/sh\nexit 1\n');
+      chmodSync(hookPath, 0o755);
+      const sessionId = 's-schema-uncommitted-list';
+      const cleanup = seedCloseTranscript(sessionId);
+      const r = runApply(dir, payloadForCleanWiki(dir, today), { sessionId });
+      cleanup();
+      const out = JSON.parse(r.stdout);
+      assert.equal(out.stage, 'commit-failed', r.stdout);
+      assert.ok(
+        parseSchemaVocab(dir).has('brand-new-tag-3'),
+        'fixture: the tag is registered on disk',
+      );
+      assert.ok(
+        out.appliedUncommitted.includes('SCHEMA.md'),
+        `SCHEMA.md is named: ${JSON.stringify(out.appliedUncommitted)}`,
+      );
+      assert.ok(
+        out.appliedUncommitted.some((a) => a.startsWith('sessionEntry (')),
+        `the entry is named: ${JSON.stringify(out.appliedUncommitted)}`,
+      );
+    },
+  );
+});
+
 // The contrast half: if the dirty SCHEMA.md's bytes no longer match what the
 // failed attempt recorded (someone else edited it in the meantime), the
 // retry must NOT trust it as its own side effect.

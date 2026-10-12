@@ -4758,21 +4758,30 @@ function buildCloseResult({
   hypoDir,
   appliedPaths,
 }) {
-  // The paths this close owns (`appliedPaths`) and still has on disk uncommitted. A write that was
-  // already current on a retry sits in `skipped`, not `applied`, yet is as uncommitted as a fresh
-  // one, so both lists are read. The session-log and log.md appends that were taken back are not
-  // on disk any more, and a path whose bytes HEAD already holds is not uncommitted work.
-  const stillOnDisk = [...applied, ...skipped].filter((line) => {
-    const rel = appliedPaths.find((p) => line.includes(`(${p})`) || line.includes(`(${p},`));
-    if (rel === undefined || withdrawnAppends.includes(rel)) return false;
-    let disk;
-    try {
-      disk = readFileSync(join(hypoDir, rel), 'utf-8');
-    } catch {
-      return false;
-    }
-    return headBlobText(hypoDir, rel) !== disk;
-  });
+  // The paths this close owns (`appliedPaths`) and still has on disk uncommitted. The list is built
+  // from the paths, not from the display strings: a write with no `applied` line (the SCHEMA.md
+  // pending-tag registration) is as uncommitted as one with a line, and is named by its path. A write
+  // that was already current on a retry sits in `skipped`, not `applied`, so both lists are read for
+  // the display string. The session-log and log.md appends that were taken back are not on disk any
+  // more, and a path whose bytes HEAD already holds is not uncommitted work.
+  const lines = [...applied, ...skipped];
+  const linesOf = (rel) =>
+    lines.filter((line) => line.includes(`(${rel})`) || line.includes(`(${rel},`));
+  const stillOnDisk = [...new Set(appliedPaths)]
+    .filter((rel) => {
+      if (withdrawnAppends.includes(rel)) return false;
+      let disk;
+      try {
+        disk = readFileSync(join(hypoDir, rel), 'utf-8');
+      } catch {
+        return false;
+      }
+      return headBlobText(hypoDir, rel) !== disk;
+    })
+    .flatMap((rel) => {
+      const named = linesOf(rel);
+      return named.length ? named : [rel];
+    });
   return {
     ok,
     stage,
@@ -5299,7 +5308,7 @@ export function applySessionClose(args, testHooks = null) {
     // "payload is required" with the same error shape as before.
   }
 
-  // A commit that names paths fails while a merge, rebase, cherry-pick or revert is open or
+  // A commit that names paths fails while a merge, rebase, git am, cherry-pick or revert is open or
   // paths are unmerged, and the close would have written its entry by then. Refuse before
   // the first byte. It runs ahead of the authority check, which invalidates this
   // session's earlier marker and receipt as soon as a new close is authorized.
