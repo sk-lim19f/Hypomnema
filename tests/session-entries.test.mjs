@@ -951,7 +951,7 @@ test('a harness-shaped file (numbered ## tracks, ## 공통 notes, no list line) 
 test('a heading inside an HTML comment is not a track: one line or several', () => {
   const oneLine = NEXT_UP_STATE.replace(
     'ALPHA_BODY\n',
-    'ALPHA_BODY\n<!-- ### x\nstill the comment -->\n<!-- ### y -->\n',
+    'ALPHA_BODY\n<!-- ### x\nstill the comment -->\n<!-- ### y -->\n<!--\n### z\n-->\n',
   );
   const { entry } = splitBaseline(oneLine);
   assert.deepEqual(
