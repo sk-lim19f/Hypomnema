@@ -970,6 +970,103 @@ test('a heading inside an HTML comment is not a track: one line or several', () 
   assert.equal(after.entry.tracks.length, 3);
 });
 
+const trackTitles = (stateText) => splitBaseline(stateText).entry.tracks.map((t) => t.title);
+const ALPHA_BETA = [
+  '이행 전 기록',
+  'Alpha (alpha) · 2026-10-01 · c1',
+  'Beta (beta) · 2026-10-01 · c2',
+];
+
+test('an indented ## notes section or a # Reference section after ### tracks stays out of the last track', () => {
+  for (const [name, heading] of [
+    ['indented ##', '  ## Notes'],
+    ['three-space ##', '   ## Notes'],
+    ['level-one #', '# Reference'],
+    ['indented #', ' # Reference'],
+  ]) {
+    const text = NEXT_UP_STATE.replace('## Notes', heading);
+    const { entry } = splitBaseline(text);
+    assert.deepEqual(
+      entry.tracks.map((t) => t.title),
+      ALPHA_BETA,
+      name,
+    );
+    const beta = entry.tracks[2].id;
+    assert.equal(
+      entry.bodies[beta],
+      'BETA_BODY\n\n',
+      `${name}: the last track ends at the heading`,
+    );
+    assert.ok(
+      entry.bodies.legacy.includes('NOTES_TEXT'),
+      `${name}: the section stays in the remainder`,
+    );
+  }
+  // Four spaces is an indented code block, not a heading: still part of the track.
+  const code = splitBaseline(NEXT_UP_STATE.replace('## Notes', '    ## Notes')).entry;
+  assert.ok(code.bodies[code.tracks[2].id].includes('NOTES_TEXT'));
+});
+
+test('a level-one heading ends the next-up part and is never a track', () => {
+  const text = [
+    '## Next Up',
+    '',
+    'Tracks: alpha, beta',
+    '',
+    '## alpha',
+    'A',
+    '',
+    '# Reference',
+    'REF_TEXT',
+    '',
+    '## beta',
+    'UNDER_REFERENCE',
+    '',
+  ].join('\n');
+  assert.deepEqual(trackTitles(text), ['이행 전 기록'], 'beta sits under # Reference: one head');
+  const two = text.replace('# Reference', '## beta').replace('## beta\nUNDER', '## gamma\nUNDER');
+  assert.deepEqual(trackTitles(two), ['이행 전 기록', 'alpha', 'beta']);
+});
+
+test('a Setext heading after the next-up heading keeps the file one whole head', () => {
+  for (const underline of ['===', '---', '  ----  ']) {
+    const text = NEXT_UP_STATE.replace('## Notes', `Reference\n${underline}`);
+    const { entry } = splitBaseline(text);
+    assert.deepEqual(
+      entry.tracks,
+      [{ id: 'legacy', title: '이행 전 기록', new: true }],
+      `underline ${underline}`,
+    );
+    assert.equal(entry.bodies.legacy, text);
+  }
+  // A dash line after a blank line is a thematic break, and one inside a fence is text.
+  for (const body of ['x\n\n---', '```\nx\n---\n```']) {
+    assert.deepEqual(trackTitles(NEXT_UP_STATE.replace('NOTES_TEXT', body)), ALPHA_BETA);
+  }
+});
+
+test('a track list line in a code fence or an HTML comment does not split, the same line outside does', () => {
+  const sections = ['## alpha', 'A', '', '## beta', 'B', ''];
+  const doc = (preamble) => ['## Next Up', '', ...preamble, '', ...sections].join('\n');
+  const line = 'Tracks: alpha, beta';
+  const whole = [{ id: 'legacy', title: '이행 전 기록', new: true }];
+  for (const [name, preamble] of Object.entries({
+    fenced: ['```', line, '```'],
+    tilde: ['~~~', line, '~~~'],
+    comment: [`<!--`, line, `-->`],
+    oneLine: [`<!-- x`, `-->`, `<!--`, line, '-->'],
+  })) {
+    assert.deepEqual(splitBaseline(doc(preamble)).entry.tracks, whole, name);
+  }
+  assert.deepEqual(trackTitles(doc([line])), ['이행 전 기록', 'alpha', 'beta']);
+  // A fenced line does not hide a real one after it.
+  assert.deepEqual(trackTitles(doc(['```', 'Tracks: nope', '```', line])), [
+    '이행 전 기록',
+    'alpha',
+    'beta',
+  ]);
+});
+
 test('a newer close that replaces one split track leaves the other tracks in the injection', () => {
   const { entry: base } = splitBaseline(MULTI_STATE);
   const flow = base.tracks.find((t) => t.title === 'flow');
