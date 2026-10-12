@@ -3820,6 +3820,29 @@ test('an entry without title is a lint error', () => {
   );
 });
 
+test('an entry file with no frontmatter at all is a lint error, not only the generic W1 warning', () => {
+  const { r, out } = lintEntries({ '2026-10-01-s1-0.md': 'just some plain text\n' });
+  assert.equal(r.status, 1, r.stdout);
+  assert.ok(
+    entryIssues(out, 'errors').some((i) => i.message.startsWith('Session entry does not parse')),
+    JSON.stringify(out.errors),
+  );
+  assert.ok(
+    entryIssues(out, 'warns').some((i) => i.message === 'No frontmatter found'),
+    'W1 still reported',
+  );
+});
+
+test('plain text with no frontmatter outside a session entry path stays a W1 warning only', () => {
+  const { r, out } = lintEntries({}, { extra: { 'pages/plain.md': 'just some plain text\n' } });
+  assert.ok(
+    out.warns.some((w) => w.file === 'pages/plain.md'),
+    JSON.stringify(out.warns),
+  );
+  assert.ok(!out.errors.some((e) => e.file === 'pages/plain.md'), JSON.stringify(out.errors));
+  assert.equal(r.status, 0, r.stdout);
+});
+
 test('an entry without close_id or tracks names each missing field', () => {
   const text = entryText()
     .replace(/^close_id: .*\n/m, '')

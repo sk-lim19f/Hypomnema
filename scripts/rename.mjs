@@ -498,6 +498,20 @@ function runDirectory(args, fromDirRel, ignorePatterns) {
   if (movedByRel.size === 0) {
     fail(args, `--from '${fromDirRel}' contains no wiki pages to rename`);
   }
+  // A session entry stays an entry only at projects/<slug>/sessions/<file>.md. The readers key an
+  // entry's project by that directory, so a move that leaves the pattern drops the entry out of the
+  // session history without any error. Moving a whole project directory keeps the pattern.
+  const strandedEntry = [...movedByRel.values()].find(
+    ({ fromPage, toPage }) => isSessionEntryPath(fromPage.rel) && !isSessionEntryPath(toPage.rel),
+  );
+  if (strandedEntry) {
+    fail(
+      args,
+      `--to '${toDirRel}' would move session entry '${strandedEntry.fromPage.rel}' to ` +
+        `'${strandedEntry.toPage.rel}', which is no longer a session entry path. ` +
+        `Rename the whole project directory instead (projects/<old> to projects/<new>).`,
+    );
+  }
 
   // Renumber / merge report: a destination that already exists means this is not a
   // clean 1:1 move. Rather than a terse hard-fail, report exactly which destination
@@ -725,6 +739,15 @@ function run(args) {
   const fromPage = resolveArgToPage(args.from, pages, formIndex);
   if (!fromPage) {
     fail(args, `--from did not resolve to a unique existing page: ${args.from}`);
+  }
+  // Session entries are immutable history and the readers find them by directory. Moving one
+  // alone would drop it from the session history, so only a whole project move may carry it.
+  if (isSessionEntryPath(fromPage.rel)) {
+    fail(
+      args,
+      `--from '${fromPage.rel}' is a session entry; renaming a single entry would remove it from ` +
+        `the session history. Rename the whole project directory instead.`,
+    );
   }
 
   // Compute the destination rel. --to may be a full rel (move across dirs) or a

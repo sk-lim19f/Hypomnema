@@ -480,6 +480,10 @@ function lintPage({ path, rel }, slugMap, tagVocab, pageDirs, validTypes) {
 
   if (!content.match(/^---\r?\n/)) {
     issue('warn', rel, 'No frontmatter found', null, 'W1');
+    // The generic W1 return would skip the entry parser, and an entry nobody can parse is lost history.
+    if (isSessionEntryPath(rel.replace(/\\/g, '/'))) {
+      issue('error', rel, 'Session entry does not parse: no frontmatter');
+    }
     return;
   }
 
