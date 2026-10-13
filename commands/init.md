@@ -11,7 +11,8 @@ You are running `/hypo:init`. Set up a new personal wiki powered by Hypomnema.
 ## What this does
 
 - Creates the Hypomnema directory structure (`pages/`, `projects/`, `sources/`, etc.)
-- Copies baseline template files (`index.md`, `hot.md`, `log.md`, `hypo-config.md`, `SCHEMA.md`, `hypo-guide.md`)
+- Copies baseline template files (`index.md`, `log.md`, `hypo-config.md`, `SCHEMA.md`, `hypo-guide.md`) and generates the root `hot.md` pointer table
+- Writes the vault `.gitignore` so the generated session views (root `hot.md`, and each project's `hot.md` and `session-state.md`) are not committed. A new vault starts on session entries: a session close writes one entry under `projects/<name>/sessions/`, and those three files are built from the entries. `projects/_template` holds only `index.md` and `prd.md`
 - Installs Claude Code hooks for automatic context injection
 - Merges hook entries into `~/.claude/settings.json` (idempotent)
 - Optionally sets up git with a remote

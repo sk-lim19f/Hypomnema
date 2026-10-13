@@ -2,8 +2,11 @@
 /**
  * Hypomnema resume script
  *
- * Reads the session-state.md for a project and outputs the next-tasks section.
- * Used by /hypo:resume to surface what was left off before Claude continues.
+ * Renders a project's next tasks and recent background from its session entries
+ * (projects/<name>/sessions/), in memory. Before a vault has moved to session
+ * entries, the old session-state.md and hot.md stand in as virtual baseline
+ * entries, so nothing is read from a generated view file. Used by /hypo:resume
+ * to surface what was left off before Claude continues.
  *
  * Usage:
  *   node scripts/resume.mjs [options]
@@ -23,30 +26,36 @@
  *                         current directory (cwd-first), and only falls back to
  *                         the most recently active hot.md row when nothing under
  *                         cwd matches.
+ *   --session-id=<id>     The session to record the shown heads for. Falls back to
+ *                         $CLAUDE_CODE_SESSION_ID, then $CLAUDE_SESSION_ID. Without
+ *                         an id nothing is recorded.
  *   --json                Output as JSON
  */
 
-import { existsSync, readFileSync, readdirSync, statSync, realpathSync } from 'fs';
+import { existsSync, readFileSync, readdirSync, realpathSync } from 'fs';
 import { join } from 'path';
 import { spawnSync } from 'child_process';
 import { resolveHypoRoot, expandHome } from './lib/hypo-root.mjs';
 import { pickProjectByCwd, collectProjectWorkingDirs } from './lib/wd-match.mjs';
 import {
   currentDevice,
-  scopeVisible,
-  readVisibilityScope,
   sanitizeProjForPrompt,
+  isUntrackedLockArtifact,
 } from '../hooks/hypo-shared.mjs';
+import { entryVisible, nextUpItems, renderViews } from '../hooks/session-entries.mjs';
+import { loadSessionModel, recordObservedHeads } from '../hooks/session-views.mjs';
 
 // ── arg parsing ──────────────────────────────────────────────────────────────
 
 function parseArgs(argv) {
-  const args = { hypoDir: null, project: null, json: false };
+  const args = { hypoDir: null, project: null, json: false, sessionId: null };
   for (const arg of argv.slice(2)) {
     if (arg.startsWith('--hypo-dir=')) args.hypoDir = expandHome(arg.slice(11));
     else if (arg.startsWith('--project=')) args.project = arg.slice(10);
+    else if (arg.startsWith('--session-id=')) args.sessionId = arg.slice(13) || null;
     else if (arg === '--json') args.json = true;
   }
+  args.sessionId ??= process.env.CLAUDE_CODE_SESSION_ID || process.env.CLAUDE_SESSION_ID || null;
   if (!args.hypoDir) args.hypoDir = resolveHypoRoot();
   return args;
 }
@@ -176,19 +185,28 @@ function resolveActiveProject(hypoDir, cwd = null) {
 
   // Skip the scaffold project init.mjs writes — it isn't a real active project.
   const candidates = readdirSync(projectsDir).filter(
-    (p) => p !== '_template' && existsSync(join(projectsDir, p, 'session-state.md')),
+    (p) =>
+      p !== '_template' &&
+      (existsSync(join(projectsDir, p, 'session-state.md')) ||
+        existsSync(join(projectsDir, p, 'sessions'))),
   );
   if (cwd) {
     const picked = pickByCwd(hypoDir, candidates, cwd);
     if (picked) return picked;
     warnCwdFallback(hypoDir, candidates, cwd);
   }
+  // Recency is the newest session entry's date (a not-yet-migrated project's old files count as
+  // baseline entries), not a file mtime: a git pull or a view rebuild moves an mtime without any
+  // session having happened.
   let latest = null;
-  let latestMtime = 0;
+  let latestDate = null;
   for (const p of candidates) {
-    const mtime = statSync(join(projectsDir, p, 'session-state.md')).mtimeMs;
-    if (mtime > latestMtime) {
-      latestMtime = mtime;
+    const date = loadSessionModel(hypoDir, p).entries.reduce(
+      (max, e) => (e.date > max ? e.date : max),
+      '',
+    );
+    if (latestDate === null || date > latestDate) {
+      latestDate = date;
       latest = p;
     }
   }
@@ -292,10 +310,11 @@ function listDirtyPaths(hypoDir) {
       i++;
       fromFile = records[i] || null;
     }
+    // A live close's `.lock` (or a waiter's staging file) is not work to attribute.
     const rel = toVaultRelative(file);
-    if (rel) out.push(rel);
+    if (rel && !isUntrackedLockArtifact(xy, rel)) out.push(rel);
     const relFrom = toVaultRelative(fromFile);
-    if (relFrom) out.push(relFrom);
+    if (relFrom && !isUntrackedLockArtifact(xy, relFrom)) out.push(relFrom);
   }
   return out;
 }
@@ -351,31 +370,6 @@ function foreignUncommittedNotice(hypoDir, ownProject) {
   return `[WIKI: ${clauses.join(', ')}이 있습니다. 사용자 명시 지시 없이는 이 세션 작업으로 편입하지 마십시오.]`;
 }
 
-// ── read session state ────────────────────────────────────────────────────────
-
-// Visibility guard: same contract as hypo-file-watch / hypo-session-start /
-// hypo-cwd-change. A machine-scoped page (visibility_scope: machine:<owner>) is
-// not surfaced on any machine but its owner, and /hypo:resume feeds its stdout
-// straight into the model, so it is one of those injection paths.
-//
-// `hidden` is kept distinct from "file absent" on purpose: reporting a scoped-out
-// state file as "no session-state.md found" would read as a broken vault. The
-// caller says which one it was.
-function readVisible(path, device) {
-  if (!existsSync(path)) return { content: null, hidden: false };
-  const raw = readFileSync(path, 'utf-8');
-  if (!scopeVisible(readVisibilityScope(raw), device)) return { content: null, hidden: true };
-  return { content: raw, hidden: false };
-}
-
-function readSessionState(hypoDir, project, device) {
-  return readVisible(join(hypoDir, 'projects', project, 'session-state.md'), device);
-}
-
-function readHot(hypoDir, project, device) {
-  return readVisible(join(hypoDir, 'projects', project, 'hot.md'), device);
-}
-
 // ── main ─────────────────────────────────────────────────────────────────────
 
 const args = parseArgs(process.argv);
@@ -390,21 +384,49 @@ if (!project) {
 const foreignNotice = foreignUncommittedNotice(args.hypoDir, project);
 const device = currentDevice();
 
-const state = readSessionState(args.hypoDir, project, device);
-if (!state.content) {
-  if (state.hidden) {
+// The model comes from the session entries (plus the old files as virtual baselines while they
+// are on disk), never from a generated view file. `localOld` keeps the old files of a project that
+// has just moved in the picture, as the SessionStart injection does. Nothing here is published.
+const model = loadSessionModel(args.hypoDir, project, { localOld: true });
+const seen = model.entries.filter((e) => entryVisible(model, e, device));
+if (seen.length === 0) {
+  if (model.unreadable.length > 0) {
     console.error(
-      `Error: session-state.md for "${project}" is scoped to another machine ` +
+      `Error: ${model.unreadable.length} session entry file(s) for "${project}" could not be read. ` +
+        `Run /hypo:doctor to see which.`,
+    );
+  } else if (model.entries.length > 0) {
+    // Scoped out is not absent: "no session state found" would read as a broken vault.
+    console.error(
+      `Error: the session state for "${project}" is scoped to another machine ` +
         `(visibility_scope). Nothing to resume on this machine (${device}).`,
     );
   } else {
-    console.error(`Error: no session-state.md found for project "${project}"`);
+    console.error(`Error: no session state found for project "${project}"`);
   }
   process.exit(1);
 }
-const sessionState = state.content;
 
-const hotContent = readHot(args.hypoDir, project, device).content;
+// The summary list comes from the model, not from the rendered markdown: a baseline's body can
+// hold `##` lines of its own, which a heading-based cut of the rendered `## Next Up` would end at.
+const nextUp = nextUpItems(model, { device });
+const rendered = renderViews([model], { device, only: [project] }).projects[project];
+const sessionState = rendered.sessionState;
+const hotContent = rendered.hot;
+
+// Everything shown in full above is "observed" by this session, so a later close replaces those
+// heads instead of refusing as if they had never been read. Recorded after the output (fail-open):
+// if this throws, the model has been shown the heads but nothing claims it.
+function recordShownHeads() {
+  if (!args.sessionId) return;
+  const heads = {};
+  for (const i of nextUp) (heads[i.trackId] ??= []).push(i.closeId);
+  try {
+    recordObservedHeads(args.hypoDir, args.sessionId, project, { level: 'full', heads });
+  } catch (err) {
+    process.stderr.write(`[resume] observed heads: ${err?.message ?? err}\n`);
+  }
+}
 
 if (args.json) {
   console.log(
@@ -413,23 +435,35 @@ if (args.json) {
         project,
         sessionState,
         hot: hotContent,
+        nextUp: nextUp.map(({ trackId, title, date, closeId, body }) => ({
+          trackId,
+          title,
+          date,
+          closeId,
+          body,
+        })),
         ...(foreignNotice ? { notice: foreignNotice } : {}),
       },
       null,
       2,
     ),
   );
+  recordShownHeads();
   process.exit(0);
 }
 
 if (foreignNotice) console.log(foreignNotice + '\n');
 console.log(`Project: ${project}`);
 console.log(`State: projects/${project}/session-state.md\n`);
+if (nextUp.length > 0) {
+  console.log(`Next up (${nextUp.length}):`);
+  for (const i of nextUp) console.log(`- ${i.title} (${i.date})`);
+  console.log('');
+}
 console.log('─'.repeat(60));
 console.log(sessionState.trim());
 
-if (hotContent) {
-  console.log('\n' + '─'.repeat(60));
-  console.log('Background (hot.md):');
-  console.log(hotContent.trim());
-}
+console.log('\n' + '─'.repeat(60));
+console.log('Background (hot.md):');
+console.log(hotContent.trim());
+recordShownHeads();

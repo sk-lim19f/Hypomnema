@@ -18,29 +18,60 @@ import {
   rmSync,
   statSync,
   readdirSync,
+  chmodSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { snapshotBase, overwriteTargets, advanceBaseForWrite } from '../hooks/base-store.mjs';
-import { closeGateStatus } from '../hooks/close-gate-store.mjs';
+import { closeGatePath, closeGateStatus } from '../hooks/close-gate-store.mjs';
+import { readJournal } from '../hooks/close-journal.mjs';
 import {
+  GITATTRIBUTES_BLOCK,
+  closeIdFor,
+  formatSessionEntry,
+  parseSessionEntry,
+  renderViews,
+  trackHeads,
+} from '../hooks/session-entries.mjs';
+import {
+  loadSessionModel,
+  migrateVaultToSessionEntries,
+  readObservedHeads,
+  recordObservedHeads,
+} from '../hooks/session-views.mjs';
+import {
+  closePinPath,
   findBackfillCandidate,
+  gitDirtyFiles,
+  isForeignAppendOnlyShard,
+  precompactGateStatus,
+  recordShardAppend,
+  readClosePin,
+  readTouchedPathsStrict,
+  writeClosePin,
+  sessionProofCloseId,
   rootLogEntry,
   sessionClosedMarkerPath,
   vaultCommitLockTarget,
   writeSessionClosedMarker,
 } from '../hooks/hypo-shared.mjs';
 import { ensureProjectIndex } from '../scripts/crystallize.mjs';
-import { receiptPath } from '../hooks/close-receipt.mjs';
+import { receiptPath, verifyEntriesInCommit, writeReceiptAtomic } from '../hooks/close-receipt.mjs';
 import {
   buildMarkCloseProof,
+  classifyExistingEntry,
+  invalidatePriorCloseArtifacts,
   landReceiptThenMarker,
+  sessionCloseLockTarget,
   withdrawOwnReceipt,
   markerWriteGenuinelyFailed,
   commitShaForUndo,
   closeIntentPath,
   writeCloseIntent,
   clearCloseIntent,
+  appendTarget,
+  withdrawUnlandedAppends,
 } from '../scripts/lib/crystallize-close-apply.mjs';
 import { test, testAsync, suite } from './harness.mjs';
 import {
@@ -48,6 +79,8 @@ import {
   REPO,
   SESSION_TMP_HOME,
   buildCleanWikiTree,
+  gitHead,
+  gitRepo,
   hasLogEntry,
   makeMultiProjectWiki,
   payloadForCleanWiki,
@@ -59,6 +92,20 @@ import {
   withTmpDir,
   withWiki,
 } from './helpers.mjs';
+
+// The one overwrite target a close payload still carries is pages/open-questions.md.
+// The guard tests below (base mismatch, local edit, section loss, lint) used to aim at
+// the project's hot.md / session-state.md, which a close no longer writes.
+const OQ_REL = join('pages', 'open-questions.md');
+const openQuestionsText = (today, marker = 'initial') =>
+  `---\ntitle: Open Questions\ntype: concept\nupdated: ${today}\n---\n\n## Questions\n\n- ${marker}\n`;
+// A `withWiki` mutate step: the page exists (and is committed) before the close.
+const seedOpenQuestions =
+  (text = null) =>
+  (dir, today) => {
+    mkdirSync(join(dir, 'pages'), { recursive: true });
+    writeFileSync(join(dir, OQ_REL), text ?? openQuestionsText(today));
+  };
 
 // ── fix #38: --apply-session-close --payload=<path|-> ─────────────────────────
 // @fix #38: clean-wiki payload → ok:true, new entries appended (apply dedup is exact-entry, not date-based)
@@ -75,24 +122,25 @@ suite('crystallize.mjs --apply-session-close (#38)');
 // two early-refusal branches) tells apart a commit that ran and found
 // nothing to stage (`true`) from one that never ran at all (`null`, a
 // verification/lint failure) or that ran and failed (`false`).
-test('a second apply of an unchanged payload: applied:[], skipped names every field, committed:true', () => {
+test('a second close with an unchanged payload appends nothing twice and writes one new entry, committed:true', () => {
   withWiki(null, (dir, today) => {
     const payload = payloadForCleanWiki(dir, today);
     const first = runApply(dir, payload);
     const firstOut = JSON.parse(first.stdout);
     assert.equal(firstOut.ok, true, `first apply must succeed: ${first.stdout}`);
 
+    // runApply seeds a fresh session per call, so this is a second close request: it
+    // gets its own entry, while the appends dedupe on their exact text.
     const second = runApply(dir, payload);
     const out = JSON.parse(second.stdout);
     assert.equal(out.ok, true, `second apply must still succeed: ${second.stdout}`);
-    assert.deepEqual(out.applied, [], 'nothing new to write on an identical re-run');
+    assert.equal(out.applied.length, 1, JSON.stringify(out.applied));
+    assert.match(out.applied[0], /^sessionEntry \(projects\/test-project\/sessions\//);
     assert.ok(
-      ['sessionState', 'projectHot', 'sessionLog', 'log'].every((k) =>
-        out.skipped.some((s) => s.startsWith(k)),
-      ),
-      `skipped must name every field the payload carries: ${JSON.stringify(out.skipped)}`,
+      ['sessionLog', 'log'].every((k) => out.skipped.some((s) => s.startsWith(k))),
+      `skipped must name every append the payload carries: ${JSON.stringify(out.skipped)}`,
     );
-    assert.equal(out.committed, true, 'nothing to stage is still a successful commit outcome');
+    assert.equal(out.committed, true, 'a commit outcome, not a skipped one');
   });
 });
 
@@ -109,7 +157,7 @@ test('append lock-timeout → proposal-pending, shard byte-untouched (FEAT-11 T5
     mkdirSync(dirname(shard), { recursive: true });
     const shardBefore = existsSync(shard) ? readFileSync(shard, 'utf-8') : null;
     writeFileSync(shardLock, ''); // fresh lock "held" by another writer, never released
-    process.env.HYPO_APPEND_LOCK_TIMEOUT_MS = '300'; // fast timeout instead of the 5s default
+    process.env.HYPO_APPEND_LOCK_TIMEOUT_MS = '300'; // fast timeout instead of the 20s default
     let r;
     try {
       r = runApply(dir, payload, { sessionId: 's-lockout' });
@@ -142,6 +190,84 @@ test('append lock-timeout → proposal-pending, shard byte-untouched (FEAT-11 T5
     if (shardAfter) {
       assert.ok(!shardAfter.includes('locked-out entry'), 'the withheld entry must not be written');
     }
+  });
+});
+
+// The two appends stand or fall together: a close whose shard append is withheld cannot
+// commit, so its log.md line must not land either. The shard lock is held by someone else
+// for the whole wait, and the close never takes the log.md lock at all.
+// Disabling the check: in runHoldingAppendLocks run the log.md hold even when the shard lock
+// was not taken (`hold(logTarget, ...)` for both branches). The close then writes its log.md
+// line and the log.md assertions below fail.
+test('a close whose session-log shard lock times out withholds the log.md append too', () => {
+  withWiki(null, (dir, today) => {
+    const payload = payloadForCleanWiki(dir, today);
+    payload.sessionLog = { entry: `## [${today}] locked-out entry\n\nbody\n` };
+    payload.log = { entry: `## [${today}] session | test-project: held-out log line\n` };
+    const shard = join(dir, 'projects', 'test-project', 'session-log', `${today}.md`);
+    const shardLock = `${shard}.lock`;
+    const logPath = join(dir, 'log.md');
+    mkdirSync(dirname(shard), { recursive: true });
+    const shardBefore = existsSync(shard) ? readFileSync(shard, 'utf-8') : null;
+    const logBefore = readFileSync(logPath, 'utf-8');
+    writeFileSync(shardLock, '');
+    process.env.HYPO_APPEND_LOCK_TIMEOUT_MS = '300';
+    let r;
+    try {
+      r = runApply(dir, payload, { sessionId: 's-lockout-both' });
+    } finally {
+      delete process.env.HYPO_APPEND_LOCK_TIMEOUT_MS;
+      rmSync(shardLock, { force: true });
+    }
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.ok, false, r.stdout);
+    assert.equal(out.stage, 'proposal-pending', r.stdout);
+    for (const key of ['sessionLog', 'log']) {
+      const c = (out.conflicts || []).find((x) => x.key === key);
+      assert.equal(c?.reason, 'append-lock-timeout', `${key}: ${JSON.stringify(out.conflicts)}`);
+    }
+    assert.equal(readFileSync(logPath, 'utf-8'), logBefore, 'log.md must be byte-untouched');
+    assert.ok(!readFileSync(logPath, 'utf-8').includes('held-out log line'));
+    assert.equal(existsSync(shard) ? readFileSync(shard, 'utf-8') : null, shardBefore);
+    assert.equal(existsSync(join(dir, 'log.md.lock')), false, 'no log.md lock is left behind');
+  });
+});
+
+// The mirror case: the shard lock is taken and the log.md lock times out. The shard append
+// must be withheld as well, because it would otherwise land on disk uncommitted and a second
+// close of the same project could commit it under its own name.
+// Disabling the check: in runHoldingAppendLocks pass `shardHeld` instead of `shardHeld: logHeld`
+// to run(). The shard entry then lands on disk and the shard assertions below fail.
+test('a close whose log.md lock times out withholds the session-log shard append too', () => {
+  withWiki(null, (dir, today) => {
+    const payload = payloadForCleanWiki(dir, today);
+    payload.sessionLog = { entry: `## [${today}] locked-out entry\n\nbody\n` };
+    payload.log = { entry: `## [${today}] session | test-project: held-out log line\n` };
+    const shard = join(dir, 'projects', 'test-project', 'session-log', `${today}.md`);
+    const logPath = join(dir, 'log.md');
+    const logLock = `${logPath}.lock`;
+    mkdirSync(dirname(shard), { recursive: true });
+    const shardBefore = existsSync(shard) ? readFileSync(shard, 'utf-8') : null;
+    const logBefore = readFileSync(logPath, 'utf-8');
+    writeFileSync(logLock, '');
+    process.env.HYPO_APPEND_LOCK_TIMEOUT_MS = '300';
+    let r;
+    try {
+      r = runApply(dir, payload, { sessionId: 's-lockout-log' });
+    } finally {
+      delete process.env.HYPO_APPEND_LOCK_TIMEOUT_MS;
+      rmSync(logLock, { force: true });
+    }
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.ok, false, r.stdout);
+    assert.equal(out.stage, 'proposal-pending', r.stdout);
+    for (const key of ['sessionLog', 'log']) {
+      const c = (out.conflicts || []).find((x) => x.key === key);
+      assert.equal(c?.reason, 'append-lock-timeout', `${key}: ${JSON.stringify(out.conflicts)}`);
+    }
+    assert.equal(existsSync(shard) ? readFileSync(shard, 'utf-8') : null, shardBefore);
+    assert.equal(readFileSync(logPath, 'utf-8'), logBefore, 'log.md must be byte-untouched');
+    assert.equal(existsSync(`${shard}.lock`), false, 'no shard lock is left behind');
   });
 });
 
@@ -289,6 +415,122 @@ test('probe (#39): no payload + gate ok → exit 0 with alreadyComplete', () => 
     assert.equal(out.ok, true);
     assert.equal(out.alreadyComplete, true, `alreadyComplete flag must be set: ${r.stdout}`);
     assert.equal(out.date, today);
+  });
+});
+
+// Disabling the check (F7): in applySessionClose make the probe always call
+// sessionCloseGlobalStatus. The session-scoped probe below then answers complete
+// for another session's close, and its first assertion goes red.
+test("probe: with --session-id, another session's close of today is not this session's: not complete", () => {
+  withWiki(null, (dir, today) => {
+    const other = JSON.parse(runApply(dir, payloadForCleanWiki(dir, today)).stdout);
+    assert.equal(other.ok, true, JSON.stringify(other));
+    const mine = `probe-mine-${process.pid}`;
+    const probe = (extra) =>
+      run('crystallize.mjs', [`--hypo-dir=${dir}`, '--apply-session-close', '--json', ...extra]);
+    const r = probe([`--session-id=${mine}`]);
+    assert.notEqual(r.status, 0, r.stdout);
+    assert.ok(!/"alreadyComplete": true/.test(r.stdout), r.stdout);
+    // Without a session id the probe can only say a close of today exists, and says so.
+    const g = probe([]);
+    assert.equal(g.status, 0, g.stdout);
+    const out = JSON.parse(g.stdout);
+    assert.equal(out.scope, 'global');
+    assert.match(out.message, /이 세션의 close인지는 확인하지 않았음/);
+  });
+});
+
+test("probe: with --session-id, this session's own finished close reads as complete (pair)", () => {
+  withWiki(null, (dir, today) => {
+    const sid = `probe-own-${process.pid}`;
+    const cleanup = seedCloseTranscript(sid);
+    try {
+      const closed = JSON.parse(runApply(dir, v2Payload(today), { sessionId: sid }).stdout);
+      assert.equal(closed.markerWritten, true, JSON.stringify(closed));
+      const r = run('crystallize.mjs', [
+        `--hypo-dir=${dir}`,
+        '--apply-session-close',
+        '--json',
+        `--session-id=${sid}`,
+      ]);
+      assert.equal(r.status, 0, `${r.stdout}\n${r.stderr}`);
+      const out = JSON.parse(r.stdout);
+      assert.equal(out.alreadyComplete, true);
+      assert.equal(out.scope, 'session');
+      assert.equal(out.project, 'test-project');
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+// The probe is the other place that has to say it: a session whose close left no log lines
+// answers alreadyComplete on its entry and carries the notice in its own result.
+// Disabling the check: drop `notices: probe.notices ?? []` from the probe result in
+// applySessionClose. The result has no `notices`.
+test('probe: with --session-id, a close with no session-log or log.md lines is complete and carries the close-logs-missing notice', () => {
+  withWiki(null, (dir, today) => {
+    const sid = `probe-nologs-${process.pid}`;
+    const cleanup = seedCloseTranscript(sid);
+    try {
+      const closed = JSON.parse(runApply(dir, v2Payload(today), { sessionId: sid }).stdout);
+      assert.equal(closed.markerWritten, true, JSON.stringify(closed));
+      // The close's own entry is committed. Take its log lines away, and commit that too.
+      rmSync(join(dir, 'projects', 'test-project', 'session-log'), { recursive: true });
+      rmSync(join(dir, 'log.md'));
+      const env = { ...process.env, HOME: SESSION_TMP_HOME };
+      spawnSync('git', ['-C', dir, 'add', '-A'], { env });
+      spawnSync('git', ['-C', dir, 'commit', '-q', '-m', 'drop logs'], { env });
+      const r = run('crystallize.mjs', [
+        `--hypo-dir=${dir}`,
+        '--apply-session-close',
+        '--json',
+        `--session-id=${sid}`,
+      ]);
+      assert.equal(r.status, 0, `${r.stdout}\n${r.stderr}`);
+      const out = JSON.parse(r.stdout);
+      assert.equal(out.alreadyComplete, true, r.stdout);
+      assert.equal(out.scope, 'session');
+      assert.ok(
+        out.notices.some((n) => n.type === 'close-logs-missing' && n.project === 'test-project'),
+        JSON.stringify(out.notices),
+      );
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+// The text-mode probe prints the notices its JSON result holds, one line each.
+// Disabling the check: drop the `for (const n of result.notices)` line from the probe's text
+// output in applySessionClose. The output has no `close-logs-missing` line.
+test('probe: the text output prints the close-logs-missing notice too', () => {
+  withWiki(null, (dir, today) => {
+    const sid = `probe-nologs-text-${process.pid}`;
+    const cleanup = seedCloseTranscript(sid);
+    try {
+      const closed = JSON.parse(runApply(dir, v2Payload(today), { sessionId: sid }).stdout);
+      assert.equal(closed.markerWritten, true, JSON.stringify(closed));
+      rmSync(join(dir, 'projects', 'test-project', 'session-log'), { recursive: true });
+      rmSync(join(dir, 'log.md'));
+      const env = { ...process.env, HOME: SESSION_TMP_HOME };
+      spawnSync('git', ['-C', dir, 'add', '-A'], { env });
+      spawnSync('git', ['-C', dir, 'commit', '-q', '-m', 'drop logs'], { env });
+      const r = run('crystallize.mjs', [
+        `--hypo-dir=${dir}`,
+        '--apply-session-close',
+        `--session-id=${sid}`,
+      ]);
+      assert.equal(r.status, 0, `${r.stdout}\n${r.stderr}`);
+      assert.match(r.stdout, /^✓ /m, r.stdout);
+      assert.match(
+        r.stdout,
+        /^ {2}· test-project: no session-log heading or log\.md line dated /m,
+        r.stdout,
+      );
+    } finally {
+      cleanup();
+    }
   });
 });
 
@@ -617,12 +859,14 @@ test('probe (#39): --force without --payload → payload-required (force does NO
 test('probe (#39): gate NOT ok + no payload → falls through to payload-required (no skip)', () => {
   // Stale gate must NOT trigger the alreadyComplete probe — fallthrough
   // surfaces the "payload is required" error so the caller knows to supply
-  // close content.
+  // close content. Stale here means no close today: the only session-log
+  // heading is an old day's, and no entry is dated today (the generated
+  // hot.md proves nothing either way).
   withWiki(
-    (dir) => {
+    (dir, today) => {
       writeFileSync(
-        join(dir, 'projects', 'test-project', 'hot.md'),
-        `---\ntitle: hot\ntype: reference\nupdated: 2020-01-01\n---\n\n# Hot\n`,
+        join(dir, 'projects', 'test-project', 'session-log', `${today.slice(0, 7)}.md`),
+        `---\ntitle: Session Log\ntype: session-log\nupdated: 2020-01-01\n---\n\n## [2020-01-01] old session\n`,
       );
     },
     (dir) => {
@@ -675,17 +919,18 @@ suite('fix #40: helper lint preflight + post-apply check');
 
 test('preflight (Bug B): pre-existing blocker in a NON-payload file → does NOT abort, apply proceeds (scoped)', () => {
   // Bug B fix: lint debt OUTSIDE the files this close writes (here a malformed
-  // page under projects/, not one of the 5 mandatory close files) must NOT block
-  // the documented apply path. It is surfaced as a notice and the payload lands.
+  // page under projects/, not a file this close writes) must NOT block the
+  // documented apply path. It is surfaced as a notice and the payload lands.
   withWiki(
-    (dir) => {
+    (dir, today) => {
       writeFileSync(
         join(dir, 'projects', 'test-project', 'broken.md'),
         '---\ntitle: broken\ntype: concept\n\nbody (frontmatter never closes)\n',
       );
+      seedOpenQuestions()(dir, today);
     },
     (dir, today) => {
-      // Overwrite fields only write cleanly with an observed, matching base
+      // The overwrite field only writes cleanly with an observed, matching base
       // (FEAT-11 T4); seed it under the session-id this apply uses, or the
       // sentinel write is refused as base-unknown before it reaches the
       // out-of-scope-debt logic this test is actually about.
@@ -693,9 +938,7 @@ test('preflight (Bug B): pre-existing blocker in a NON-payload file → does NOT
       snapshotBase(dir, sid, overwriteTargets('test-project'));
       const sentinel = `<!-- preflight-sentinel-${Date.now()} -->`;
       const payload = payloadForCleanWiki(dir, today);
-      payload.sessionState = {
-        content: `---\ntitle: session-state\ntype: session-state\nupdated: ${today}\n---\n\n${sentinel}\n\n## 다음 작업\n\n- next\n`,
-      };
+      payload.openQuestions = { content: `${openQuestionsText(today)}\n${sentinel}\n` };
       const r = runApply(dir, payload, { sessionId: sid });
       assert.equal(
         r.status,
@@ -708,10 +951,7 @@ test('preflight (Bug B): pre-existing blocker in a NON-payload file → does NOT
         out.notices.some((f) => f.endsWith('broken.md')),
         `out-of-scope blocker should surface as a notice: ${r.stdout}`,
       );
-      const onDisk = readFileSync(
-        join(dir, 'projects', 'test-project', 'session-state.md'),
-        'utf-8',
-      );
+      const onDisk = readFileSync(join(dir, OQ_REL), 'utf-8');
       assert.ok(onDisk.includes(sentinel), 'apply should have written the payload sentinel');
     },
   );
@@ -811,38 +1051,51 @@ test('preflight (#40 + Bug B): corrupt APPEND target (session-log) STILL blocks 
     const out = JSON.parse(r.stdout);
     assert.equal(out.ok, false);
     assert.equal(out.stage, 'preflight-lint', `stage should be preflight-lint: ${r.stdout}`);
-    const onDisk = readFileSync(join(dir, 'projects', 'test-project', 'session-state.md'), 'utf-8');
+    const sessionsDir = join(dir, 'projects', 'test-project', 'sessions');
+    assert.deepEqual(
+      existsSync(sessionsDir) ? readdirSync(sessionsDir) : [],
+      [],
+      'preflight failure must NOT have written the entry',
+    );
     assert.ok(
-      !onDisk.includes(sentinel),
-      'preflight failure must NOT have written payload sentinel',
+      !JSON.stringify(readdirSync(join(dir, 'projects', 'test-project'))).includes(sentinel),
+      sentinel,
     );
   });
 });
 
 test('post-apply (#40): payload introduces lint blocker → exit 1 stage=post-apply-lint, bytes written', () => {
-  // Payload writes a session-state body that omits the required "## 다음 작업"
-  // heading — lint raises an error, but freshness gate still passes (updated:
-  // today). Apply DID write (sentinel present on disk), but final result is
-  // ok:false with stage=post-apply-lint so caller distinguishes "wiki was
-  // damaged" from "frontmatter stale".
+  // The payload's open-questions page omits the required `title`: lint raises an
+  // error, but the freshness gate still passes. Apply DID write (sentinel present on
+  // disk), but the final result is ok:false with stage=post-apply-lint so the caller
+  // distinguishes "wiki was damaged" from "frontmatter stale".
   withWiki(null, (dir, today) => {
-    // Overwrite fields only write cleanly with an observed, matching base
-    // (FEAT-11 T4); seed it under the session-id this apply uses, or the write
-    // is refused as base-unknown before it ever reaches post-apply lint.
+    // The overwrite only writes cleanly with an observed, matching base (FEAT-11 T4);
+    // seed it under the session-id this apply uses, or the write is refused as
+    // base-unknown before it ever reaches post-apply lint.
     const sid = 'post-apply-lint-session';
     snapshotBase(dir, sid, overwriteTargets('test-project'));
     const sentinel = `<!-- post-apply-sentinel-${Date.now()} -->`;
     const payload = payloadForCleanWiki(dir, today);
-    payload.sessionState = {
-      content: `---\ntitle: session-state\ntype: session-state\nupdated: ${today}\n---\n\n${sentinel}\n\n## random heading without required label\n\n- next\n`,
+    payload.openQuestions = {
+      content: `---\ntype: concept\nupdated: ${today}\n---\n\n${sentinel}\n`,
     };
     const r = runApply(dir, payload, { sessionId: sid });
     assert.equal(r.status, 1, `post-apply lint must fail, got ${r.status}\n${r.stdout}`);
     const out = JSON.parse(r.stdout);
     assert.equal(out.ok, false);
     assert.equal(out.stage, 'post-apply-lint', `stage should be post-apply-lint: ${r.stdout}`);
-    assert.equal(out.verification.ok, true, 'freshness gate should still pass');
-    const onDisk = readFileSync(join(dir, 'projects', 'test-project', 'session-state.md'), 'utf-8');
+    // Lint failed before the commit, so the verification (read after the commit
+    // step) does not decide this close. What it still shows: the session-log and
+    // log.md lines are in place, and only the entry waits for the commit lint withheld.
+    assert.equal(out.committed, null, 'a lint failure stops before the commit');
+    assert.deepEqual(out.verification.missing, [], JSON.stringify(out.verification));
+    assert.deepEqual(
+      out.verification.stale,
+      [out.verification.entry],
+      JSON.stringify(out.verification),
+    );
+    const onDisk = readFileSync(join(dir, OQ_REL), 'utf-8');
     assert.ok(onDisk.includes(sentinel), 'post-apply path must have written the payload sentinel');
   });
 });
@@ -860,20 +1113,16 @@ test('preflight (#40 codex-P2): post-apply-lint failure + fixed payload retry �
     const sid = 'post-apply-retry-session';
     snapshotBase(dir, sid, overwriteTargets('test-project'));
 
-    // 1. Apply a bad payload (session-state missing required heading)
+    // 1. Apply a bad payload (open-questions page without a title)
     const bad = payloadForCleanWiki(dir, today);
-    bad.sessionState = {
-      content: `---\ntitle: session-state\ntype: session-state\nupdated: ${today}\n---\n\n## wrong heading\n\n- next\n`,
-    };
+    bad.openQuestions = { content: `---\ntype: concept\nupdated: ${today}\n---\n\n- bad\n` };
     const r1 = runApply(dir, bad, { sessionId: sid });
     assert.equal(r1.status, 1, `bad payload must fail: ${r1.stdout}`);
     assert.equal(JSON.parse(r1.stdout).stage, 'post-apply-lint');
 
     // 2. Retry with corrected payload — must succeed (was dead-locked before fix)
     const good = payloadForCleanWiki(dir, today);
-    good.sessionState = {
-      content: `---\ntitle: session-state\ntype: session-state\nupdated: ${today}\n---\n\n## 다음 작업\n\n- fixed\n`,
-    };
+    good.openQuestions = { content: openQuestionsText(today, 'fixed') };
     good.sessionLog.entry = `## [${today}] retry after fix\n`;
     good.log.entry = `## [${today}] session | test-project — retry\n`;
     const r2 = runApply(dir, good, { sessionId: sid });
@@ -900,22 +1149,18 @@ test('preflight (#40 codex-P2): post-apply-lint failure + fixed payload retry �
 // frontmatter-less log.md, W1) must stay untouched.
 suite('W9 promotion: payload-scope invalid-YAML frontmatter blocks close');
 
-test('post-apply: broken YAML in a payload-scope file (project hot.md) → ok:false, exit 1', () => {
+test('post-apply: broken YAML in a payload-scope file (open-questions page) → ok:false, exit 1', () => {
   // "title: hot: broken" is an unquoted top-level value containing ": ", the
   // exact shape lint.mjs's checkYamlInvalid (W9) narrow detector flags. Not
   // W1: the frontmatter block itself opens and closes cleanly, only its
-  // content is invalid YAML.
-  //
-  // The root hot.md carried this before it left the payload. The axis the
-  // suite tests is in-payload-scope versus out-of-scope, not root versus
-  // project, so the broken bytes move to a file the payload still writes.
-  const projHotRel = join('projects', 'test-project', 'hot.md');
+  // content is invalid YAML. The axis the suite tests is in-payload-scope versus
+  // out-of-scope; open-questions is the one page a payload still writes whole.
   withWiki(null, (dir, today) => {
     const sid = 'w9-promotion-session';
     snapshotBase(dir, sid, overwriteTargets('test-project'));
     const payload = payloadForCleanWiki(dir, today);
-    payload.projectHot = {
-      content: `---\ntitle: hot: broken\ntype: hot\nupdated: ${today}\n---\n\nbody\n`,
+    payload.openQuestions = {
+      content: `---\ntitle: hot: broken\ntype: concept\nupdated: ${today}\n---\n\nbody\n`,
     };
     const r = runApply(dir, payload, { sessionId: sid });
     assert.equal(
@@ -926,7 +1171,7 @@ test('post-apply: broken YAML in a payload-scope file (project hot.md) → ok:fa
     const out = JSON.parse(r.stdout);
     assert.equal(out.ok, false);
     assert.equal(out.stage, 'post-apply-lint', `stage should be post-apply-lint: ${r.stdout}`);
-    const onDisk = readFileSync(join(dir, projHotRel), 'utf-8');
+    const onDisk = readFileSync(join(dir, OQ_REL), 'utf-8');
     assert.ok(
       onDisk.includes('title: hot: broken'),
       'apply still writes the payload bytes to disk (post-apply lint runs AFTER the write)',
@@ -998,8 +1243,8 @@ test('payload.sessionId ≠ --session-id → session-id-mismatch, zero bytes', (
     // A distinct entry a successful apply WOULD append. Its absence proves the
     // guard blocked the write — and proves the test red: strip the guard and the
     // unknown field is simply ignored, so this entry lands and the assert fails.
-    // The payload also rewrites overwrite targets (session-state, both hot files)
-    // that a successful apply touches BEFORE the shard append. Assert the whole
+    // The payload also carries an entry that a successful apply writes BEFORE the
+    // shard append. Assert the whole
     // committed tree is untouched — not just the shard — so a future guard misplaced
     // after the overwrites but before the append can't pass this vacuously. `git
     // diff --quiet` ignores the untracked .payload.json runApply drops in.
@@ -1135,11 +1380,8 @@ test('apply commit excludes an unrelated pre-existing dirty file outside the pay
     writeFileSync(join(dir, 'unrelated-debt.md'), '# pre-existing, unrelated debt\n');
 
     const payload = payloadForCleanWiki(dir, today);
-    // sessionState/projectHot/rootHot re-assert identical content (idempotent
-    // skip); sessionLog + log carry fresh entries, so this close DOES write
-    // bytes — session-log/<ym>.md and log.md — while leaving the three
-    // overwrite targets untouched. That is exactly the mixed applied/skipped
-    // shape the scoped commit must handle correctly.
+    // The close writes its entry, the session-log shard and log.md, and must
+    // commit exactly those: the scoped commit is what this test pins.
     const r = runApply(dir, payload, { sessionId: 'sess-issue69-apply' });
     assert.equal(r.status, 0, `apply must succeed: ${r.stdout}`);
     const out = JSON.parse(r.stdout);
@@ -1346,31 +1588,27 @@ test('apply on a project that already has an index.md leaves it byte-for-byte un
 suite('every whole-file base-mismatch parks');
 
 test('an overwrite target parks on a mismatch even when the payload keeps every disk line', () => {
-  // The root hot.md used to be the target here, because a pointer table is
-  // where "the payload is a superset of disk" shows up naturally. That file is
-  // no longer an overwrite target, so the same shape moves to the project
-  // hot.md: a foreign write lands after the snapshot, the payload carries every
-  // byte of it plus one more, and the close still parks rather than write.
-  const projHotRel = join('projects', 'test-project', 'hot.md');
-  withWiki(null, (dir, today) => {
+  // A foreign write lands after the snapshot, the payload carries every byte of it
+  // plus one more, and the close still parks rather than write.
+  withWiki(seedOpenQuestions(), (dir, today) => {
     const sid = 'mismatch-parks';
     snapshotBase(dir, sid, overwriteTargets('test-project'));
 
-    const original = readFileSync(join(dir, projHotRel), 'utf-8');
+    const original = readFileSync(join(dir, OQ_REL), 'utf-8');
     const drifted = `${original.trimEnd()}\n\n## Added by the other machine\n`;
-    writeFileSync(join(dir, projHotRel), drifted);
+    writeFileSync(join(dir, OQ_REL), drifted);
 
     const payload = payloadForCleanWiki(dir, today);
-    payload.projectHot = { content: `${drifted.trimEnd()}\n\n## And by this session\n` };
+    payload.openQuestions = { content: `${drifted.trimEnd()}\n\n## And by this session\n` };
 
     const r = runApply(dir, payload, { sessionId: sid });
     assert.notEqual(r.status, 0, 'a drifted overwrite must not write');
     const out = JSON.parse(r.stdout);
-    const c = out.conflicts.find((x) => x.target === projHotRel);
-    assert.ok(c, `${projHotRel} must park: ${JSON.stringify(out.conflicts)}`);
+    const c = out.conflicts.find((x) => x.target === OQ_REL);
+    assert.ok(c, `${OQ_REL} must park: ${JSON.stringify(out.conflicts)}`);
     assert.equal(c.reason, 'base-mismatch');
     assert.equal(
-      readFileSync(join(dir, projHotRel), 'utf-8'),
+      readFileSync(join(dir, OQ_REL), 'utf-8'),
       drifted,
       "the other machine's bytes are left exactly as they were",
     );
@@ -1431,15 +1669,15 @@ test('a legacy payload carrying rootHot closes clean, writes nothing to hot.md, 
 suite('local edit protection: reapplying a payload must not bury a hand edit');
 
 test('a hand edit after a successful apply parks a reapply of the SAME payload, and survives it', () => {
-  withWiki(null, (dir, today) => {
+  withWiki(seedOpenQuestions(), (dir, today) => {
     const sid = 'local-edit-reapply';
     snapshotBase(dir, sid, overwriteTargets('test-project'));
 
-    const rel = join('projects', 'test-project', 'session-state.md');
+    const rel = OQ_REL;
     const target = join(dir, rel);
-    const appliedContent = `---\ntitle: session-state\ntype: session-state\nupdated: ${today}\n---\n\napplied by payload\n\n## 다음 작업\n\n- next\n`;
+    const appliedContent = `---\ntitle: Open Questions\ntype: concept\nupdated: ${today}\n---\n\napplied by payload\n\n## Questions\n\n- next\n`;
     const payload = payloadForCleanWiki(dir, today);
-    payload.sessionState = { content: appliedContent };
+    payload.openQuestions = { content: appliedContent };
 
     const r1 = runApply(dir, payload, { sessionId: sid });
     assert.equal(r1.status, 0, `first apply must succeed: ${r1.stdout}\n${r1.stderr}`);
@@ -1485,7 +1723,7 @@ test('a hand edit after a successful apply parks a reapply of the SAME payload, 
       assert.notEqual(r2.status, 0, 'a reapply that would bury a local edit must not exit 0');
       const out2 = JSON.parse(r2.stdout);
       const c = out2.conflicts.find((x) => x.target === rel);
-      assert.ok(c, `sessionState must park: ${JSON.stringify(out2.conflicts)}`);
+      assert.ok(c, `openQuestions must park: ${JSON.stringify(out2.conflicts)}`);
       assert.equal(c.reason, 'will-overwrite-local-change');
       assert.equal(
         readFileSync(target, 'utf-8'),
@@ -1499,15 +1737,15 @@ test('a hand edit after a successful apply parks a reapply of the SAME payload, 
 });
 
 test('a reapply with NO intervening edit still writes a genuinely new payload through (no false park)', () => {
-  withWiki(null, (dir, today) => {
+  withWiki(seedOpenQuestions(), (dir, today) => {
     const sid = 'local-edit-no-edit-inbetween';
     snapshotBase(dir, sid, overwriteTargets('test-project'));
 
-    const rel = join('projects', 'test-project', 'session-state.md');
+    const rel = OQ_REL;
     const target = join(dir, rel);
-    const appliedContent = `---\ntitle: session-state\ntype: session-state\nupdated: ${today}\n---\n\napplied by payload\n\n## 다음 작업\n\n- next\n`;
+    const appliedContent = `---\ntitle: Open Questions\ntype: concept\nupdated: ${today}\n---\n\napplied by payload\n\n## Questions\n\n- next\n`;
     const payload = payloadForCleanWiki(dir, today);
-    payload.sessionState = { content: appliedContent };
+    payload.openQuestions = { content: appliedContent };
 
     const r1 = runApply(dir, payload, { sessionId: sid });
     assert.equal(r1.status, 0, `first apply must succeed: ${r1.stdout}\n${r1.stderr}`);
@@ -1528,7 +1766,7 @@ test('a reapply with NO intervening edit still writes a genuinely new payload th
     try {
       const payload2 = payloadForCleanWiki(dir, today);
       const updatedContent = appliedContent.replace('applied by payload', 'second close, no edit');
-      payload2.sessionState = { content: updatedContent };
+      payload2.openQuestions = { content: updatedContent };
       const r2 = runApply(dir, payload2, { sessionId: sid });
       assert.equal(
         r2.status,
@@ -1555,15 +1793,15 @@ test('a hand edit folded into a genuinely new payload STILL parks (review r5-w3 
   // drift from `appliedHash`, folded-in or not, and a human decides through
   // `proposal challenge`/`proposal resolve`: this is the accepted friction
   // cost, not a bug.
-  withWiki(null, (dir, today) => {
+  withWiki(seedOpenQuestions(), (dir, today) => {
     const sid = 'local-edit-folded-payload';
     snapshotBase(dir, sid, overwriteTargets('test-project'));
 
-    const rel = join('projects', 'test-project', 'session-state.md');
+    const rel = OQ_REL;
     const target = join(dir, rel);
-    const appliedContent = `---\ntitle: session-state\ntype: session-state\nupdated: ${today}\n---\n\napplied by payload\n\n## 다음 작업\n\n- next\n`;
+    const appliedContent = `---\ntitle: Open Questions\ntype: concept\nupdated: ${today}\n---\n\napplied by payload\n\n## Questions\n\n- next\n`;
     const payload = payloadForCleanWiki(dir, today);
-    payload.sessionState = { content: appliedContent };
+    payload.openQuestions = { content: appliedContent };
 
     const r1 = runApply(dir, payload, { sessionId: sid });
     assert.equal(r1.status, 0, `first apply must succeed: ${r1.stdout}\n${r1.stderr}`);
@@ -1595,7 +1833,7 @@ test('a hand edit folded into a genuinely new payload STILL parks (review r5-w3 
       // the guard has no way to credit it for folding the edit in.
       const folded = handEdited.replace('- next', '- next\n- folded the hand edit in, plus this');
       const payload2 = payloadForCleanWiki(dir, today);
-      payload2.sessionState = { content: folded };
+      payload2.openQuestions = { content: folded };
       const r2 = runApply(dir, payload2, { sessionId: sid });
       assert.notEqual(
         r2.status,
@@ -1604,7 +1842,7 @@ test('a hand edit folded into a genuinely new payload STILL parks (review r5-w3 
       );
       const out2 = JSON.parse(r2.stdout);
       const c = out2.conflicts.find((x) => x.target === rel);
-      assert.ok(c, `sessionState must park: ${JSON.stringify(out2.conflicts)}`);
+      assert.ok(c, `openQuestions must park: ${JSON.stringify(out2.conflicts)}`);
       assert.equal(c.reason, 'will-overwrite-local-change');
       assert.equal(
         readFileSync(target, 'utf-8'),
@@ -1626,15 +1864,15 @@ test('a genuinely different payload that does NOT fold the hand edit in also par
   // different from the old applied bytes, silently discarding the edit with
   // no proposal. It must now park exactly like the exact-reapply and the
   // folded-payload cases.
-  withWiki(null, (dir, today) => {
+  withWiki(seedOpenQuestions(), (dir, today) => {
     const sid = 'local-edit-unrelated-payload';
     snapshotBase(dir, sid, overwriteTargets('test-project'));
 
-    const rel = join('projects', 'test-project', 'session-state.md');
+    const rel = OQ_REL;
     const target = join(dir, rel);
-    const appliedContent = `---\ntitle: session-state\ntype: session-state\nupdated: ${today}\n---\n\napplied by payload\n\n## 다음 작업\n\n- next\n`;
+    const appliedContent = `---\ntitle: Open Questions\ntype: concept\nupdated: ${today}\n---\n\napplied by payload\n\n## Questions\n\n- next\n`;
     const payload = payloadForCleanWiki(dir, today);
-    payload.sessionState = { content: appliedContent };
+    payload.openQuestions = { content: appliedContent };
 
     const r1 = runApply(dir, payload, { sessionId: sid });
     assert.equal(r1.status, 0, `first apply must succeed: ${r1.stdout}\n${r1.stderr}`);
@@ -1660,9 +1898,9 @@ test('a genuinely different payload that does NOT fold the hand edit in also par
       // Different from BOTH the original apply and the hand edit, and does
       // NOT carry "hand-edited after apply" forward at all: the shape review
       // r5-w3 blocker 2 called out as unprotected.
-      const unrelated = `---\ntitle: session-state\ntype: session-state\nupdated: ${today}\n---\n\nunrelated new content, does not mention the edit\n\n## 다음 작업\n\n- something else\n`;
+      const unrelated = `---\ntitle: Open Questions\ntype: concept\nupdated: ${today}\n---\n\nunrelated new content, does not mention the edit\n\n## Questions\n\n- something else\n`;
       const payload2 = payloadForCleanWiki(dir, today);
-      payload2.sessionState = { content: unrelated };
+      payload2.openQuestions = { content: unrelated };
       const r2 = runApply(dir, payload2, { sessionId: sid });
       assert.notEqual(
         r2.status,
@@ -1671,7 +1909,7 @@ test('a genuinely different payload that does NOT fold the hand edit in also par
       );
       const out2 = JSON.parse(r2.stdout);
       const c = out2.conflicts.find((x) => x.target === rel);
-      assert.ok(c, `sessionState must park: ${JSON.stringify(out2.conflicts)}`);
+      assert.ok(c, `openQuestions must park: ${JSON.stringify(out2.conflicts)}`);
       assert.equal(c.reason, 'will-overwrite-local-change');
       assert.equal(
         readFileSync(target, 'utf-8'),
@@ -1697,27 +1935,25 @@ suite('ISSUE-149: restructure:true no longer self-approves a destructive overwri
 
 test('a real section-loss trip parks whether or not restructure:true is set: the flag only changes the park reason', () => {
   withWiki(
-    (dir) => {
-      const projHot = join(dir, 'projects', 'test-project', 'hot.md');
-      writeFileSync(
-        projHot,
-        readFileSync(projHot, 'utf-8') +
+    (dir, today) => {
+      seedOpenQuestions(
+        openQuestionsText(today) +
           `\n## Track A\nnote A\n\n## Track B\nnote B\n\n## Track C\nnote C\n`,
-      );
+      )(dir, today);
     },
     (dir, today) => {
       const sid = 'issue149-restructure-park';
       snapshotBase(dir, sid, overwriteTargets('test-project'));
-      const hotPath = join(dir, 'projects', 'test-project', 'hot.md');
+      const hotPath = join(dir, OQ_REL);
       const multiTrack = readFileSync(hotPath, 'utf-8');
       // Drops Track B and Track C, keeps Track A: the same 2-of-3 shape the
       // real incident (security-backoffice) tripped on.
       const onlyTrackA = multiTrack.replace(/\n## Track B[\s\S]*## Track C\nnote C\n/, '\n');
-      const target = join('projects', 'test-project', 'hot.md');
+      const target = OQ_REL;
 
       // Phase 1: no `restructure` flag, the pre-existing guard, unchanged.
       const payload1 = payloadForCleanWiki(dir, today);
-      payload1.projectHot = { content: onlyTrackA };
+      payload1.openQuestions = { content: onlyTrackA };
       const r1 = runApply(dir, payload1, { sessionId: sid });
       const out1 = JSON.parse(r1.stdout);
       assert.notEqual(r1.status, 0, `dropping 2 of 3 sections must park: ${r1.stdout}`);
@@ -1733,7 +1969,7 @@ test('a real section-loss trip parks whether or not restructure:true is set: the
       // signal is still open for this retry, mirroring every other
       // park-then-retry test in this suite.
       const payload2 = payloadForCleanWiki(dir, today);
-      payload2.projectHot = { content: onlyTrackA, restructure: true };
+      payload2.openQuestions = { content: onlyTrackA, restructure: true };
       payload2.sessionLog.entry = `## [${today}] restructure retry\n`;
       payload2.log.entry = `## [${today}] session | test-project — restructure retry\n`;
       const r2 = runApply(dir, payload2, { sessionId: sid });
@@ -1782,12 +2018,12 @@ test('a real section-loss trip parks whether or not restructure:true is set: the
 // failure as ok:true / exit 0. The same failure landing on two different
 // exit codes depending on which command hit it. The fix is scoped to that one
 // failure mode (`marker-did-not-land`): the OTHER skip reasons
-// (compact-gate-not-ok, no-user-close-signal, transcript-unresolved,
-// commit-failed) are conditions this session can clear and retry, and stay
-// ok:true by design (see "a marker withheld by a real vault-commit failure
-// leaves the close signal unspent for a retry" in tests/close-hooks-gate.test.mjs
-// and the ISSUE-140 test in tests/close-global.test.mjs, both of which pin
-// that ok:true must survive those).
+// (compact-gate-not-ok, no-user-close-signal, transcript-unresolved) are policy
+// withholds this session can clear and retry, and they stay ok:true by
+// design (see the ISSUE-140 test in tests/close-global.test.mjs). commit-failed is
+// not one of them any more: nothing was published, so it is ok:false at stage
+// commit-failed (see "a marker withheld by a real vault-commit failure leaves the
+// close signal unspent for a retry" in tests/close-hooks-gate.test.mjs).
 
 suite('ISSUE-153: a marker write that genuinely fails must not exit 0');
 
@@ -2015,6 +2251,8 @@ test('--mark-session-closed warns too, with the marker-only undo (it makes no co
   withWiki(null, (dir) => {
     const sessionId = `hosttag-mark-${process.pid}-${Math.random().toString(36).slice(2, 10)}`;
     const cleanup = seedCloseTranscript(sessionId, { toolUseLines: [HOST_TAG_ENQUEUE] });
+    // --mark proves THIS session's close, so the session needs one to prove.
+    pinCommittedClose(dir, sessionId, todayLocal());
     try {
       const r = run('crystallize.mjs', [
         `--hypo-dir=${dir}`,
@@ -2231,24 +2469,26 @@ test('a .hypoignore-excluded target commits the OLD bytes, and the receipt is wi
   });
 });
 
-// The original fixture of the test above: hot.md sits inside the project folder
-// being closed. Since the gate blocks any dirty file there, the close is now
-// refused one step earlier, as compact-gate-not-ok, with no marker and no receipt.
-test('a .hypoignore-excluded hot.md in the project folder is refused by the gate (compact-gate-not-ok), no marker, no receipt', () => {
+// The test above with a file inside the project folder being closed instead:
+// the gate blocks any dirty file there, so the close is refused one step
+// earlier, as compact-gate-not-ok, with no marker and no receipt. (Its original
+// fixture, an ignored project's entry, now passes the gate on its local proof:
+// see the .hypoignore suite below.)
+test('a dirty file in the project folder being closed refuses the gate (compact-gate-not-ok), no marker, no receipt', () => {
   withWiki(null, (dir, today) => {
-    writeFileSync(join(dir, '.hypoignore'), 'projects/test-project/hot.md\n');
+    // Not a .md page, so preflight lint has nothing to say about it.
+    writeFileSync(join(dir, 'projects', 'test-project', 'scratch.txt'), 'unsaved work\n');
     const payload = payloadForCleanWiki(dir, today);
-    payload.projectHot.content = `${payload.projectHot.content}\n## 새로 쓴 hot.md 내용\n`;
     const sessionId = 's-hypoignore-gate-refusal';
-    snapshotBase(dir, sessionId, ['projects/test-project/hot.md']);
     const r = runApply(dir, payload, { sessionId });
     const out = JSON.parse(r.stdout);
+    assert.equal(out.committed, true, `the close itself committed: ${r.stdout}`);
     assert.equal(out.markerSkipReason, 'compact-gate-not-ok', `stage: ${r.stdout}\n${r.stderr}`);
     assert.equal(out.markerWritten, false);
     // The result names the checkpoint gate's own blocker, so a caller does not
     // have to reach for --check-session-close, which judges a wider git axis.
     assert.ok(
-      (out.gateBlockers || []).some((b) => b.file === 'projects/test-project/hot.md'),
+      (out.gateBlockers || []).some((b) => b.file === 'projects/test-project/scratch.txt'),
       `gateBlockers must name the refused file: ${JSON.stringify(out.gateBlockers)}`,
     );
     assert.ok(
@@ -2297,12 +2537,10 @@ test('the console report for receipt-proof-mismatch says ok:false and points at 
 // blocker in the vault is what stopped the marker.
 test('the console report for compact-gate-not-ok names the gate blocker, not --session-id or a new close phrase', () => {
   withWiki(null, (dir, today) => {
-    writeFileSync(join(dir, '.hypoignore'), 'projects/test-project/hot.md\n');
+    writeFileSync(join(dir, 'projects', 'test-project', 'scratch.txt'), 'unsaved work\n');
     const payload = payloadForCleanWiki(dir, today);
-    payload.projectHot.content = `${payload.projectHot.content}\n## 새로 쓴 hot.md 내용\n`;
     const sessionId = `s-hypoignore-gate-console-${process.pid}`;
     const cleanup = seedCloseTranscript(sessionId);
-    snapshotBase(dir, sessionId, ['projects/test-project/hot.md']);
     let r;
     try {
       r = runApplyConsole(dir, payload, sessionId);
@@ -2340,10 +2578,9 @@ test('a skipped target whose bytes are already committed (idempotent same-sessio
     assert.equal(out1.ok, true, `first apply must succeed: ${r1.stdout}\n${r1.stderr}`);
     assert.equal(out1.markerWritten, true);
 
-    // Re-apply the SAME payload. sessionState and projectHot are both
-    // idempotent skips now (disk already matches, and it is THIS commit,
-    // not just dirty disk); only the append targets (session-log, log.md)
-    // are already-present skips too, since the entry text is unchanged.
+    // Re-apply the SAME payload. The append targets (session-log, log.md) are
+    // already-present skips (the entry text is unchanged), and the entry is the
+    // one this same close already committed.
     // A second, distinct close phrase (attempt 1 already spent the first):
     // seedCloseTranscript overwrites the file, so the fixture repeats the
     // same opening line and adds a fresh one after it.
@@ -3025,6 +3262,7 @@ test('a receipt whose re-read fails is withdrawn, and the marker writer is never
     const sid = `lrm-reread-${process.pid}`;
     const rp = receiptPath(dir, sid);
     mkdirSync(dirname(rp), { recursive: true }); // created before the umask change, at a usable mode
+    mkdirSync(dirname(sessionCloseLockTarget(dir, sid)), { recursive: true }); // the session lock's directory, likewise
     let called = false;
     const old = process.umask(0o777);
     let out;
@@ -3087,6 +3325,110 @@ test('withdrawOwnReceipt takes back a receipt of the same generation, and treats
   });
 });
 
+// Two attempts for one session id. The second one starts while the first sits between its
+// receipt and its marker (the marker writer is the seam). Unserialized, the second lands a
+// full pair and the first then stamps its own marker over it: receipt B beside marker A,
+// both attempts reporting ok.
+// Disabling the check: in landReceiptThenMarker (scripts/lib/crystallize-close-apply.mjs)
+// call landReceiptThenMarkerLocked directly instead of through withSessionCloseLock.
+test('two attempts for one session id leave a receipt and a marker of the same generation', () => {
+  withTmpDir((dir) => {
+    const sid = `lrm-interleave-${process.pid}`;
+    const filing = (generation) => ({ ...fakeReceipt(sid), generation });
+    const markerFor = (generation) => () =>
+      writeSessionClosedMarker(dir, sid, {
+        project: 'p',
+        projects: ['p'],
+        receiptGeneration: generation,
+      });
+    const a = filing('a'.repeat(32));
+    const b = filing('b'.repeat(32));
+    let inner;
+    const outer = landReceiptThenMarker(
+      dir,
+      sid,
+      a,
+      () => {
+        inner = landReceiptThenMarker(dir, sid, b, markerFor(b.generation), { lockTimeoutMs: 100 });
+        return markerFor(a.generation)();
+      },
+      { lockTimeoutMs: 100 },
+    );
+    assert.deepEqual(outer, { ok: true }, 'the attempt holding the lock lands');
+    assert.deepEqual(inner, { ok: false, reason: 'session-close-lock-timeout' });
+    const receipt = JSON.parse(readFileSync(receiptPath(dir, sid), 'utf-8'));
+    const marker = JSON.parse(readFileSync(sessionClosedMarkerPath(dir, sid), 'utf-8'));
+    assert.equal(receipt.generation, a.generation);
+    assert.equal(marker.receipt_generation, receipt.generation, 'the marker names the receipt');
+  });
+});
+
+// The resolution is recorded in `afterLanded`, which has to sit under the same lock, and a
+// new close request's invalidation of the prior artifacts waits on it too.
+// Disabling the check: in landReceiptThenMarkerLocked move the `afterLanded()` call out of
+// the lock (return the callback instead of calling it) and run it after withSessionCloseLock.
+test('the close resolution and a new request invalidation wait behind the session lock', () => {
+  withTmpDir((dir) => {
+    const sid = `lrm-after-${process.pid}`;
+    const receipt = fakeReceipt(sid);
+    let invalidation;
+    let rival;
+    const out = landReceiptThenMarker(
+      dir,
+      sid,
+      receipt,
+      () =>
+        writeSessionClosedMarker(dir, sid, {
+          project: 'p',
+          projects: ['p'],
+          receiptGeneration: receipt.generation,
+        }),
+      {
+        lockTimeoutMs: 100,
+        afterLanded: () => {
+          invalidation = invalidatePriorCloseArtifacts(dir, sid, 100);
+          rival = landReceiptThenMarker(dir, sid, receipt, () => true, { lockTimeoutMs: 100 });
+          return { ok: true, recorded: true };
+        },
+      },
+    );
+    assert.deepEqual(out, { ok: true, afterLanded: { ok: true, recorded: true } });
+    assert.deepEqual(invalidation, { ok: false, reason: 'session-close-lock-timeout' });
+    assert.equal(rival.reason, 'session-close-lock-timeout');
+    assert.ok(existsSync(receiptPath(dir, sid)), 'the landed receipt was not invalidated');
+    assert.ok(existsSync(sessionClosedMarkerPath(dir, sid)));
+  });
+});
+
+// A failed attempt takes back only the generation it wrote. A pair another writer (an older
+// installed copy that does not take the session lock) landed in the meantime stays.
+// Disabling the check: in the marker-did-not-land branch of landReceiptThenMarkerLocked
+// replace the two withdrawOwn* calls with invalidateCloseArtifacts(hypoDir, sessionId).
+test('a failed attempt leaves the receipt and marker another close of the session landed', () => {
+  withTmpDir((dir) => {
+    const sid = `lrm-foreign-pair-${process.pid}`;
+    const theirs = { ...fakeReceipt(sid), generation: 'o'.repeat(32) };
+    const out = landReceiptThenMarker(dir, sid, fakeReceipt(sid), () => {
+      assert.equal(writeReceiptAtomic(dir, sid, theirs).ok, true);
+      writeSessionClosedMarker(dir, sid, {
+        project: 'p',
+        projects: ['p'],
+        receiptGeneration: theirs.generation,
+      });
+      return false; // this attempt's own marker write failed
+    });
+    assert.deepEqual(out, { ok: false, reason: 'marker-did-not-land' });
+    assert.equal(
+      JSON.parse(readFileSync(receiptPath(dir, sid), 'utf-8')).generation,
+      'o'.repeat(32),
+    );
+    assert.equal(
+      JSON.parse(readFileSync(sessionClosedMarkerPath(dir, sid), 'utf-8')).receipt_generation,
+      'o'.repeat(32),
+    );
+  });
+});
+
 // Disabling the check: in runMarkSessionClosed remove the try/catch around the
 // withFileLock call (the pre-fix shape), so ELOCKTIMEOUT escapes as a stack.
 test('--mark-session-closed reports a vault-commit lock timeout as JSON and exit 1, not a stack', () => {
@@ -3117,38 +3459,54 @@ test('--mark-session-closed reports a vault-commit lock timeout as JSON and exit
   });
 });
 
-// Disabling the check: in buildMarkCloseProof delete the `if (!status.ok ||
-// !status.sessionLogEvidence?.path)` early continue and restore the conditional
-// spread `...(status.sessionLogEvidence?.path ? [status.sessionLogEvidence.path] : [])`
-// in targets. The session-log target then silently drops out of the proof.
-test('buildMarkCloseProof marks a project incomplete when it has no session-log evidence file', () => {
+// A project with no session-log file is still certified on its own entry: the log lines carry
+// no close id (ISSUE-199), so they are reported as a notice and are not part of the proof.
+// Disabling the check: in sessionCloseFileStatus's 'session' branch push the log gaps into
+// `stale` / `missing`, and the project reads as incomplete again.
+test('buildMarkCloseProof certifies a project with no session-log file on its entry alone and carries a notice', () => {
   withWiki(
     (dir, today) => {
-      // No session-log file at all for the project: sessionCloseFileStatus then
-      // has no evidence path to name, and every OTHER target is committed and clean.
       rmSync(join(dir, 'projects', 'test-project', 'session-log', `${today.slice(0, 7)}.md`));
     },
-    (dir) => {
-      const proof = buildMarkCloseProof(dir, ['test-project'], false);
-      assert.equal(
-        proof.ok,
-        false,
-        `an uncheckable session-log must not certify: ${JSON.stringify(proof)}`,
+    (dir, today) => {
+      const closeId = closeIdFor('s-proof-nolog', 0);
+      const rel = writeEntryFile(dir, {
+        closeId,
+        date: today,
+        tracks: [{ id: 'main', new: true }],
+      });
+      const proof = buildMarkCloseProof(dir, ['test-project'], false, { closeId });
+      assert.equal(proof.ok, true, JSON.stringify(proof));
+      assert.deepEqual(proof.incompleteProjects, []);
+      assert.deepEqual(
+        proof.entries.map((e) => e.path),
+        [rel],
       );
-      assert.deepEqual(proof.incompleteProjects, ['test-project']);
-      assert.deepEqual(proof.entries, []);
+      assert.ok(
+        proof.notices.some(
+          (n) => n.type === 'close-logs-missing' && /session-log\//.test(n.reason),
+        ),
+        JSON.stringify(proof.notices),
+      );
     },
   );
 });
 
-test('buildMarkCloseProof certifies a project whose session-log evidence is committed (negative control)', () => {
-  withWiki(null, (dir) => {
-    const proof = buildMarkCloseProof(dir, ['test-project'], false);
+test('buildMarkCloseProof proves a project by its committed entry as a create, with no log file among the entries (negative control)', () => {
+  withWiki(null, (dir, today) => {
+    const closeId = closeIdFor('s-proof-ok', 0);
+    const rel = writeEntryFile(dir, { closeId, date: today, tracks: [{ id: 'main', new: true }] });
+    const proof = buildMarkCloseProof(dir, ['test-project'], false, { closeId });
     assert.equal(proof.ok, true, JSON.stringify(proof));
     assert.ok(
-      proof.entries.some((e) => /session-log\//.test(e.path)),
-      `the session-log evidence file must be among the proven paths: ${JSON.stringify(proof.entries)}`,
+      !proof.entries.some((e) => /session-log\/|^log\.md$/.test(e.path)),
+      `no log file is proven: ${JSON.stringify(proof.entries)}`,
     );
+    assert.ok(
+      proof.entries.some((e) => e.path === rel && e.kind === 'create'),
+      `this close's committed entry is proven as a create: ${JSON.stringify(proof.entries)}`,
+    );
+    assert.deepEqual(proof.notices, []);
   });
 });
 
@@ -3514,4 +3872,3739 @@ test('overflow heading in a project without design-history.md: close lists it as
       cleanup();
     }
   });
+});
+
+// ── close pin: one close id per close request ────────────────────────────────
+// Until the original-entry writer lands, the observable face of "the same
+// original path" is the id the pin hands out: the entry file name is
+// `<date>-<closeId>.md`.
+
+suite('crystallize.mjs close pin (one close id per close request)');
+
+const PIN_CLOSE_PHRASE = JSON.stringify({
+  type: 'user',
+  message: { role: 'user', content: '세션 마무리 해줘' },
+});
+
+function pinTranscriptPath(sessionId) {
+  return join(SESSION_TMP_HOME, '.claude', 'projects', 'hypo-test-proj', `${sessionId}.jsonl`);
+}
+
+/** The user types the close phrase again: one more genuine close record. */
+function typeCloseAgain(sessionId) {
+  appendFileSync(pinTranscriptPath(sessionId), PIN_CLOSE_PHRASE + '\n');
+}
+
+function pinGate(dir, sessionId) {
+  return closeGateStatus({
+    transcriptPath: pinTranscriptPath(sessionId),
+    hypoDir: dir,
+    sessionId,
+  });
+}
+
+/** What the PreCompact and `--mark-session-closed` verdict sites compute. */
+function pinProofId(dir, sessionId) {
+  const gate = pinGate(dir, sessionId);
+  return sessionProofCloseId(dir, sessionId, {
+    closeOpen: gate.ok,
+    resolvedAtIndex: gate.resolvedAtIndex,
+  });
+}
+
+// An apply that stops at payload validation: authority passed and the pin was
+// taken, but nothing resolved, so the close request stays open.
+function unresolvedApply(dir, today, sessionId) {
+  const out = JSON.parse(
+    runApply(dir, { project: 'test-project', date: today }, { sessionId }).stdout,
+  );
+  assert.equal(out.ok, false);
+  assert.match(out.error, /payload schema invalid/);
+}
+
+function newPinSession(label) {
+  return `${label}-${process.pid}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+// Disabling the check: in applying a close, skip the stored-pin lookup in
+// pinCloseId (always build the pending from the current openedAtIndex).
+test('a retry after the user typed the close phrase again keeps the first close id', () => {
+  withWiki(null, (dir, today) => {
+    const sessionId = newPinSession('pin-retype');
+    const cleanup = seedCloseTranscript(sessionId);
+    try {
+      unresolvedApply(dir, today, sessionId);
+      assert.equal(readClosePin(dir, sessionId).pending.closeId, closeIdFor(sessionId, 0));
+
+      typeCloseAgain(sessionId);
+      assert.equal(
+        pinGate(dir, sessionId).openedAtIndex,
+        1,
+        'the fixture must move the signal, or this test pins nothing',
+      );
+      unresolvedApply(dir, today, sessionId);
+      const pending = readClosePin(dir, sessionId).pending;
+      assert.equal(pending.closeId, closeIdFor(sessionId, 0));
+      assert.equal(pending.openedAtIndex, 0);
+
+      // The close has not resolved: the open request's id is the pending one.
+      assert.equal(pinProofId(dir, sessionId), closeIdFor(sessionId, 0));
+
+      // The retry that finally carries a valid payload publishes under the FIRST id: the
+      // entry path is what the pin pins, not a pending record the observable id stands for.
+      const done = JSON.parse(runApply(dir, v2Payload(today), { sessionId }).stdout);
+      assert.equal(done.ok, true, JSON.stringify(done));
+      assert.deepEqual(sessionFilesOf(dir), [`${today}-${closeIdFor(sessionId, 0)}.md`]);
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+// Disabling the check: in pinCloseId, build the pending from `openedAtIndex`
+// whenever the signal moved, or in resolveClosePin drop the lastResolved write.
+test('a failed receipt after the commit (journal cleared) retries under the same id, and a resolved close hands out its id until a new request opens', () => {
+  withWiki(null, (dir, today) => {
+    const sessionId = newPinSession('pin-receipt');
+    const cleanup = seedCloseTranscript(sessionId);
+    try {
+      const sessionCacheDir = join(dir, '.cache', 'sessions', sessionId);
+      mkdirSync(dirname(sessionCacheDir), { recursive: true });
+      writeFileSync(sessionCacheDir, 'occupied by a file, not a directory\n');
+      const payload = payloadForCleanWiki(dir, today);
+      const first = JSON.parse(runApply(dir, payload, { sessionId }).stdout);
+      assert.equal(first.stage, 'receipt-write-failed', JSON.stringify(first));
+      assert.equal(first.committed, true);
+      assert.deepEqual(
+        readJournal(dir, sessionId),
+        {},
+        'the commit landed, so the journal is gone',
+      );
+
+      const id = closeIdFor(sessionId, 0);
+      assert.equal(readClosePin(dir, sessionId).pending.closeId, id);
+      assert.deepEqual(sessionFilesOf(dir), [`${today}-${id}.md`], 'the entry is under that id');
+      // The close stamped its write time; a retry must keep it, or the bytes of a close change.
+      const firstClosedAt = entryAt(dir, `${today}-${id}.md`).closedAt;
+      assert.match(firstClosedAt ?? '', /^\d{4}-\d{2}-\d{2}T[\d:.]+Z$/);
+      assert.ok(Math.abs(Date.now() - Date.parse(firstClosedAt)) < 120000, firstClosedAt);
+      assert.equal(
+        pinProofId(dir, sessionId),
+        id,
+        'closeOpen:true still resolves to the pinned id',
+      );
+
+      unlinkSync(sessionCacheDir);
+      typeCloseAgain(sessionId);
+      const retry = JSON.parse(runApply(dir, payload, { sessionId }).stdout);
+      assert.equal(retry.ok, true, JSON.stringify(retry));
+      const resolved = readClosePin(dir, sessionId);
+      assert.equal(resolved.pending, null);
+      assert.equal(resolved.lastResolved, id, 'the retry kept the id although the signal moved');
+      assert.deepEqual(
+        sessionFilesOf(dir),
+        [`${today}-${id}.md`],
+        'the retry adopted the same entry file, it did not write a second one',
+      );
+      assert.equal(
+        entryAt(dir, `${today}-${id}.md`).closedAt,
+        firstClosedAt,
+        'the retry keeps closed_at',
+      );
+
+      // Resolved, no open signal: the finished close vouches for itself.
+      const afterGate = pinGate(dir, sessionId);
+      assert.equal(afterGate.ok, false);
+      assert.equal(pinProofId(dir, sessionId), id);
+
+      // A new close request after the resolution gets a new id.
+      typeCloseAgain(sessionId);
+      const newGate = pinGate(dir, sessionId);
+      assert.equal(newGate.ok, true);
+      unresolvedApply(dir, today, sessionId);
+      const next = readClosePin(dir, sessionId);
+      assert.equal(next.pending.closeId, closeIdFor(sessionId, newGate.openedAtIndex));
+      assert.notEqual(next.pending.closeId, id);
+      assert.equal(next.lastResolved, id);
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+// Disabling the check: in sessionProofCloseId delete the `closeOpen ? null :`
+// branch (return lastResolved whenever there is no pending).
+test('after a resolution, a second close signal that has not been applied yet is not proven by the earlier close id', () => {
+  withWiki(null, (dir, today) => {
+    const sessionId = newPinSession('pin-second-signal');
+    const cleanup = seedCloseTranscript(sessionId);
+    try {
+      const ok = JSON.parse(runApply(dir, payloadForCleanWiki(dir, today), { sessionId }).stdout);
+      assert.equal(ok.ok, true, JSON.stringify(ok));
+      const id = closeIdFor(sessionId, 0);
+      assert.equal(readClosePin(dir, sessionId).lastResolved, id);
+
+      typeCloseAgain(sessionId);
+      assert.equal(pinGate(dir, sessionId).ok, true, 'the new signal is open');
+      assert.equal(pinProofId(dir, sessionId), null);
+      // Paired: the same pin with no open signal is the earlier close's proof.
+      const gate = pinGate(dir, sessionId);
+      assert.equal(
+        sessionProofCloseId(dir, sessionId, {
+          closeOpen: false,
+          resolvedAtIndex: gate.resolvedAtIndex,
+        }),
+        id,
+      );
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+// Runs applySessionClose in a child with the seam that crashes a close between
+// the gate resolution record and the pin move.
+function applyCrashingAfterResolution(dir, payload, sessionId) {
+  const payloadPath = join(
+    tmpdir(),
+    `hypo-payload-${process.pid}-${Math.random().toString(36).slice(2, 10)}.json`,
+  );
+  writeFileSync(payloadPath, JSON.stringify(payload));
+  const argv = [
+    'node',
+    'crystallize.mjs',
+    `--hypo-dir=${dir}`,
+    '--apply-session-close',
+    `--payload=${payloadPath}`,
+    '--json',
+    `--session-id=${sessionId}`,
+  ];
+  const script = `
+    import { parseArgs } from ${JSON.stringify(pathToFileURL(join(REPO, 'scripts', 'lib', 'crystallize-args.mjs')).href)};
+    import { applySessionClose } from ${JSON.stringify(pathToFileURL(join(REPO, 'scripts', 'lib', 'crystallize-close-apply.mjs')).href)};
+    applySessionClose(parseArgs(${JSON.stringify(argv)}), {
+      afterResolutionBeforePin() {
+        throw new Error('crash between resolution and pin');
+      },
+    });
+  `;
+  try {
+    return spawnSync(process.execPath, ['--input-type=module', '-e', script], {
+      encoding: 'utf-8',
+      env: { ...process.env, HYPO_DIR: '', HOME: SESSION_TMP_HOME },
+    });
+  } finally {
+    rmSync(payloadPath, { force: true });
+  }
+}
+
+// Disabling the check: delete the normalizeClosePin call in pinCloseId and in
+// sessionProofCloseId. The "new request gets a new id" assertion goes red; the
+// retry-keeps-its-id test above stays green.
+test('a close that crashed between its resolution record and the pin move does not lend its id to the next request', () => {
+  withWiki(null, (dir, today) => {
+    const sessionId = newPinSession('pin-crash');
+    const cleanup = seedCloseTranscript(sessionId);
+    try {
+      const r = applyCrashingAfterResolution(dir, payloadForCleanWiki(dir, today), sessionId);
+      assert.notEqual(r.status, 0, `the seam must crash the child: ${r.stdout}`);
+      assert.match(r.stderr, /crash between resolution and pin/);
+      assert.ok(existsSync(closeGatePath(dir, sessionId)), 'the resolution record landed first');
+      const stale = closeIdFor(sessionId, 0);
+      assert.equal(
+        readClosePin(dir, sessionId).pending?.closeId,
+        stale,
+        'pending was left standing',
+      );
+      const staleFile = join(sessionsDirOf(dir), `${today}-${stale}.md`);
+      const staleBytes = readFileSync(staleFile, 'utf-8');
+
+      typeCloseAgain(sessionId);
+      const gate = pinGate(dir, sessionId);
+      assert.equal(gate.ok, true);
+      // Before any apply: the already-resolved pending must not prove the new request.
+      assert.equal(pinProofId(dir, sessionId), null);
+
+      unresolvedApply(dir, today, sessionId);
+      const pin = readClosePin(dir, sessionId);
+      assert.equal(pin.pending.closeId, closeIdFor(sessionId, gate.openedAtIndex));
+      assert.notEqual(pin.pending.closeId, stale);
+      assert.equal(pin.lastResolved, stale);
+
+      // The new request writes its own entry; the earlier close's bytes are untouched.
+      const next = JSON.parse(
+        runApply(
+          dir,
+          v2Payload(today, {
+            tracks: [{ id: 'p2-track', new: true, next: '- p2' }],
+            tag: 'p2 new request',
+          }),
+          { sessionId },
+        ).stdout,
+      );
+      assert.equal(next.ok, true, JSON.stringify(next));
+      assert.equal(
+        existsSync(
+          join(sessionsDirOf(dir), `${today}-${closeIdFor(sessionId, gate.openedAtIndex)}.md`),
+        ),
+        true,
+        'the new request has its own entry path',
+      );
+      assert.equal(readFileSync(staleFile, 'utf-8'), staleBytes, 'the earlier entry is unchanged');
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+// The close-gate resolution directory refuses writes while the receipt and marker
+// still land: the one state where a close spends nothing and must say so.
+function withUnwritableGateDir(dir, sessionId, fn) {
+  const gateDir = dirname(closeGatePath(dir, sessionId));
+  mkdirSync(gateDir, { recursive: true });
+  chmodSync(gateDir, 0o500);
+  try {
+    return fn();
+  } finally {
+    chmodSync(gateDir, 0o700);
+  }
+}
+
+// The second close request after a recovered close: a new id, a new entry, and the
+// first close's bytes untouched (the state a lent id would have broken).
+function assertSecondRequestGetsItsOwnEntry(
+  dir,
+  today,
+  sessionId,
+  firstId,
+  firstBytes,
+  { typeAgain = true } = {},
+) {
+  if (typeAgain) typeCloseAgain(sessionId);
+  const gate = pinGate(dir, sessionId);
+  assert.equal(gate.ok, true, 'the new request is open');
+  const second = JSON.parse(
+    runApply(
+      dir,
+      v2Payload(today, {
+        summary: 'second request summary',
+        tracks: [{ id: 'second-request', new: true, next: '- second' }],
+        tag: 'second request',
+      }),
+      { sessionId },
+    ).stdout,
+  );
+  assert.equal(second.ok, true, JSON.stringify(second));
+  const secondId = closeIdFor(sessionId, gate.openedAtIndex);
+  assert.notEqual(secondId, firstId);
+  assert.equal(entryAt(dir, `${today}-${secondId}.md`).summary, 'second request summary');
+  assert.equal(
+    readFileSync(join(sessionsDirOf(dir), `${today}-${firstId}.md`), 'utf-8'),
+    firstBytes,
+    'the first close entry is unchanged',
+  );
+}
+
+// Disabling the check: in settleCloseResolution return `{ ok: true }` when the
+// record did not land (skip the withdrawal). The first apply then ends ok with its
+// marker, and the stage assertion goes red.
+test('a close whose gate resolution cannot be recorded fails at close-resolution-failed and takes back its receipt and marker; the retry finishes it and the next request gets a new id', () => {
+  if (process.getuid && process.getuid() === 0) return; // root ignores directory modes
+  withWiki(null, (dir, today) => {
+    const sessionId = newPinSession('pin-resolution');
+    const cleanup = seedCloseTranscript(sessionId);
+    try {
+      const first = withUnwritableGateDir(dir, sessionId, () =>
+        JSON.parse(runApply(dir, payloadForCleanWiki(dir, today), { sessionId }).stdout),
+      );
+      assert.equal(first.ok, false, JSON.stringify(first));
+      assert.equal(first.stage, 'close-resolution-failed', JSON.stringify(first));
+      assert.equal(first.committed, true);
+      assert.equal(first.markerWritten, false);
+      assert.equal(existsSync(sessionClosedMarkerPath(dir, sessionId)), false, 'marker taken back');
+      assert.equal(existsSync(receiptPath(dir, sessionId)), false, 'receipt taken back');
+      assert.equal(existsSync(closeGatePath(dir, sessionId)), false, 'nothing resolved');
+      const id = closeIdFor(sessionId, 0);
+      assert.equal(readClosePin(dir, sessionId).pending.closeId, id, 'the close stays pending');
+      const bytes = readFileSync(join(sessionsDirOf(dir), `${today}-${id}.md`), 'utf-8');
+
+      // No new close phrase: the signal was never spent, the retry adopts the entry.
+      const retry = JSON.parse(
+        runApply(dir, payloadForCleanWiki(dir, today), { sessionId }).stdout,
+      );
+      assert.equal(retry.ok, true, JSON.stringify(retry));
+      assert.equal(retry.markerWritten, true, JSON.stringify(retry));
+      assert.ok(existsSync(closeGatePath(dir, sessionId)), 'the retry recorded the resolution');
+      assert.equal(readClosePin(dir, sessionId).lastResolved, id);
+
+      assertSecondRequestGetsItsOwnEntry(dir, today, sessionId, id, bytes);
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+// Disabling the check: in runMarkSessionClosed's lock body return `{ ok: true }` on
+// `landed.ok` without calling settleCloseResolution. The first --mark then ends ok,
+// and with no resolution recorded the pin keeps lending the id.
+test('--mark-session-closed records the resolution too: one that cannot be written fails it with its receipt and marker taken back, and the fixed re-run spends the signal', () => {
+  if (process.getuid && process.getuid() === 0) return; // root ignores directory modes
+  withWiki(null, (dir, today) => {
+    const sessionId = newPinSession('mark-resolution');
+    const cleanup = seedCloseTranscript(sessionId);
+    try {
+      const unblock = blockReceipt(dir, sessionId);
+      const applied = JSON.parse(
+        runApply(dir, payloadForCleanWiki(dir, today), { sessionId }).stdout,
+      );
+      assert.equal(applied.stage, 'receipt-write-failed', JSON.stringify(applied));
+      unblock();
+      const id = closeIdFor(sessionId, 0);
+      const bytes = readFileSync(join(sessionsDirOf(dir), `${today}-${id}.md`), 'utf-8');
+      const mark = () => {
+        const r = run('crystallize.mjs', [
+          `--hypo-dir=${dir}`,
+          '--mark-session-closed',
+          `--session-id=${sessionId}`,
+          '--project=test-project',
+          '--json',
+        ]);
+        return { r, out: JSON.parse(r.stdout) };
+      };
+
+      const refused = withUnwritableGateDir(dir, sessionId, mark);
+      assert.equal(refused.r.status, 1, refused.r.stdout);
+      assert.equal(refused.out.reason, 'close-resolution-failed', refused.r.stdout);
+      assert.equal(existsSync(sessionClosedMarkerPath(dir, sessionId)), false, 'marker taken back');
+      assert.equal(existsSync(receiptPath(dir, sessionId)), false, 'receipt taken back');
+      assert.equal(readClosePin(dir, sessionId).pending.closeId, id);
+
+      const marked = mark();
+      assert.equal(marked.r.status, 0, `${marked.r.stdout}\n${marked.r.stderr}`);
+      assert.equal(marked.out.ok, true);
+      assert.ok(existsSync(closeGatePath(dir, sessionId)), '--mark recorded the resolution');
+      assert.equal(readClosePin(dir, sessionId).lastResolved, id);
+
+      assertSecondRequestGetsItsOwnEntry(dir, today, sessionId, id, bytes);
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+// Runs `--mark-session-closed` or `--apply-session-close` in a child whose
+// `beforeResolution` seam appends a genuine second close request to the transcript:
+// the user typing between this close's gate check and its resolution record.
+// `payload` is only for the apply mode. `hook` picks the seam that types: the default
+// `beforeResolution`, or the mark's `afterCloseGateRead`, which fires right after its
+// one gate read. `lines` are the transcript lines it appends.
+function runTypingBeforeResolution(
+  dir,
+  sessionId,
+  mode,
+  payload = null,
+  { hook = 'beforeResolution', lines = [PIN_CLOSE_PHRASE] } = {},
+) {
+  const payloadPath = join(
+    tmpdir(),
+    `hypo-payload-${process.pid}-${Math.random().toString(36).slice(2, 10)}.json`,
+  );
+  const argv = [
+    'node',
+    'crystallize.mjs',
+    `--hypo-dir=${dir}`,
+    `--session-id=${sessionId}`,
+    '--json',
+    ...(mode === 'apply'
+      ? ['--apply-session-close', `--payload=${payloadPath}`]
+      : ['--mark-session-closed', '--project=test-project']),
+  ];
+  if (payload) writeFileSync(payloadPath, JSON.stringify(payload));
+  const entry = mode === 'apply' ? 'applySessionClose' : 'runMarkSessionClosed';
+  const script = `
+    import { appendFileSync } from 'node:fs';
+    import { parseArgs } from ${JSON.stringify(pathToFileURL(join(REPO, 'scripts', 'lib', 'crystallize-args.mjs')).href)};
+    import { ${entry} } from ${JSON.stringify(pathToFileURL(join(REPO, 'scripts', 'lib', 'crystallize-close-apply.mjs')).href)};
+    ${entry}(parseArgs(${JSON.stringify(argv)}), {
+      ${hook}() {
+        appendFileSync(${JSON.stringify(pinTranscriptPath(sessionId))}, ${JSON.stringify(lines.join('\n') + '\n')});
+      },
+    });
+  `;
+  try {
+    return spawnSync(process.execPath, ['--input-type=module', '-e', script], {
+      encoding: 'utf-8',
+      env: { ...process.env, HYPO_DIR: '', HOME: SESSION_TMP_HOME },
+    });
+  } finally {
+    rmSync(payloadPath, { force: true });
+  }
+}
+
+function recordedClosedAtIndex(dir, sessionId) {
+  return JSON.parse(readFileSync(closeGatePath(dir, sessionId), 'utf-8')).closedAtIndex;
+}
+
+// Disabling the check: in settleCloseResolution call `resolutionStamp` without the
+// bound (`resolutionStamp(readFileSync(transcriptPath))`), or in runMarkSessionClosed
+// pass `{ openedAtIndex: -1, ... }`. The first goes red on the closedAtIndex line,
+// the second on the mark's own ok.
+// The fixture puts a blank line, a `null` and a number before the first signal: they
+// are not records for either walkCloseGate or resolutionStamp, so position 0 and a
+// count of 1 must still line up.
+test('--mark-session-closed does not resolve a close request typed after its gate check: the signal stays open and the next apply succeeds under a new close id', () => {
+  withWiki(null, (dir, today) => {
+    const sessionId = newPinSession('mark-race');
+    const cleanup = seedCloseTranscript(sessionId);
+    try {
+      const tp = pinTranscriptPath(sessionId);
+      writeFileSync(tp, '\nnull\n42\n' + readFileSync(tp, 'utf-8'));
+      const unblock = blockReceipt(dir, sessionId);
+      const applied = JSON.parse(
+        runApply(dir, payloadForCleanWiki(dir, today), { sessionId }).stdout,
+      );
+      assert.equal(applied.stage, 'receipt-write-failed', JSON.stringify(applied));
+      unblock();
+      const id = closeIdFor(sessionId, 0);
+      const bytes = readFileSync(join(sessionsDirOf(dir), `${today}-${id}.md`), 'utf-8');
+
+      const r = runTypingBeforeResolution(dir, sessionId, 'mark');
+      assert.equal(r.status, 0, `${r.stdout}\n${r.stderr}`);
+      assert.equal(JSON.parse(r.stdout).ok, true, r.stdout);
+      assert.equal(recordedClosedAtIndex(dir, sessionId), 1, 'only the first request is resolved');
+      assert.equal(readClosePin(dir, sessionId).lastResolved, id);
+      const gate = pinGate(dir, sessionId);
+      assert.equal(gate.ok, true, 'the request typed in the gap is still open');
+      assert.equal(gate.openedAtIndex, 1);
+
+      assertSecondRequestGetsItsOwnEntry(dir, today, sessionId, id, bytes, { typeAgain: false });
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+// Disabling the check: pass `{ openedAtIndex: -1, ... }` at the settleCloseResolution
+// call in the apply marker phase, or drop the bound there as above. The first apply
+// then fails at close-resolution-failed, the second refuses
+// no-new-open-since-resolution.
+test('an apply does not resolve a close request typed between its gate check and its resolution record: the next apply succeeds under a new close id', () => {
+  withWiki(null, (dir, today) => {
+    const sessionId = newPinSession('apply-race');
+    const cleanup = seedCloseTranscript(sessionId);
+    try {
+      const r = runTypingBeforeResolution(dir, sessionId, 'apply', payloadForCleanWiki(dir, today));
+      const first = JSON.parse(r.stdout);
+      assert.equal(first.ok, true, `${r.stdout}\n${r.stderr}`);
+      assert.equal(first.markerWritten, true, r.stdout);
+      const id = closeIdFor(sessionId, 0);
+      assert.equal(recordedClosedAtIndex(dir, sessionId), 1, 'only the first request is resolved');
+      assert.equal(readClosePin(dir, sessionId).lastResolved, id);
+      assert.equal(pinGate(dir, sessionId).ok, true, 'the request typed in the gap is still open');
+      const bytes = readFileSync(join(sessionsDirOf(dir), `${today}-${id}.md`), 'utf-8');
+
+      assertSecondRequestGetsItsOwnEntry(dir, today, sessionId, id, bytes, { typeAgain: false });
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+// Disabling the check: in runMarkSessionClosed gate on a second read again,
+// `!closeTranscript || !isCloseGateOpen(closeTranscript)`. The close request typed
+// after the gate read then authorizes the mark, which stamps the first read's bound
+// (the old close's position) and succeeds, so the refusal assertion goes red.
+// The gate read sees a retracted close: the mark has no user close signal and refuses.
+// A phrase typed after that read is a new request the mark neither authorizes nor
+// spends, so the next apply uses it once and a second apply is refused.
+test('--mark-session-closed judges the user close signal on the same read that bounds its resolution: a close phrase typed after that read neither authorizes the mark nor gets spent', () => {
+  withWiki(null, (dir, today) => {
+    const sessionId = newPinSession('mark-reread');
+    const cleanup = seedCloseTranscript(sessionId);
+    try {
+      const unblock = blockReceipt(dir, sessionId);
+      const applied = JSON.parse(
+        runApply(dir, payloadForCleanWiki(dir, today), { sessionId }).stdout,
+      );
+      assert.equal(applied.stage, 'receipt-write-failed', JSON.stringify(applied));
+      assert.equal(applied.committed, true, JSON.stringify(applied));
+      unblock();
+      appendFileSync(pinTranscriptPath(sessionId), UNREGISTERED_HOST_TAG_ENQUEUE + '\n');
+      assert.equal(pinGate(dir, sessionId).open, false, 'the fixture must retract the close');
+
+      const r = runTypingBeforeResolution(dir, sessionId, 'mark', null, {
+        hook: 'afterCloseGateRead',
+      });
+      const out = JSON.parse(r.stdout);
+      assert.equal(r.status, 1, `${r.stdout}\n${r.stderr}`);
+      assert.equal(out.ok, false, r.stdout);
+      assert.equal(out.skipReason, 'no-user-close-signal', r.stdout);
+      assert.equal(existsSync(sessionClosedMarkerPath(dir, sessionId)), false, 'no marker');
+      assert.equal(existsSync(receiptPath(dir, sessionId)), false, 'no receipt');
+      assert.equal(existsSync(closeGatePath(dir, sessionId)), false, 'nothing resolved');
+      const gate = pinGate(dir, sessionId);
+      assert.equal(gate.ok, true, 'the phrase typed after the read is still an open request');
+      assert.equal(gate.openedAtIndex, 2);
+
+      const next = () =>
+        JSON.parse(runApply(dir, payloadForCleanWiki(dir, today), { sessionId }).stdout);
+      const used = next();
+      assert.equal(used.ok, true, JSON.stringify(used));
+      assert.equal(used.committed, true, JSON.stringify(used));
+      assert.equal(used.markerWritten, true, JSON.stringify(used));
+      assert.equal(recordedClosedAtIndex(dir, sessionId), 3, 'resolved at the new phrase');
+      const again = next();
+      assert.equal(again.ok, false, JSON.stringify(again));
+      assert.equal(again.stage, 'no-user-close-signal', JSON.stringify(again));
+      assert.equal(again.committed, null, JSON.stringify(again));
+      assert.match(again.gateReason, /^no-new-open-since-resolution/, JSON.stringify(again));
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+// A mark whose session holds a stored resolution that the transcript no longer
+// verifies leaves that record alone. Three shapes: the transcript rewritten at a spent
+// position (B2), shortened with a new phrase typed after the mark's gate read (C1),
+// and a stored count that is not a plausible record count (C2).
+// Disabling the check: delete the `closeGate.reason?.startsWith(...)` branch in
+// runMarkSessionClosed so the mark flows into settleCloseResolution. All three go red.
+const REWRITE_NEUTRAL = JSON.stringify({
+  type: 'user',
+  message: { role: 'user', content: '계속' },
+});
+const REWRITE_ORIGINAL = [PIN_CLOSE_PHRASE, REWRITE_NEUTRAL, PIN_CLOSE_PHRASE].join('\n') + '\n';
+
+/** Applies a close on REWRITE_ORIGINAL (stored count 3), then withdraws receipt and marker. */
+function applyRewriteOriginal(dir, today, sessionId) {
+  writeFileSync(pinTranscriptPath(sessionId), REWRITE_ORIGINAL);
+  const applied = JSON.parse(runApply(dir, payloadForCleanWiki(dir, today), { sessionId }).stdout);
+  assert.equal(applied.ok, true, JSON.stringify(applied));
+  assert.equal(applied.markerWritten, true, JSON.stringify(applied));
+  assert.equal(recordedClosedAtIndex(dir, sessionId), 3);
+  rmSync(receiptPath(dir, sessionId), { force: true });
+  rmSync(sessionClosedMarkerPath(dir, sessionId), { force: true });
+}
+
+function markPlain(dir, sessionId) {
+  return run('crystallize.mjs', [
+    `--hypo-dir=${dir}`,
+    '--mark-session-closed',
+    `--session-id=${sessionId}`,
+    '--project=test-project',
+    '--json',
+  ]);
+}
+
+function assertLeftUnverifiable(r, dir, sessionId, storedBefore) {
+  assert.equal(r.status, 0, `${r.stdout}\n${r.stderr}`);
+  const out = JSON.parse(r.stdout);
+  assert.equal(out.ok, true, r.stdout);
+  assert.equal(out.resolution, 'left-unverifiable', r.stdout);
+  assert.match(out.resolution_note, /new session/, r.stdout);
+  assert.equal(existsSync(sessionClosedMarkerPath(dir, sessionId)), true, 'the marker landed');
+  assert.equal(existsSync(receiptPath(dir, sessionId)), true, 'the receipt landed');
+  assert.equal(
+    readFileSync(closeGatePath(dir, sessionId), 'utf-8'),
+    storedBefore,
+    'the stored resolution is byte-identical (count and prefix hash)',
+  );
+}
+
+test('a re-mark after the transcript was rewritten leaves the stored resolution untouched, and the restored transcript does not reopen a phrase an earlier close spent', () => {
+  withWiki(null, (dir, today) => {
+    const sessionId = newPinSession('mark-rewrite');
+    const cleanup = seedCloseTranscript(sessionId);
+    try {
+      const tp = pinTranscriptPath(sessionId);
+      applyRewriteOriginal(dir, today, sessionId);
+      const storedBefore = readFileSync(closeGatePath(dir, sessionId), 'utf-8');
+
+      writeFileSync(tp, [PIN_CLOSE_PHRASE, REWRITE_NEUTRAL, REWRITE_NEUTRAL].join('\n') + '\n');
+      const gate = pinGate(dir, sessionId);
+      assert.equal(gate.open, true, 'the earlier phrase is still open');
+      assert.equal(gate.resolvedAtIndex, null, 'the stored hash no longer matches');
+      assertLeftUnverifiable(markPlain(dir, sessionId), dir, sessionId, storedBefore);
+
+      writeFileSync(tp, REWRITE_ORIGINAL);
+      const replay = JSON.parse(
+        runApply(dir, payloadForCleanWiki(dir, today), { sessionId }).stdout,
+      );
+      assert.equal(replay.ok, false, JSON.stringify(replay));
+      assert.equal(replay.stage, 'no-user-close-signal', JSON.stringify(replay));
+      assert.equal(replay.committed, null, JSON.stringify(replay));
+      assert.match(replay.gateReason, /^no-new-open-since-resolution/, JSON.stringify(replay));
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+test('--mark-session-closed does not stamp a phrase typed after its gate read when the stored resolution is unverifiable: the stored record stays as it was', () => {
+  withWiki(null, (dir, today) => {
+    const sessionId = newPinSession('mark-shrunk');
+    const cleanup = seedCloseTranscript(sessionId);
+    try {
+      applyRewriteOriginal(dir, today, sessionId);
+      const storedBefore = readFileSync(closeGatePath(dir, sessionId), 'utf-8');
+
+      // Two records: the stored count 3 no longer fits, position 0 is open again.
+      writeFileSync(
+        pinTranscriptPath(sessionId),
+        [PIN_CLOSE_PHRASE, REWRITE_NEUTRAL].join('\n') + '\n',
+      );
+      assert.equal(pinGate(dir, sessionId).resolvedAtIndex, null);
+      const r = runTypingBeforeResolution(dir, sessionId, 'mark', null, {
+        hook: 'afterCloseGateRead',
+      });
+      assertLeftUnverifiable(r, dir, sessionId, storedBefore);
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+test('--mark-session-closed with an implausible stored count succeeds and leaves the record alone instead of failing close-resolution-failed on every retry', () => {
+  withWiki(null, (dir, today) => {
+    const sessionId = newPinSession('mark-huge-count');
+    const cleanup = seedCloseTranscript(sessionId);
+    try {
+      applyRewriteOriginal(dir, today, sessionId);
+      const stored = JSON.parse(readFileSync(closeGatePath(dir, sessionId), 'utf-8'));
+      writeFileSync(
+        closeGatePath(dir, sessionId),
+        JSON.stringify({ ...stored, closedAtIndex: Number.MAX_SAFE_INTEGER }),
+      );
+      const storedBefore = readFileSync(closeGatePath(dir, sessionId), 'utf-8');
+      assert.equal(pinGate(dir, sessionId).resolvedAtIndex, null);
+
+      for (let attempt = 0; attempt < 2; attempt++) {
+        rmSync(receiptPath(dir, sessionId), { force: true });
+        rmSync(sessionClosedMarkerPath(dir, sessionId), { force: true });
+        const r = markPlain(dir, sessionId);
+        assert.doesNotMatch(r.stdout, /close-resolution-failed/, r.stdout);
+        assertLeftUnverifiable(r, dir, sessionId, storedBefore);
+      }
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+// Disabling the check: in runMarkSessionClosed drop the `if (args.logOnly) return
+// { ok: true };` line. The log-only mark then records a resolution and retires the
+// pending close, and the retry gets a new id.
+// The pending close here is committed and failed at its receipt: with its entry still
+// uncommitted the checkpoint gate refuses the log-only mark (known-session-write)
+// before it reaches this branch.
+test('a --log-only mark spends no close signal: a pending close keeps its id, and the retry finishes under it', () => {
+  withWiki(null, (dir, today) => {
+    const sessionId = newPinSession('mark-log-only');
+    const cleanup = seedCloseTranscript(sessionId);
+    try {
+      const unblock = blockReceipt(dir, sessionId);
+      const first = applyJson(dir, v2Payload(today, { summary: 'first summary' }), sessionId);
+      assert.equal(first.out.stage, 'receipt-write-failed', JSON.stringify(first.out));
+      unblock();
+      const id = closeIdFor(sessionId, 0);
+      assert.equal(readClosePin(dir, sessionId).pending.closeId, id);
+
+      const r = run('crystallize.mjs', [
+        `--hypo-dir=${dir}`,
+        '--mark-session-closed',
+        `--session-id=${sessionId}`,
+        '--log-only',
+        '--json',
+      ]);
+      assert.equal(r.status, 0, `precondition: the log-only mark lands: ${r.stdout}\n${r.stderr}`);
+      assert.equal(JSON.parse(r.stdout).ok, true);
+      assert.equal(existsSync(closeGatePath(dir, sessionId)), false, 'no resolution recorded');
+      const pin = readClosePin(dir, sessionId);
+      assert.equal(pin.pending?.closeId, id, 'the pending close is untouched');
+      assert.equal(pin.lastResolved, null);
+
+      const retry = applyJson(dir, v2Payload(today, { summary: 'fixed summary' }), sessionId);
+      assert.equal(retry.out.ok, true, JSON.stringify(retry.out));
+      assert.equal(retry.out.markerWritten, true, JSON.stringify(retry.out));
+      assert.deepEqual(sessionFilesOf(dir), [`${today}-${id}.md`], 'the retry kept the close id');
+      assert.equal(readClosePin(dir, sessionId).lastResolved, id);
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+test('a pin that cannot be written stops the close before any wiki write, at stage close-pin', () => {
+  withWiki(null, (dir, today) => {
+    const sessionId = newPinSession('pin-unwritable');
+    const cleanup = seedCloseTranscript(sessionId);
+    try {
+      // A plain file where the pin directory must go makes the durable write fail.
+      mkdirSync(join(dir, '.cache'), { recursive: true });
+      writeFileSync(dirname(closePinPath(dir, sessionId)), 'occupied by a file\n');
+      const headBefore = spawnSync('git', ['rev-parse', 'HEAD'], { cwd: dir, encoding: 'utf-8' });
+      const r = runApply(dir, payloadForCleanWiki(dir, today), { sessionId });
+      const out = JSON.parse(r.stdout);
+      assert.equal(r.status, 1, r.stdout);
+      assert.equal(out.stage, 'close-pin', r.stdout);
+      assert.equal(out.committed, null);
+      const headAfter = spawnSync('git', ['rev-parse', 'HEAD'], { cwd: dir, encoding: 'utf-8' });
+      assert.equal(headAfter.stdout, headBefore.stdout, 'no commit was made');
+      assert.equal(existsSync(closeGatePath(dir, sessionId)), false, 'nothing resolved');
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+// ── original session entries: what a close writes ────────────────────────────
+// A close writes one immutable `projects/<p>/sessions/<date>-<close_id>.md` and no state file.
+// Helpers shared by the suites below. Each suite is its own selection unit.
+
+function sessionsDirOf(dir, project = 'test-project') {
+  return join(dir, 'projects', project, 'sessions');
+}
+
+function sessionFilesOf(dir, project = 'test-project') {
+  const d = sessionsDirOf(dir, project);
+  return existsSync(d)
+    ? readdirSync(d)
+        .filter((f) => f.endsWith('.md'))
+        .sort()
+    : [];
+}
+
+function entryAt(dir, file, project = 'test-project') {
+  const parsed = parseSessionEntry(readFileSync(join(sessionsDirOf(dir, project), file), 'utf-8'));
+  assert.equal(parsed.ok, true, `${file} must parse: ${parsed.reason}`);
+  return parsed.entry;
+}
+
+/** A current-format payload; `tag` keeps each close's session-log entry distinct. */
+function v2Payload(
+  today,
+  { summary = 'close summary', tracks, tag = 'entry close', ...rest } = {},
+) {
+  return {
+    project: 'test-project',
+    date: today,
+    summary,
+    tracks: tracks ?? [{ id: 'main', new: true, next: '- next step' }],
+    sessionLog: { entry: `## [${today}] ${tag}\n` },
+    ...rest,
+  };
+}
+
+function applyJson(dir, payload, sessionId) {
+  const r = runApply(dir, payload, { sessionId });
+  let out = null;
+  try {
+    out = JSON.parse(r.stdout);
+  } catch {
+    assert.fail(`apply printed no JSON (status ${r.status}): ${r.stdout}\n${r.stderr}`);
+  }
+  return { r, out };
+}
+
+// A close of `sessionId` that committed its entry and stopped before its receipt:
+// the pin still holds it as pending, which is what `--mark-session-closed` proves
+// this session by while the close signal is still open.
+function pinCommittedClose(dir, sessionId, date) {
+  const closeId = closeIdFor(sessionId, 0);
+  const rel = writeEntryFile(dir, { closeId, date, tracks: [{ id: 'main', new: true }] });
+  writeClosePin(dir, sessionId, {
+    pending: { closeId, openedAtIndex: 0, entryRelPath: rel, entrySha256s: [] },
+    lastResolved: null,
+    localProofs: {},
+  });
+  return closeId;
+}
+
+/** An entry file written (and committed) as if another session had closed. */
+function writeEntryFile(dir, { closeId, date, tracks, summary = 'other session', bodies = {} }) {
+  const text = formatSessionEntry({
+    project: 'test-project',
+    closeId,
+    date,
+    tracks,
+    summary,
+    bodies,
+  });
+  const rel = join('projects', 'test-project', 'sessions', `${date}-${closeId}.md`);
+  mkdirSync(sessionsDirOf(dir), { recursive: true });
+  writeFileSync(join(dir, rel), text);
+  const env = { ...process.env, HOME: SESSION_TMP_HOME };
+  spawnSync('git', ['add', '-A'], { cwd: dir, env });
+  spawnSync('git', ['commit', '-m', `entry ${closeId}`], { cwd: dir, env });
+  return rel;
+}
+
+function headsOf(dir, project = 'test-project') {
+  const model = loadSessionModel(dir, project);
+  return Object.fromEntries(
+    trackHeads(model.entries).map((t) => [t.trackId, t.heads.map((h) => h.closeId)]),
+  );
+}
+
+const commitCountOf = (dir) =>
+  Number(spawnSync('git', ['rev-list', '--count', 'HEAD'], { cwd: dir, encoding: 'utf-8' }).stdout);
+
+// A pre-commit hook that rejects every commit: the close commits nothing, which is the
+// "commit failed" state a retry has to cope with.
+function blockCommits(dir) {
+  const hook = join(dir, '.git', 'hooks', 'pre-commit');
+  mkdirSync(dirname(hook), { recursive: true });
+  writeFileSync(hook, '#!/bin/sh\necho blocked by test >&2\nexit 1\n', { mode: 0o755 });
+  return () => rmSync(hook, { force: true });
+}
+
+/**
+ * `applySessionClose` in a child with test seams: `hooksSource` is the source of the
+ * `testHooks` object literal (it may use `writeFileSync`).
+ */
+function applyWithHooks(dir, payload, sessionId, hooksSource) {
+  const payloadPath = join(
+    tmpdir(),
+    `hypo-payload-${process.pid}-${Math.random().toString(36).slice(2, 10)}.json`,
+  );
+  writeFileSync(payloadPath, JSON.stringify(payload));
+  const argv = [
+    'node',
+    'crystallize.mjs',
+    `--hypo-dir=${dir}`,
+    '--apply-session-close',
+    `--payload=${payloadPath}`,
+    '--json',
+    `--session-id=${sessionId}`,
+  ];
+  const script = `
+    import { writeFileSync } from 'node:fs';
+    import { parseArgs } from ${JSON.stringify(pathToFileURL(join(REPO, 'scripts', 'lib', 'crystallize-args.mjs')).href)};
+    import { applySessionClose } from ${JSON.stringify(pathToFileURL(join(REPO, 'scripts', 'lib', 'crystallize-close-apply.mjs')).href)};
+    applySessionClose(parseArgs(${JSON.stringify(argv)}), ${hooksSource});
+  `;
+  try {
+    return spawnSync(process.execPath, ['--input-type=module', '-e', script], {
+      encoding: 'utf-8',
+      env: { ...process.env, HYPO_DIR: '', HOME: SESSION_TMP_HOME },
+    });
+  } finally {
+    rmSync(payloadPath, { force: true });
+  }
+}
+
+const CRASH_AFTER_PUBLISH = `{ afterPublish() { throw new Error('crash after publish'); } }`;
+const CRASH_AFTER_PIN = `{ afterPinBeforeReplace() { throw new Error('crash after pin'); } }`;
+
+suite('close entries: tracks, supersedes and heads');
+
+test('two sessions close one project on different tracks one after the other: both ok, no proposal, no parked file', () => {
+  withWiki(null, (dir, today) => {
+    const a = applyJson(
+      dir,
+      v2Payload(today, { tracks: [{ id: 'track-a', new: true, next: '- a' }], tag: 'close a' }),
+      newPinSession('seq-a'),
+    );
+    const b = applyJson(
+      dir,
+      v2Payload(today, { tracks: [{ id: 'track-b', new: true, next: '- b' }], tag: 'close b' }),
+      newPinSession('seq-b'),
+    );
+    for (const { out } of [a, b]) {
+      assert.equal(out.ok, true, JSON.stringify(out));
+      assert.deepEqual(out.proposals, []);
+      assert.deepEqual(out.conflicts, []);
+    }
+    const parked = join(dir, '.cache', 'proposals');
+    assert.deepEqual(existsSync(parked) ? readdirSync(parked) : [], [], 'nothing was parked');
+    assert.equal(sessionFilesOf(dir).length, 2);
+    const heads = headsOf(dir);
+    assert.equal(heads['track-a'].length, 1);
+    assert.equal(heads['track-b'].length, 1);
+  });
+});
+
+// Two real `--apply-session-close` processes on one project, the second started `staggerMs`
+// after the first. Every run must end ok, committed and with its marker written.
+async function closeTwiceInParallel(staggerMs) {
+  const dir = mkdtempSync(join(tmpdir(), 'hypo-wiki-'));
+  try {
+    const today = todayLocal();
+    buildCleanWikiTree(dir, today);
+    const env = { ...process.env, HOME: SESSION_TMP_HOME };
+    spawnSync('git', ['init'], { cwd: dir, env });
+    spawnSync('git', ['config', 'user.email', 'test@test.com'], { cwd: dir, env });
+    spawnSync('git', ['config', 'user.name', 'Test'], { cwd: dir, env });
+    spawnSync('git', ['add', '-A'], { cwd: dir, env });
+    spawnSync('git', ['commit', '-m', 'init'], { cwd: dir, env });
+
+    const spawnClose = (label, trackId) => {
+      const sessionId = newPinSession(label);
+      const cleanup = seedCloseTranscript(sessionId);
+      const payloadPath = join(tmpdir(), `hypo-payload-${sessionId}.json`);
+      writeFileSync(
+        payloadPath,
+        JSON.stringify(
+          v2Payload(today, {
+            tracks: [{ id: trackId, new: true, next: `- ${trackId}` }],
+            tag: `close ${trackId}`,
+          }),
+        ),
+      );
+      const child = spawn(
+        process.execPath,
+        [
+          join(REPO, 'scripts', 'crystallize.mjs'),
+          `--hypo-dir=${dir}`,
+          '--apply-session-close',
+          `--payload=${payloadPath}`,
+          `--session-id=${sessionId}`,
+          '--json',
+        ],
+        { env: { ...process.env, HYPO_DIR: '', HOME: SESSION_TMP_HOME } },
+      );
+      let stdout = '';
+      let stderr = '';
+      child.stdout.on('data', (d) => (stdout += d));
+      child.stderr.on('data', (d) => (stderr += d));
+      return new Promise((resolve) =>
+        child.on('exit', (code) => {
+          cleanup();
+          rmSync(payloadPath, { force: true });
+          resolve({ code, stdout, stderr });
+        }),
+      );
+    };
+    const first = spawnClose('par-a', 'par-a');
+    if (staggerMs > 0) await sleep(staggerMs);
+    const [one, two] = await Promise.all([first, spawnClose('par-b', 'par-b')]);
+    for (const res of [one, two]) {
+      const out = JSON.parse(res.stdout);
+      assert.equal(out.ok, true, `${res.stdout}\n${res.stderr}`);
+      assert.deepEqual(out.proposals, []);
+      assert.deepEqual(out.conflicts, []);
+      // The first to commit must not be refused its marker over the other one's
+      // entry, published and not committed yet (F1).
+      assert.equal(out.committed, true, res.stdout);
+      assert.equal(out.markerWritten, true, res.stdout);
+    }
+    assert.equal(sessionFilesOf(dir).length, 2);
+    const parked = join(dir, '.cache', 'proposals');
+    assert.deepEqual(existsSync(parked) ? readdirSync(parked) : [], []);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+await testAsync(
+  'two processes closing the same project at the same moment both succeed with no proposal and both write their marker',
+  () => closeTwiceInParallel(0),
+);
+
+// A timing sample, not a pin. Started 400ms apart, the second close usually appends its
+// session-log heading while the first one's marker gate runs lint after its commit, but
+// nothing here forces that overlap: on a fast or a loaded machine the two can run apart,
+// and the test then passes without exercising it. The overlap is pinned deterministically
+// by the gate-level test of foreign appends in close-global. A barrier would need a seam
+// in the marker gate that only this test uses.
+await testAsync(
+  'timing sample: two closes of one project started 400ms apart both commit and both write their marker',
+  () => closeTwiceInParallel(400),
+);
+
+// ISSUE-200: a commit takes each whole path (`--only`), so a second close appending to the
+// session-log shard or to log.md between the first one's append and its commit had its text
+// committed under the first close, before its own close finished. Held without timing:
+// close A is parked by the `beforeCommit` seam (its appends have landed, its commit has not)
+// until the test lets it go, and close B, a real process, is started in that window.
+// `pending` names what B has done once it is waiting for the lock under test, `parked` is
+// asserted while A is parked, `after` once both closes have finished.
+// B of the same project is waiting on the shard lock A holds: withFileLock leaves a staging
+// file `<shard>.lock.<hex>.tmp` for the whole wait, and a process that has not reached the
+// lock has none.
+function waitingOnShardLock({ dir, today }) {
+  const logDir = join(dir, 'projects', 'test-project', 'session-log');
+  return (
+    existsSync(logDir) &&
+    readdirSync(logDir).some((f) => f.startsWith(`${today}.md.lock.`) && f.endsWith('.tmp'))
+  );
+}
+
+async function withCloseParkedBeforeCommit(bProject, { pending, parked, after, gitignore }) {
+  const dir = mkdtempSync(join(tmpdir(), 'hypo-wiki-heldlock-'));
+  const cleanups = [];
+  try {
+    const today = todayLocal();
+    buildCleanWikiTree(dir, today);
+    // A vault's own `.gitignore` decides what a close's lock files look like to git.
+    if (gitignore !== undefined) writeFileSync(join(dir, '.gitignore'), gitignore);
+    if (bProject !== 'test-project') {
+      cpSync(join(dir, 'projects', 'test-project'), join(dir, 'projects', bProject), {
+        recursive: true,
+      });
+    }
+    const env = { ...process.env, HOME: SESSION_TMP_HOME };
+    spawnSync('git', ['init'], { cwd: dir, env });
+    spawnSync('git', ['config', 'user.email', 'test@test.com'], { cwd: dir, env });
+    spawnSync('git', ['config', 'user.name', 'Test'], { cwd: dir, env });
+    spawnSync('git', ['add', '-A'], { cwd: dir, env });
+    spawnSync('git', ['commit', '-m', 'init'], { cwd: dir, env });
+    const atCommit = join(dir, '.cache', 'a-at-commit');
+    const release = join(dir, '.cache', 'a-release');
+    mkdirSync(join(dir, '.cache'), { recursive: true });
+
+    const run = (label, project, tag, parkBeforeCommit) => {
+      const sessionId = newPinSession(label);
+      cleanups.push(seedCloseTranscript(sessionId));
+      const payloadPath = join(tmpdir(), `hypo-payload-${sessionId}.json`);
+      cleanups.push(() => rmSync(payloadPath, { force: true }));
+      writeFileSync(
+        payloadPath,
+        JSON.stringify(
+          v2Payload(today, { project, tracks: [{ id: tag, new: true, next: `- ${tag}` }], tag }),
+        ),
+      );
+      const argv = [
+        'node',
+        'crystallize.mjs',
+        `--hypo-dir=${dir}`,
+        '--apply-session-close',
+        `--payload=${payloadPath}`,
+        '--json',
+        `--session-id=${sessionId}`,
+      ];
+      const child = spawn(
+        process.execPath,
+        parkBeforeCommit
+          ? [
+              '--input-type=module',
+              '-e',
+              `
+              import { existsSync, writeFileSync } from 'node:fs';
+              import { parseArgs } from ${JSON.stringify(pathToFileURL(join(REPO, 'scripts', 'lib', 'crystallize-args.mjs')).href)};
+              import { applySessionClose } from ${JSON.stringify(pathToFileURL(join(REPO, 'scripts', 'lib', 'crystallize-close-apply.mjs')).href)};
+              applySessionClose(parseArgs(${JSON.stringify(argv)}), {
+                beforeCommit() {
+                  writeFileSync(${JSON.stringify(atCommit)}, '1');
+                  const until = Date.now() + 30000;
+                  while (!existsSync(${JSON.stringify(release)}) && Date.now() < until) {
+                    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
+                  }
+                },
+              });`,
+            ]
+          : [join(REPO, 'scripts', 'crystallize.mjs'), ...argv.slice(2)],
+        { env: { ...process.env, HYPO_DIR: '', HOME: SESSION_TMP_HOME } },
+      );
+      let stdout = '';
+      let stderr = '';
+      child.stdout.on('data', (d) => (stdout += d));
+      child.stderr.on('data', (d) => (stderr += d));
+      return new Promise((resolve) =>
+        child.on('exit', (code) => resolve({ code, stdout, stderr })),
+      );
+    };
+    const waitFor = async (check, what) => {
+      const deadline = Date.now() + 20000;
+      while (Date.now() < deadline) {
+        if (check()) return;
+        await sleep(10);
+      }
+      assert.fail(`timed out waiting for ${what}`);
+    };
+    const read = (rel) => readFileSync(join(dir, rel), 'utf-8');
+    const shaOf = (...args) =>
+      spawnSync('git', ['-C', dir, ...args], { encoding: 'utf-8', env }).stdout.trim();
+    const ctx = { dir, today, read, shaOf };
+
+    const a = run('heldlock-a', 'test-project', 'close-a-text', true);
+    await waitFor(() => existsSync(atCommit), 'close A to reach its commit');
+    const b = run('heldlock-b', bProject, 'close-b-text', false);
+    let bEnded = null;
+    b.then((res) => (bEnded = res));
+    await waitFor(() => {
+      // B can only finish early by failing: it is waiting on A's lock.
+      assert.equal(bEnded, null, `close B ended before reaching the lock: ${bEnded?.stdout}`);
+      return pending(ctx);
+    }, 'close B to reach the lock under test');
+    await sleep(500);
+    parked(ctx);
+    writeFileSync(release, '1');
+    const [one, two] = await Promise.all([a, b]);
+    for (const res of [one, two]) {
+      const out = JSON.parse(res.stdout);
+      assert.equal(out.ok, true, `${res.stdout}\n${res.stderr}`);
+      assert.equal(out.committed, true, res.stdout);
+      assert.equal(out.markerWritten, true, `${res.stdout}\n${res.stderr}`);
+    }
+    const commitsOf = (rel) => shaOf('log', '--reverse', '--format=%H', '--', rel).split('\n');
+    const inCommit = (sha, rel) => shaOf('show', `${sha}:${rel}`);
+    after({ ...ctx, commitsOf, inCommit });
+  } finally {
+    for (const c of cleanups) c();
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+// The log.md lock alone already keeps B out of the shard here (B takes the shard lock and
+// then waits on log.md before it writes anything), so disabling either lock on its own leaves
+// this test green: the shard lock is pinned by the old-close test below, and this test goes
+// red only if both locks are given per-process paths.
+await testAsync(
+  "a close that appends to the session-log shard after another close's append waits for that close's commit, and each commit holds only its own text",
+  () => {
+    const shard = (today) => `projects/test-project/session-log/${today}.md`;
+    return withCloseParkedBeforeCommit('test-project', {
+      // B's staging file is the sign it reached the shard lock and is waiting there.
+      pending: waitingOnShardLock,
+      parked: ({ read, today }) => {
+        assert.match(
+          read(shard(today)),
+          /close-a-text/,
+          "A's heading is in the shard before its commit",
+        );
+        assert.ok(
+          !read(shard(today)).includes('close-b-text'),
+          `B must not append while A holds the shard: ${read(shard(today))}`,
+        );
+      },
+      after: ({ dir, today, commitsOf, inCommit, shaOf }) => {
+        const rel = shard(today);
+        const commits = commitsOf(rel);
+        assert.equal(commits.length, 2, `the shard was committed twice: ${commits}`);
+        const [aCommit, bCommit] = commits;
+        assert.ok(inCommit(aCommit, rel).includes('close-a-text'), "A's commit has A's text");
+        assert.ok(!inCommit(aCommit, rel).includes('close-b-text'), "A's commit has none of B's");
+        assert.ok(inCommit(bCommit, rel).includes('close-b-text'), "B's own commit has B's text");
+        assert.ok(inCommit(bCommit, rel).includes('close-a-text'), 'and B appended after A');
+        assert.deepEqual(
+          shaOf('diff-tree', '--no-commit-id', '--name-only', '-r', bCommit, '--', rel).split('\n'),
+          [rel],
+        );
+        assert.equal(existsSync(join(dir, `${rel}.lock`)), false, 'no lock is left behind');
+      },
+    });
+  },
+);
+
+// Two closes of the same project overlap. While A holds the locks, A's own `.lock` and B's
+// staging file `.lock.<hex>.tmp` (present the whole wait) sit untracked in the project
+// folder, and once A releases, B's lock does until B's commit. Both closes must still write
+// their marker: a lock file is bookkeeping of a close in progress, not unsaved work. The
+// vault `.gitignore` is the shape real vaults have: one that lacks `*.lock.*.tmp` (the
+// maintainer's), and one that lacks `*.lock` (an old vault). The shared fixture's own
+// `.gitignore` lists neither, so it cannot hide this.
+// Disabling the check: in hooks/hypo-shared.mjs make isUntrackedLockArtifact return false. The
+// `parked` assertion fails in both variants (it matches the artifact names by its own regex,
+// not by the predicate), and the gate then counts the lock files, so a marker is withheld.
+const LOCK_ARTIFACT = /\.lock(\.[0-9a-f]{16}\.tmp)?$/;
+for (const [name, gitignore] of [
+  ['no `*.lock.*.tmp` line', '.cache/\n*.lock\n'],
+  ['no `*.lock` line', '.cache/\n*.lock.*.tmp\n'],
+]) {
+  await testAsync(
+    `two closes of one project overlap and both write their marker when the vault .gitignore has ${name}`,
+    () =>
+      withCloseParkedBeforeCommit('test-project', {
+        gitignore,
+        pending: waitingOnShardLock,
+        parked: ({ dir, today }) => {
+          // The lock artifacts are really there, untracked, and the dirty list skips them.
+          const status = spawnSync('git', ['-C', dir, 'status', '--porcelain', '-uall'], {
+            encoding: 'utf-8',
+            env: { ...process.env, HOME: SESSION_TMP_HOME },
+          }).stdout;
+          const shard = `projects/test-project/session-log/${today}.md`;
+          const lockLines = status.split('\n').filter((l) => LOCK_ARTIFACT.test(l));
+          assert.ok(lockLines.length > 0, `precondition: a lock artifact is untracked:\n${status}`);
+          const dirty = gitDirtyFiles(dir);
+          assert.ok(dirty.includes(shard), `real dirt is still listed: ${dirty}`);
+          assert.deepEqual(
+            dirty.filter((f) => LOCK_ARTIFACT.test(f)),
+            [],
+            `lock artifacts must not count as dirt: ${dirty}`,
+          );
+        },
+        after: ({ dir }) => {
+          assert.equal(existsSync(join(dir, 'log.md.lock')), false, 'no lock is left behind');
+        },
+      }),
+  );
+}
+
+// What an old-version close does: it takes only the shard lock and appends. The log.md lock
+// does not cover it, so the shard lock is the only thing that keeps its text out of A's commit.
+// Disabling the check: in applySessionClose give the shard lock a path of its own per
+// process (`${date}.md.${process.pid}`). The old close then gets the lock it asked for, its
+// text lands in the shard while A is parked, and the ELOCKTIMEOUT and `parked` assertions fail.
+await testAsync(
+  "a close that takes only the shard lock times out while another close holds it through its commit, and that close's commit holds none of its text",
+  () => {
+    const shard = (today) => `projects/test-project/session-log/${today}.md`;
+    return withCloseParkedBeforeCommit('test-project', {
+      pending: waitingOnShardLock,
+      parked: ({ dir, today, read }) => {
+        const oldClose = spawnSync(
+          process.execPath,
+          [
+            '--input-type=module',
+            '-e',
+            `
+            import { appendFileSync } from 'node:fs';
+            import { withFileLock } from ${JSON.stringify(pathToFileURL(join(REPO, 'hooks', 'hypo-shared.mjs')).href)};
+            try {
+              withFileLock(${JSON.stringify(join(dir, shard(today)))}, () => {
+                appendFileSync(${JSON.stringify(join(dir, shard(today)))}, 'OLD-CLOSE-TEXT\\n');
+              }, { timeoutMs: 300 });
+              console.log('LOCK-TAKEN');
+            } catch (err) {
+              console.log(err.code);
+            }`,
+          ],
+          { encoding: 'utf-8', env: { ...process.env, HOME: SESSION_TMP_HOME } },
+        );
+        assert.equal(
+          oldClose.stdout.trim(),
+          'ELOCKTIMEOUT',
+          `${oldClose.stdout}${oldClose.stderr}`,
+        );
+        assert.ok(!read(shard(today)).includes('OLD-CLOSE-TEXT'), 'the old close wrote nothing');
+      },
+      after: ({ today, commitsOf, inCommit, read }) => {
+        const rel = shard(today);
+        const [aCommit] = commitsOf(rel);
+        assert.ok(inCommit(aCommit, rel).includes('close-a-text'), "A's commit has A's text");
+        assert.ok(!inCommit(aCommit, rel).includes('OLD-CLOSE-TEXT'), "A's commit has none of it");
+        assert.ok(!read(rel).includes('OLD-CLOSE-TEXT'), 'and it never reached the shard');
+      },
+    });
+  },
+);
+
+// The log.md half. B closes another project, so it has its own shard and is not held up by
+// A's shard lock: it takes its own shard lock and waits for the log.md lock, the next one in
+// line, before it writes anything to either file.
+// Disabling the check: in applySessionClose give the log.md lock a path of its own per
+// process (`join(args.hypoDir, \`log.md.${process.pid}\`)`). B then appends its line to log.md
+// while A is parked, and the `parked` assertion fails (A's commit would carry B's line too).
+await testAsync(
+  "a close that appends to log.md after another close's append waits for that close's commit, and each commit holds only its own line",
+  () => {
+    const otherShard = (today) => `projects/other-project/session-log/${today}.md`;
+    return withCloseParkedBeforeCommit('other-project', {
+      // B takes the locks in order and has its shard's by now; the staging file it leaves while
+      // it spins on the log.md lock A holds is the sign it is waiting there.
+      pending: ({ dir, today }) =>
+        existsSync(join(dir, `${otherShard(today)}.lock`)) &&
+        readdirSync(dir).some((f) => /^log\.md\.lock\..+\.tmp$/.test(f)),
+      parked: ({ read }) => {
+        assert.match(read('log.md'), /close-a-text/, "A's line is in log.md before its commit");
+        assert.ok(
+          !read('log.md').includes('other-project'),
+          `B must not append while A holds log.md: ${read('log.md')}`,
+        );
+      },
+      after: ({ dir, commitsOf, inCommit }) => {
+        const commits = commitsOf('log.md');
+        // The fixture's own commit, then A, then B.
+        assert.equal(commits.length, 3, `log.md was committed by each close: ${commits}`);
+        const [, aCommit, bCommit] = commits;
+        assert.ok(inCommit(aCommit, 'log.md').includes('close-a-text'), "A's commit has A's line");
+        assert.ok(
+          !inCommit(aCommit, 'log.md').includes('other-project'),
+          "A's commit has none of B's lines",
+        );
+        assert.ok(inCommit(bCommit, 'log.md').includes('other-project'), "B's commit has B's line");
+        assert.ok(inCommit(bCommit, 'log.md').includes('close-a-text'), 'and B appended after A');
+        assert.equal(existsSync(join(dir, 'log.md.lock')), false, 'no lock is left behind');
+      },
+    });
+  },
+);
+
+// A close whose commit does not land takes its appended text back before it releases the
+// append locks. A commit takes each whole file (`--only`), so text left behind on disk would
+// be committed by the next close of that file, under the next close's name.
+// Disabling the check: in applySessionClose skip `withdrawUnlandedAppends` (make the finally
+// block's `if (!commitLanded)` never true). A's shard and log.md keep A's text after the
+// refused commit, and B's commit then carries it.
+function withRefusingPreCommit(dir, extraScript = '') {
+  const hooks = join(dir, '.git', 'x-test-hooks');
+  mkdirSync(hooks, { recursive: true });
+  writeFileSync(join(hooks, 'pre-commit'), `#!/bin/sh\n${extraScript}exit 1\n`);
+  chmodSync(join(hooks, 'pre-commit'), 0o755);
+  spawnSync('git', ['-C', dir, 'config', 'core.hooksPath', hooks]);
+  return () => spawnSync('git', ['-C', dir, 'config', '--unset', 'core.hooksPath']);
+}
+
+test("a close whose commit is refused takes its appended text back, and the next close's commit holds none of it", () => {
+  withWiki(null, (dir, today) => {
+    const shard = `projects/test-project/session-log/${today}.md`;
+    const bytes = (rel) => (existsSync(join(dir, rel)) ? readFileSync(join(dir, rel)) : null);
+    const seed = applyJson(
+      dir,
+      v2Payload(today, { tag: 'seed-close' }),
+      newPinSession('wd-seed'),
+    ).out;
+    assert.equal(seed.committed, true, JSON.stringify(seed));
+    const shardBefore = bytes(shard);
+    const logBefore = bytes('log.md');
+    assert.ok(shardBefore && logBefore, 'precondition: both files exist before the closes');
+
+    const lift = withRefusingPreCommit(dir);
+    const a = applyJson(
+      dir,
+      v2Payload(today, { tag: 'close-aaa-text', tracks: [{ id: 'a', new: true, next: '- a' }] }),
+      newPinSession('wd-a'),
+    ).out;
+    lift();
+    assert.equal(a.committed, false, JSON.stringify(a));
+    assert.equal(a.markerWritten, false, JSON.stringify(a));
+    assert.ok(bytes(shard).equals(shardBefore), 'the shard is back to its bytes before A');
+    assert.ok(bytes('log.md').equals(logBefore), 'log.md is back to its bytes before A');
+    assert.ok(
+      a.notices.some((n) => n.includes(shard) && n.includes('되돌렸')),
+      JSON.stringify(a.notices),
+    );
+
+    const b = applyJson(
+      dir,
+      v2Payload(today, { tag: 'close-bbb-text', tracks: [{ id: 'b', new: true, next: '- b' }] }),
+      newPinSession('wd-b'),
+    ).out;
+    assert.equal(b.committed, true, JSON.stringify(b));
+    assert.equal(b.markerWritten, true, JSON.stringify(b));
+    for (const rel of [shard, 'log.md']) {
+      const inHead = spawnSync('git', ['-C', dir, 'show', `HEAD:${rel}`], {
+        encoding: 'utf-8',
+        env: { ...process.env, HOME: SESSION_TMP_HOME },
+      }).stdout;
+      assert.match(inHead, /close-bbb-text|bbb/, `B's text is in HEAD:${rel}`);
+      assert.ok(!inHead.includes('close-aaa-text'), `A's text is not in HEAD:${rel}`);
+    }
+  });
+});
+
+// A restored append leaves no ownership witness behind: identical bytes added by hand later
+// must not read as this close's append, and a retry must not restage them by the old hash.
+// The entry file's journal record stays, because the retry still needs it.
+// Disabling the check: in withdrawUnlandedAppends make `witnessOk` always true without
+// calling removeJournalEntry and removeShardAppend. The journal and shard-append assertions
+// fail, and so does the foreign-append check.
+test('a withdrawn append takes its journal record and shard-append record with it, and a hand-added copy is nobody close', () => {
+  withWiki(null, (dir, today) => {
+    const shard = `projects/test-project/session-log/${today}.md`;
+    const seed = applyJson(
+      dir,
+      v2Payload(today, { tag: 'seed-close' }),
+      newPinSession('wit-seed'),
+    ).out;
+    assert.equal(seed.committed, true, JSON.stringify(seed));
+    const shardBefore = readFileSync(join(dir, shard));
+    const kept = join(dir, '.cache', 'kept-shard');
+    mkdirSync(dirname(kept), { recursive: true });
+    const lift = withRefusingPreCommit(dir, `cp '${join(dir, shard)}' '${kept}'\n`);
+    const sid = newPinSession('wit-a');
+    const payload = v2Payload(today, {
+      tag: 'close-aaa-text',
+      tracks: [{ id: 'a', new: true, next: '- a' }],
+    });
+    const a = applyJson(dir, payload, sid).out;
+    lift();
+    assert.equal(a.committed, false, JSON.stringify(a));
+    assert.ok(readFileSync(join(dir, shard)).equals(shardBefore), 'the shard is restored');
+
+    const journal = readJournal(dir, sid);
+    assert.equal(
+      journal[shard],
+      undefined,
+      `the shard's journal record is gone: ${JSON.stringify(journal)}`,
+    );
+    assert.ok(
+      Object.keys(journal).some((k) => k.includes('/sessions/')),
+      `the entry file's record stays for the retry: ${JSON.stringify(journal)}`,
+    );
+    const appendsFile = join(dir, '.cache', 'sessions', sid, 'shard-appends.json');
+    assert.ok(
+      existsSync(dirname(appendsFile)),
+      'the session cache folder is where this test looks',
+    );
+    const appends = existsSync(appendsFile) ? JSON.parse(readFileSync(appendsFile, 'utf-8')) : [];
+    assert.ok(
+      !appends.some((r) => r.path === shard),
+      `no append record: ${JSON.stringify(appends)}`,
+    );
+
+    // The same bytes, added by hand.
+    writeFileSync(join(dir, shard), readFileSync(kept));
+    assert.equal(isForeignAppendOnlyShard(dir, shard, newPinSession('wit-other')), false);
+    // The check does recognise those bytes once a close has recorded them.
+    const addedText = readFileSync(kept, 'utf-8').slice(shardBefore.toString('utf-8').length);
+    assert.ok(
+      recordShardAppend(dir, 'wit-writer', shard, shardBefore.toString('utf-8'), addedText, 'x-0'),
+    );
+    assert.equal(isForeignAppendOnlyShard(dir, shard, newPinSession('wit-other')), true);
+
+    // The retry does not restage the hand-added copy through the old hash.
+    const retry = applyJson(dir, payload, sid).out;
+    assert.ok(!gitShow(dir, shard).includes('close-aaa-text'), JSON.stringify(retry));
+    assert.equal(retry.markerWritten, false, JSON.stringify(retry));
+  });
+});
+
+// The other branch: the shard changed after A appended to it (here a pre-commit hook appends
+// a line), so its bytes are not what A left. The close leaves it alone and names it.
+// Disabling the check: in withdrawUnlandedAppends treat `unchanged` as always true. The restore
+// then overwrites the foreign line, and the "left as is" assertion fails.
+test('a close whose commit is refused leaves a shard that changed under it, and names the file', () => {
+  withWiki(null, (dir, today) => {
+    const shard = `projects/test-project/session-log/${today}.md`;
+    const seed = applyJson(
+      dir,
+      v2Payload(today, { tag: 'seed-close' }),
+      newPinSession('wc-seed'),
+    ).out;
+    assert.equal(seed.committed, true, JSON.stringify(seed));
+    const logBefore = readFileSync(join(dir, 'log.md'));
+    const lift = withRefusingPreCommit(dir, `echo 'FOREIGN-LINE' >> '${shard}'\n`);
+    const a = applyJson(
+      dir,
+      v2Payload(today, { tag: 'close-aaa-text', tracks: [{ id: 'a', new: true, next: '- a' }] }),
+      newPinSession('wc-a'),
+    ).out;
+    lift();
+    assert.equal(a.committed, false, JSON.stringify(a));
+    assert.equal(a.markerWritten, false, JSON.stringify(a));
+    const now = readFileSync(join(dir, shard), 'utf-8');
+    assert.ok(now.includes('FOREIGN-LINE') && now.includes('close-aaa-text'), `left as is: ${now}`);
+    assert.ok(
+      a.notices.some((n) => n.includes(shard) && n.includes('되돌리지 못했습니다')),
+      JSON.stringify(a.notices),
+    );
+    // The untouched file is still taken back.
+    assert.ok(readFileSync(join(dir, 'log.md')).equals(logBefore), 'log.md is back to its bytes');
+  });
+});
+
+function gitShow(dir, rel) {
+  return spawnSync('git', ['-C', dir, 'show', `HEAD:${rel}`], {
+    encoding: 'utf-8',
+    env: { ...process.env, HOME: SESSION_TMP_HOME },
+  }).stdout;
+}
+
+// A path the vault's ignore filter keeps out of every commit is the user's own file, so a
+// close never takes its appends back, whatever happens to its commit.
+// Disabling the check: in withdrawUnlandedAppends delete the `isExcludedFromCommit` line.
+// The close then restores the shard and log.md, and the "stay on disk" assertions fail.
+test('a close whose append targets .hypoignore keeps out of every commit leaves its appends on disk and claims no commit of them', () => {
+  withWiki(null, (dir, today) => {
+    const shard = `projects/test-project/session-log/${today}.md`;
+    const seed = applyJson(
+      dir,
+      v2Payload(today, { tag: 'seed-close' }),
+      newPinSession('ig-seed'),
+    ).out;
+    assert.equal(seed.committed, true, JSON.stringify(seed));
+    const shardBefore = readFileSync(join(dir, shard));
+    const logBefore = readFileSync(join(dir, 'log.md'));
+    writeFileSync(join(dir, '.hypoignore'), 'projects/test-project/\nlog.md\n');
+
+    const a = applyJson(
+      dir,
+      v2Payload(today, { tag: 'close-aaa-text', tracks: [{ id: 'a', new: true, next: '- a' }] }),
+      newPinSession('ig-a'),
+    ).out;
+    // Nothing was committed for the excluded paths, so no marker: the gate still names the shard.
+    assert.equal(a.markerWritten, false, JSON.stringify(a));
+    assert.ok(
+      a.gateBlockers.some((b) => b.file === shard),
+      JSON.stringify(a.gateBlockers),
+    );
+    const shardNow = readFileSync(join(dir, shard), 'utf-8');
+    const logNow = readFileSync(join(dir, 'log.md'), 'utf-8');
+    assert.ok(shardNow.startsWith(shardBefore.toString('utf-8')), 'the shard keeps its old bytes');
+    assert.match(shardNow, /close-aaa-text/, "the shard keeps A's append");
+    assert.ok(logNow.length > logBefore.length, "log.md keeps A's line");
+    assert.ok(
+      !a.notices.some((n) => n.includes('되돌렸') || n.includes('되돌리지 못했습니다')),
+      `nothing is withdrawn or reported: ${JSON.stringify(a.notices)}`,
+    );
+    assert.ok(!gitShow(dir, shard).includes('close-aaa-text'), 'HEAD never holds the shard text');
+    assert.equal(
+      gitShow(dir, 'log.md'),
+      logBefore.toString('utf-8'),
+      'HEAD never holds the log line',
+    );
+  });
+});
+
+// One target committed, the other left out of the commit by the filter: the committed one
+// stands and the excluded one stays on disk.
+test('a close whose log.md alone is .hypoignored commits the shard and leaves the log line on disk', () => {
+  withWiki(null, (dir, today) => {
+    const shard = `projects/test-project/session-log/${today}.md`;
+    const seed = applyJson(
+      dir,
+      v2Payload(today, { tag: 'seed-close' }),
+      newPinSession('ig2-seed'),
+    ).out;
+    assert.equal(seed.committed, true, JSON.stringify(seed));
+    const logBefore = readFileSync(join(dir, 'log.md'));
+    writeFileSync(join(dir, '.hypoignore'), 'log.md\n');
+    const a = applyJson(
+      dir,
+      v2Payload(today, { tag: 'close-aaa-text', tracks: [{ id: 'a', new: true, next: '- a' }] }),
+      newPinSession('ig2-a'),
+    ).out;
+    assert.equal(a.committed, true, JSON.stringify(a));
+    assert.match(gitShow(dir, shard), /close-aaa-text/, 'the shard append is committed');
+    assert.ok(readFileSync(join(dir, 'log.md')).length > logBefore.length, 'the log line stays');
+    assert.ok(!a.notices.some((n) => n.includes('되돌렸')), JSON.stringify(a.notices));
+  });
+});
+
+// An untracked path git's own ignore rules match never reaches a commit either (`git status`
+// does not list it, so commitWikiChanges drops it silently), so it is the user's file and
+// stays as written. The shard is not ignored, so its commit lands and the close succeeds.
+// Disabling the check: in withdrawUnlandedAppends delete the `isIgnoredByGit` line. The
+// close then restores log.md, a withdrawal notice names it, and the byte comparison fails.
+test('a close whose log.md is untracked and .gitignored leaves the log line on disk and withdraws nothing', () => {
+  withWiki(null, (dir, today) => {
+    const shard = `projects/test-project/session-log/${today}.md`;
+    const seed = applyJson(
+      dir,
+      v2Payload(today, { tag: 'seed-close' }),
+      newPinSession('gi-seed'),
+    ).out;
+    assert.equal(seed.committed, true, JSON.stringify(seed));
+    const git = (...args) =>
+      spawnSync('git', ['-C', dir, '-c', 'user.name=t', '-c', 'user.email=t@t', ...args], {
+        encoding: 'utf-8',
+        env: { ...process.env, HOME: SESSION_TMP_HOME },
+      });
+    assert.equal(git('rm', '--cached', '-q', 'log.md').status, 0);
+    assert.equal(git('commit', '-q', '-m', 'untrack log.md').status, 0);
+    writeFileSync(join(dir, '.gitignore'), 'log.md\n');
+    assert.equal(git('check-ignore', '-q', '--', 'log.md').status, 0, 'log.md is git-ignored');
+    const logBefore = readFileSync(join(dir, 'log.md'), 'utf-8');
+
+    const a = applyJson(
+      dir,
+      v2Payload(today, { tag: 'close-aaa-text', tracks: [{ id: 'a', new: true, next: '- a' }] }),
+      newPinSession('gi-a'),
+    ).out;
+    assert.equal(a.committed, true, JSON.stringify(a));
+    assert.match(gitShow(dir, shard), /close-aaa-text/, 'the shard append is committed');
+    const logNow = readFileSync(join(dir, 'log.md'), 'utf-8');
+    assert.ok(
+      logNow.length > logBefore.length && logNow.startsWith(logBefore),
+      'log.md gained a line',
+    );
+    assert.ok(
+      !a.notices.some((n) => n.includes('log.md')),
+      `no notice names log.md: ${JSON.stringify(a.notices)}`,
+    );
+    assert.equal(git('ls-files', '--', 'log.md').stdout, '', 'log.md is still untracked');
+  });
+});
+
+// The judgment per target, with a commit that landed for one of two appends: only the
+// uncommitted one is taken back. Through a whole close commitWikiChanges takes all of its
+// in-scope paths or none, so this split cannot be produced end to end.
+// Disabling the check: in withdrawUnlandedAppends delete the `headBlob(...)` line. The
+// committed shard is then restored too and the first assertion fails.
+test('withdrawUnlandedAppends takes back only the append HEAD does not hold', () => {
+  withTmpDir((dir) => {
+    gitRepo(dir);
+    writeFileSync(join(dir, 'a.md'), 'a0\n');
+    writeFileSync(join(dir, 'b.md'), 'b0\n');
+    spawnSync('git', ['add', '-A'], { cwd: dir });
+    spawnSync('git', ['commit', '-m', 'seed'], { cwd: dir });
+    const targets = ['a.md', 'b.md'].map((rel) => {
+      const t = appendTarget(rel, join(dir, rel));
+      t.before = readFileSync(t.full);
+      writeFileSync(t.full, `${t.before}${rel} close line\n`);
+      t.after = readFileSync(t.full);
+      return t;
+    });
+    spawnSync('git', ['commit', '--only', '-m', 'a lands', '--', 'a.md'], { cwd: dir });
+    const notices = [];
+    withdrawUnlandedAppends({ hypoDir: dir, sessionId: null, closeId: null }, targets, notices);
+    assert.equal(readFileSync(join(dir, 'a.md'), 'utf-8'), 'a0\na.md close line\n');
+    assert.equal(readFileSync(join(dir, 'b.md'), 'utf-8'), 'b0\n');
+    assert.equal(notices.length, 1, JSON.stringify(notices));
+    assert.ok(notices[0].includes('b.md'), notices[0]);
+  });
+});
+
+// X3 (wave B, third review): another session's gate tells a close's append from a hand
+// edit only by the record apply leaves before it writes. The fixture holds the moment
+// without timing: close A committed the day's shard, close B appended to it and its
+// commit was refused (B keeps its heading uncommitted on top of A's commit). Disabling
+// the check (X3, apply record): in appendSessionLogEntry pass no `recordAppend` to
+// appendIfAbsent. A's gate then blocks on the shard: red.
+test("a close whose commit was refused leaves its shard append recorded, so another session's gate reads it as that close's append", () => {
+  withWiki(null, (dir, today) => {
+    const a = newPinSession('rec-a');
+    const first = applyJson(dir, v2Payload(today, { tag: 'close a' }), a).out;
+    assert.equal(first.committed, true, JSON.stringify(first));
+    const shard = `projects/test-project/session-log/${today}.md`;
+    // A refused commit takes the append back, so the append has to stay: the hook makes the
+    // shard folder read-only, which fails that restore and is reported (the notice below).
+    const logDir = join(dir, 'projects', 'test-project', 'session-log');
+    const lift = withRefusingPreCommit(dir, `chmod a-w '${logDir}'\n`);
+    const b = newPinSession('rec-b');
+    let second;
+    try {
+      second = applyJson(
+        dir,
+        v2Payload(today, { tag: 'close b', tracks: [{ id: 'b', new: true, next: '- b' }] }),
+        b,
+      ).out;
+    } finally {
+      chmodSync(logDir, 0o755);
+      lift();
+    }
+    assert.notEqual(second.committed, true, JSON.stringify(second));
+    assert.ok(
+      second.notices.some((n) => n.includes(shard) && n.includes('되돌리지 못했습니다 (')),
+      `a failed restore is reported: ${JSON.stringify(second.notices)}`,
+    );
+    assert.match(readFileSync(join(dir, shard), 'utf-8'), /close b/);
+    const gateOf = (sessionId) =>
+      precompactGateStatus(dir, {
+        claudeHome: join(dir, '.claude-none'),
+        checkpointMode: true,
+        sessionId,
+        attributionScope: 'test-project',
+      });
+    const mine = gateOf(a);
+    assert.ok(
+      !mine.blockers.some((x) => x.file === shard),
+      `A must not block on B's append: ${JSON.stringify(mine.blockers)}`,
+    );
+    assert.ok(
+      mine.notices.some((n) => n.type === 'foreign-append' && n.file === shard),
+      JSON.stringify(mine.notices),
+    );
+    // Pair: the close that appended still owns it.
+    const theirs = gateOf(b);
+    assert.ok(
+      theirs.blockers.some((x) => x.file === shard),
+      JSON.stringify(theirs.blockers),
+    );
+  });
+});
+
+test('the 2026-10-01 shape: session 229 on track a, another project closes in between, session 230 on track b: no approval asked', () => {
+  withWiki(
+    (dir, today) => {
+      const other = join(dir, 'projects', 'other-proj');
+      mkdirSync(join(other, 'session-log'), { recursive: true });
+      writeFileSync(
+        join(other, 'session-state.md'),
+        `---\ntitle: ss\ntype: session-state\nupdated: ${today}\n---\n\n## 다음 작업\n\n- n\n`,
+      );
+      writeFileSync(
+        join(other, 'hot.md'),
+        `---\ntitle: hot\ntype: reference\nupdated: ${today}\n---\n\n# Hot\n`,
+      );
+    },
+    (dir, today) => {
+      const s229 = applyJson(
+        dir,
+        v2Payload(today, { tracks: [{ id: 'a', new: true, next: '- a' }], tag: 'session 229' }),
+        newPinSession('s229'),
+      );
+      const between = applyJson(
+        dir,
+        v2Payload(today, {
+          project: 'other-proj',
+          tracks: [{ id: 'x', new: true, next: '- x' }],
+          tag: 'other project close',
+        }),
+        newPinSession('s-other'),
+      );
+      const s230 = applyJson(
+        dir,
+        v2Payload(today, { tracks: [{ id: 'b', new: true, next: '- b' }], tag: 'session 230' }),
+        newPinSession('s230'),
+      );
+      for (const { out } of [s229, between, s230]) {
+        assert.equal(out.ok, true, JSON.stringify(out));
+        assert.deepEqual(out.proposals, [], 'no approval is asked for');
+        assert.deepEqual(out.conflicts, []);
+      }
+    },
+  );
+});
+
+test('an unregistered track id is refused before anything is written, and "new": true starts it', () => {
+  withWiki(null, (dir, today) => {
+    const sid = newPinSession('track-unknown');
+    const bad = applyJson(dir, v2Payload(today, { tracks: [{ id: 'nope', next: '- x' }] }), sid);
+    assert.equal(bad.out.ok, false);
+    assert.equal(bad.out.stage, 'track-unknown', JSON.stringify(bad.out));
+    assert.match(bad.out.error, /legacy/, 'the message lists the registered ids');
+    assert.deepEqual(sessionFilesOf(dir), []);
+    assert.deepEqual(readJournal(dir, sid), {}, 'no journal record either');
+
+    const good = applyJson(
+      dir,
+      v2Payload(today, { tracks: [{ id: 'nope', new: true, next: '- x' }] }),
+      sid,
+    );
+    assert.equal(good.out.ok, true, JSON.stringify(good.out));
+  });
+});
+
+test('"new": true on a registered track is refused (track-exists), a plain update of it is accepted', () => {
+  withWiki(null, (dir, today) => {
+    const first = applyJson(
+      dir,
+      v2Payload(today, { tracks: [{ id: 'main', new: true, next: '- one' }], tag: 'first' }),
+      newPinSession('exists-1'),
+    );
+    assert.equal(first.out.ok, true, JSON.stringify(first.out));
+    const again = applyJson(
+      dir,
+      v2Payload(today, { tracks: [{ id: 'main', new: true, next: '- two' }], tag: 'second' }),
+      newPinSession('exists-2'),
+    );
+    assert.equal(again.out.stage, 'track-exists', JSON.stringify(again.out));
+    assert.equal(sessionFilesOf(dir).length, 1);
+    const plain = applyJson(
+      dir,
+      v2Payload(today, { tracks: [{ id: 'main', next: '- two' }], tag: 'third' }),
+      newPinSession('exists-3'),
+    );
+    assert.equal(plain.out.ok, true, JSON.stringify(plain.out));
+  });
+});
+
+test('the same track id twice in one payload is refused (track-duplicate) with no file and no journal record; two different ids pass', () => {
+  withWiki(null, (dir, today) => {
+    const sid = newPinSession('dup');
+    const dup = applyJson(
+      dir,
+      v2Payload(today, {
+        tracks: [
+          { id: 'a', new: true, next: '- one' },
+          { id: 'a', done: true },
+        ],
+      }),
+      sid,
+    );
+    assert.equal(dup.out.stage, 'track-duplicate', JSON.stringify(dup.out));
+    assert.deepEqual(sessionFilesOf(dir), []);
+    assert.deepEqual(readJournal(dir, sid), {});
+
+    const ok = applyJson(
+      dir,
+      v2Payload(today, {
+        tracks: [
+          { id: 'a', new: true, next: '- one' },
+          { id: 'b', new: true, next: '- two' },
+        ],
+      }),
+      sid,
+    );
+    assert.equal(ok.out.ok, true, JSON.stringify(ok.out));
+  });
+});
+
+test('an entry marker line of this close inside the summary is refused (payload-reserved-marker), a look-alike of another close passes', () => {
+  withWiki(null, (dir, today) => {
+    const sid = newPinSession('marker');
+    const closeId = closeIdFor(sid, 0);
+    const bad = applyJson(
+      dir,
+      v2Payload(today, { summary: `before\n<!-- hypomnema:summary ${closeId} -->\nafter` }),
+      sid,
+    );
+    assert.equal(bad.out.stage, 'payload-reserved-marker', JSON.stringify(bad.out));
+    assert.deepEqual(sessionFilesOf(dir), []);
+    const fine = applyJson(
+      dir,
+      v2Payload(today, { summary: 'talks about <!-- hypomnema:summary other-close --> in prose' }),
+      sid,
+    );
+    assert.equal(fine.out.ok, true, JSON.stringify(fine.out));
+  });
+});
+
+test('supersedes: a unique prefix resolves and the file carries the full id, an ambiguous or unknown one is refused', () => {
+  withWiki(null, (dir, today) => {
+    const idA = 'aaaa1111-1';
+    const idB = 'aaaa2222-1';
+    writeEntryFile(dir, { closeId: idA, date: today, tracks: [{ id: 'main', new: true }] });
+    writeEntryFile(dir, { closeId: idB, date: today, tracks: [{ id: 'main' }] });
+    const sid = newPinSession('prefix');
+    const ambiguous = applyJson(
+      dir,
+      v2Payload(today, { tracks: [{ id: 'main', supersedes: ['aaaa'], next: '- x' }] }),
+      sid,
+    );
+    assert.equal(ambiguous.out.stage, 'supersedes-unknown', JSON.stringify(ambiguous.out));
+    const unknown = applyJson(
+      dir,
+      v2Payload(today, { tracks: [{ id: 'main', supersedes: ['zzzz'], next: '- x' }] }),
+      sid,
+    );
+    assert.equal(unknown.out.stage, 'supersedes-unknown');
+    const ok = applyJson(
+      dir,
+      v2Payload(today, { tracks: [{ id: 'main', supersedes: ['aaaa1'], next: '- x' }] }),
+      sid,
+    );
+    assert.equal(ok.out.ok, true, JSON.stringify(ok.out));
+    const mine = sessionFilesOf(dir).find((f) => f.includes(sid));
+    assert.deepEqual(entryAt(dir, mine).tracks[0].supersedes, [idA], 'the full id is written');
+  });
+});
+
+test('an unambiguous baseline prefix is resolved and written as the full id', () => {
+  withWiki(null, (dir, today) => {
+    // the state baseline is the one that carries the `legacy` track
+    const baseline = loadSessionModel(dir, 'test-project').entries.find(
+      (e) => e.closeId.startsWith('baseline-') && e.bodies.legacy !== undefined,
+    );
+    assert.ok(baseline, 'the fixture tracks the old state files, so a virtual baseline exists');
+    const sid = newPinSession('baseline-prefix');
+    const { out } = applyJson(
+      dir,
+      v2Payload(today, {
+        tracks: [
+          {
+            id: 'legacy',
+            supersedes: [baseline.closeId.slice(0, 'baseline-'.length + 2)],
+            done: true,
+          },
+        ],
+      }),
+      sid,
+    );
+    assert.equal(out.ok, true, JSON.stringify(out));
+    const mine = sessionFilesOf(dir).find((f) => f.includes(sid));
+    assert.ok(entryAt(dir, mine).tracks[0].supersedes.includes(baseline.closeId));
+    assert.deepEqual(headsOf(dir).legacy, [closeIdFor(sid, 0)]);
+  });
+});
+
+test('the same session closing a track twice leaves one head: the second entry replaces the first without an observed record written by hand (N1)', () => {
+  withWiki(null, (dir, today) => {
+    const sid = newPinSession('n1');
+    const cleanup = seedCloseTranscript(sid);
+    try {
+      const first = applyJson(
+        dir,
+        v2Payload(today, { tracks: [{ id: 'a', new: true, next: '- one' }], tag: 'n1 first' }),
+        sid,
+      );
+      assert.equal(first.out.ok, true, JSON.stringify(first.out));
+      typeCloseAgain(sid);
+      const second = applyJson(
+        dir,
+        v2Payload(today, { tracks: [{ id: 'a', next: '- two' }], tag: 'n1 second' }),
+        sid,
+      );
+      assert.equal(second.out.ok, true, JSON.stringify(second.out));
+      const heads = headsOf(dir);
+      assert.equal(heads.a.length, 1, JSON.stringify(heads));
+      assert.notEqual(heads.a[0], closeIdFor(sid, 0), 'the head is the second entry');
+      assert.equal(readObservedHeads(dir, sid, 'test-project').full.a.length, 2);
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+test('a head this session saw only as a pointer is replaced by its close; a head another session wrote after is not (N1)', () => {
+  withWiki(null, (dir, today) => {
+    writeEntryFile(dir, { closeId: 'seen-1', date: today, tracks: [{ id: 'a', new: true }] });
+    const sid = newPinSession('pointer');
+    recordObservedHeads(dir, sid, 'test-project', { level: 'pointer', heads: { a: ['seen-1'] } });
+    writeEntryFile(dir, { closeId: 'later-1', date: today, tracks: [{ id: 'a' }] });
+    const { out } = applyJson(
+      dir,
+      v2Payload(today, { tracks: [{ id: 'a', next: '- mine' }], tag: 'pointer close' }),
+      sid,
+    );
+    assert.equal(out.ok, true, JSON.stringify(out));
+    const heads = headsOf(dir).a;
+    assert.ok(!heads.includes('seen-1'), `the pointer-only head is replaced: ${heads}`);
+    assert.ok(heads.includes('later-1'), `the head written after the observation stays: ${heads}`);
+    assert.ok(heads.includes(closeIdFor(sid, 0)));
+  });
+});
+
+test('"done" closes only the heads the session knew: a concurrent head stays active and out of Finished tracks (Q5)', () => {
+  const render = (dir) =>
+    renderViews([loadSessionModel(dir, 'test-project')], { device: 'dev-test' }).projects[
+      'test-project'
+    ].sessionState;
+  withWiki(null, (dir, today) => {
+    writeEntryFile(dir, {
+      closeId: 'h1-1',
+      date: today,
+      tracks: [{ id: 't', new: true, title: 'T' }],
+      bodies: { t: 'body h1' },
+    });
+    const sid = newPinSession('q5');
+    recordObservedHeads(dir, sid, 'test-project', { level: 'pointer', heads: { t: ['h1-1'] } });
+    writeEntryFile(dir, {
+      closeId: 'h2-1',
+      date: today,
+      tracks: [{ id: 't' }],
+      bodies: { t: 'body h2 concurrent' },
+    });
+    const { out } = applyJson(
+      dir,
+      v2Payload(today, { tracks: [{ id: 't', done: true }], tag: 'q5 done' }),
+      sid,
+    );
+    assert.equal(out.ok, true, JSON.stringify(out));
+    assert.ok(!headsOf(dir).t.includes('h1-1'), 'h1 is replaced');
+    assert.ok(headsOf(dir).t.includes('h2-1'), 'h2 is still a head');
+    const view = render(dir);
+    const nextUp = view.slice(
+      view.indexOf('## Next Up'),
+      view.indexOf('## Finished tracks') === -1 ? undefined : view.indexOf('## Finished tracks'),
+    );
+    assert.ok(nextUp.includes('body h2 concurrent'), `h2 is in Next Up: ${view}`);
+    assert.ok(!view.includes('## Finished tracks'), `t is not folded: ${view}`);
+    assert.ok(
+      !(out.notices ?? []).some((n) => /h2/.test(n)),
+      `no notice about h2: ${JSON.stringify(out.notices)}`,
+    );
+  });
+  // The pair: with no concurrent head the same close folds the track.
+  withWiki(null, (dir, today) => {
+    writeEntryFile(dir, {
+      closeId: 'h1-1',
+      date: today,
+      tracks: [{ id: 't', new: true, title: 'T' }],
+      bodies: { t: 'body h1' },
+    });
+    const sid = newPinSession('q5-pair');
+    recordObservedHeads(dir, sid, 'test-project', { level: 'pointer', heads: { t: ['h1-1'] } });
+    const { out } = applyJson(
+      dir,
+      v2Payload(today, { tracks: [{ id: 't', done: true }], tag: 'q5 done pair' }),
+      sid,
+    );
+    assert.equal(out.ok, true, JSON.stringify(out));
+    const view = render(dir);
+    assert.ok(view.includes('## Finished tracks'), `t is folded: ${view}`);
+  });
+});
+
+test('a large legacy baseline seen only as a pointer is folded by "done" (Q5)', () => {
+  withWiki(
+    (dir, today) => {
+      writeFileSync(
+        join(dir, 'projects', 'test-project', 'session-state.md'),
+        `---\ntitle: session-state\ntype: session-state\nupdated: ${today}\n---\n\n## 다음 작업\n\n${'long body line\n'.repeat(400)}`,
+      );
+    },
+    (dir, today) => {
+      const model = loadSessionModel(dir, 'test-project');
+      const baseline = model.entries.find(
+        (e) => e.closeId.startsWith('baseline-') && e.bodies.legacy !== undefined,
+      );
+      assert.ok(baseline.bodies.legacy.length > 5000);
+      const sid = newPinSession('big-legacy');
+      recordObservedHeads(dir, sid, 'test-project', {
+        level: 'pointer',
+        heads: { legacy: [baseline.closeId] },
+      });
+      const { out } = applyJson(
+        dir,
+        v2Payload(today, { tracks: [{ id: 'legacy', done: true }], tag: 'big legacy' }),
+        sid,
+      );
+      assert.equal(out.ok, true, JSON.stringify(out));
+      const view = renderViews([loadSessionModel(dir, 'test-project')], { device: 'dev-test' })
+        .projects['test-project'].sessionState;
+      assert.ok(view.includes('## Finished tracks'), view);
+      assert.deepEqual(headsOf(dir).legacy, [closeIdFor(sid, 0)]);
+    },
+  );
+});
+
+test('a close in a vault that has not moved to entries writes only the entry and leaves the two old files byte-identical', () => {
+  withWiki(null, (dir, today) => {
+    const stateBefore = readFileSync(
+      join(dir, 'projects', 'test-project', 'session-state.md'),
+      'utf-8',
+    );
+    const hotBefore = readFileSync(join(dir, 'projects', 'test-project', 'hot.md'), 'utf-8');
+    const { out } = applyJson(dir, v2Payload(today), newPinSession('pre-migration'));
+    assert.equal(out.ok, true, JSON.stringify(out));
+    assert.equal(sessionFilesOf(dir).length, 1);
+    assert.equal(
+      readFileSync(join(dir, 'projects', 'test-project', 'session-state.md'), 'utf-8'),
+      stateBefore,
+    );
+    assert.equal(readFileSync(join(dir, 'projects', 'test-project', 'hot.md'), 'utf-8'), hotBefore);
+  });
+});
+
+test('a close in a migrated vault regenerates the project views from the new entry', () => {
+  withWiki(null, (dir, today) => {
+    const moved = migrateVaultToSessionEntries(dir);
+    assert.equal(moved.migrated, true, JSON.stringify(moved));
+    const { out } = applyJson(
+      dir,
+      v2Payload(today, {
+        summary: 'regen-summary-marker',
+        tracks: [{ id: 'main', new: true, next: '- regen-next-marker' }],
+      }),
+      newPinSession('regen'),
+    );
+    assert.equal(out.ok, true, JSON.stringify(out));
+    const hot = readFileSync(join(dir, 'projects', 'test-project', 'hot.md'), 'utf-8');
+    const state = readFileSync(join(dir, 'projects', 'test-project', 'session-state.md'), 'utf-8');
+    assert.ok(hot.includes('regen-summary-marker'), hot);
+    assert.ok(state.includes('regen-next-marker'), state);
+  });
+});
+
+test('the new entry takes the narrowest scope: a shared index and a machine baseline give machine:devA (W1)', () => {
+  withWiki(
+    (dir, today) => {
+      writeFileSync(
+        join(dir, 'projects', 'test-project', 'index.md'),
+        `---\ntitle: test-project\ntype: project-index\nupdated: ${today}\nvisibility_scope: shared\n---\n# test-project\n`,
+      );
+      writeFileSync(
+        join(dir, 'projects', 'test-project', 'session-state.md'),
+        `---\ntitle: session-state\ntype: session-state\nupdated: ${today}\nvisibility_scope: machine:devA\n---\n\n## 다음 작업\n\n- next\n`,
+      );
+    },
+    (dir, today) => {
+      const sid = newPinSession('scope');
+      const { out } = applyJson(dir, v2Payload(today), sid);
+      assert.equal(out.ok, true, JSON.stringify(out));
+      const mine = sessionFilesOf(dir).find((f) => f.includes(sid));
+      assert.equal(entryAt(dir, mine).visibilityScope, 'machine:devA');
+    },
+  );
+});
+
+test('legacy payload: the old two fields become the summary and a legacy track body, one notice says so, and a mix of both forms is refused', () => {
+  withWiki(null, (dir, today) => {
+    const payload = payloadForCleanWiki(dir, today);
+    const sid = newPinSession('legacy-form');
+    const { out } = applyJson(dir, payload, sid);
+    assert.equal(out.ok, true, JSON.stringify(out));
+    assert.ok(
+      out.notices.some((n) => /구버전 형식 payload/.test(n)),
+      JSON.stringify(out.notices),
+    );
+    const entry = entryAt(
+      dir,
+      sessionFilesOf(dir).find((f) => f.includes(sid)),
+    );
+    assert.ok(
+      entry.summary.includes('# Hot'),
+      'projectHot became the summary, frontmatter stripped',
+    );
+    assert.ok(!entry.summary.startsWith('---'));
+    assert.ok(
+      entry.bodies.legacy.includes('## 다음 작업'),
+      'sessionState became the legacy track body',
+    );
+
+    const mixed = { ...payloadForCleanWiki(dir, today), summary: 'x', tracks: [] };
+    const bad = applyJson(dir, mixed, newPinSession('legacy-mixed'));
+    assert.equal(bad.out.ok, false);
+    assert.match(JSON.stringify(bad.out.details), /both the old fields/);
+    assert.equal(sessionFilesOf(dir).length, 1, 'the refused payload wrote nothing');
+  });
+});
+
+// The Step 2 json block of commands/crystallize.md is what a model copies. It has to survive a
+// real apply, not only the shape check: a duplicate track id or an unregistered track passes the
+// shape check and is refused later, which is how the first version of the example got through.
+// Disabling the check: put a `done` element for the same <track-id> back into that block (the
+// real apply refuses it as track-duplicate), or add an `openQuestions` key to the block.
+test('commands/crystallize.md Step 2 payload example applies for real against a registered track', () => {
+  const md = readFileSync(join(REPO, 'commands', 'crystallize.md'), 'utf-8');
+  const step2 = md.slice(md.indexOf('## Step 2'), md.indexOf('## Step 3'));
+  const blocks = [...step2.matchAll(/```json\n([\s\S]*?)```/g)];
+  assert.equal(blocks.length, 1, 'Step 2 must hold exactly one json example');
+  const template = JSON.parse(blocks[0][1]);
+  assert.ok(!('openQuestions' in template), 'the example must not carry openQuestions by default');
+
+  const strings = (v) =>
+    typeof v === 'string'
+      ? [v]
+      : Array.isArray(v)
+        ? v.flatMap(strings)
+        : v && typeof v === 'object'
+          ? Object.values(v).flatMap(strings)
+          : [];
+
+  withWiki(null, (dir, today) => {
+    // Register track `main` the way a real earlier close does.
+    const seed = applyJson(dir, v2Payload(today, { tag: 'seed close' }), newPinSession('doc-seed'));
+    assert.equal(seed.out.ok, true, JSON.stringify(seed.out));
+    const filesBefore = sessionFilesOf(dir).length;
+
+    const sessionId = newPinSession('doc-example');
+    const values = {
+      '<slug>': 'test-project',
+      '<current session id>': sessionId,
+      '<what this session did and decided, markdown>': 'summary written from the doc example',
+      '<track-id>': 'main',
+      '<display title>': 'Main track',
+      '<next steps and state, markdown>': '- next step written from the doc example',
+      '<entry to append to projects/<slug>/session-log/YYYY-MM-DD.md>': `## [${today}] crystallize.md example\n`,
+    };
+    const fill = (v) =>
+      typeof v === 'string'
+        ? Object.hasOwn(values, v)
+          ? values[v]
+          : v
+        : Array.isArray(v)
+          ? v.map(fill)
+          : v && typeof v === 'object'
+            ? Object.fromEntries(Object.entries(v).map(([k, x]) => [k, fill(x)]))
+            : v;
+    const payload = fill(template);
+    assert.deepEqual(
+      strings(payload).filter((s) => s.startsWith('<')),
+      [],
+      'every placeholder in the example must have a value in this test',
+    );
+
+    const { out } = applyJson(dir, payload, sessionId);
+    assert.equal(out.ok, true, `the doc example must apply: ${JSON.stringify(out)}`);
+    assert.equal(out.committed, true, 'the doc example must commit its entry');
+    assert.equal(sessionFilesOf(dir).length, filesBefore + 1, 'exactly one entry was created');
+  });
+});
+
+// An old-format payload with bodies that make byte loss visible: Korean text, trailing
+// spaces, an inner blank line, and frontmatter fields that must not reach the entry.
+const LEGACY_HOT_BODY = '# 옛 hot\n\n- legacy-hot-line  \n\n- 두 번째 줄 legacy-hot-end';
+const LEGACY_STATE_BODY = '## 다음 작업\n\n- legacy-state-line  \n\n- 두 번째 legacy-state-end';
+
+// `legacy` is registered only through the baseline that the old files on disk make. Untrack both
+// and record their bytes as the generator's own output (they stay on disk, which the post-apply
+// verification needs): they are not old memory then, and no baseline exists.
+function untrackOldStateFiles(dir) {
+  const env = { ...process.env, HOME: SESSION_TMP_HOME };
+  const files = ['hot.md', 'session-state.md'].map((f) => join('projects', 'test-project', f));
+  spawnSync('git', ['rm', '--cached', ...files], { cwd: dir, env });
+  spawnSync('git', ['commit', '-m', 'untrack old files'], { cwd: dir, env });
+  appendFileSync(join(dir, '.git', 'info', 'exclude'), `${files.join('\n')}\n`);
+  const views = Object.fromEntries(
+    files.map((f) => [
+      f,
+      createHash('sha256')
+        .update(readFileSync(join(dir, f), 'utf-8'), 'utf-8')
+        .digest('hex'),
+    ]),
+  );
+  mkdirSync(join(dir, '.cache'), { recursive: true });
+  writeFileSync(join(dir, '.cache', 'generated-views.json'), JSON.stringify({ views }));
+}
+
+function legacyFormatPayload(today, tag) {
+  return {
+    project: 'test-project',
+    date: today,
+    sessionState: {
+      content: `---\ntitle: session-state\ntype: session-state\nupdated: ${today}\n---\n\n${LEGACY_STATE_BODY}\n`,
+    },
+    projectHot: {
+      content: `---\ntitle: hot\ntype: hot\nupdated: ${today}\nlegacy-fm-marker: x\n---\n\n${LEGACY_HOT_BODY}\n`,
+    },
+    sessionLog: { entry: `## [${today}] ${tag}\n` },
+  };
+}
+
+test('legacy payload: both old field bodies sit in the original entry byte for byte, frontmatter stripped, and exactly one notice says it was absorbed', () => {
+  withWiki(null, (dir, today) => {
+    untrackOldStateFiles(dir);
+    const sid = newPinSession('legacy-bytes');
+    const { out } = applyJson(dir, legacyFormatPayload(today, 'legacy bytes'), sid);
+    assert.equal(out.ok, true, JSON.stringify(out));
+    const file = sessionFilesOf(dir).find((f) => f.includes(sid));
+    const text = readFileSync(join(sessionsDirOf(dir), file), 'utf-8');
+    assert.ok(text.includes(LEGACY_HOT_BODY), 'the projectHot body is in the file as sent');
+    assert.ok(text.includes(LEGACY_STATE_BODY), 'the sessionState body is in the file as sent');
+    assert.ok(!text.includes('legacy-fm-marker'), 'the old frontmatter did not come along');
+    const entry = entryAt(dir, file);
+    assert.ok(entry.summary.includes(LEGACY_HOT_BODY), entry.summary);
+    assert.ok(entry.bodies.legacy.includes(LEGACY_STATE_BODY), entry.bodies.legacy);
+    assert.equal(entry.tracks.length, 1);
+    assert.equal(entry.tracks[0].id, 'legacy');
+    assert.equal(entry.tracks[0].new, true, 'legacy is registered by this close');
+    const absorbed = (out.notices ?? []).filter((n) => /구버전 형식 payload/.test(n));
+    assert.equal(absorbed.length, 1, JSON.stringify(out.notices));
+  });
+});
+
+test('legacy payload: the same session closing in the old format twice leaves one legacy head, and the first entry is not it', () => {
+  withWiki(null, (dir, today) => {
+    untrackOldStateFiles(dir);
+    const sid = newPinSession('legacy-twice');
+    const cleanup = seedCloseTranscript(sid);
+    try {
+      const first = applyJson(dir, legacyFormatPayload(today, 'legacy twice first'), sid);
+      assert.equal(first.out.ok, true, JSON.stringify(first.out));
+      typeCloseAgain(sid);
+      const second = applyJson(dir, legacyFormatPayload(today, 'legacy twice second'), sid);
+      assert.equal(second.out.ok, true, JSON.stringify(second.out));
+      assert.equal(sessionFilesOf(dir).length, 2, 'both closes wrote an entry');
+      const heads = headsOf(dir);
+      assert.equal(heads.legacy.length, 1, JSON.stringify(heads));
+      assert.notEqual(heads.legacy[0], closeIdFor(sid, 0), 'the first entry is no longer a head');
+      const secondEntry = entryAt(
+        dir,
+        sessionFilesOf(dir).find((f) => f.includes(heads.legacy[0])),
+      );
+      assert.deepEqual(secondEntry.tracks[0].supersedes, [closeIdFor(sid, 0)]);
+      assert.ok(!secondEntry.tracks[0].new, 'legacy was already registered');
+      assert.equal(readObservedHeads(dir, sid, 'test-project').full.legacy.length, 2);
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+// A migration splits the old session-state into one head per track. The old payload form writes the
+// whole new session-state into `legacy`, so the split heads this session saw must go with it.
+// Disabling the check: in planSessionEntry drop the `legacyFormat && t.id === 'legacy'` block that
+// fills legacySplitRetired. The split bodies then stay live next to the full copy.
+test('legacy payload against a split baseline: the observed legacy-* heads are retired and the new text appears once', () => {
+  withWiki(null, (dir, today) => {
+    untrackOldStateFiles(dir);
+    const base = 'aaaa1111-1';
+    const splitA = 'legacy-stage-a-111111';
+    const splitB = 'legacy-stage-b-222222';
+    writeEntryFile(dir, {
+      closeId: base,
+      date: today,
+      summary: '',
+      tracks: [
+        { id: 'legacy', title: '이행 전 기록', new: true },
+        { id: splitA, title: 'Stage A', new: true },
+        { id: splitB, title: 'Stage B', new: true },
+      ],
+      bodies: { legacy: 'REMAINDER-BODY', [splitA]: 'SPLIT-A-BODY', [splitB]: 'SPLIT-B-BODY' },
+    });
+    const sid = newPinSession('legacy-split');
+    recordObservedHeads(dir, sid, 'test-project', {
+      level: 'full',
+      heads: { legacy: [base], [splitA]: [base], [splitB]: [base] },
+    });
+    const { out } = applyJson(dir, legacyFormatPayload(today, 'legacy split'), sid);
+    assert.equal(out.ok, true, JSON.stringify(out));
+    const mine = closeIdFor(sid, 0);
+    const model = loadSessionModel(dir, 'test-project');
+    const tracks = trackHeads(model.entries);
+    assert.deepEqual(
+      tracks.find((t) => t.trackId === 'legacy').heads.map((h) => h.closeId),
+      [mine],
+    );
+    for (const id of [splitA, splitB]) {
+      const t = tracks.find((x) => x.trackId === id);
+      assert.deepEqual(
+        t.heads.map((h) => h.closeId),
+        [mine],
+        `the baseline head of ${id} is replaced by this close's retiring update`,
+      );
+      assert.equal(t.done, true, `${id} is retired, not live`);
+    }
+    const view = renderViews([model], { device: 'dev-test' }).projects['test-project'].sessionState;
+    assert.ok(!view.includes('SPLIT-A-BODY') && !view.includes('SPLIT-B-BODY'), view);
+    assert.ok(!view.includes('REMAINDER-BODY'), 'the old remainder is replaced too');
+    assert.equal(view.split('legacy-state-line').length - 1, 1, 'the new text appears once');
+  });
+});
+
+// The old-form close retires only the split heads this session observed. Disabling the check:
+// in planSessionEntry replace the `retired` filter with `const retired = closeIds;`. The heads that
+// were never observed, or that another close published after the observation, are then retired too.
+test('legacy payload against a split baseline: a legacy-* head another close published after the observation stays live', () => {
+  withWiki(null, (dir, today) => {
+    untrackOldStateFiles(dir);
+    const base = 'aaaa1111-1';
+    const splitA = 'legacy-stage-a-111111';
+    const late = 'legacy-late-333333';
+    writeEntryFile(dir, {
+      closeId: base,
+      date: today,
+      summary: '',
+      tracks: [
+        { id: 'legacy', title: '이행 전 기록', new: true },
+        { id: splitA, title: 'Stage A', new: true },
+      ],
+      bodies: { legacy: 'REMAINDER-BODY', [splitA]: 'SPLIT-A-BODY' },
+    });
+    const sid = newPinSession('legacy-split-late');
+    recordObservedHeads(dir, sid, 'test-project', {
+      level: 'full',
+      heads: { legacy: [base], [splitA]: [base] },
+    });
+    // Another close lands after the observation: a new split track, and an update of an observed one.
+    const other = 'bbbb2222-2';
+    writeEntryFile(dir, {
+      closeId: other,
+      date: today,
+      summary: 'later close',
+      tracks: [
+        { id: late, title: 'Late', new: true },
+        { id: splitA, supersedes: [base] },
+      ],
+      bodies: { [late]: 'LATE-BODY', [splitA]: 'SPLIT-A-NEWER' },
+    });
+    const { out } = applyJson(dir, legacyFormatPayload(today, 'legacy split late'), sid);
+    assert.equal(out.ok, true, JSON.stringify(out));
+    const model = loadSessionModel(dir, 'test-project');
+    const tracks = trackHeads(model.entries);
+    const lateTrack = tracks.find((t) => t.trackId === late);
+    assert.deepEqual(
+      lateTrack.heads.map((h) => h.closeId),
+      [other],
+      'the track published after the observation keeps its own head',
+    );
+    assert.notEqual(lateTrack.done, true, 'and is not retired');
+    const aTrack = tracks.find((t) => t.trackId === splitA);
+    assert.ok(
+      aTrack.heads.some((h) => h.closeId === other),
+      `the later update of an observed split track is not retired: ${JSON.stringify(aTrack.heads.map((h) => h.closeId))}`,
+    );
+    const view = renderViews([model], { device: 'dev-test' }).projects['test-project'].sessionState;
+    assert.ok(view.includes('LATE-BODY'), view);
+    assert.ok(view.includes('SPLIT-A-NEWER'), view);
+    assert.ok(!view.includes('REMAINDER-BODY'), 'the observed legacy head is still replaced');
+  });
+});
+
+test('legacy payload against a split baseline: a split track this session never observed stays live', () => {
+  withWiki(null, (dir, today) => {
+    untrackOldStateFiles(dir);
+    const base = 'aaaa1111-1';
+    const seenTrack = 'legacy-stage-a-111111';
+    const unseen = 'legacy-stage-c-444444';
+    writeEntryFile(dir, {
+      closeId: base,
+      date: today,
+      summary: '',
+      tracks: [
+        { id: 'legacy', title: '이행 전 기록', new: true },
+        { id: seenTrack, title: 'Stage A', new: true },
+        { id: unseen, title: 'Stage C', new: true },
+      ],
+      bodies: { legacy: 'REMAINDER-BODY', [seenTrack]: 'SPLIT-A-BODY', [unseen]: 'UNSEEN-BODY' },
+    });
+    const sid = newPinSession('legacy-split-unseen');
+    recordObservedHeads(dir, sid, 'test-project', {
+      level: 'full',
+      heads: { legacy: [base], [seenTrack]: [base] },
+    });
+    const { out } = applyJson(dir, legacyFormatPayload(today, 'legacy split unseen'), sid);
+    assert.equal(out.ok, true, JSON.stringify(out));
+    const model = loadSessionModel(dir, 'test-project');
+    const tracks = trackHeads(model.entries);
+    const t = tracks.find((x) => x.trackId === unseen);
+    assert.deepEqual(
+      t.heads.map((h) => h.closeId),
+      [base],
+      'the unobserved split head is left as it was',
+    );
+    assert.notEqual(t.done, true);
+    assert.equal(
+      tracks.find((x) => x.trackId === seenTrack).done,
+      true,
+      'the observed one is retired',
+    );
+    const view = renderViews([model], { device: 'dev-test' }).projects['test-project'].sessionState;
+    assert.ok(view.includes('UNSEEN-BODY'), view);
+    assert.ok(!view.includes('SPLIT-A-BODY'), view);
+  });
+});
+
+test('legacy payload: a payload mixing either old field with summary or tracks fails and writes nothing', () => {
+  const mixes = [
+    { summary: 'x' },
+    { tracks: [{ id: 'main', new: true }] },
+    { summary: 'x', tracks: [{ id: 'main', new: true }] },
+  ];
+  withWiki(null, (dir, today) => {
+    const head = gitHead(dir);
+    for (const [i, extra] of mixes.entries()) {
+      for (const drop of ['projectHot', 'sessionState']) {
+        const payload = { ...legacyFormatPayload(today, `legacy mixed ${i}`), ...extra };
+        delete payload[drop];
+        const { out } = applyJson(dir, payload, newPinSession(`legacy-mixed-${i}`));
+        assert.equal(out.ok, false, JSON.stringify(out));
+        assert.match(JSON.stringify(out.details), /both the old fields/);
+      }
+    }
+    assert.equal(sessionFilesOf(dir).length, 0, 'no entry was written');
+    assert.equal(gitHead(dir), head, 'no commit was made');
+    const status = spawnSync('git', ['status', '--porcelain'], { cwd: dir, encoding: 'utf-8' });
+    assert.equal(status.stdout, '', 'the vault is untouched');
+  });
+});
+
+suite('close entries: publishing and retrying one close');
+
+// Occupy the receipt directory with a file: the commit lands, the receipt cannot.
+function blockReceipt(dir, sessionId) {
+  const blocker = join(dir, '.cache', 'sessions', sessionId);
+  mkdirSync(dirname(blocker), { recursive: true });
+  writeFileSync(blocker, 'occupied by a file, not a directory\n');
+  return () => rmSync(blocker, { force: true });
+}
+
+test('a close that committed and failed at the receipt keeps its entry when retried with a fixed summary, says so, and issues the receipt (N2)', () => {
+  withWiki(null, (dir, today) => {
+    const sid = newPinSession('n2');
+    const unblock = blockReceipt(dir, sid);
+    const first = applyJson(dir, v2Payload(today, { summary: 'first summary' }), sid);
+    assert.equal(first.out.stage, 'receipt-write-failed', JSON.stringify(first.out));
+    assert.equal(first.out.committed, true);
+    const file = sessionFilesOf(dir)[0];
+    const bytes = readFileSync(join(sessionsDirOf(dir), file), 'utf-8');
+    const head = gitHead(dir);
+
+    unblock();
+    const retry = applyJson(dir, v2Payload(today, { summary: 'fixed summary' }), sid);
+    assert.equal(retry.out.ok, true, JSON.stringify(retry.out));
+    assert.equal(readFileSync(join(sessionsDirOf(dir), file), 'utf-8'), bytes, 'bytes unchanged');
+    assert.ok(
+      retry.out.notices.some((n) => /이번 payload의 요약은 반영되지 않았습니다/.test(n)),
+      JSON.stringify(retry.out.notices),
+    );
+    assert.ok(existsSync(receiptPath(dir, sid)), 'the receipt was issued');
+    assert.equal(gitHead(dir), head, 'no new commit');
+  });
+});
+
+test('a committed entry edited by hand is not adopted or replaced: the retry fails with entry-conflict and leaves the bytes alone', () => {
+  withWiki(null, (dir, today) => {
+    const sid = newPinSession('hand-edit');
+    const unblock = blockReceipt(dir, sid);
+    applyJson(dir, v2Payload(today), sid);
+    const file = join(sessionsDirOf(dir), sessionFilesOf(dir)[0]);
+    const edited = `${readFileSync(file, 'utf-8')}\nhand edit\n`;
+    writeFileSync(file, edited);
+    unblock();
+    const retry = applyJson(dir, v2Payload(today), sid);
+    assert.equal(retry.out.stage, 'entry-conflict', JSON.stringify(retry.out));
+    assert.equal(readFileSync(file, 'utf-8'), edited);
+  });
+});
+
+// Disabling the check: in classifyExistingEntry answer `identical` first whenever
+// `disk === text`, before asking HEAD. The retry then commits the edited bytes.
+test('a committed entry edited by hand into exactly the retry payload bytes is still a conflict, and the edit is not committed', () => {
+  withWiki(null, (dir, today) => {
+    const sid = newPinSession('hand-edit-to-payload');
+    const unblock = blockReceipt(dir, sid);
+    const first = applyJson(dir, v2Payload(today, { summary: 'first summary' }), sid);
+    assert.equal(first.out.stage, 'receipt-write-failed', JSON.stringify(first.out));
+    const file = join(sessionsDirOf(dir), sessionFilesOf(dir)[0]);
+    // What the retry payload formats to: the same entry with the fixed summary.
+    const edited = readFileSync(file, 'utf-8').replace('first summary', 'fixed summary');
+    writeFileSync(file, edited);
+    const head = gitHead(dir);
+    unblock();
+    const retry = applyJson(dir, v2Payload(today, { summary: 'fixed summary' }), sid);
+    assert.equal(retry.out.stage, 'entry-conflict', JSON.stringify(retry.out));
+    assert.equal(readFileSync(file, 'utf-8'), edited);
+    assert.equal(gitHead(dir), head, 'nothing was committed');
+  });
+});
+
+test('bytes another writer puts at the entry path just before the publish are never replaced (entry-conflict)', () => {
+  withWiki(null, (dir, today) => {
+    const sid = newPinSession('race');
+    const cleanup = seedCloseTranscript(sid);
+    try {
+      const r = applyWithHooks(
+        dir,
+        v2Payload(today),
+        sid,
+        `{ beforePublish({ abs }) { writeFileSync(abs, 'foreign bytes\\n'); } }`,
+      );
+      const out = JSON.parse(r.stdout);
+      assert.equal(out.stage, 'entry-conflict', `${r.stdout}\n${r.stderr}`);
+      const files = sessionFilesOf(dir);
+      assert.equal(files.length, 1);
+      assert.equal(readFileSync(join(sessionsDirOf(dir), files[0]), 'utf-8'), 'foreign bytes\n');
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+test('a commit failure then a retry with a fixed summary replaces the uncommitted entry and succeeds; touched-paths and the journal name the entry', () => {
+  withWiki(null, (dir, today) => {
+    const sid = newPinSession('commit-fail');
+    const unblock = blockCommits(dir);
+    const first = applyJson(dir, v2Payload(today, { summary: 'first summary' }), sid);
+    assert.equal(first.out.committed, false, JSON.stringify(first.out));
+    const rel = join('projects', 'test-project', 'sessions', sessionFilesOf(dir)[0]);
+    const shard = join('projects', 'test-project', 'session-log', `${today}.md`);
+    const touched = readTouchedPathsStrict(dir, sid);
+    assert.ok(touched.paths.includes(rel), `touched-paths names the entry: ${touched.paths}`);
+    assert.ok(touched.paths.includes(shard), `and the shard: ${touched.paths}`);
+    assert.ok(readJournal(dir, sid)[rel], 'the close journal has the entry path as a key');
+
+    unblock();
+    const retry = applyJson(dir, v2Payload(today, { summary: 'fixed summary' }), sid);
+    assert.equal(retry.out.ok, true, JSON.stringify(retry.out));
+    assert.equal(retry.out.committed, true);
+    assert.equal(entryAt(dir, sessionFilesOf(dir)[0]).summary, 'fixed summary');
+    const blob = spawnSync('git', ['show', `HEAD:${rel}`], { cwd: dir, encoding: 'utf-8' }).stdout;
+    assert.ok(blob.includes('fixed summary'), 'the committed bytes are the fixed ones');
+  });
+});
+
+// Leave the vault repo with a conflicting merge open: MERGE_HEAD present, `log.md` unmerged.
+function openConflictingMerge(dir) {
+  const env = { ...process.env, HOME: SESSION_TMP_HOME };
+  const git = (...a) => spawnSync('git', a, { cwd: dir, env, encoding: 'utf-8' });
+  const base = git('rev-parse', '--abbrev-ref', 'HEAD').stdout.trim();
+  git('checkout', '-q', '-b', 'side');
+  appendFileSync(join(dir, 'log.md'), 'side change\n');
+  git('commit', '-qam', 'side');
+  git('checkout', '-q', base);
+  appendFileSync(join(dir, 'log.md'), 'main change\n');
+  git('commit', '-qam', 'main');
+  const merged = git('merge', 'side');
+  assert.equal(merged.status, 1, `the fixture must stop on a conflict: ${merged.stdout}`);
+  assert.match(git('status', '--porcelain').stdout, /^UU log\.md$/m);
+  return git;
+}
+
+// Disabling the check: in applySessionClose drop the `vaultOperationInProgress` refusal.
+// The close then writes its entry, the commit fails, and the entry file is left behind.
+test('a close in a vault stopped mid-merge is refused before any write: ok:false, the stage and the blocker name the merge, exit 1', () => {
+  withWiki(null, (dir, today) => {
+    const sid = newPinSession('mid-merge');
+    openConflictingMerge(dir);
+    const logBefore = readFileSync(join(dir, 'log.md'), 'utf-8');
+    const first = applyJson(dir, v2Payload(today), sid);
+    assert.equal(first.r.status, 1, first.r.stdout);
+    assert.equal(first.out.ok, false, JSON.stringify(first.out));
+    assert.equal(first.out.stage, 'vault-operation-in-progress');
+    assert.equal(first.out.blocker.state, 'merge');
+    assert.match(first.out.error, /git merge --abort/);
+    assert.equal(first.out.committed, null);
+    assert.deepEqual(sessionFilesOf(dir), [], 'no entry file was written');
+    assert.equal(
+      existsSync(join(dir, 'projects', 'test-project', 'session-log', `${today}.md`)),
+      false,
+      'no session-log shard was written',
+    );
+    assert.equal(readFileSync(join(dir, 'log.md'), 'utf-8'), logBefore, 'log.md is untouched');
+    assert.equal(existsSync(join(dir, '.cache', `session-closed-${sid}.marker`)), false);
+    assert.equal(existsSync(join(dir, '.cache', 'sessions', sid, 'close-receipt.json')), false);
+    assert.equal(existsSync(join(dir, '.cache', 'close-intent')), false, 'no intent record');
+
+    // Control: the same payload closes once the person aborts the merge, so the refusal
+    // above was about the merge and not about the payload.
+    spawnSync('git', ['merge', '--abort'], {
+      cwd: dir,
+      env: { ...process.env, HOME: SESSION_TMP_HOME },
+    });
+    const retry = applyJson(dir, v2Payload(today), sid);
+    assert.equal(retry.out.ok, true, JSON.stringify(retry.out));
+    assert.equal(retry.out.committed, true);
+    assert.equal(sessionFilesOf(dir).length, 1);
+  });
+});
+
+// Disabling the check: in applySessionClose call vaultOperationInProgress directly again, without
+// the vault commit lock. A merge another session is finishing then reads as a stuck one.
+test('a close that finds the vault commit lock held mid-merge says another session is syncing, with no abort advice', () => {
+  withWiki(null, (dir, today) => {
+    openConflictingMerge(dir);
+    mkdirSync(join(dir, '.cache'), { recursive: true });
+    // This test process is alive and the lock is fresh, so withFileLock neither steals nor frees it.
+    writeFileSync(join(dir, '.cache', 'vault-commit.lock'), String(process.pid));
+    const r = applyJson(dir, v2Payload(today), newPinSession('merge-locked'));
+    assert.equal(r.r.status, 1, r.r.stdout);
+    assert.equal(r.out.ok, false, JSON.stringify(r.out));
+    assert.equal(r.out.stage, 'vault-locked');
+    assert.match(
+      r.out.error,
+      /another session is syncing the vault; run the close again in a moment/,
+    );
+    assert.doesNotMatch(r.out.error, /abort/);
+    assert.equal(r.out.blocker, undefined);
+    assert.deepEqual(sessionFilesOf(dir), [], 'no entry file was written');
+  });
+});
+
+test('unmerged paths without a MERGE_HEAD refuse the close the same way', () => {
+  withWiki(null, (dir, today) => {
+    const git = openConflictingMerge(dir);
+    rmSync(join(dir, '.git', 'MERGE_HEAD'));
+    assert.equal(git('rev-parse', '-q', '--verify', 'MERGE_HEAD').status, 1);
+    const r = applyJson(dir, v2Payload(today), newPinSession('unmerged'));
+    assert.equal(r.out.ok, false, JSON.stringify(r.out));
+    assert.equal(r.out.stage, 'vault-operation-in-progress');
+    assert.equal(r.out.blocker.state, 'unmerged');
+    assert.match(r.out.error, /log\.md/);
+    assert.deepEqual(sessionFilesOf(dir), []);
+  });
+});
+
+// Disabling the check: in vaultOperationInProgress (hooks/hypo-shared.mjs) make the `am` branch
+// unreachable (`if (false && gitPathExists('rebase-apply/applying'))`). The am state then reads as a
+// rebase and the advice names `git rebase`, which refuses while an am is in progress.
+test('a failed git am is reported as an am, not a rebase; git am --abort lets the close succeed', () => {
+  withWiki(null, (dir, today) => {
+    const env = { ...process.env, HOME: SESSION_TMP_HOME };
+    const git = (...a) => spawnSync('git', a, { cwd: dir, env, encoding: 'utf-8' });
+    const base = git('rev-parse', '--abbrev-ref', 'HEAD').stdout.trim();
+    writeFileSync(join(dir, 'am-probe.txt'), 'one\n');
+    git('add', 'am-probe.txt');
+    git('commit', '-qm', 'probe');
+    git('checkout', '-q', '-b', 'side');
+    writeFileSync(join(dir, 'am-probe.txt'), 'two\n');
+    git('commit', '-qam', 'side');
+    const patchDir = mkdtempSync(join(tmpdir(), 'hypo-am-patch-'));
+    try {
+      git('format-patch', '-1', '-o', patchDir);
+      git('checkout', '-q', base);
+      writeFileSync(join(dir, 'am-probe.txt'), 'three\n');
+      git('commit', '-qam', 'main');
+      const am = git('am', join(patchDir, readdirSync(patchDir)[0]));
+      assert.notEqual(am.status, 0, `the fixture must stop in git am: ${am.stdout}`);
+      assert.ok(
+        existsSync(join(dir, '.git', 'rebase-apply', 'applying')),
+        'fixture: an am is open',
+      );
+      assert.notEqual(git('rebase', '--abort').status, 0, 'premise: git rebase cannot end an am');
+
+      const sid = newPinSession('mid-am');
+      const refused = applyJson(dir, v2Payload(today), sid);
+      assert.equal(refused.out.ok, false, JSON.stringify(refused.out));
+      assert.equal(refused.out.stage, 'vault-operation-in-progress');
+      assert.equal(refused.out.blocker.state, 'am');
+      assert.match(refused.out.error, /git am --continue/);
+      assert.match(refused.out.error, /git am --abort/);
+      assert.doesNotMatch(refused.out.error, /git rebase/);
+      assert.deepEqual(sessionFilesOf(dir), [], 'refused before any write');
+
+      assert.equal(git('am', '--abort').status, 0);
+      const closed = applyJson(dir, v2Payload(today), sid);
+      assert.equal(closed.out.ok, true, JSON.stringify(closed.out));
+      assert.equal(closed.out.committed, true);
+    } finally {
+      rmSync(patchDir, { recursive: true, force: true });
+    }
+  });
+});
+
+// Disabling the check: in applySessionClose make the lock callback return the stale `busy`
+// (`() => busy`). The close then reports the merge another session had just finished.
+await testAsync(
+  'a close that waits for the vault commit lock proceeds when the merge finishes meanwhile',
+  async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'hypo-wiki-'));
+    const today = todayLocal();
+    try {
+      buildCleanWikiTree(dir, today);
+      const gitInit = (...a) => spawnSync('git', a, { cwd: dir, encoding: 'utf-8' });
+      gitInit('init');
+      gitInit('config', 'user.email', 'test@test.com');
+      gitInit('config', 'user.name', 'Test');
+      gitInit('add', '-A');
+      gitInit('commit', '-m', 'init');
+      const git = openConflictingMerge(dir);
+      const lock = join(dir, '.cache', 'vault-commit.lock');
+      mkdirSync(join(dir, '.cache'), { recursive: true });
+      // This process is alive and the lock is fresh, so the close waits for it.
+      writeFileSync(lock, String(process.pid));
+      const sid = newPinSession('merge-finishes');
+      const cleanup = seedCloseTranscript(sid);
+      const payloadPath = join(tmpdir(), `hypo-payload-${sid}.json`);
+      writeFileSync(payloadPath, JSON.stringify(v2Payload(today)));
+      const child = spawn(
+        process.execPath,
+        [
+          join(REPO, 'scripts', 'crystallize.mjs'),
+          `--hypo-dir=${dir}`,
+          '--apply-session-close',
+          `--payload=${payloadPath}`,
+          `--session-id=${sid}`,
+          '--json',
+        ],
+        { env: { ...process.env, HYPO_DIR: '', HOME: SESSION_TMP_HOME } },
+      );
+      let stdout = '';
+      let stderr = '';
+      child.stdout.on('data', (d) => (stdout += d));
+      child.stderr.on('data', (d) => (stderr += d));
+      const exited = new Promise((resolve) => child.on('exit', (code) => resolve(code)));
+      try {
+        // The waiter stages its own lock file before it polls, so that file shows it is waiting.
+        const waiting = () =>
+          readdirSync(join(dir, '.cache')).some((f) => /^vault-commit\.lock\..+\.tmp$/.test(f));
+        for (let i = 0; i < 100 && !waiting(); i++) await sleep(50);
+        assert.ok(waiting(), `fixture: the close is waiting for the lock\n${stdout}\n${stderr}`);
+        // The merge finishes while the close waits, then the lock is released.
+        writeFileSync(join(dir, 'log.md'), 'resolved\n');
+        git('add', 'log.md');
+        const done = git('commit', '--no-edit');
+        assert.equal(done.status, 0, `fixture: the merge finishes: ${done.stderr}`);
+        rmSync(lock);
+        const code = await exited;
+        const out = JSON.parse(stdout);
+        assert.equal(out.ok, true, `${stdout}\n${stderr}`);
+        assert.equal(code, 0, stdout);
+        assert.equal(out.committed, true, stdout);
+      } finally {
+        child.kill();
+        cleanup();
+        rmSync(payloadPath, { force: true });
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  },
+);
+
+test('a commit that fails after the writes is ok:false at stage commit-failed, with no marker or receipt, and names the entry it left; the retry closes', () => {
+  withWiki(null, (dir, today) => {
+    const sid = newPinSession('commit-fail-stage');
+    const unblock = blockCommits(dir);
+    const first = applyJson(dir, v2Payload(today, { summary: 'first summary' }), sid);
+    assert.equal(first.r.status, 1, first.r.stdout);
+    assert.equal(first.out.ok, false, JSON.stringify(first.out));
+    assert.equal(first.out.stage, 'commit-failed');
+    assert.equal(first.out.committed, false);
+    assert.equal(first.out.markerWritten, false);
+    assert.match(first.out.markerSkipReason, /^commit-failed:/);
+    assert.match(first.out.commitFailure, /blocked by test|pre-commit|hook/i);
+    const file = sessionFilesOf(dir)[0];
+    const rel = join('projects', 'test-project', 'sessions', file);
+    assert.ok(file, 'the entry file stays on disk for the retry to find');
+    assert.ok(
+      first.out.appliedUncommitted.some((a) => a.includes(rel)),
+      `the result names the entry it left: ${JSON.stringify(first.out.appliedUncommitted)}`,
+    );
+    assert.equal(existsSync(join(dir, '.cache', `session-closed-${sid}.marker`)), false);
+    assert.equal(existsSync(join(dir, '.cache', 'sessions', sid, 'close-receipt.json')), false);
+
+    unblock();
+    const retry = applyJson(dir, v2Payload(today, { summary: 'first summary' }), sid);
+    assert.equal(retry.out.ok, true, JSON.stringify(retry.out));
+    assert.equal(retry.out.stage, null);
+    assert.equal(retry.out.committed, true);
+    assert.equal(retry.out.markerWritten, true);
+    assert.equal(retry.out.appliedUncommitted, undefined);
+    assert.equal(sessionFilesOf(dir).length, 1, 'the retry reuses the entry, no second file');
+  });
+});
+
+// Disabling the check: in buildCloseResult make `stillOnDisk` equal `applied`. The withdrawn
+// session-log and log.md appends are then listed as work left on disk.
+test('a commit failure lists only what is still on disk: the withdrawn session-log and log.md appends are not in appliedUncommitted', () => {
+  withWiki(null, (dir, today) => {
+    const sid = newPinSession('commit-fail-withdrawn');
+    const unblock = blockCommits(dir);
+    const first = applyJson(dir, v2Payload(today, { summary: 'first summary' }), sid);
+    assert.equal(first.out.stage, 'commit-failed', JSON.stringify(first.out));
+    assert.ok(
+      first.out.applied.some((a) => a.startsWith('sessionLog (')) &&
+        first.out.applied.some((a) => a.startsWith('log (')),
+      `fixture: the close did append to both: ${JSON.stringify(first.out.applied)}`,
+    );
+    assert.ok(
+      (first.out.notices ?? []).some((n) => /추가한 내용을 되돌렸습니다/.test(n)),
+      `fixture: the appends were taken back: ${JSON.stringify(first.out.notices)}`,
+    );
+    assert.ok(
+      first.out.appliedUncommitted.some((a) => a.startsWith('sessionEntry (')),
+      JSON.stringify(first.out.appliedUncommitted),
+    );
+    assert.deepEqual(
+      first.out.appliedUncommitted.filter((a) => /sessionLog|log \(/.test(a)),
+      [],
+      `the withdrawn appends are not listed: ${JSON.stringify(first.out.appliedUncommitted)}`,
+    );
+    unblock();
+  });
+});
+
+// Disabling the check: in buildCloseResult read only `applied` again (`[...applied]`). On the
+// second failure the unchanged entry is in `skipped`, so the list comes back empty.
+test('a second commit failure under the same session still lists the entry it left uncommitted', () => {
+  withWiki(null, (dir, today) => {
+    const sid = newPinSession('commit-fail-twice');
+    const unblock = blockCommits(dir);
+    const payload = v2Payload(today, { summary: 'first summary' });
+    const first = applyJson(dir, payload, sid);
+    assert.equal(first.out.stage, 'commit-failed', JSON.stringify(first.out));
+    const second = applyJson(dir, payload, sid);
+    assert.equal(second.out.stage, 'commit-failed', JSON.stringify(second.out));
+    assert.ok(
+      second.out.skipped.some((a) => a.startsWith('sessionEntry (')),
+      `fixture: the entry is unchanged, so it is skipped now: ${JSON.stringify(second.out)}`,
+    );
+    const rel = join('projects', 'test-project', 'sessions', sessionFilesOf(dir)[0]);
+    assert.ok(
+      second.out.appliedUncommitted.some((a) => a.includes(rel)),
+      `the entry is still uncommitted and is named: ${JSON.stringify(second.out.appliedUncommitted)}`,
+    );
+    assert.deepEqual(
+      second.out.appliedUncommitted.filter((a) => /sessionLog|log \(/.test(a)),
+      [],
+      'the withdrawn appends stay out of it',
+    );
+    unblock();
+  });
+});
+
+test('a normal close is ok:true, committed, no stage, and the entry is in HEAD', () => {
+  withWiki(null, (dir, today) => {
+    const r = applyJson(dir, v2Payload(today), newPinSession('normal-close'));
+    assert.equal(r.r.status, 0, r.r.stdout);
+    assert.equal(r.out.ok, true, JSON.stringify(r.out));
+    assert.equal(r.out.stage, null);
+    assert.equal(r.out.committed, true);
+    const rel = join('projects', 'test-project', 'sessions', sessionFilesOf(dir)[0]);
+    const inHead = spawnSync('git', ['cat-file', '-e', `HEAD:${rel}`], { cwd: dir });
+    assert.equal(inHead.status, 0, 'the entry is committed');
+  });
+});
+
+test('an uncommitted entry another process changed, matching neither the journal nor the pinned hashes, is a conflict', () => {
+  withWiki(null, (dir, today) => {
+    const sid = newPinSession('uncommitted-foreign');
+    const unblock = blockCommits(dir);
+    applyJson(dir, v2Payload(today), sid);
+    const file = join(sessionsDirOf(dir), sessionFilesOf(dir)[0]);
+    writeFileSync(file, 'someone else rewrote this\n');
+    unblock();
+    const retry = applyJson(dir, v2Payload(today, { summary: 'fixed' }), sid);
+    assert.equal(retry.out.stage, 'entry-conflict', JSON.stringify(retry.out));
+    assert.equal(readFileSync(file, 'utf-8'), 'someone else rewrote this\n');
+  });
+});
+
+// Disabling the check: in writeSessionEntry drop the re-read before the replace
+// (`readTarget(abs) !== disk`). The retry then writes over the bytes the seam put there.
+test('bytes that land after the retry judged its uncommitted entry and before it replaces it are kept (entry-conflict)', () => {
+  withWiki(null, (dir, today) => {
+    const sid = newPinSession('replace-race');
+    const cleanup = seedCloseTranscript(sid);
+    try {
+      const unblock = blockCommits(dir);
+      const first = applyJson(dir, v2Payload(today, { summary: 'first summary' }), sid);
+      assert.equal(first.out.committed, false, JSON.stringify(first.out));
+      unblock();
+      const file = join(sessionsDirOf(dir), sessionFilesOf(dir)[0]);
+      const head = gitHead(dir);
+      const r = applyWithHooks(
+        dir,
+        v2Payload(today, { summary: 'fixed summary' }),
+        sid,
+        `{ afterPinBeforeReplace({ abs }) { writeFileSync(abs, 'landed in between\\n'); } }`,
+      );
+      const out = JSON.parse(r.stdout);
+      assert.equal(out.stage, 'entry-conflict', `${r.stdout}\n${r.stderr}`);
+      assert.equal(readFileSync(file, 'utf-8'), 'landed in between\n');
+      assert.equal(gitHead(dir), head, 'nothing was committed');
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+test('a crash right after the publish (before the journal) is repaired by a retry with a fixed summary: one commit, new bytes, with or without a journal (P1)', () => {
+  for (const dropJournal of [false, true]) {
+    withWiki(null, (dir, today) => {
+      const sid = newPinSession(`p1-${dropJournal}`);
+      const cleanup = seedCloseTranscript(sid);
+      try {
+        const crash = applyWithHooks(
+          dir,
+          v2Payload(today, { summary: 'first summary' }),
+          sid,
+          CRASH_AFTER_PUBLISH,
+        );
+        assert.notEqual(crash.status, 0, 'the seam crashes the child');
+        assert.match(crash.stderr, /crash after publish/);
+        const file = sessionFilesOf(dir)[0];
+        const rel = join('projects', 'test-project', 'sessions', file);
+        assert.equal(readJournal(dir, sid)[rel], undefined, 'the journal never heard of the entry');
+        assert.equal(readClosePin(dir, sid).pending.entrySha256s.length, 1, 'the pin did');
+        if (dropJournal)
+          rmSync(join(dir, '.cache', 'close-journal', `${sid}.json`), { force: true });
+
+        const before = commitCountOf(dir);
+        const retry = applyJson(dir, v2Payload(today, { summary: 'fixed summary' }), sid);
+        assert.equal(retry.out.ok, true, JSON.stringify(retry.out));
+        assert.equal(entryAt(dir, file).summary, 'fixed summary');
+        assert.equal(commitCountOf(dir), before + 1, 'one commit');
+      } finally {
+        cleanup();
+      }
+    });
+  }
+});
+
+test('a crash after the pin took the fixed bytes but before the replace leaves both hashes pinned: a third payload still replaces (P1)', () => {
+  withWiki(null, (dir, today) => {
+    const sid = newPinSession('p1-third');
+    const cleanup = seedCloseTranscript(sid);
+    try {
+      applyWithHooks(dir, v2Payload(today, { summary: 'first summary' }), sid, CRASH_AFTER_PUBLISH);
+      const file = sessionFilesOf(dir)[0];
+      const second = applyWithHooks(
+        dir,
+        v2Payload(today, { summary: 'second summary' }),
+        sid,
+        CRASH_AFTER_PIN,
+      );
+      assert.match(second.stderr, /crash after pin/);
+      assert.equal(entryAt(dir, file).summary, 'first summary', 'the replace never happened');
+      assert.equal(readClosePin(dir, sid).pending.entrySha256s.length, 2);
+
+      const third = applyJson(dir, v2Payload(today, { summary: 'third summary' }), sid);
+      assert.equal(third.out.ok, true, JSON.stringify(third.out));
+      assert.equal(entryAt(dir, file).summary, 'third summary');
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+test('the pinned hashes license a replace only for the pinned path: a pin that names another path leaves the same disk bytes alone (P1)', () => {
+  withWiki(null, (dir, today) => {
+    const sid = newPinSession('p1-path');
+    const cleanup = seedCloseTranscript(sid);
+    try {
+      applyWithHooks(dir, v2Payload(today, { summary: 'first summary' }), sid, CRASH_AFTER_PUBLISH);
+      const file = join(sessionsDirOf(dir), sessionFilesOf(dir)[0]);
+      const bytes = readFileSync(file, 'utf-8');
+      const pin = readClosePin(dir, sid);
+      writeClosePin(dir, sid, {
+        ...pin,
+        pending: { ...pin.pending, entryRelPath: 'projects/test-project/sessions/elsewhere.md' },
+      });
+      const retry = applyJson(dir, v2Payload(today, { summary: 'fixed summary' }), sid);
+      assert.equal(retry.out.stage, 'entry-conflict', JSON.stringify(retry.out));
+      assert.equal(readFileSync(file, 'utf-8'), bytes);
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+test('classifyExistingEntry: the same disk bytes are replaceable for the pinned close and path, and not for another close id or path (P1)', () => {
+  withWiki(null, (dir) => {
+    const text = 'new bytes\n';
+    const disk = 'old bytes\n';
+    const relPath = 'projects/test-project/sessions/2026-10-01-s-1.md';
+    const pinFor = (closeId, entryRelPath) => ({
+      pending: {
+        closeId,
+        openedAtIndex: 1,
+        entryRelPath,
+        entrySha256s: [createHash('sha256').update(disk).digest('hex')],
+      },
+      lastResolved: null,
+      localProofs: {},
+    });
+    const base = { hypoDir: dir, sessionId: 'no-journal', relPath, text, disk, ignored: false };
+    assert.equal(
+      classifyExistingEntry({ ...base, closeId: 's-1', pin: pinFor('s-1', relPath) }).action,
+      'replace',
+    );
+    assert.equal(
+      classifyExistingEntry({ ...base, closeId: 's-2', pin: pinFor('s-1', relPath) }).action,
+      'conflict',
+    );
+    assert.equal(
+      classifyExistingEntry({
+        ...base,
+        closeId: 's-1',
+        pin: pinFor('s-1', 'projects/test-project/sessions/other.md'),
+      }).action,
+      'conflict',
+    );
+  });
+});
+
+test('an unwritable close-pin directory stops the close at stage close-pin before anything is published', () => {
+  if (process.getuid && process.getuid() === 0) return; // root ignores directory modes
+  withWiki(null, (dir, today) => {
+    const sid = newPinSession('pin-dir');
+    const cleanup = seedCloseTranscript(sid);
+    try {
+      unresolvedApply(dir, today, sid); // takes the pin: later writes are the publish intent only
+      const pinDir = dirname(closePinPath(dir, sid));
+      chmodSync(pinDir, 0o500);
+      try {
+        const { out } = applyJson(dir, v2Payload(today), sid);
+        assert.equal(out.stage, 'close-pin', JSON.stringify(out));
+        assert.deepEqual(sessionFilesOf(dir), [], 'nothing was published');
+      } finally {
+        chmodSync(pinDir, 0o700);
+      }
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+test('a retry that crosses midnight keeps the first date: the same close id found under another date is the entry', () => {
+  withWiki(null, (dir, today) => {
+    const sid = newPinSession('date-move');
+    const unblock = blockCommits(dir);
+    applyJson(dir, v2Payload(today, { summary: 'first' }), sid);
+    const file = sessionFilesOf(dir)[0];
+    unblock();
+    const [y, m, d] = today.split('-').map(Number);
+    const tomorrow = new Date(Date.UTC(y, m - 1, d + 1)).toISOString().slice(0, 10);
+    // The logs go under the entry's date (today here), so the retry's heading
+    // carries it although the payload date moved (see the day-alignment tests).
+    const retry = applyJson(
+      dir,
+      {
+        ...v2Payload(tomorrow, { summary: 'second' }),
+        sessionLog: { entry: `## [${today}] second day\n` },
+      },
+      sid,
+    );
+    assert.equal(retry.out.ok, true, JSON.stringify(retry.out));
+    // The payload date moves, the entry stays under the date it was first published with.
+    assert.deepEqual(sessionFilesOf(dir), [file], JSON.stringify(retry.out));
+    assert.equal(entryAt(dir, file).date, today);
+  });
+});
+
+test('a retry that crosses midnight with no close pin left still finds the entry on disk by its close id', () => {
+  withWiki(null, (dir, today) => {
+    const sid = newPinSession('date-move-nopin');
+    const unblock = blockCommits(dir);
+    applyJson(dir, v2Payload(today, { summary: 'first' }), sid);
+    const file = sessionFilesOf(dir)[0];
+    unblock();
+    // the pin also names the path; without it only the scan of sessions/ can find the entry
+    rmSync(closePinPath(dir, sid), { force: true });
+    const [y, m, d] = today.split('-').map(Number);
+    const tomorrow = new Date(Date.UTC(y, m - 1, d + 1)).toISOString().slice(0, 10);
+    // The logs go under the entry's date (today here), so the retry's heading
+    // carries it although the payload date moved (see the day-alignment tests).
+    const retry = applyJson(
+      dir,
+      {
+        ...v2Payload(tomorrow, { summary: 'second' }),
+        sessionLog: { entry: `## [${today}] second day\n` },
+      },
+      sid,
+    );
+    assert.equal(retry.out.ok, true, JSON.stringify(retry.out));
+    assert.deepEqual(sessionFilesOf(dir), [file], JSON.stringify(retry.out));
+    assert.equal(entryAt(dir, file).date, today);
+  });
+});
+
+test('twelve closes over forty days, three of them superseding an earlier entry and one marking the track done: every close commit only adds one entry and never deletes (never deletes)', () => {
+  withWiki(null, (dir, today) => {
+    const [y, m, d] = today.split('-').map(Number);
+    const daysAgo = (n) => {
+      const t = new Date(y, m - 1, d - n);
+      return `${t.getFullYear()}-${String(t.getMonth() + 1).padStart(2, '0')}-${String(t.getDate()).padStart(2, '0')}`;
+    };
+    const offsets = [40, 37, 34, 30, 27, 24, 20, 17, 13, 9, 4, 0];
+    const sessionsRel = join('projects', 'test-project', 'sessions');
+    const git = (...args) => spawnSync('git', args, { cwd: dir, encoding: 'utf-8' });
+    const supersedingAt = new Set([3, 7, 9]);
+    const doneAt = 10;
+
+    const written = [];
+    offsets.forEach((offset, i) => {
+      const date = daysAgo(offset);
+      const track = { id: 'main', next: `- step ${i}` };
+      if (i === 0) track.new = true;
+      if (supersedingAt.has(i)) track.supersedes = [entryAt(dir, written[i - 1]).closeId];
+      if (i === doneAt) track.done = true;
+      const before = commitCountOf(dir);
+      const { out } = applyJson(
+        dir,
+        v2Payload(date, { tracks: [track], tag: `close ${i}`, summary: `summary ${i}` }),
+        newPinSession(`never-deletes-${i}`),
+      );
+      assert.equal(out.ok, true, `close ${i} (${date}): ${JSON.stringify(out)}`);
+      assert.equal(out.committed, true, `close ${i} (${date}) must commit`);
+      assert.equal(commitCountOf(dir), before + 1, `close ${i} made exactly one commit`);
+
+      const files = sessionFilesOf(dir);
+      const fresh = files.filter((f) => !written.includes(f));
+      assert.equal(fresh.length, 1, `close ${i} added exactly one entry file: ${files}`);
+      assert.ok(fresh[0].startsWith(`${date}-`), `close ${i} entry is dated ${date}: ${fresh[0]}`);
+      written.push(fresh[0]);
+
+      const diff = git(
+        'diff-tree',
+        '--no-commit-id',
+        '--name-status',
+        '-r',
+        'HEAD',
+        '--',
+        sessionsRel,
+      );
+      assert.equal(diff.status, 0, diff.stderr);
+      assert.deepEqual(
+        diff.stdout.split('\n').filter(Boolean),
+        [`A\t${join(sessionsRel, fresh[0])}`],
+        `close ${i}'s commit changes sessions/ by one added entry and nothing else`,
+      );
+
+      // Every earlier entry is still on disk and in HEAD, however it was superseded.
+      const inHead = git('ls-tree', '--name-only', 'HEAD', `${sessionsRel}/`)
+        .stdout.split('\n')
+        .filter(Boolean)
+        .map((p) => p.slice(sessionsRel.length + 1))
+        .sort();
+      assert.deepEqual(inHead, files, `after close ${i} HEAD holds every entry written so far`);
+      assert.deepEqual(files, [...written].sort());
+    });
+
+    assert.equal(written.length, 12);
+    const dayNumber = (f) => Date.parse(`${f.slice(0, 10)}T00:00:00Z`) / 86400000;
+    assert.equal(dayNumber(written[11]) - dayNumber(written[0]), 40, 'the closes span forty days');
+
+    // The supersedes really point at the entry before them, and that entry stays a file.
+    const closeIds = written.map((f) => entryAt(dir, f).closeId);
+    for (const i of supersedingAt) {
+      assert.deepEqual(entryAt(dir, written[i]).tracks[0].supersedes, [closeIds[i - 1]]);
+      assert.ok(
+        existsSync(join(sessionsDirOf(dir), written[i - 1])),
+        `entry ${i - 1} stays on disk`,
+      );
+      assert.ok(!headsOf(dir).main.includes(closeIds[i - 1]), `entry ${i - 1} is no longer a head`);
+    }
+    assert.equal(entryAt(dir, written[doneAt]).tracks[0].done, true);
+  });
+});
+
+// A second project to move a close to.
+const addOtherProject = (dir, today) => {
+  mkdirSync(join(dir, 'projects', 'other'), { recursive: true });
+  writeFileSync(
+    join(dir, 'projects', 'other', 'index.md'),
+    `---\ntitle: other\ntype: project-index\nstatus: active\nstarted: ${today}\nupdated: ${today}\n---\n# other\n`,
+  );
+};
+
+// `today` moved `n` days back, as a local date.
+function daysBefore(today, n) {
+  const [y, m, d] = today.split('-').map(Number);
+  const t = new Date(y, m - 1, d - n);
+  return `${t.getFullYear()}-${String(t.getMonth() + 1).padStart(2, '0')}-${String(t.getDate()).padStart(2, '0')}`;
+}
+
+// Disabling the check (F3): in entryPathFor drop the `if (elsewhere) failEntry(...)`
+// refusal. The retry then replaces test-project's entry with the other project's
+// summary and commits it: the stage assertion and the bytes assertion go red.
+test('a retry that names another project than the one its entry is in is refused before any write (entry-project-mismatch)', () => {
+  withWiki(addOtherProject, (dir, today) => {
+    const sid = newPinSession('proj-move');
+    const unblock = blockCommits(dir);
+    const first = applyJson(dir, v2Payload(today, { summary: 'test-project summary' }), sid);
+    unblock();
+    assert.equal(first.out.committed, false, JSON.stringify(first.out));
+    const [file] = sessionFilesOf(dir);
+    const bytes = readFileSync(join(sessionsDirOf(dir), file), 'utf-8');
+    const head = gitHead(dir);
+
+    const moved = applyJson(
+      dir,
+      v2Payload(today, { project: 'other', summary: 'other summary', tag: 'other close' }),
+      sid,
+    );
+    assert.equal(moved.out.stage, 'entry-project-mismatch', JSON.stringify(moved.out));
+    assert.equal(moved.out.committed, null);
+    assert.match(moved.out.error, /Re-run with "project": "test-project"/);
+    assert.match(moved.out.error, new RegExp(file.replace(/\./g, '\\.')));
+    assert.equal(readFileSync(join(sessionsDirOf(dir), file), 'utf-8'), bytes);
+    assert.deepEqual(sessionFilesOf(dir, 'other'), []);
+    assert.equal(gitHead(dir), head, 'nothing was committed');
+
+    // The way out the refusal names works: the first project finishes the close.
+    const back = applyJson(dir, v2Payload(today, { summary: 'test-project summary' }), sid);
+    assert.equal(back.out.ok, true, JSON.stringify(back.out));
+    assert.equal(back.out.markerWritten, true, JSON.stringify(back.out));
+  });
+});
+
+// Disabling the check (F3, scan half): in entryPathFor replace the
+// listSessionProjects(...) scan with `undefined`. With no pin left only the scan
+// knows where the entry is, so this test goes red and the one above stays green.
+test('with its close pin gone, a retry naming another project still finds the entry by its close id and is refused (entry-project-mismatch)', () => {
+  withWiki(addOtherProject, (dir, today) => {
+    const sid = newPinSession('proj-move-nopin');
+    const unblock = blockCommits(dir);
+    applyJson(dir, v2Payload(today, { summary: 'test-project summary' }), sid);
+    unblock();
+    const [file] = sessionFilesOf(dir);
+    const bytes = readFileSync(join(sessionsDirOf(dir), file), 'utf-8');
+    rmSync(closePinPath(dir, sid), { force: true });
+    const moved = applyJson(
+      dir,
+      v2Payload(today, { project: 'other', summary: 'other summary', tag: 'other close' }),
+      sid,
+    );
+    assert.equal(moved.out.stage, 'entry-project-mismatch', JSON.stringify(moved.out));
+    assert.equal(readFileSync(join(sessionsDirOf(dir), file), 'utf-8'), bytes);
+    assert.deepEqual(sessionFilesOf(dir, 'other'), []);
+  });
+});
+
+// Disabling the check (F4): in applySessionClose set `date` to `requestedDate`
+// instead of `entryPath.date`. The retry is then refused at pre-apply (its
+// heading is dated D, the payload today) and this test goes red; with the
+// heading of today instead it appends under today and fails verification, which
+// is the next test.
+test('a retry on a later day writes its logs under the day its entry was published, and the close verifies and marks', () => {
+  withWiki(null, (dir, today) => {
+    const D = daysBefore(today, 3);
+    const sid = newPinSession('day-align');
+    const cleanup = seedCloseTranscript(sid);
+    try {
+      // The first attempt published the entry dated D and died before any log.
+      applyWithHooks(dir, v2Payload(D, { summary: 'first' }), sid, CRASH_AFTER_PUBLISH);
+      const [file] = sessionFilesOf(dir);
+      assert.ok(file.startsWith(`${D}-`), file);
+      const shardD = join(dir, 'projects', 'test-project', 'session-log', `${D}.md`);
+      assert.equal(existsSync(shardD), false, 'precondition: no log of D yet');
+
+      const retry = applyJson(
+        dir,
+        { ...v2Payload(today, { summary: 'first' }), sessionLog: { entry: `## [${D}] retried\n` } },
+        sid,
+      );
+      assert.equal(retry.out.ok, true, JSON.stringify(retry.out));
+      assert.equal(retry.out.committed, true);
+      assert.equal(retry.out.markerWritten, true, JSON.stringify(retry.out));
+      assert.equal(retry.out.date, D);
+      assert.match(readFileSync(shardD, 'utf-8'), new RegExp(`## \\[${D}\\] retried`));
+      assert.match(
+        readFileSync(join(dir, 'log.md'), 'utf-8'),
+        new RegExp(`## \\[${D}\\] session \\| test-project`),
+      );
+      assert.deepEqual(sessionFilesOf(dir), [file]);
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+// Disabling the check (F4, refusal half): same disable as above. The retry
+// below then passes pre-apply, appends under today and ends at
+// post-apply-verification: the stage assertion goes red.
+test('a retry on a later day whose heading carries the new day is refused before any write, and says the entry fixed the date', () => {
+  withWiki(null, (dir, today) => {
+    const D = daysBefore(today, 3);
+    const sid = newPinSession('day-refuse');
+    const cleanup = seedCloseTranscript(sid);
+    try {
+      applyWithHooks(dir, v2Payload(D, { summary: 'first' }), sid, CRASH_AFTER_PUBLISH);
+      const [file] = sessionFilesOf(dir);
+      const head = gitHead(dir);
+      const logBefore = readFileSync(join(dir, 'log.md'), 'utf-8');
+      const retry = applyJson(dir, v2Payload(today, { summary: 'first', tag: 'next day' }), sid);
+      assert.equal(retry.out.stage, 'pre-apply-verification', JSON.stringify(retry.out));
+      assert.match(retry.out.error, new RegExp(`already published dated ${D}`));
+      assert.ok(retry.out.error.includes(file), retry.out.error);
+      assert.match(retry.out.error, new RegExp(`## \\[${D}\\]`));
+      assert.equal(gitHead(dir), head);
+      assert.equal(readFileSync(join(dir, 'log.md'), 'utf-8'), logBefore);
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+// Disabling the check (F5): in classifyExistingEntry delete the
+// `if (inHead === 'error') return ...` line. A broken HEAD then reads as "not
+// committed", the pin licenses the bytes, and the second assertion goes red.
+test('classifyExistingEntry: when git cannot read HEAD, bytes the pin would license are not replaced (head-unreadable)', () => {
+  withWiki(null, (dir) => {
+    const text = 'new bytes\n';
+    const disk = 'old bytes\n';
+    const relPath = 'projects/test-project/sessions/2026-10-01-s-1.md';
+    const pin = {
+      pending: {
+        closeId: 's-1',
+        openedAtIndex: 1,
+        entryRelPath: relPath,
+        entrySha256s: [createHash('sha256').update(disk).digest('hex')],
+      },
+      lastResolved: null,
+      localProofs: {},
+    };
+    const args = { hypoDir: dir, sessionId: 'no-journal', closeId: 's-1', relPath, text, disk };
+    assert.equal(classifyExistingEntry({ ...args, ignored: false, pin }).action, 'replace');
+    writeFileSync(join(dir, '.git', 'HEAD'), 'not a ref\n');
+    assert.deepEqual(classifyExistingEntry({ ...args, ignored: false, pin }), {
+      action: 'conflict',
+      reason: 'head-unreadable',
+    });
+  });
+});
+
+// Disabling the check (F9): in runMarkerPhase return `verification` as it is.
+// The `counted: false` assertion goes red; the committed retry stays green.
+test('a close whose commit failed marks its verification as not counted', () => {
+  withWiki(null, (dir, today) => {
+    const sid = newPinSession('not-counted');
+    const unblock = blockCommits(dir);
+    const failed = applyJson(dir, v2Payload(today), sid);
+    unblock();
+    assert.equal(failed.out.committed, false, JSON.stringify(failed.out));
+    assert.equal(failed.out.verification.counted, false, JSON.stringify(failed.out.verification));
+    const done = applyJson(dir, v2Payload(today), sid);
+    assert.equal(done.out.committed, true, JSON.stringify(done.out));
+    assert.equal('counted' in done.out.verification, false);
+  });
+});
+
+// Disabling the check (F1, the seeded index half): in applyOverwrites make
+// adoptSeededIndex return at once. Another session's seeded index.md then stays
+// out of this close's commit, the gate refuses on it, and markerWritten goes red.
+test("another session's seeded index.md, not committed yet, is committed with this close when its bytes are this close's own seed", () => {
+  withWiki(null, (dir, today) => {
+    const rel = join('projects', 'test-project', 'index.md');
+    assert.equal(
+      ensureProjectIndex(dir, 'test-project', rel, today, newPinSession('seeder')),
+      rel,
+      'precondition: the other session seeded it',
+    );
+    const { out } = applyJson(dir, v2Payload(today), newPinSession('index-adopt'));
+    assert.equal(out.ok, true, JSON.stringify(out));
+    assert.equal(out.markerWritten, true, JSON.stringify(out));
+    const tracked = spawnSync('git', ['ls-files', '--', rel], { cwd: dir, encoding: 'utf-8' });
+    assert.equal(tracked.stdout.trim(), rel);
+  });
+});
+
+test("an uncommitted index.md that is not this close's seed stays out of its commit and still blocks the marker (pair)", () => {
+  withWiki(null, (dir, today) => {
+    const rel = join('projects', 'test-project', 'index.md');
+    writeFileSync(
+      join(dir, rel),
+      `---\ntitle: test-project\ntype: project-index\n---\n# hand made\n`,
+    );
+    const { out } = applyJson(dir, v2Payload(today), newPinSession('index-hand'));
+    assert.equal(out.markerWritten, false, JSON.stringify(out));
+    assert.ok(
+      (out.gateBlockers || []).some((b) => b.file === rel),
+      JSON.stringify(out.gateBlockers),
+    );
+  });
+});
+
+// Disabling the check (F1, checkpoint half): in precompactGateStatus's
+// checkpointMode loop delete the `isForeignUncommittedEntry` branch. The other
+// session's entry then blocks as a dirty file of the project folder:
+// markerWritten goes red. The modified-entry pair below stays green.
+test("another session's new entry, published and not committed yet, does not keep this close from its marker, and is left alone", () => {
+  withWiki(null, (dir, today) => {
+    const otherId = closeIdFor(newPinSession('other-close'), 0);
+    const text = formatSessionEntry({
+      project: 'test-project',
+      closeId: otherId,
+      date: today,
+      tracks: [{ id: 'other-track', new: true }],
+      summary: 'the other session',
+      bodies: {},
+    });
+    const otherRel = join('projects', 'test-project', 'sessions', `${today}-${otherId}.md`);
+    mkdirSync(sessionsDirOf(dir), { recursive: true });
+    writeFileSync(join(dir, otherRel), text);
+    const { out } = applyJson(dir, v2Payload(today), newPinSession('mine'));
+    assert.equal(out.ok, true, JSON.stringify(out));
+    assert.equal(out.markerWritten, true, JSON.stringify(out));
+    assert.ok(
+      (out.gateNotices || []).some((n) => n.type === 'foreign-entry' && n.file === otherRel),
+      JSON.stringify(out.gateNotices),
+    );
+    assert.equal(readFileSync(join(dir, otherRel), 'utf-8'), text, 'left alone');
+    const tracked = spawnSync('git', ['ls-files', '--', otherRel], { cwd: dir, encoding: 'utf-8' });
+    assert.equal(tracked.stdout, '', 'not committed by this close');
+  });
+});
+
+test("another session's committed entry edited since its commit still keeps this close from its marker (pair)", () => {
+  withWiki(null, (dir, today) => {
+    const otherId = closeIdFor(newPinSession('other-close-m'), 0);
+    const file = writeEntryFile(dir, {
+      closeId: otherId,
+      date: today,
+      tracks: [{ id: 'other-track', new: true }],
+    });
+    appendFileSync(join(dir, file), '\nedited after its commit\n');
+    const { out } = applyJson(dir, v2Payload(today), newPinSession('mine-m'));
+    assert.equal(out.markerWritten, false, JSON.stringify(out));
+    assert.ok(
+      (out.gateBlockers || []).some((b) => b.file === file),
+      JSON.stringify(out.gateBlockers),
+    );
+  });
+});
+
+suite('close entries: a project that .hypoignore keeps out of git');
+
+test('an ignored project: the entry is never committed, the local proof outlives the commit step, and a fixed retry keeps the bytes (X2)', () => {
+  withWiki(null, (dir, today) => {
+    writeFileSync(join(dir, '.hypoignore'), 'projects/test-project/hot.md\n');
+    const sid = newPinSession('ignored');
+    // The receipt step fails throughout, so the close request stays open for the retries.
+    blockReceipt(dir, sid);
+    const first = applyJson(dir, v2Payload(today, { summary: 'first summary' }), sid);
+    assert.equal(first.out.committed, true, JSON.stringify(first.out));
+    assert.equal(first.out.stage, 'receipt-write-failed', JSON.stringify(first.out));
+    assert.deepEqual(readJournal(dir, sid), {}, 'the commit step cleared the journal');
+    const file = join(sessionsDirOf(dir), sessionFilesOf(dir)[0]);
+    const bytes = readFileSync(file, 'utf-8');
+    const rel = join('projects', 'test-project', 'sessions', sessionFilesOf(dir)[0]);
+    const closeId = closeIdFor(sid, 0);
+    const proof = readClosePin(dir, sid).localProofs[closeId];
+    assert.equal(proof.entryRelPath, rel);
+    assert.equal(proof.entrySha256, createHash('sha256').update(bytes).digest('hex'));
+    assert.equal(
+      spawnSync('git', ['ls-files', '--', rel], { cwd: dir, encoding: 'utf-8' }).stdout.trim(),
+      '',
+      'the entry is not in git',
+    );
+
+    const retry = applyJson(dir, v2Payload(today, { summary: 'fixed summary' }), sid);
+    assert.equal(retry.out.stage, 'receipt-write-failed', JSON.stringify(retry.out));
+    assert.equal(readFileSync(file, 'utf-8'), bytes, 'bytes unchanged');
+    assert.ok(
+      retry.out.notices.some((n) => /이번 payload의 요약은 반영되지 않았습니다/.test(n)),
+      JSON.stringify(retry.out),
+    );
+
+    writeFileSync(file, `${bytes}\nhand edit\n`);
+    const conflict = applyJson(dir, v2Payload(today, { summary: 'fixed summary' }), sid);
+    assert.equal(conflict.out.stage, 'entry-conflict', JSON.stringify(conflict.out));
+    assert.equal(readFileSync(file, 'utf-8'), `${bytes}\nhand edit\n`);
+  });
+});
+
+// The local counterpart of the committed hand edit above. Disabling the check: in
+// classifyExistingEntry's ignored branch return `identical` whenever `same`.
+test('an ignored project: a proven entry edited by hand into exactly the retry payload bytes is a conflict', () => {
+  withWiki(null, (dir, today) => {
+    writeFileSync(join(dir, '.hypoignore'), 'projects/test-project/hot.md\n');
+    const sid = newPinSession('ignored-edit-to-payload');
+    const unblock = blockReceipt(dir, sid);
+    const first = applyJson(dir, v2Payload(today, { summary: 'first summary' }), sid);
+    assert.equal(first.out.stage, 'receipt-write-failed', JSON.stringify(first.out));
+    const file = join(sessionsDirOf(dir), sessionFilesOf(dir)[0]);
+    const edited = readFileSync(file, 'utf-8').replace('first summary', 'fixed summary');
+    writeFileSync(file, edited);
+    unblock();
+    const retry = applyJson(dir, v2Payload(today, { summary: 'fixed summary' }), sid);
+    assert.equal(retry.out.stage, 'entry-conflict', JSON.stringify(retry.out));
+    assert.equal(readFileSync(file, 'utf-8'), edited);
+  });
+});
+
+// The two halves the gate and the receipt used to block: the ignored entry stays
+// dirty for good (the checkpoint gate refused it as this session's own uncommitted
+// write), and no commit holds it (the receipt had no kind to prove it with).
+// Disabling the check: in precompactGateStatus drop the `provenLocal.has(pf) ||` term,
+// or in close-receipt.mjs drop 'local-create' from RECEIPT_ENTRY_KINDS. Either way
+// the retry ends compact-gate-not-ok or receipt-proof-mismatch, not ok.
+test('an ignored project: a retry with a fixed summary after a failed receipt is ok:true and lands the marker (X2)', () => {
+  withWiki(null, (dir, today) => {
+    writeFileSync(join(dir, '.hypoignore'), 'projects/test-project/hot.md\n');
+    const sid = newPinSession('ignored-fixed');
+    const unblock = blockReceipt(dir, sid);
+    const first = applyJson(dir, v2Payload(today, { summary: 'first summary' }), sid);
+    assert.equal(first.out.stage, 'receipt-write-failed', JSON.stringify(first.out));
+    assert.equal(first.out.committed, true);
+    const file = join(sessionsDirOf(dir), sessionFilesOf(dir)[0]);
+    const bytes = readFileSync(file, 'utf-8');
+
+    unblock();
+    const retry = applyJson(dir, v2Payload(today, { summary: 'fixed summary' }), sid);
+    assert.equal(retry.out.ok, true, JSON.stringify(retry.out));
+    assert.equal(retry.out.committed, true);
+    assert.equal(retry.out.markerWritten, true, JSON.stringify(retry.out));
+    assert.equal(readFileSync(file, 'utf-8'), bytes, 'the proven bytes are kept');
+    assert.ok(
+      retry.out.notices.some((n) => /이번 payload의 요약은 반영되지 않았습니다/.test(n)),
+      JSON.stringify(retry.out.notices),
+    );
+    assert.ok(existsSync(sessionClosedMarkerPath(dir, sid)), 'the marker landed');
+  });
+});
+
+// Disabling the check: in close-receipt.mjs verifyEntriesInCommit, drop the hash
+// comparison of the local-create branch (only the missing-file check stays): the
+// disk-edit mismatch below disappears.
+test('an ignored project: the receipt proves the entry as local-create with the hash of the bytes on disk (X2)', () => {
+  withWiki(null, (dir, today) => {
+    writeFileSync(join(dir, '.hypoignore'), 'projects/test-project/hot.md\n');
+    const sid = newPinSession('ignored-receipt');
+    const { out } = applyJson(dir, v2Payload(today, { summary: 'local summary' }), sid);
+    assert.equal(out.ok, true, JSON.stringify(out));
+    assert.equal(out.markerWritten, true, JSON.stringify(out));
+    const rel = join('projects', 'test-project', 'sessions', sessionFilesOf(dir)[0]);
+    const receipt = JSON.parse(readFileSync(receiptPath(dir, sid), 'utf-8'));
+    const entry = receipt.entries.find((e) => e.path === rel);
+    assert.ok(entry, `the receipt names the entry: ${JSON.stringify(receipt.entries)}`);
+    assert.equal(entry.kind, 'local-create');
+    assert.equal(
+      entry.expected.bytesSha256,
+      createHash('sha256')
+        .update(readFileSync(join(dir, rel)))
+        .digest('hex'),
+    );
+    assert.equal(
+      entry.expected.bytesSha256,
+      readClosePin(dir, sid).localProofs[closeIdFor(sid, 0)].entrySha256,
+      'the same hash the close pin records',
+    );
+    assert.equal(verifyEntriesInCommit(dir, receipt.commit, receipt.entries).ok, true);
+
+    appendFileSync(join(dir, rel), 'edited after the close\n');
+    assert.deepEqual(verifyEntriesInCommit(dir, receipt.commit, [entry]).mismatches, [
+      { path: rel, reason: 'local-entry-mismatch' },
+    ]);
+  });
+});
+
+test('an ignored project whose close failed before the commit step can still correct its payload: the journal still names the bytes, so they are replaced', () => {
+  withWiki(null, (dir, today) => {
+    writeFileSync(join(dir, '.hypoignore'), 'projects/test-project/hot.md\n');
+    const sid = newPinSession('ignored-precommit');
+    snapshotBase(dir, sid, overwriteTargets('test-project'));
+    const bad = applyJson(
+      dir,
+      v2Payload(today, {
+        summary: 'first summary',
+        openQuestions: { content: `---\ntype: concept\nupdated: ${today}\n---\n\n- no title\n` },
+      }),
+      sid,
+    );
+    assert.equal(bad.out.stage, 'post-apply-lint', JSON.stringify(bad.out));
+    const file = sessionFilesOf(dir)[0];
+    assert.ok(
+      Object.keys(readJournal(dir, sid)).some((k) => k.endsWith(file)),
+      'journal still has it',
+    );
+    const retry = applyJson(dir, v2Payload(today, { summary: 'fixed summary' }), sid);
+    assert.equal(entryAt(dir, file).summary, 'fixed summary');
+    assert.ok(!(retry.out.notices ?? []).some((n) => /반영되지 않았습니다/.test(n)));
+  });
+});
+
+suite('close entries: the first session-log shard header');
+
+function firstShardHeader(sessionId, device) {
+  let header = null;
+  const prev = process.env.HYPO_DEVICE;
+  process.env.HYPO_DEVICE = device;
+  try {
+    withWiki(null, (dir, today) => {
+      const payload = v2Payload(today, { tag: 'header probe' });
+      // The fixture already has a monthly log; a daily shard for today is what a close creates.
+      const { out } = applyJson(dir, payload, sessionId);
+      assert.equal(out.ok, true, JSON.stringify(out));
+      const text = readFileSync(
+        join(dir, 'projects', 'test-project', 'session-log', `${today}.md`),
+        'utf-8',
+      );
+      header = text.slice(0, text.indexOf('\n## ')).replaceAll(today, '<today>');
+    });
+  } finally {
+    if (prev === undefined) delete process.env.HYPO_DEVICE;
+    else process.env.HYPO_DEVICE = prev;
+  }
+  return header;
+}
+
+test('the first shard of a day has the same header bytes whatever the session id and device', () => {
+  const a = firstShardHeader(newPinSession('hdr-a'), 'device-one');
+  const b = firstShardHeader(newPinSession('hdr-b'), 'device-two');
+  assert.equal(a, b);
+  assert.ok(!/session_id|device/.test(a), a);
+});
+
+// The seed below adds a union driver for log.md, which every close also appends to:
+// without it the pull conflicts in log.md. This test answers only how the shard merges.
+test('the session-log shard that two clones each create on one day merges into one frontmatter block with no session_id or device keys', () => {
+  const base = mkdtempSync(join(tmpdir(), 'hypo-clones-'));
+  const env = { ...process.env, HOME: SESSION_TMP_HOME };
+  const git = (cwd, ...args) => spawnSync('git', args, { cwd, env, encoding: 'utf-8' });
+  try {
+    const today = todayLocal();
+    const seed = join(base, 'seed');
+    mkdirSync(seed);
+    buildCleanWikiTree(seed, today);
+    // log.md is shared by every close: the union driver keeps both sides' lines there too.
+    writeFileSync(join(seed, '.gitattributes'), `${GITATTRIBUTES_BLOCK}log.md merge=union\n`);
+    git(seed, 'init', '-q');
+    git(seed, 'config', 'user.email', 't@t.test');
+    git(seed, 'config', 'user.name', 'T');
+    git(seed, 'add', '-A');
+    git(seed, 'commit', '-q', '-m', 'init');
+    git(base, 'init', '--bare', '-q', 'remote.git');
+    git(seed, 'remote', 'add', 'origin', join(base, 'remote.git'));
+    git(seed, 'push', '-q', 'origin', 'HEAD:refs/heads/main');
+    const cloneOf = (name) => {
+      const dir = join(base, name);
+      git(base, 'clone', '-q', '-b', 'main', join(base, 'remote.git'), name);
+      git(dir, 'config', 'user.email', 't@t.test');
+      git(dir, 'config', 'user.name', 'T');
+      return dir;
+    };
+    const one = cloneOf('one');
+    const two = cloneOf('two');
+    const closeIn = (dir, label, device) => {
+      const prev = process.env.HYPO_DEVICE;
+      process.env.HYPO_DEVICE = device;
+      try {
+        const { out } = applyJson(
+          dir,
+          v2Payload(today, { tag: `close ${label}` }),
+          newPinSession(label),
+        );
+        assert.equal(out.ok, true, JSON.stringify(out));
+      } finally {
+        if (prev === undefined) delete process.env.HYPO_DEVICE;
+        else process.env.HYPO_DEVICE = prev;
+      }
+    };
+    closeIn(one, 'clone-one', 'device-one');
+    closeIn(two, 'clone-two', 'device-two');
+    assert.equal(git(one, 'push', '-q', 'origin', 'HEAD:main').status, 0);
+    const pulled = git(two, 'pull', '--no-rebase', '--no-edit', 'origin', 'main');
+    assert.equal(pulled.status, 0, `${pulled.stdout}\n${pulled.stderr}`);
+    const shard = readFileSync(
+      join(two, 'projects', 'test-project', 'session-log', `${today}.md`),
+      'utf-8',
+    );
+    const frontmatter = shard.slice(0, shard.indexOf('\n---\n', 4));
+    assert.ok(!/^session_id:/m.test(frontmatter) && !/^device:/m.test(frontmatter), frontmatter);
+    assert.ok(shard.includes('close clone-one') && shard.includes('close clone-two'), shard);
+    assert.equal((shard.match(/^---$/gm) || []).length, 2, 'one frontmatter block, not two merged');
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
 });

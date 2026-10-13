@@ -15,6 +15,7 @@ import {
   statSync,
   mkdtempSync,
   rmSync,
+  readdirSync,
 } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { join, basename } from 'node:path';
@@ -28,8 +29,9 @@ import {
   slugForms,
   extractWikilinks,
 } from '../scripts/lib/wikilink.mjs';
+import { formatSessionEntry, nfcRenameCommands } from '../hooks/session-entries.mjs';
 import { test, suite } from './harness.mjs';
-import { run, withTmpDir, SCRIPTS, SESSION_TMP_HOME } from './helpers.mjs';
+import { run, withTmpDir, SCRIPTS, HOOKS, SESSION_TMP_HOME } from './helpers.mjs';
 
 // ── rename.mjs (inbound wikilink rewrite) ─────────────────────────────────────
 
@@ -369,6 +371,8 @@ process.on('exit', () => {
 const KILL_SCRIPTS = join(KILL_COPY_ROOT, 'scripts');
 const KILL_RENAME = join(KILL_SCRIPTS, 'rename.mjs');
 cpSync(SCRIPTS, KILL_SCRIPTS, { recursive: true });
+// scripts/ imports hooks/ (the shipped layout has both side by side), so the copy needs it too.
+cpSync(HOOKS, join(KILL_COPY_ROOT, 'hooks'), { recursive: true });
 {
   let src = readFileSync(KILL_RENAME, 'utf-8');
   const pageAnchor = 'renameSync(fromPage.path, toPath);';
@@ -484,6 +488,126 @@ test('crash bracketing the single-file renameSync converges, two paths never coe
       }
     });
   }
+});
+
+// The not-NFC refusals and the migration notice tell a person to run one rename. Run it as written:
+// a command the advice prints but rename refuses leaves the person with no way out.
+const runAdvised = (wiki, command, extra = []) => {
+  const args = [...command.matchAll(/--(from|to)="([^"]+)"/g)].map(([, k, v]) => `--${k}=${v}`);
+  assert.equal(args.length, 2, command);
+  return run('rename.mjs', [`--hypo-dir=${wiki}`, ...args, ...extra, '--json']);
+};
+
+test('the one rename the not-NFC advice prints moves a decomposed project directory to its NFC name', () => {
+  // `프로젝트.md` is the case a bare path breaks: rename strips a trailing `.md` before it resolves.
+  for (const name of ['프로젝트', '프로젝트.md']) {
+    const nfd = name.normalize('NFD');
+    const nfc = nfd.normalize('NFC');
+    withTmpDir((base) => {
+      const wiki = join(base, 'wiki');
+      mkdirSync(join(wiki, 'projects', nfd), { recursive: true });
+      writeFileSync(join(wiki, 'projects', nfd, 'index.md'), '---\ntitle: p\n---\nbody\n');
+      const commands = nfcRenameCommands(nfd);
+      assert.equal(commands.length, 1, 'one command, not a pair through a temporary name');
+      const r = runAdvised(wiki, commands[0], ['--apply']);
+      assert.equal(r.status, 0, `${commands[0]}: ${r.stdout}${r.stderr}`);
+      const out = JSON.parse(r.stdout);
+      assert.equal(out.ok, true);
+      assert.equal(out.moved, true);
+      assert.deepEqual(readdirSync(join(wiki, 'projects')), [nfc]);
+      assert.equal(
+        readFileSync(join(wiki, 'projects', nfc, 'index.md'), 'utf-8'),
+        '---\ntitle: p\n---\nbody\n',
+      );
+    });
+  }
+});
+
+// A project that already has entries could never be respelled (rename refused any project with
+// entries), so the close refusal looped. The entries name the NFC project, so the respelling keeps
+// them correct; an entry that names another project stops it.
+const decomposedEntryVault = (wiki, entryProject) => {
+  const nfd = '프로젝트'.normalize('NFD');
+  const sessions = join(wiki, 'projects', nfd, 'sessions');
+  mkdirSync(sessions, { recursive: true });
+  writeFileSync(join(wiki, 'projects', nfd, 'index.md'), '---\ntitle: P\n---\n');
+  const entry = formatSessionEntry({
+    project: entryProject,
+    closeId: 's1-0',
+    date: '2026-10-01',
+    tracks: [{ id: 'main', new: true }],
+    summary: 'done\n',
+    bodies: { main: 'body' },
+  });
+  const entryPath = join(sessions, '2026-10-01-s1-0.md');
+  writeFileSync(entryPath, entry);
+  return { nfd, entry, entryRel: join('sessions', '2026-10-01-s1-0.md') };
+};
+
+test('the advised NFC rename moves a decomposed project directory that has entries naming the NFC project', () => {
+  withTmpDir((base) => {
+    const wiki = join(base, 'wiki');
+    const nfc = '프로젝트'.normalize('NFC');
+    const { nfd, entry, entryRel } = decomposedEntryVault(wiki, nfc);
+    const r = runAdvised(wiki, nfcRenameCommands(nfd)[0], ['--apply']);
+    assert.equal(r.status, 0, `${r.stdout}${r.stderr}`);
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.ok, true, r.stdout);
+    assert.equal(out.moved, true);
+    assert.deepEqual(readdirSync(join(wiki, 'projects')), [nfc]);
+    assert.equal(readFileSync(join(wiki, 'projects', nfc, entryRel), 'utf-8'), entry);
+  });
+});
+
+test('an NFC respelling whose entries name a different project is refused and the directory stays', () => {
+  withTmpDir((base) => {
+    const wiki = join(base, 'wiki');
+    const { nfd, entry, entryRel } = decomposedEntryVault(wiki, 'other');
+    const r = runAdvised(wiki, nfcRenameCommands(nfd)[0], ['--apply']);
+    assert.equal(r.status, 1, `${r.stdout}${r.stderr}`);
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.ok, false);
+    assert.match(out.error, /does not name project/);
+    assert.deepEqual(readdirSync(join(wiki, 'projects')), [nfd]);
+    assert.equal(readFileSync(join(wiki, 'projects', nfd, entryRel), 'utf-8'), entry);
+  });
+});
+
+test('a move to a different name still refuses a decomposed project that has entries (only the NFC respelling is allowed)', () => {
+  withTmpDir((base) => {
+    const wiki = join(base, 'wiki');
+    const { nfd, entryRel } = decomposedEntryVault(wiki, '프로젝트'.normalize('NFC'));
+    const r = run('rename.mjs', [
+      `--hypo-dir=${wiki}`,
+      `--from=projects/${nfd}/`,
+      '--to=projects/renamed/',
+      '--apply',
+      '--json',
+    ]);
+    assert.equal(r.status, 1, `${r.stdout}${r.stderr}`);
+    assert.match(JSON.parse(r.stdout).error, /has session entries/);
+    assert.ok(existsSync(join(wiki, 'projects', nfd, entryRel)));
+    assert.ok(!existsSync(join(wiki, 'projects', 'renamed')));
+  });
+});
+
+// The invalid-name advice has the same shape (`--from="projects/<x>/" --to="projects/<y>/"`); the
+// trailing slash is what keeps a name ending in `.md` a directory.
+test('the slash-ended directory form the invalid-name advice prints renames a project named like a page', () => {
+  withTmpDir((base) => {
+    const wiki = join(base, 'wiki');
+    mkdirSync(join(wiki, 'projects', 'my notes.md'), { recursive: true });
+    writeFileSync(join(wiki, 'projects', 'my notes.md', 'index.md'), '---\ntitle: p\n---\nbody\n');
+    const r = run('rename.mjs', [
+      `--hypo-dir=${wiki}`,
+      '--from=projects/my notes.md/',
+      '--to=projects/my-notes.md/',
+      '--apply',
+      '--json',
+    ]);
+    assert.equal(r.status, 0, `${r.stdout}${r.stderr}`);
+    assert.deepEqual(readdirSync(join(wiki, 'projects')), ['my-notes.md']);
+  });
 });
 
 // Same property, directory mode (BLOCKER: moved-body content used to be written
@@ -1364,5 +1488,184 @@ test('collectPages presets emit the historical output shape', () => {
     const [l] = collectPagesLint(dir, dir, []);
     assert.equal(norm(l.rel), 'sub/b.md');
     assert.equal(l.slug, undefined);
+  });
+});
+
+// ── rename.mjs leaves session entries alone ──────────────────────────────────
+
+suite('rename.mjs session entries');
+
+function entryLinking(target) {
+  return formatSessionEntry({
+    project: 'p',
+    closeId: 's1-0',
+    date: '2026-10-01',
+    tracks: [{ id: 'main', new: true }],
+    summary: `see [[${target}]] for the design`,
+    bodies: { main: `and [[${target}|again]]` },
+  });
+}
+
+test('renaming a page rewrites the pages that link it but never a session entry', () => {
+  withTmpDir((dir) => {
+    mkdirSync(join(dir, 'pages'), { recursive: true });
+    mkdirSync(join(dir, 'projects', 'p', 'sessions'), { recursive: true });
+    writeFileSync(join(dir, 'pages', 'foo.md'), '---\ntitle: foo\n---\nself\n');
+    writeFileSync(join(dir, 'pages', 'a.md'), '---\ntitle: a\n---\nsee [[foo]].\n');
+    const entryPath = join(dir, 'projects', 'p', 'sessions', '2026-10-01-s1-0.md');
+    const entry = entryLinking('foo');
+    writeFileSync(entryPath, entry);
+
+    const r = run('rename.mjs', [
+      `--hypo-dir=${dir}`,
+      '--from=foo',
+      '--to=bar',
+      '--apply',
+      '--json',
+    ]);
+    assert.equal(r.status, 0, `${r.stdout}${r.stderr}`);
+    assert.equal(JSON.parse(r.stdout).links_rewritten, 1, `only the page link: ${r.stdout}`);
+    assert.ok(readFileSync(join(dir, 'pages', 'a.md'), 'utf-8').includes('[[bar]]'));
+    assert.ok(existsSync(join(dir, 'pages', 'bar.md')), 'the page moved');
+    assert.equal(readFileSync(entryPath, 'utf-8'), entry, 'entry bytes unchanged');
+  });
+});
+
+test('renaming a directory never rewrites a session entry that links into it', () => {
+  withTmpDir((dir) => {
+    mkdirSync(join(dir, 'pages', 'old'), { recursive: true });
+    mkdirSync(join(dir, 'projects', 'p', 'sessions'), { recursive: true });
+    writeFileSync(join(dir, 'pages', 'old', 'foo.md'), '---\ntitle: foo\n---\nself\n');
+    writeFileSync(join(dir, 'pages', 'a.md'), '---\ntitle: a\n---\nsee [[pages/old/foo]].\n');
+    const entryPath = join(dir, 'projects', 'p', 'sessions', '2026-10-01-s1-0.md');
+    const entry = entryLinking('pages/old/foo');
+    writeFileSync(entryPath, entry);
+
+    const r = run('rename.mjs', [
+      `--hypo-dir=${dir}`,
+      '--from=pages/old',
+      '--to=pages/new',
+      '--apply',
+      '--json',
+    ]);
+    assert.equal(r.status, 0, `${r.stdout}${r.stderr}`);
+    assert.ok(readFileSync(join(dir, 'pages', 'a.md'), 'utf-8').includes('[[pages/new/foo]]'));
+    assert.ok(existsSync(join(dir, 'pages', 'new', 'foo.md')), 'the directory moved');
+    assert.equal(readFileSync(entryPath, 'utf-8'), entry, 'entry bytes unchanged');
+  });
+});
+
+// The readers key an entry's project by its directory, so a move out of
+// projects/<slug>/sessions/ silently drops the entry from the session history.
+function renameEntryVault(dir) {
+  mkdirSync(join(dir, 'pages'), { recursive: true });
+  mkdirSync(join(dir, 'projects', 'p', 'sessions'), { recursive: true });
+  writeFileSync(join(dir, 'projects', 'p', 'index.md'), '---\ntitle: P\n---\n');
+  const entryPath = join(dir, 'projects', 'p', 'sessions', '2026-10-01-s1-0.md');
+  const entry = entryLinking('foo');
+  writeFileSync(entryPath, entry);
+  return { entryPath, entry };
+}
+
+test('renaming a single session entry is refused and nothing changes on disk', () => {
+  withTmpDir((dir) => {
+    const { entryPath, entry } = renameEntryVault(dir);
+    const r = run('rename.mjs', [
+      `--hypo-dir=${dir}`,
+      '--from=projects/p/sessions/2026-10-01-s1-0',
+      '--to=pages/moved',
+      '--apply',
+      '--json',
+    ]);
+    assert.equal(r.status, 1, `${r.stdout}${r.stderr}`);
+    assert.match(JSON.parse(r.stdout).error, /is a session entry/);
+    assert.equal(readFileSync(entryPath, 'utf-8'), entry, 'entry bytes unchanged');
+    assert.ok(!existsSync(join(dir, 'pages', 'moved.md')), 'nothing was written');
+  });
+});
+
+test('a directory rename that moves entries off the entry path is refused with nothing written', () => {
+  withTmpDir((dir) => {
+    const { entryPath, entry } = renameEntryVault(dir);
+    // Across areas the existing area guard refuses already; the within-area case is the new one.
+    const r = run('rename.mjs', [
+      `--hypo-dir=${dir}`,
+      '--from=projects/p/sessions',
+      '--to=projects/p/old-sessions',
+      '--apply',
+      '--json',
+    ]);
+    assert.equal(r.status, 1, `${r.stdout}${r.stderr}`);
+    assert.match(JSON.parse(r.stdout).error, /no longer a session entry path/);
+    assert.equal(readFileSync(entryPath, 'utf-8'), entry, 'entry bytes unchanged');
+    assert.ok(!existsSync(join(dir, 'projects', 'p', 'old-sessions')), 'nothing was written');
+    const r2 = run('rename.mjs', [
+      `--hypo-dir=${dir}`,
+      '--from=projects/p/sessions',
+      '--to=pages/x',
+      '--apply',
+      '--json',
+    ]);
+    assert.equal(r2.status, 1, `${r2.stdout}${r2.stderr}`);
+    assert.equal(readFileSync(entryPath, 'utf-8'), entry, 'entry bytes unchanged');
+    assert.ok(!existsSync(join(dir, 'pages', 'x')), 'nothing was written');
+  });
+});
+
+// Contract change: a project directory with entries used to be renameable. Each entry's
+// `project:` field is immutable and names the directory it was written in, so the move broke close
+// recovery and left a missing-predecessor warning. The display name is the index.md title.
+test('renaming a project directory that has session entries is refused with nothing written', () => {
+  withTmpDir((dir) => {
+    const { entryPath, entry } = renameEntryVault(dir);
+    const r = run('rename.mjs', [
+      `--hypo-dir=${dir}`,
+      '--from=projects/p',
+      '--to=projects/q',
+      '--apply',
+      '--json',
+    ]);
+    assert.equal(r.status, 1, `${r.stdout}${r.stderr}`);
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.ok, false);
+    assert.match(out.error, /has session entries/);
+    assert.match(out.error, /`title` in projects\/p\/index\.md/);
+    assert.equal(readFileSync(entryPath, 'utf-8'), entry, 'entry bytes unchanged');
+    assert.ok(!existsSync(join(dir, 'projects', 'q')), 'nothing was written');
+  });
+});
+
+test('a project directory with no session entries can still be renamed', () => {
+  withTmpDir((dir) => {
+    mkdirSync(join(dir, 'projects', 'p'), { recursive: true });
+    writeFileSync(join(dir, 'projects', 'p', 'index.md'), '---\ntitle: P\n---\n');
+    const r = run('rename.mjs', [
+      `--hypo-dir=${dir}`,
+      '--from=projects/p',
+      '--to=projects/q',
+      '--apply',
+      '--json',
+    ]);
+    assert.equal(r.status, 0, `${r.stdout}${r.stderr}`);
+    assert.ok(existsSync(join(dir, 'projects', 'q', 'index.md')), 'the directory moved');
+    assert.ok(!existsSync(join(dir, 'projects', 'p')), 'the old directory is gone');
+  });
+});
+
+test('renaming a page an entry links to reports how many entries keep the old link', () => {
+  withTmpDir((dir) => {
+    mkdirSync(join(dir, 'pages'), { recursive: true });
+    mkdirSync(join(dir, 'projects', 'p', 'sessions'), { recursive: true });
+    writeFileSync(join(dir, 'pages', 'foo.md'), '---\ntitle: foo\n---\nself\n');
+    writeFileSync(
+      join(dir, 'projects', 'p', 'sessions', '2026-10-01-s1-0.md'),
+      entryLinking('foo'),
+    );
+    const r = run('rename.mjs', [`--hypo-dir=${dir}`, '--from=foo', '--to=bar', '--apply']);
+    assert.equal(r.status, 0, `${r.stdout}${r.stderr}`);
+    assert.match(r.stdout, /1 session entry still links to the old name/);
+    assert.match(r.stdout, /rendered views keep the old link/);
+    const j = run('rename.mjs', [`--hypo-dir=${dir}`, '--from=bar', '--to=foo', '--json']);
+    assert.equal(JSON.parse(j.stdout).session_entries_with_old_link, 0, 'no entry links to bar');
   });
 });

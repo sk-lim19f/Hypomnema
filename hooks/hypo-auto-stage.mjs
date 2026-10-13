@@ -7,10 +7,22 @@
 
 import { spawnSync } from 'child_process';
 import { relative } from 'path';
-import { HYPO_DIR, loadHypoIgnore, isIgnored, recordTouchedPaths } from './hypo-shared.mjs';
+import {
+  HYPO_DIR,
+  loadHypoIgnore,
+  isIgnored,
+  indexAndHeadBlobs,
+  isAutoStagedBlob,
+  isStagedDeletion,
+  readAutoStagedRecord,
+  recordAutoStagedBlob,
+  recordTouchedPaths,
+  vaultCommitLockTarget,
+  withFileLock,
+} from './hypo-shared.mjs';
 import { advanceBaseForWrite, hashContent } from './base-store.mjs';
 
-// Tools that REPLACE file bytes. The base advance below must fire only for these:
+// Tools that REPLACE file bytes. The add and the base advance below fire only for these:
 // this hook has no matcher in hooks.json (it runs on every PostToolUse), and a
 // read-only tool like Read also carries `tool_input.file_path`. Without this
 // allowlist, merely Reading a target another session had drifted would advance
@@ -36,8 +48,60 @@ const filePath = input.tool_input?.file_path ?? '';
 
 if (filePath.startsWith(HYPO_DIR + '/') || filePath === HYPO_DIR) {
   const patterns = loadHypoIgnore(HYPO_DIR);
-  if (patterns.length === 0 || !isIgnored(filePath, HYPO_DIR, patterns)) {
-    spawnSync('git', ['-C', HYPO_DIR, 'add', filePath], { stdio: 'ignore' });
+  // Only a write stages: a Read of a vault file must not change the index.
+  if (
+    WRITE_TOOLS.has(input.tool_name) &&
+    (patterns.length === 0 || !isIgnored(filePath, HYPO_DIR, patterns))
+  ) {
+    // Under the vault commit lock, like every other writer of the index: the catch-up pre-step
+    // (clearGeneratedPathsBlockingPull) reads and releases the index while it holds that lock, and
+    // an add landing in between would stage bytes it is about to set aside. A lock that cannot be
+    // taken skips the add: the session's scoped auto-commit stages its own paths, so nothing is
+    // lost.
+    try {
+      withFileLock(
+        vaultCommitLockTarget(HYPO_DIR),
+        () => {
+          const rel = relative(HYPO_DIR, filePath);
+          // A merge in progress (open conflict, or a resolution waiting for its commit): staging
+          // now would change that resolution. The path is still in the session's touched set
+          // below, so Stop commits it once the merge is done.
+          if (
+            spawnSync('git', ['-C', HYPO_DIR, 'rev-parse', '-q', '--verify', 'MERGE_HEAD'], {
+              stdio: 'ignore',
+            }).status === 0
+          )
+            return;
+          // A version a person already staged for this path must reach the commit intact, so that
+          // it can be backed up there: `git add` would put the tool's bytes over it first. The
+          // path is left unstaged (it is still in the session's touched set below, so Stop commits
+          // it). A staged deletion (`git rm`) is skipped the same way: `git add` would turn it into a
+          // modification. With no answer from git about the index, skip too: Stop stages it either
+          // way.
+          const before = indexAndHeadBlobs(HYPO_DIR, rel);
+          if (
+            !before ||
+            isStagedDeletion(before.head, before.indexed) ||
+            (before.index &&
+              before.index !== before.head &&
+              !isAutoStagedBlob(readAutoStagedRecord(HYPO_DIR), rel, before.index, before.head))
+          )
+            return;
+          const add = spawnSync('git', ['-C', HYPO_DIR, 'add', filePath], { stdio: 'ignore' });
+          if (add.status !== 0) return;
+          // Record the blob this hook staged (and the HEAD blob it sat on), so the commit can tell
+          // it from one a person staged later and does not back up Claude's own write.
+          // Best-effort: with no record the commit saves the blob as it would for a person's.
+          const after = indexAndHeadBlobs(HYPO_DIR, rel);
+          if (after?.index) recordAutoStagedBlob(HYPO_DIR, rel, after.index, before.head);
+        },
+        { timeoutMs: Number(process.env.HYPO_VAULT_LOCK_TIMEOUT_MS) || 5000 },
+      );
+    } catch (err) {
+      process.stderr.write(
+        `[hypo-auto-stage] 볼트 잠금을 못 잡아 ${filePath} 의 git add 를 건너뛰었습니다 (${err?.code ?? err?.message})\n`,
+      );
+    }
   }
 
   if (WRITE_TOOLS.has(input.tool_name)) {

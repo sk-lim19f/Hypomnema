@@ -260,6 +260,14 @@
     "exec": false
   },
   {
+    "path": "hooks/session-entries.mjs",
+    "exec": false
+  },
+  {
+    "path": "hooks/session-views.mjs",
+    "exec": false
+  },
+  {
     "path": "hooks/shared.json",
     "exec": false
   },
@@ -444,6 +452,10 @@
     "exec": false
   },
   {
+    "path": "scripts/session-entries.mjs",
+    "exec": false
+  },
+  {
     "path": "scripts/stats.mjs",
     "exec": false
   },
@@ -516,6 +528,10 @@
     "exec": false
   },
   {
+    "path": "templates/gitattributes",
+    "exec": false
+  },
+  {
     "path": "templates/gitignore",
     "exec": false
   },
@@ -552,19 +568,11 @@
     "exec": false
   },
   {
-    "path": "templates/projects/_template/hot.md",
-    "exec": false
-  },
-  {
     "path": "templates/projects/_template/index.md",
     "exec": false
   },
   {
     "path": "templates/projects/_template/prd.md",
-    "exec": false
-  },
-  {
-    "path": "templates/projects/_template/session-state.md",
     "exec": false
   },
   {

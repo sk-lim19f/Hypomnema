@@ -6,11 +6,10 @@
  * carry four separate registrations (hot-rebuild, session-record, auto-commit,
  * auto-minimal-crystallize), so the order they ran in was whatever the four
  * processes happened to reach first. hypo-hot-rebuild.mjs was written against
- * an order it did not have: it writes root hot.md and log.md and only THEN
- * claims those paths into the session's touched-paths set, and hypo-auto-commit
- * could take the vault lock in between and commit without them. The rebuild
- * still succeeded, so no health notice fired either, and the fresh bytes just
- * sat uncommitted.
+ * an order it did not have: it writes log.md and only THEN claims that path
+ * into the session's touched-paths set, and hypo-auto-commit could take the
+ * vault lock in between and commit without it. The rebuild still succeeded, so
+ * no health notice fired either, and the fresh bytes just sat uncommitted.
  *
  * One registration, four stages, run in order. The order is the contract now,
  * and STAGES below is the only place it is written down.
@@ -40,9 +39,10 @@ const HOOKS_DIR = dirname(fileURLToPath(import.meta.url));
 /**
  * The Stop chain, in the order it must run.
  *
- * - hot-rebuild first: it writes root hot.md and log.md and claims them into
- *   the session's touched-paths set, which is the scope auto-commit later
- *   commits. Anything that runs before it contributes nothing to that scope.
+ * - hot-rebuild first: it regenerates the (untracked) views, writes log.md and
+ *   claims that into the session's touched-paths set, which is the scope
+ *   auto-commit later commits. Anything that runs before it contributes nothing
+ *   to that scope.
  * - session-record next: it only appends to a gitignored cache file, so its
  *   position is free; it sits here because it is cheap and cannot fail the
  *   ones after it.
@@ -130,8 +130,8 @@ try {
 const messages = [];
 // Stages that did not finish normally. The chain still runs past them (see the
 // fail-open note in the loop), but the reply must not read as a clean Stop:
-// hot-rebuild dying after its rename and before it claims the path leaves a
-// changed, uncommitted hot.md, and stderr alone is not something a person
+// hot-rebuild dying after its log.md write and before it claims the path leaves
+// a changed, uncommitted log.md, and stderr alone is not something a person
 // sees. So each one is also named in systemMessage, which turns suppressOutput
 // off. Not a `decision: "block"`: a transient timeout would then keep the
 // session from ending, over and over.

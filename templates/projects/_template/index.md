@@ -26,8 +26,9 @@ tags: [project]
 | File | Purpose |
 |------|---------|
 | `prd.md` | Purpose and success criteria |
-| `hot.md` | Session snapshot and background |
-| `session-state.md` | Next-session handoff |
+| `sessions/` | Session entries, one file per close (the source of the two views below) |
+| `hot.md` | Generated session snapshot (not committed) |
+| `session-state.md` | Generated next-session handoff (not committed) |
 | `session-log/` | Daily-sharded work narrative (YYYY-MM-DD.md) |
 | `decisions/` | Architecture decision records |
 

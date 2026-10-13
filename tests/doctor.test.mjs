@@ -17,6 +17,7 @@ import {
   utimesSync,
   writeFileSync,
 } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { spawnSync } from 'node:child_process';
@@ -35,6 +36,8 @@ import {
   withTmpHome,
 } from './helpers.mjs';
 import { PROVENANCE_FILENAME, EXPECTED_PKG_NAME } from '../scripts/lib/pkg-provenance.mjs';
+import { buildBaselineEntry, GITIGNORE_BLOCK, renderViews } from '../hooks/session-entries.mjs';
+import { loadSessionModel } from '../hooks/session-views.mjs';
 import {
   RECEIPT_SCHEMA_VERSION,
   CERT_CHECKPOINT,
@@ -1445,11 +1448,13 @@ test('doctor-close-artifacts: ROOT session-state.md is never covered by ANY mark
 
 // A merge or a multi-project commit can touch more than one project — the
 // close-worded message must then be verified against ALL of them, not
-// silently attributed to whichever one a marker happens to name.
+// silently attributed to whichever one a marker happens to name. The file is `index.md`: a
+// project `hot.md` is a generated view the vault .gitignore keeps out of every commit, so a
+// commit of it would touch no project at all.
 function commitTouchingProjects(dir, projects, message, isoDate) {
   for (const p of projects) {
     mkdirSync(join(dir, 'projects', p), { recursive: true });
-    writeFileSync(join(dir, 'projects', p, 'hot.md'), `# ${p}\n`);
+    writeFileSync(join(dir, 'projects', p, 'index.md'), `# ${p}\n`);
   }
   spawnSync('git', ['-C', dir, 'add', '-A']);
   spawnSync('git', ['-C', dir, 'commit', '-q', '-m', message], {
@@ -1521,7 +1526,7 @@ test('doctor-close-artifacts: a commit that RENAMES a file from project-a to pro
     baseWiki(dir);
     gitRepo(dir);
     mkdirSync(join(dir, 'projects', 'project-a'), { recursive: true });
-    writeFileSync(join(dir, 'projects', 'project-a', 'hot.md'), '# project-a\n');
+    writeFileSync(join(dir, 'projects', 'project-a', 'index.md'), '# project-a\n');
     spawnSync('git', ['-C', dir, 'add', '-A']);
     const seedIso = recentUtcIso(2);
     spawnSync('git', ['-C', dir, 'commit', '-q', '-m', 'seed'], {
@@ -1529,8 +1534,8 @@ test('doctor-close-artifacts: a commit that RENAMES a file from project-a to pro
     });
     mkdirSync(join(dir, 'projects', 'project-b'), { recursive: true });
     renameSync(
-      join(dir, 'projects', 'project-a', 'hot.md'),
-      join(dir, 'projects', 'project-b', 'hot.md'),
+      join(dir, 'projects', 'project-a', 'index.md'),
+      join(dir, 'projects', 'project-b', 'index.md'),
     );
     spawnSync('git', ['-C', dir, 'add', '-A']);
     const renameIso = recentUtcIso(1);
@@ -3963,3 +3968,411 @@ test('registry has user and project rows on one path: drift reads the user row, 
 // build-failed comment in evaluateTarget).
 
 suite('doctor.mjs: feedback projection attributes hook-broken');
+
+// ── doctor.mjs: a baseline entry must still name its own content ──────────────
+//
+// git pairs a baseline with the old file it was cut from as a rename when it merges the migration
+// commit, so another machine's edit to the old file can land inside the baseline with no conflict.
+
+suite('doctor.mjs: session baselines');
+
+function writeBaseline(dir, kind, text, edit = (t) => t) {
+  const built = buildBaselineEntry({
+    kind,
+    text,
+    date: '2026-09-25',
+    visibilityScope: null,
+    project: 'demo',
+    legacyDone: false,
+  });
+  mkdirSync(join(dir, 'projects', 'demo', 'sessions'), { recursive: true });
+  const rel = join('projects', 'demo', 'sessions', built.fileName);
+  writeFileSync(join(dir, rel), edit(built.text));
+  return rel;
+}
+
+function runBaselineCheck(dir) {
+  const r = run('doctor.mjs', [`--hypo-dir=${dir}`, '--json']);
+  return JSON.parse(r.stdout).find((c) => c.label === 'Session baselines');
+}
+
+test('doctor-baselines: baselines that match their names pass, and the count is reported', () => {
+  withTmpDir((dir) => {
+    writeFileSync(join(dir, 'hypo-config.md'), '# config');
+    writeBaseline(dir, 'hot', 'old hot body\n');
+    writeBaseline(dir, 'state', '## Next Up\nold state body\n');
+    const check = runBaselineCheck(dir);
+    assert.ok(check, 'the check ran');
+    assert.equal(check.status, 'pass', check.detail);
+    assert.match(check.detail, /2 baseline entries/);
+  });
+});
+
+test('doctor-baselines: a baseline whose bytes were edited after it was named is a warn that names the file', () => {
+  withTmpDir((dir) => {
+    writeFileSync(join(dir, 'hypo-config.md'), '# config');
+    const good = writeBaseline(dir, 'hot', 'old hot body\n');
+    const bad = writeBaseline(dir, 'state', '## Next Up\nold state body\n', (t) =>
+      t.replace('old state body', 'old state body, edited on another machine'),
+    );
+    const check = runBaselineCheck(dir);
+    assert.ok(check, 'the check ran');
+    assert.equal(check.status, 'warn', check.detail);
+    assert.ok(check.detail.includes(bad), check.detail);
+    assert.ok(!check.detail.includes(good), 'the intact baseline is not named');
+    assert.match(check.detail, /1 baseline entry holds bytes that do not match the name/);
+  });
+});
+
+test('doctor-baselines: a vault with no baselines has no such check', () => {
+  withTmpDir((dir) => {
+    writeFileSync(join(dir, 'hypo-config.md'), '# config');
+    mkdirSync(join(dir, 'projects', 'demo', 'sessions'), { recursive: true });
+    assert.equal(runBaselineCheck(dir), undefined);
+  });
+});
+
+test('doctor-baselines: a baseline that cannot be parsed is a warn that names the file, not a pass, and the intact one is not named', () => {
+  withTmpDir((dir) => {
+    writeFileSync(join(dir, 'hypo-config.md'), '# config');
+    const good = writeBaseline(dir, 'hot', 'old hot body\n');
+    const broken = writeBaseline(
+      dir,
+      'state',
+      '## Next Up\nold state body\n',
+      () => 'not an entry\n',
+    );
+    const checks = JSON.parse(run('doctor.mjs', [`--hypo-dir=${dir}`, '--json']).stdout).filter(
+      (c) => c.label === 'Session baselines',
+    );
+    assert.deepEqual(
+      checks.map((c) => c.status),
+      ['warn'],
+      JSON.stringify(checks),
+    );
+    assert.ok(checks[0].detail.includes(broken), checks[0].detail);
+    assert.match(checks[0].detail, /cannot be parsed/);
+    assert.ok(!checks[0].detail.includes(good), 'the intact baseline is not named');
+  });
+});
+
+// ── session entries: migration state, scope, old-version traces ─────────────
+suite('doctor.mjs: session entry migration state');
+
+const SE_NOW = '2026-10-12T12:00:00Z';
+
+function seGit(dir, ...args) {
+  const r = spawnSync('git', args, { cwd: dir, encoding: 'utf-8' });
+  assert.equal(r.status, 0, `git ${args.join(' ')}: ${r.stderr}`);
+}
+
+function seWrite(dir, rel, text) {
+  mkdirSync(join(dir, rel, '..'), { recursive: true });
+  writeFileSync(join(dir, rel), text);
+}
+
+// A git vault whose HEAD carries the Hypomnema .gitignore block and tracks no generated view
+// (`migrated`), or, with `migrated: false`, one that still tracks projects/p/hot.md (`not-migrated`).
+function seVault(dir, { migrated = true } = {}) {
+  writeFileSync(join(dir, 'hypo-config.md'), '# config');
+  mkdirSync(join(dir, 'pages'), { recursive: true });
+  gitRepo(dir);
+  seWrite(dir, 'projects/p/index.md', '---\ntitle: P\n---\n');
+  if (migrated) writeFileSync(join(dir, '.gitignore'), GITIGNORE_BLOCK);
+  else seWrite(dir, 'projects/p/hot.md', '# hot\n');
+  seGit(dir, 'add', '-A');
+  seGit(dir, 'commit', '-qm', 'init');
+}
+
+function seDoctor(dir, env = {}) {
+  const r = spawnSync(
+    process.execPath,
+    [join(SCRIPTS, 'doctor.mjs'), `--hypo-dir=${dir}`, '--json'],
+    {
+      encoding: 'utf-8',
+      env: { ...process.env, HOME: SESSION_TMP_HOME, HYPO_DIR: dir, HYPO_TEST_NOW: SE_NOW, ...env },
+    },
+  );
+  return JSON.parse(r.stdout);
+}
+
+const seCheck = (out, label) => out.find((c) => c.label === label);
+
+test('doctor-session-entries: a migrated vault reports the state, a vault with a remote waits for the command', () => {
+  withTmpDir((dir) => {
+    seVault(dir);
+    const c = seCheck(seDoctor(dir), 'Session entries');
+    assert.equal(c.status, 'pass', c.detail);
+    assert.match(c.detail, /^migrated/);
+  });
+  withTmpDir((dir) => {
+    seVault(dir, { migrated: false });
+    seGit(dir, 'remote', 'add', 'origin', 'https://example.invalid/vault.git');
+    const c = seCheck(seDoctor(dir), 'Session entries');
+    assert.equal(c.status, 'pass', c.detail);
+    assert.match(c.detail, /^not migrated: this vault has a remote/);
+    assert.match(c.detail, /--migrate-sessions/);
+  });
+});
+
+test('doctor-session-entries: a generated view tracked again after the migration is reported, a sub-track page is not', () => {
+  withTmpDir((dir) => {
+    seVault(dir);
+    seWrite(dir, 'projects/p/hot.md', '# hot\n');
+    seGit(dir, 'add', '-f', 'projects/p/hot.md');
+    const c = seCheck(seDoctor(dir), 'Session views re-tracked');
+    assert.equal(c.status, 'warn', c.detail);
+    assert.ok(c.detail.includes('projects/p/hot.md'), c.detail);
+  });
+  withTmpDir((dir) => {
+    seVault(dir);
+    seWrite(dir, 'projects/p/platform/session-state.md', '# sub-track page\n');
+    seGit(dir, 'add', '-f', 'projects/p/platform/session-state.md');
+    const c = seCheck(seDoctor(dir), 'Session views re-tracked');
+    assert.equal(c.status, 'pass', `a depth-2 page is not a generated view: ${c.detail}`);
+  });
+});
+
+test('doctor-session-entries: a re-track that is committed is reported with the git rm --cached remedy, not as "not migrated"', () => {
+  withTmpDir((dir) => {
+    seVault(dir);
+    seWrite(dir, 'projects/p/hot.md', '# hot\n');
+    seGit(dir, 'add', '-f', 'projects/p/hot.md');
+    seGit(dir, 'commit', '-qm', 're-track');
+    const out = seDoctor(dir);
+    const c = seCheck(out, 'Session views re-tracked');
+    assert.equal(c.status, 'warn', c.detail);
+    assert.ok(c.detail.includes('projects/p/hot.md'), c.detail);
+    assert.match(c.detail, /rm --cached -- 'projects\/p\/hot\.md'/);
+    assert.equal(
+      seCheck(out, 'Session entries'),
+      undefined,
+      'the vault is not described as one that migrates at the next session start',
+    );
+  });
+});
+
+test('doctor-session-entries: a committed re-track under the rollback marker is the rollback itself, not a re-track', () => {
+  withTmpDir((dir) => {
+    seVault(dir);
+    seWrite(dir, 'projects/p/hot.md', '# hot\n');
+    seWrite(dir, '.hypo-session-entries-off', 'rolled back\n');
+    seGit(dir, 'add', '-f', 'projects/p/hot.md', '.hypo-session-entries-off');
+    seGit(dir, 'commit', '-qm', 'rollback');
+    const out = seDoctor(dir);
+    assert.equal(seCheck(out, 'Session views re-tracked'), undefined);
+    const c = seCheck(out, 'Session entries');
+    assert.equal(c.status, 'warn', c.detail);
+    assert.match(c.detail, /rolled back/);
+  });
+});
+
+test('doctor-session-entries: a copy that has not pulled the migrated remote is "not caught up", not re-tracked', () => {
+  withTmpDir((root) => {
+    const origin = join(root, 'origin.git');
+    const a = join(root, 'a');
+    const b = join(root, 'b');
+    seGit(root, 'init', '-q', '--bare', origin);
+    seGit(root, 'clone', '-q', origin, a);
+    seGit(a, 'config', 'user.email', 't@example.com');
+    seGit(a, 'config', 'user.name', 't');
+    seWrite(a, 'hypo-config.md', '# config');
+    seWrite(a, '.gitignore', '.cache/\n');
+    seWrite(a, 'projects/p/index.md', '---\ntitle: P\n---\n');
+    seWrite(a, 'projects/p/hot.md', '# hot\n');
+    seGit(a, 'add', '-A');
+    seGit(a, 'commit', '-qm', 'old state');
+    seGit(a, 'push', '-q', '-u', 'origin', 'HEAD');
+    seGit(root, 'clone', '-q', origin, b);
+    seGit(a, 'rm', '-q', 'projects/p/hot.md');
+    seWrite(a, '.gitignore', `.cache/\n${GITIGNORE_BLOCK}`);
+    seGit(a, 'add', '-A');
+    seGit(a, 'commit', '-qm', 'migrated');
+    seGit(a, 'push', '-q');
+    seGit(b, 'fetch', '-q');
+    const out = seDoctor(b);
+    assert.equal(seCheck(out, 'Session views re-tracked'), undefined);
+    const c = seCheck(out, 'Session entries');
+    assert.equal(c.status, 'warn', c.detail);
+    assert.match(c.detail, /has not caught up/);
+  });
+});
+
+test('doctor broken links: a link inside a session entry is not reported, the same link in a page is, and an entry is still a target', () => {
+  withTmpDir((dir) => {
+    seVault(dir);
+    seWrite(
+      dir,
+      'projects/p/sessions/2026-10-01-aaaa.md',
+      '---\ntitle: e\n---\nsee [[gone-page]]\n',
+    );
+    seWrite(dir, 'pages/target.md', '---\ntitle: t\n---\nlinks [[2026-10-01-aaaa]]\n');
+    const c = seCheck(seDoctor(dir), 'Broken wiki links');
+    assert.equal(c.status, 'pass', `the entry's own broken link is skipped: ${c.detail}`);
+    seWrite(dir, 'pages/page.md', '---\ntitle: pg\n---\nsee [[gone-page]]\n');
+    const d = seCheck(seDoctor(dir), 'Broken wiki links');
+    assert.equal(d.status, 'warn', d.detail);
+    assert.ok(d.detail.includes('1 broken'), d.detail);
+    assert.ok(d.detail.includes('pages/page.md'), d.detail);
+    assert.ok(!d.detail.includes('sessions/'), d.detail);
+  });
+});
+
+test('doctor-session-entries: backup files under .cache/backups are counted', () => {
+  withTmpDir((dir) => {
+    seVault(dir);
+    seWrite(dir, '.cache/backups/hot.md.pre-projection-backup.md', 'old\n');
+    seWrite(dir, '.cache/backups/projects/p/hot.md.pre-projection-backup.md', 'old\n');
+    const c = seCheck(seDoctor(dir), 'Session view backups');
+    assert.equal(c.status, 'pass', c.detail);
+    assert.match(c.detail, /^2 backup file\(s\)/);
+  });
+});
+
+test('doctor-session-entries: only a project whose entry scope is an empty "machine:" is reported as hidden', () => {
+  withTmpDir((dir) => {
+    seVault(dir);
+    const index = (scope) => `---\ntitle: T\nvisibility_scope: ${scope}\n---\n`;
+    seWrite(dir, 'projects/a/index.md', index('machine:'));
+    seWrite(dir, 'projects/b/index.md', index('machine:devA'));
+    seWrite(dir, 'projects/c/index.md', index('shared'));
+    seWrite(dir, 'projects/d/index.md', index('shared'));
+    // c: the index says shared, the baseline (the migration's record of the old scope) says machine:
+    const built = buildBaselineEntry({
+      kind: 'state',
+      text: '## Next Up\nold state\n',
+      date: '2026-09-25',
+      visibilityScope: 'machine:',
+      project: 'c',
+      legacyDone: false,
+    });
+    seWrite(dir, `projects/c/sessions/${built.fileName}`, built.text);
+    const c = seCheck(seDoctor(dir), 'Session projects hidden by scope');
+    assert.ok(c, 'the hidden-project check ran');
+    assert.equal(c.status, 'warn', c.detail);
+    assert.deepEqual(c.detail.split(':')[0].split(', ').sort(), ['a', 'c'], c.detail);
+  });
+});
+
+test('doctor-session-entries: the hidden-scope remedy names entry_scope and following it makes the next run quiet', () => {
+  withTmpDir((dir) => {
+    seVault(dir);
+    seWrite(dir, 'projects/c/index.md', '---\ntitle: T\nvisibility_scope: shared\n---\n');
+    const built = buildBaselineEntry({
+      kind: 'state',
+      text: '## Next Up\nold state\n',
+      date: '2026-09-25',
+      visibilityScope: 'machine:',
+      project: 'c',
+      legacyDone: false,
+    });
+    seWrite(dir, `projects/c/sessions/${built.fileName}`, built.text);
+    const c = seCheck(seDoctor(dir), 'Session projects hidden by scope');
+    assert.equal(c.status, 'warn', c.detail);
+    assert.match(
+      c.detail,
+      /Set entry_scope in projects\/<name>\/index\.md to shared or machine:<device>/,
+    );
+    assert.match(c.detail, /shows entries that were limited to one machine/);
+    // The old advice (the index's visibility_scope: shared) is already in place and changes nothing.
+    seWrite(
+      dir,
+      'projects/c/index.md',
+      '---\ntitle: T\nvisibility_scope: shared\nentry_scope: shared\n---\n',
+    );
+    assert.equal(
+      seCheck(seDoctor(dir), 'Session projects hidden by scope'),
+      undefined,
+      'entry_scope: shared unhides the project',
+    );
+  });
+});
+
+test('doctor-session-entries: a view equal to a fresh render is no close artifact even when the ownership record lacks it', () => {
+  withTmpDir((dir) => {
+    seVault(dir);
+    const built = buildBaselineEntry({
+      kind: 'state',
+      text: `> **${'2026-10-11'} 마감(1번째 세션).** 옛 상태.\n`,
+      date: '2026-10-11',
+      visibilityScope: 'shared',
+      project: 'p',
+      legacyDone: false,
+    });
+    seWrite(dir, `projects/p/sessions/${built.fileName}`, built.text);
+    const rendered = renderViews([loadSessionModel(dir, 'p')], {
+      device: 'any',
+      only: ['p'],
+    }).projects.p.sessionState;
+    assert.match(rendered, /마감/, 'the fixture view carries a close heading');
+    seWrite(dir, 'projects/p/session-state.md', rendered);
+    assert.ok(!existsSync(join(dir, '.cache', 'generated-views.json')), 'no ownership record');
+    const quiet = seCheck(seDoctor(dir), 'Session-close artifacts');
+    assert.equal(quiet.status, 'pass', quiet.detail);
+    // The same file with one hand-added line is not the generator's bytes: it is scanned again.
+    seWrite(dir, 'projects/p/session-state.md', `${rendered}\nhand note\n`);
+    const loud = seCheck(seDoctor(dir), 'Session-close artifacts');
+    assert.equal(loud.status, 'warn', loud.detail);
+  });
+});
+
+test('doctor-session-entries: close headings without an entry are reported inside the last 7 days only', () => {
+  withTmpDir((dir) => {
+    seVault(dir);
+    seWrite(dir, 'projects/q/index.md', '---\ntitle: Q\n---\n');
+    seWrite(dir, 'projects/r/index.md', '---\ntitle: R\n---\n');
+    // p: D-3, no entry that day. q: D-9, the same state. r: D-3 but the entry exists.
+    seWrite(dir, 'projects/p/session-log/2026-10-09.md', '## [2026-10-09] close\n');
+    seWrite(dir, 'projects/q/session-log/2026-10-03.md', '## [2026-10-03] close\n');
+    seWrite(dir, 'projects/r/session-log/2026-10-09.md', '## [2026-10-09] close\n');
+    seWrite(dir, 'projects/r/sessions/2026-10-09-abc-1.md', 'entry\n');
+    // s: D-6, the last day inside the window. t: D-7, the first day outside it.
+    seWrite(dir, 'projects/s/index.md', '---\ntitle: S\n---\n');
+    seWrite(dir, 'projects/t/index.md', '---\ntitle: T\n---\n');
+    seWrite(dir, 'projects/s/session-log/2026-10-06.md', '## [2026-10-06] close\n');
+    seWrite(dir, 'projects/t/session-log/2026-10-05.md', '## [2026-10-05] close\n');
+    const c = seCheck(seDoctor(dir), 'Session old-version closes');
+    assert.equal(c.status, 'warn', c.detail);
+    assert.ok(c.detail.includes('p (2026-10-09)'), c.detail);
+    assert.ok(
+      c.detail.includes(
+        'A past trace leaves this report after 7 days, and upgrading that machine stops new ones',
+      ),
+      c.detail,
+    );
+    assert.ok(
+      !c.detail.includes('upgrade that machine'),
+      `the old remedy text is gone: ${c.detail}`,
+    );
+    assert.ok(c.detail.includes('s (2026-10-06)'), `D-6 is inside the window: ${c.detail}`);
+    assert.ok(!c.detail.includes('t ('), `D-7 is outside the window: ${c.detail}`);
+    assert.ok(!c.detail.includes('q ('), `D-9 is outside the window: ${c.detail}`);
+    assert.ok(!c.detail.includes('r ('), `a project with its entry is not a trace: ${c.detail}`);
+  });
+});
+
+test('doctor-session-entries: a vault that is not migrated reports no old-version closes', () => {
+  withTmpDir((dir) => {
+    seVault(dir, { migrated: false });
+    seWrite(dir, 'projects/p/session-log/2026-10-09.md', '## [2026-10-09] close\n');
+    const out = seDoctor(dir);
+    assert.equal(seCheck(out, 'Session old-version closes'), undefined);
+    assert.equal(seCheck(out, 'Session entries').status, 'pass');
+  });
+});
+
+test('doctor-session-entries: a view the generator owns is not a close artifact, hand-edited bytes still are', () => {
+  withTmpDir((dir) => {
+    baseWiki(dir);
+    const rel = 'projects/demo/session-state.md';
+    const text = `> **${recentUtcDate(1)} 마감(1번째 세션).** 생성된 뷰.\n`;
+    seWrite(dir, rel, text);
+    const own = (body) => ({
+      views: { [rel]: createHash('sha256').update(body, 'utf-8').digest('hex') },
+    });
+    seWrite(dir, '.cache/generated-views.json', JSON.stringify(own(text)));
+    assert.equal(doctorCloseArtifactCheck(dir).status, 'pass');
+    seWrite(dir, '.cache/generated-views.json', JSON.stringify(own('other bytes\n')));
+    assert.equal(doctorCloseArtifactCheck(dir).status, 'warn');
+  });
+});

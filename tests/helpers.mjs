@@ -531,6 +531,8 @@ function withSyncedWiki(fn) {
     spawnSync('git', ['-C', dir, 'config', 'user.email', 'test@test.com']);
     spawnSync('git', ['-C', dir, 'config', 'user.name', 'Test']);
     writeFileSync(join(dir, 'hypo-config.md'), '# config');
+    // The ignore line every vault this plugin creates has; a staged-version backup needs it.
+    writeFileSync(join(dir, '.gitignore'), '/.cache/\n');
     writeFileSync(
       join(dir, 'hot.md'),
       '---\ntitle: Hot\nupdated: today\n---\n## Active Projects\n\n| Project | Last Session | Hot Cache |\n|---|---|---|\n',

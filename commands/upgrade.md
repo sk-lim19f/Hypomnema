@@ -4,11 +4,15 @@ description: Check for Hypomnema updates and optionally apply them. Use when the
 
 You are running `/hypo:upgrade`. Check if the installed Hypomnema wiki is out of date and offer to apply updates.
 
+**If the arguments contain `--migrate-sessions`**, resolve the package root (Step 1), then skip Steps 2 to 5 and go straight to the `--migrate-sessions` section at the end of this file.
+
 ## What this checks
 
 - **SCHEMA version**: compares `~/hypomnema/SCHEMA.md` version against the package's current version
 - **Hook files**: checks if any hooks in `~/.claude/hooks/` are stale or missing
 - **settings.json**: checks if all hook registrations are present in `~/.claude/settings.json`
+
+A vault with no git remote moves its session state into per-session entries (`projects/<p>/sessions/`) by itself at the next SessionStart. A vault with a remote is never moved from a hook; SessionStart only tells you it has not moved.
 
 ---
 
@@ -63,3 +67,29 @@ If there is anything to update, ask the user:
 ## Step 5 — Post-apply
 
 After applying, recommend running `/hypo:doctor` to verify the installation is healthy.
+
+---
+
+## `--migrate-sessions` (a vault with a git remote)
+
+```bash
+node ${CLAUDE_PLUGIN_ROOT}/scripts/upgrade.mjs [--hypo-dir="<path>"] --migrate-sessions
+```
+
+This moves the vault from the tracked `hot.md` and `session-state.md` files to per-session entries under `projects/<p>/sessions/`. A vault with a remote does not move by itself: it waits for this command, which commits the move and pushes it right away.
+
+**Upgrade all machines first.** Every machine that uses the vault must run this Hypomnema version before you run the command. A machine that skipped the upgrade, once it pulls the move commit:
+
+1. loses the session view in what it injects at session start,
+2. stalls its whole sync if it holds an unpushed commit that edits `hot.md` or `session-state.md`, and
+3. if it uses the plugin channel, is not refreshed on its own (run `/plugin marketplace update hypomnema`, then `/reload-plugins`).
+
+**When to ask.** If the user typed `/hypo:upgrade --migrate-sessions` directly, run it without asking again: typing the flag is their statement that all machines are upgraded. Only when you are the one proposing this flag, or about to run it during another flow, first ask the user whether every machine that uses the same vault has been upgraded, because the command pushes the migration commit at once.
+
+What it does, in order: fetch; if another machine already moved the vault, take in that commit without migrating (this machine never migrates a remote that is already moved), then pull and push as the last step does; otherwise merge the remote history first so the move is built on the newest commit; migrate (also clearing a rollback marker); pull and push. It brings an older edition of the `.gitignore` / `.gitattributes` block up to the current one. If taking in a moved remote leaves generated views tracked here (an old machine's unpushed work came along), it stops before pushing, names the paths and the `git rm --cached` repair, and exits 1.
+
+During this one-time merge, a page that one machine renamed and edited while another machine edited it too ends as a modify/delete conflict, and the sync aborts so you can merge that page by hand.
+
+Show the output verbatim. Exit code 1 means a step stopped and printed why (a deferred pull, a lock held by another session, a rejected push). Fix the cause and run the same command again: a repeat after a failed push adds no new commit and only pushes.
+
+While machines are catching up, a plain `git pull` or Obsidian Git can hit conflicts that Hypomnema's own sync resolves. Tell the user this once after the command succeeds.

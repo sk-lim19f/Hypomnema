@@ -26,7 +26,7 @@ HYPO_SKIP_GATE=1
 <hypo-root>/
 ├── hypo-config.md      ← you are here (root marker)
 ├── index.md            ← searchable page index
-├── hot.md              ← active-project pointer table
+├── hot.md              ← active-project pointer table (generated)
 ├── log.md              ← chronological activity log
 ├── hypo-guide.md       ← operations guide
 ├── SCHEMA.md           ← type system reference
@@ -35,7 +35,10 @@ HYPO_SKIP_GATE=1
 ├── projects/           ← project work artifacts
 │   └── <name>/
 │       ├── index.md    ← project overview (working_dir: field)
-│       ├── hot.md      ← project-scoped session snapshot
+│       ├── sessions/   ← one entry per session close (never deleted)
+│       ├── notes.md    ← notes shared by every session (optional)
+│       ├── hot.md      ← recent session summaries (generated)
+│       ├── session-state.md ← next-session handoff (generated)
 │       └── session-log/    ← daily shards (YYYY-MM-DD.md)
 └── sources/            ← raw ingested sources (read-only)
 ```

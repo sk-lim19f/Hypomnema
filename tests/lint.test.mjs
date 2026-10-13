@@ -5,12 +5,14 @@
 
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { tmpdir } from 'node:os';
 import { parseSchemaVocab, appendPendingTags } from '../scripts/lib/schema-vocab.mjs';
 import { fencedLineMask, maskNonProse, retiredLineMask } from '../scripts/lib/code-fence.mjs';
 import { parseFrontmatter as libParseFrontmatter } from '../scripts/lib/frontmatter.mjs';
+import { GITIGNORE_BLOCK, formatSessionEntry, renderViews } from '../hooks/session-entries.mjs';
+import { loadSessionModel } from '../hooks/session-views.mjs';
 import { test, suite } from './harness.mjs';
 import {
   HOME,
@@ -3723,4 +3725,347 @@ test('maskNonProse: keeps length and newlines, blanks only the comment span and 
   const out = maskNonProse(text);
   assert.equal(out.length, text.length);
   assert.equal(out, `x${' '.repeat(12)}y\n   \n \n   \nz\n`);
+});
+
+// ── lint.mjs session entries (projects/*/sessions/*.md) ──────────────────────
+
+suite('lint.mjs session entries');
+
+const ENTRY_INDEX =
+  '---\ntitle: P\ntype: project-index\nstatus: active\nstarted: 2026-10-01\nupdated: 2026-10-01\nworking_dir: /x\n---\n# P\n';
+
+function entryText(over = {}) {
+  return formatSessionEntry({
+    project: 'p',
+    closeId: 's1-0',
+    date: '2026-10-01',
+    tracks: [{ id: 'main', title: 'Main', new: true }],
+    summary: 'summary of the close',
+    bodies: { main: 'main track body' },
+    ...over,
+  });
+}
+
+// A vault with project p, its index, and the given entries ({name: text}). `schema` is
+// written as SCHEMA.md when given. Returns the lint result and runs `after(dir)` before cleanup.
+function lintEntries(entries, { schema, args = [], extra = {}, after, setup } = {}) {
+  const dir = mkdtempSync(join(tmpdir(), 'hypo-lint-entry-'));
+  try {
+    mkdirSync(join(dir, 'projects', 'p', 'sessions'), { recursive: true });
+    writeFileSync(join(dir, 'projects', 'p', 'index.md'), ENTRY_INDEX);
+    if (schema !== undefined) writeFileSync(join(dir, 'SCHEMA.md'), schema);
+    for (const [name, text] of Object.entries(entries)) {
+      writeFileSync(join(dir, 'projects', 'p', 'sessions', name), text);
+    }
+    for (const [rel, text] of Object.entries(extra)) {
+      mkdirSync(dirname(join(dir, rel)), { recursive: true });
+      writeFileSync(join(dir, rel), text);
+    }
+    setup?.(dir);
+    const r = run('lint.mjs', [`--hypo-dir=${dir}`, '--json', ...args]);
+    const out = JSON.parse(r.stdout);
+    return { r, out, after: after?.(dir) };
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+const ENTRY_FILE = 'projects/p/sessions/2026-10-01-s1-0.md';
+const entryIssues = (out, kind) => out[kind].filter((i) => i.file === ENTRY_FILE);
+
+test('a well-formed entry lints clean, and a broken link inside it is not reported', () => {
+  const { r, out } = lintEntries({
+    '2026-10-01-s1-0.md': entryText({ summary: 'see [[no-such-page]]' }),
+  });
+  assert.equal(r.status, 0, r.stdout);
+  assert.deepEqual(entryIssues(out, 'errors'), []);
+  assert.deepEqual(entryIssues(out, 'warns'), []);
+});
+
+test('the same broken link in an ordinary page is still reported (pair for the entry skip)', () => {
+  const { out } = lintEntries(
+    {},
+    {
+      extra: {
+        'pages/a.md': '---\ntitle: A\ntype: concept\nupdated: 2026-10-01\n---\n[[no-such-page]]\n',
+      },
+    },
+  );
+  assert.ok(
+    out.warns.some((w) => w.file === 'pages/a.md' && w.message.includes('no-such-page')),
+    JSON.stringify(out.warns),
+  );
+});
+
+test('a vault SCHEMA without a session-entry row raises no W2 for an entry', () => {
+  const old = readFileSync(join(REPO, 'templates', 'SCHEMA.md'), 'utf-8')
+    .split('\n')
+    .filter((l) => !l.startsWith('| `session-entry`'))
+    .join('\n');
+  assert.ok(!old.includes('`session-entry`'), 'fixture SCHEMA has no session-entry row');
+  const { out } = lintEntries({ '2026-10-01-s1-0.md': entryText() }, { schema: old });
+  assert.deepEqual(entryIssues(out, 'warns'), []);
+  assert.deepEqual(entryIssues(out, 'errors'), []);
+});
+
+test('an entry without title is a lint error', () => {
+  const text = entryText().replace(/^title: .*\n/m, '');
+  const { r, out } = lintEntries({ '2026-10-01-s1-0.md': text });
+  assert.equal(r.status, 1, r.stdout);
+  assert.ok(
+    entryIssues(out, 'errors').some(
+      (i) => i.message === 'Missing required frontmatter field: title',
+    ),
+    JSON.stringify(out.errors),
+  );
+});
+
+test('an entry file with no frontmatter at all is a lint error, not only the generic W1 warning', () => {
+  const { r, out } = lintEntries({ '2026-10-01-s1-0.md': 'just some plain text\n' });
+  assert.equal(r.status, 1, r.stdout);
+  assert.ok(
+    entryIssues(out, 'errors').some((i) => i.message.startsWith('Session entry does not parse')),
+    JSON.stringify(out.errors),
+  );
+  assert.ok(
+    entryIssues(out, 'warns').some((i) => i.message === 'No frontmatter found'),
+    'W1 still reported',
+  );
+});
+
+test('plain text with no frontmatter outside a session entry path stays a W1 warning only', () => {
+  const { r, out } = lintEntries({}, { extra: { 'pages/plain.md': 'just some plain text\n' } });
+  assert.ok(
+    out.warns.some((w) => w.file === 'pages/plain.md'),
+    JSON.stringify(out.warns),
+  );
+  assert.ok(!out.errors.some((e) => e.file === 'pages/plain.md'), JSON.stringify(out.errors));
+  assert.equal(r.status, 0, r.stdout);
+});
+
+test('an entry without close_id or tracks names each missing field', () => {
+  const text = entryText()
+    .replace(/^close_id: .*\n/m, '')
+    .replace(/^tracks: .*\n/m, '');
+  const { out } = lintEntries({ '2026-10-01-s1-0.md': text });
+  const msgs = entryIssues(out, 'errors').map((i) => i.message);
+  assert.ok(msgs.includes('Missing required frontmatter field: close_id'), msgs.join('|'));
+  assert.ok(msgs.includes('Missing required frontmatter field: tracks'), msgs.join('|'));
+});
+
+test('an entry whose body has a track section the frontmatter tracks do not declare is an error', () => {
+  const text = entryText().replace(/^tracks: .*$/m, 'tracks: [{"id":"other"}]');
+  const { r, out } = lintEntries({ '2026-10-01-s1-0.md': text });
+  assert.equal(r.status, 1, r.stdout);
+  assert.ok(
+    entryIssues(out, 'errors').some((i) => /do not match the frontmatter tracks/.test(i.message)),
+    JSON.stringify(out.errors),
+  );
+});
+
+test('an entry with an invalid close id or an unparseable body is an error naming the reason', () => {
+  const badId = entryText().replace(/^close_id: .*$/m, 'close_id: Bad Id!');
+  const noSummary = entryText().replace(/<!-- hypomnema:summary s1-0 -->\n/, '');
+  for (const [text, reason] of [
+    [badId, 'bad-close_id'],
+    [noSummary, 'missing-summary'],
+  ]) {
+    const { out } = lintEntries({ '2026-10-01-s1-0.md': text });
+    assert.ok(
+      entryIssues(out, 'errors').some(
+        (i) => i.message === `Session entry does not parse: ${reason}`,
+      ),
+      `${reason}: ${JSON.stringify(out.errors)}`,
+    );
+  }
+});
+
+test('a supersedes id that names no entry of the project warns; a real one does not', () => {
+  const first = entryText();
+  const second = entryText({
+    closeId: 's2-0',
+    date: '2026-10-02',
+    tracks: [{ id: 'main', supersedes: ['s1-0', 'ghost-9'] }],
+    bodies: {},
+  });
+  // `ghost-9` is a valid entry of another project: a vault-wide id pool would resolve it.
+  const { r, out } = lintEntries(
+    { '2026-10-01-s1-0.md': first, '2026-10-02-s2-0.md': second },
+    {
+      extra: {
+        'projects/q/index.md': ENTRY_INDEX.replace('title: P', 'title: Q'),
+        'projects/q/sessions/2026-10-01-ghost-9.md': entryText({
+          project: 'q',
+          closeId: 'ghost-9',
+        }),
+      },
+    },
+  );
+  assert.deepEqual(
+    out.warns.filter((i) => i.file === 'projects/q/sessions/2026-10-01-ghost-9.md'),
+    [],
+    'the foreign entry itself is valid',
+  );
+  assert.equal(r.status, 0, 'a warning does not fail lint');
+  const w = out.warns.filter((i) => i.file === 'projects/p/sessions/2026-10-02-s2-0.md');
+  assert.equal(w.length, 1, JSON.stringify(out.warns));
+  assert.ok(w[0].message.includes('"ghost-9"'), w[0].message);
+});
+
+// A close that updates the `legacy` track supersedes the virtual baseline's id. Before the move to
+// session entries no entry file carries that id (the reader builds it from the old flat files), so
+// W20 stays quiet; once the vault has moved, the same dangling id is a real finding again.
+function baselineSupersedeVault(migrated) {
+  const baselineId = 'baseline-0123456789abcdef';
+  const entry = entryText({
+    closeId: 's2-0',
+    date: '2026-10-02',
+    tracks: [{ id: 'legacy', supersedes: [baselineId] }],
+    bodies: {},
+  });
+  const git = (dir, ...a) =>
+    spawnSync('git', ['-c', 'user.email=t@t.test', '-c', 'user.name=t', ...a], {
+      cwd: dir,
+      env: { ...process.env, HOME: SESSION_TMP_HOME },
+      encoding: 'utf-8',
+    });
+  const { out } = lintEntries(
+    { '2026-10-02-s2-0.md': entry },
+    {
+      setup: (dir) => {
+        git(dir, 'init', '-q');
+        if (migrated) {
+          writeFileSync(join(dir, '.gitignore'), `.cache/\n${GITIGNORE_BLOCK}`);
+          git(dir, 'add', '.gitignore');
+          git(dir, 'commit', '-q', '-m', 'migrate');
+        }
+      },
+    },
+  );
+  return out.warns.filter((i) => i.file === 'projects/p/sessions/2026-10-02-s2-0.md');
+}
+
+test('W20 skips a baseline id while the vault has not moved to session entries', () => {
+  assert.deepEqual(baselineSupersedeVault(false), []);
+});
+
+test('W20 still warns about a dangling baseline id once the vault has moved', () => {
+  const w = baselineSupersedeVault(true);
+  assert.equal(w.length, 1, JSON.stringify(w));
+  assert.ok(w[0].message.includes('"baseline-0123456789abcdef"'), w[0].message);
+});
+
+test('lint --fix leaves an entry without updated byte for byte, and still fixes an ordinary page', () => {
+  const text = entryText().replace(/^updated: .*\n/m, '');
+  assert.ok(!text.includes('updated:'), 'fixture entry lacks updated');
+  const page = '---\ntitle: A\ntype: concept\n---\nbody\n';
+  const { out, after } = lintEntries(
+    { '2026-10-01-s1-0.md': text },
+    {
+      args: ['--fix'],
+      extra: { 'pages/a.md': page },
+      after: (dir) => ({
+        entry: readFileSync(join(dir, ENTRY_FILE), 'utf-8'),
+        page: readFileSync(join(dir, 'pages', 'a.md'), 'utf-8'),
+      }),
+    },
+  );
+  assert.equal(after.entry, text, 'entry bytes unchanged by --fix');
+  assert.ok(after.page.includes('updated:'), 'the ordinary page was fixed (the fix did run)');
+  assert.ok(
+    entryIssues(out, 'warns').some((i) => i.message === 'Missing frontmatter field: updated'),
+    'the entry still reports the missing updated',
+  );
+});
+
+test('the three generated views of a project lint with no errors', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'hypo-lint-views-'));
+  try {
+    mkdirSync(join(dir, 'projects', 'p', 'sessions'), { recursive: true });
+    writeFileSync(join(dir, 'projects', 'p', 'index.md'), ENTRY_INDEX);
+    writeFileSync(join(dir, 'projects', 'p', 'sessions', '2026-10-01-s1-0.md'), entryText());
+    const model = loadSessionModel(dir, 'p', { state: 'migrated' });
+    assert.equal(model.entries.length, 1, 'the model read the entry');
+    const views = renderViews([model], { device: 'dev-test' });
+    writeFileSync(join(dir, 'projects', 'p', 'hot.md'), views.projects.p.hot);
+    writeFileSync(join(dir, 'projects', 'p', 'session-state.md'), views.projects.p.sessionState);
+    writeFileSync(join(dir, 'hot.md'), views.root);
+    const r = run('lint.mjs', [`--hypo-dir=${dir}`, '--json']);
+    const out = JSON.parse(r.stdout);
+    assert.deepEqual(out.errors, [], r.stdout);
+    assert.equal(r.status, 0, r.stdout);
+    // "No errors" also holds for a view that lost its frontmatter (lint stops at W1 before the
+    // required-field checks), so the structure is asserted on its own.
+    const viewFiles = ['hot.md', 'projects/p/hot.md', 'projects/p/session-state.md'];
+    for (const rel of viewFiles) {
+      const text = readFileSync(join(dir, rel), 'utf-8');
+      const fm = (text.match(/^---\n([\s\S]*?)\n---\n/) ?? [])[1] ?? '';
+      const fields = rel === 'hot.md' ? ['type', 'title'] : ['type', 'title', 'generated'];
+      for (const field of fields) {
+        assert.match(fm, new RegExp(`^${field}: .+$`, 'm'), `${rel} carries ${field}: ${text}`);
+      }
+      assert.deepEqual(
+        out.warns.filter((i) => i.file === rel && ['W1', 'W2', 'W9'].includes(i.id)),
+        [],
+        `${rel} has well-formed frontmatter: ${r.stdout}`,
+      );
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('generated views whose entries link a renamed-away page raise no broken-link warning, even under --strict', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'hypo-lint-views-'));
+  try {
+    mkdirSync(join(dir, 'projects', 'p', 'sessions'), { recursive: true });
+    writeFileSync(join(dir, 'projects', 'p', 'index.md'), ENTRY_INDEX);
+    writeFileSync(
+      join(dir, 'projects', 'p', 'sessions', '2026-10-01-s1-0.md'),
+      entryText({ summary: 'see [[pages/old-name]]', bodies: { main: 'and [[pages/old-name]]' } }),
+    );
+    const model = loadSessionModel(dir, 'p', { state: 'migrated' });
+    const views = renderViews([model], { device: 'dev-test' });
+    writeFileSync(join(dir, 'projects', 'p', 'hot.md'), views.projects.p.hot);
+    writeFileSync(join(dir, 'projects', 'p', 'session-state.md'), views.projects.p.sessionState);
+    writeFileSync(join(dir, 'hot.md'), views.root);
+    const viewText = [views.projects.p.hot, views.projects.p.sessionState, views.root].join('\n');
+    assert.ok(viewText.includes('[[pages/old-name]]'), 'the views carry the old link');
+    const r = run('lint.mjs', [`--hypo-dir=${dir}`, '--json', '--strict']);
+    const out = JSON.parse(r.stdout);
+    const broken = [...out.errors, ...out.warns].filter((i) => /Broken wikilink/.test(i.message));
+    assert.deepEqual(broken, [], r.stdout);
+    assert.equal(r.status, 0, r.stdout);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('the generated root hot.md links a project whose views this machine has not rendered yet, and strict lint does not block on it', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'hypo-lint-root-'));
+  try {
+    for (const p of ['p', 'q']) {
+      mkdirSync(join(dir, 'projects', p, 'sessions'), { recursive: true });
+      writeFileSync(join(dir, 'projects', p, 'index.md'), ENTRY_INDEX);
+      writeFileSync(
+        join(dir, 'projects', p, 'sessions', '2026-10-01-s1-0.md'),
+        entryText({ summary: `summary of ${p}`, bodies: { main: 'body' } }),
+      );
+    }
+    const models = ['p', 'q'].map((p) => loadSessionModel(dir, p, { state: 'migrated' }));
+    const views = renderViews(models, { device: 'dev-test' });
+    // Only p's views exist here: q's are written by a later Stop, but the root table already rows it.
+    writeFileSync(join(dir, 'projects', 'p', 'hot.md'), views.projects.p.hot);
+    writeFileSync(join(dir, 'projects', 'p', 'session-state.md'), views.projects.p.sessionState);
+    writeFileSync(join(dir, 'hot.md'), views.root);
+    assert.ok(views.root.includes('[[projects/q/hot]]'), 'the root rows q');
+    assert.ok(!existsSync(join(dir, 'projects', 'q', 'hot.md')), 'q has no view on disk');
+    const r = run('lint.mjs', [`--hypo-dir=${dir}`, '--json', '--strict']);
+    const out = JSON.parse(r.stdout);
+    const broken = [...out.errors, ...out.warns].filter((i) => /Broken wikilink/.test(i.message));
+    assert.deepEqual(broken, [], r.stdout);
+    assert.equal(r.status, 0, r.stdout);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

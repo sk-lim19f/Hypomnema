@@ -85,8 +85,11 @@ import {
   CLOSE_RECONFIRM_MARK,
   resolveGateProjectOverride,
   gitDirtyFiles,
+  isForeignAppendOnlyShard,
+  isForeignUncommittedEntry,
 } from './hypo-shared.mjs';
 import { closeCheckpointState, isCloseComplete, receiptPath } from './close-receipt.mjs';
+import { closeGateStatus } from './close-gate-store.mjs';
 import { atomicWrite } from './atomic-write.mjs';
 
 // Carrying a systemMessage does not turn this into a block: the session is
@@ -111,7 +114,15 @@ function emitContinue(systemMessage) {
 // replaced receipt (a fresh close attempt) starts this notice fresh too.
 function notifyUnresolved(hypoDir, sessionId, receipt) {
   const certified = new Set((receipt.entries || []).map((e) => e && e.path));
-  const dirty = gitDirtyFiles(hypoDir).sort();
+  // Another session's close still committing (its new entry, its append to a
+  // session-log shard) is not this session's to resolve.
+  const dirty = gitDirtyFiles(hypoDir)
+    .filter(
+      (f) =>
+        !isForeignUncommittedEntry(hypoDir, f, sessionId) &&
+        !isForeignAppendOnlyShard(hypoDir, f, sessionId),
+    )
+    .sort();
   if (dirty.length === 0) return null;
   const rp = receiptPath(hypoDir, sessionId);
   if (!rp) return null;
@@ -341,7 +352,12 @@ process.stdin.on('end', () => {
         // a notice instead of holding this session's Stop hostage on debt it
         // never touched.
         const attributionScope = resolveGateProjectOverride(HYPO_DIR, { sessionCwd });
+        // Which close id proves this session for the gate's cwd check (injected:
+        // close-gate-store.mjs imports hypo-shared.mjs).
+        const closeGate = closeGateStatus({ transcriptPath, hypoDir: HYPO_DIR, sessionId });
         return precompactGateStatus(HYPO_DIR, {
+          closeOpen: closeGate.ok,
+          resolvedAtIndex: closeGate.resolvedAtIndex,
           ...(transcriptPath ? { transcriptPath } : {}),
           ...(sessionCwd ? { sessionCwd } : {}),
           ...(sessionId ? { sessionId } : {}),

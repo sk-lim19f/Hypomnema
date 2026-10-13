@@ -19,6 +19,7 @@ import { existsSync, readFileSync, readdirSync, statSync } from 'fs';
 import { join, relative, extname } from 'path';
 import { resolveHypoRoot, expandHome } from './lib/hypo-root.mjs';
 import { loadHypoIgnore, isScanIgnored } from './lib/hypo-ignore.mjs';
+import { isSessionEntryPath } from '../hooks/session-entries.mjs';
 import { DAY_MS } from './lib/time.mjs';
 
 // ── arg parsing ──────────────────────────────────────────────────────────────
@@ -64,7 +65,12 @@ function collectMdFiles(dir, acc = [], hypoDir = '', ignorePatterns = []) {
     if (hypoDir && isScanIgnored(full, hypoDir, ignorePatterns)) continue;
     const st = statSync(full);
     if (st.isDirectory()) collectMdFiles(full, acc, hypoDir, ignorePatterns);
-    else if (extname(entry) === '.md') acc.push(full);
+    else if (
+      extname(entry) === '.md' &&
+      !(hypoDir && isSessionEntryPath(relative(hypoDir, full).replace(/\\/g, '/')))
+    ) {
+      acc.push(full);
+    }
   }
   return acc;
 }

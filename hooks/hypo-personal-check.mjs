@@ -36,6 +36,7 @@ import {
   resolveGateProjectOverride,
 } from './hypo-shared.mjs';
 import { closeCheckpointState, isCloseComplete } from './close-receipt.mjs';
+import { closeGateStatus } from './close-gate-store.mjs';
 
 const WARNING_FILE = join(homedir(), '.claude', 'state', 'wiki-context-warning.json');
 
@@ -123,9 +124,15 @@ process.stdin.on('end', () => {
     // closeCheckpointState calls this session's close finished, the verdict
     // Stop uses too. A marker whose receipt is missing or invalid is ignored.
     const checkpoint = sessionId ? closeCheckpointState(HYPO_DIR, sessionId) : null;
+    // Is a close signal open now, and where was the last one resolved: which
+    // close id proves this session for the gate's cwd check. Injected, since
+    // close-gate-store.mjs imports hypo-shared.mjs.
+    const closeGate = closeGateStatus({ transcriptPath, hypoDir: HYPO_DIR, sessionId });
     gate = precompactGateStatus(HYPO_DIR, {
       transcriptPath,
       ...(sessionId ? { sessionId } : {}),
+      closeOpen: closeGate.ok,
+      resolvedAtIndex: closeGate.resolvedAtIndex,
       ...(checkpoint
         ? { closeMarker: isCloseComplete(checkpoint) ? checkpoint.marker : null }
         : {}),
@@ -398,8 +405,8 @@ process.stdin.on('end', () => {
       `  [ ] 6. session-log — append to projects/<name>/session-log/YYYY-MM-DD.md (daily shard)`,
       `  [ ] 7. index.md  — update Projects section if needed`,
       `  [ ] 8. log.md    — append ## [${today}] session | <project-name>`,
-      `  [ ] 9. hot.md    — update projects/<name>/hot.md (no exceptions)`,
-      `  [ ] 10. root hot.md: generated automatically from projects/*/hot.md; no manual edit needed`,
+      `  [ ] 9. hot.md: generated from projects/<name>/sessions/ at the next session start or stop; do not edit it`,
+      `  [ ] 10. root hot.md: generated automatically; no manual edit needed`,
       `  [ ] 11. updated: field — verify today's date on all touched .md files`,
       `  [ ] 12. lint — run /hypo:lint; fix errors in files YOU touched`,
       `           (other projects' / shared-page debt is reported as non-blocking notice)`,

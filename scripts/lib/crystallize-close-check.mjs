@@ -1,12 +1,15 @@
 import { fileURLToPath } from 'url';
-import { dirname, join } from 'path';
+import { realpathSync } from 'fs';
+import { dirname, join, resolve } from 'path';
 import {
+  datedEntryPaths,
   precompactGateStatus,
   resolveTranscriptBySessionId,
   sessionLogShardPath,
 } from '../../hooks/hypo-shared.mjs';
 import { requireProjectDir, deriveTouchedProject } from './crystallize-close-gate.mjs';
 import { closeCheckpointState, isCloseComplete } from '../../hooks/close-receipt.mjs';
+import { closeGateStatus } from '../../hooks/close-gate-store.mjs';
 
 // This script's own absolute path. Used to print copy-pasteable recovery
 // commands as `node <SELF_SCRIPT> ...` rather than a bare `crystallize` bin,
@@ -50,10 +53,26 @@ export function runSessionCloseCheck(args) {
   // close scope, fall back to the global block, and report RED for debt that the
   // PreCompact notice demotes. Checklist step 14 tells the model to trust this command, so an over-red
   // check is as harmful as an over-green one.
-  const checkTranscript =
-    args.transcriptPath ||
-    (args.sessionId ? resolveTranscriptBySessionId(args.sessionId) : null) ||
-    null;
+  const sessionTranscript = args.sessionId ? resolveTranscriptBySessionId(args.sessionId) : null;
+  const checkTranscript = args.transcriptPath || sessionTranscript || null;
+  // Whether a close is open is read only from the transcript --session-id resolves,
+  // never from --transcript-path: an older copy of the transcript would hide a close
+  // request typed since and read an open close as finished (the marker writers
+  // resolve it the same way). --transcript-path keeps its lint scope role above.
+  const samePath = (a, b) => {
+    const real = (p) => {
+      try {
+        return realpathSync(p);
+      } catch {
+        return resolve(p);
+      }
+    };
+    return real(a) === real(b);
+  };
+  const closeSignalTranscriptDiffers =
+    !!args.transcriptPath &&
+    !!args.sessionId &&
+    (!sessionTranscript || !samePath(sessionTranscript, args.transcriptPath));
   // This session's close verdict, the same closeCheckpointState Stop blocks on.
   // Read first, and only once: readSessionClosedMarker (inside it) unlinks an
   // expired or corrupt marker as it reads, exactly as the next Stop would.
@@ -62,8 +81,21 @@ export function runSessionCloseCheck(args) {
   // The gate takes the marker only from a finished close, so a marker whose
   // receipt is missing or invalid cannot switch it into log-only mode.
   const gateMarker = checkpoint ? { closeMarker: closeComplete ? checkpoint.marker : null } : {};
+  // Which close id proves this session (the gate's cwd check reads it through
+  // sessionProofCloseId): is a close signal open now, and where was the last one
+  // resolved. Read once, for both gate calls below. Without a session id there
+  // is no pin to read and nothing open.
+  const closeGate = args.sessionId
+    ? closeGateStatus({
+        transcriptPath: sessionTranscript,
+        hypoDir: args.hypoDir,
+        sessionId: args.sessionId,
+      })
+    : { ok: false, resolvedAtIndex: null };
+  const closeFacts = { closeOpen: closeGate.ok, resolvedAtIndex: closeGate.resolvedAtIndex };
   let status = precompactGateStatus(args.hypoDir, {
     ...gateMarker,
+    ...closeFacts,
     ...(args.project
       ? { projectOverride: args.project }
       : checkTranscript
@@ -96,6 +128,7 @@ export function runSessionCloseCheck(args) {
     if (inferredProject) {
       status = precompactGateStatus(args.hypoDir, {
         ...gateMarker,
+        ...closeFacts,
         projectOverride: inferredProject,
         ...(args.sessionId ? { sessionId: args.sessionId } : {}),
       });
@@ -168,6 +201,11 @@ export function runSessionCloseCheck(args) {
                 marker_present: markerPresent,
                 close_state: checkpoint.state,
                 ...(checkpoint.reason ? { close_state_reason: checkpoint.reason } : {}),
+                // Present when --transcript-path is not the session's own transcript:
+                // the close signal was read from this one (null: none resolved).
+                ...(closeSignalTranscriptDiffers
+                  ? { close_signal_transcript: sessionTranscript }
+                  : {}),
               }
             : {}),
         },
@@ -200,17 +238,35 @@ export function runSessionCloseCheck(args) {
     `Close check (${scope === 'global' ? `project: ${proj}` : `scope: ${scope}, project: ${proj}`}, date: ${close.dates.join(' / ')}):\n`,
   );
 
+  if (closeSignalTranscriptDiffers) {
+    console.log(
+      `Note: --transcript-path only scopes lint. Whether a close is open was read from this session's own transcript (${sessionTranscript ?? 'none resolved'}).\n`,
+    );
+  }
+
+  // A close is proven by an entry under projects/<p>/sessions/, never by the
+  // generated hot.md / session-state.md views.
   const required = close.project
     ? [
-        `projects/${close.project}/session-state.md`,
-        `projects/${close.project}/hot.md`,
+        `projects/${close.project}/sessions/${close.dates[0]}-<close id>.md`,
         sessionLogShardPath(close.project, close.dates[0]),
         'log.md',
       ]
     : [];
+  // The entry line gets a ✓ only for an entry that is on disk. A close that the
+  // gate passed on its session-log heading alone (an older writer) has none.
+  const entryOnDisk = close.project
+    ? datedEntryPaths(args.hypoDir, close.project, close.dates)[0]
+    : null;
   for (const f of required) {
     const bad = close.missing.includes(f) ? 'missing' : close.stale.includes(f) ? 'stale' : '';
-    console.log(`  ${bad ? '✗' : '✓'} ${f}${bad ? ` — ${bad}` : ''}`);
+    if (!bad && f === required[0] && !entryOnDisk) {
+      console.log(`  · ${f}: none, this close was recorded without an entry (an older writer)`);
+      continue;
+    }
+    console.log(
+      `  ${bad ? '✗' : '✓'} ${bad || f !== required[0] ? f : entryOnDisk}${bad ? ` — ${bad}` : ''}`,
+    );
   }
   // Surface anything not covered by the canonical list (e.g. unresolved project).
   for (const f of [...close.missing, ...close.stale]) {

@@ -61,6 +61,55 @@ test('ADR entry ranked above plain entry with same keyword', () => {
   });
 });
 
+test('lookup never injects a session entry, and still finds a page with the same word', () => {
+  withTmpDir((dir) => {
+    mkdirSync(join(dir, 'projects', 'p', 'sessions'), { recursive: true });
+    mkdirSync(join(dir, 'pages'), { recursive: true });
+    writeFileSync(
+      join(dir, 'projects', 'p', 'sessions', 'x.md'),
+      '# entry\nSESSIONBODYCANARY ZZSESSIONONLY\n',
+    );
+    writeFileSync(join(dir, 'index.md'), '# Index\n- [[x]] — ZZSESSIONONLY note\n');
+    const ask = () => {
+      const r = runHook('hypo-lookup.mjs', { prompt: 'ZZSESSIONONLY' }, { HYPO_DIR: dir });
+      return JSON.stringify(JSON.parse(r.stdout));
+    };
+    const withoutPage = ask();
+    assert.ok(!withoutPage.includes('SESSIONBODYCANARY'), `entry body injected: ${withoutPage}`);
+    assert.ok(!withoutPage.includes('projects/p/sessions'), withoutPage);
+
+    // The pair: the same word in a page is found, so the absence above is the exclusion.
+    writeFileSync(join(dir, 'pages', 'y.md'), '# y\nPAGEBODYCANARY ZZSESSIONONLY\n');
+    writeFileSync(
+      join(dir, 'index.md'),
+      '# Index\n- [[x]] — ZZSESSIONONLY note\n- [[y]] — ZZSESSIONONLY page\n',
+    );
+    const withPage = ask();
+    assert.ok(withPage.includes('PAGEBODYCANARY'), `the page is a hit: ${withPage}`);
+    assert.ok(!withPage.includes('SESSIONBODYCANARY'), `entry body injected: ${withPage}`);
+  });
+});
+
+test('lookup keeps a session entry out of the hits when HYPO_DIR ends in a slash', () => {
+  withTmpDir((dir) => {
+    mkdirSync(join(dir, 'projects', 'p', 'sessions'), { recursive: true });
+    mkdirSync(join(dir, 'pages'), { recursive: true });
+    writeFileSync(
+      join(dir, 'projects', 'p', 'sessions', 'x.md'),
+      '# entry\nSLASHENTRYCANARY ZZSLASHONLY\n',
+    );
+    writeFileSync(join(dir, 'pages', 'y.md'), '# y\nSLASHPAGECANARY ZZSLASHONLY\n');
+    writeFileSync(
+      join(dir, 'index.md'),
+      '# Index\n- [[x]] — ZZSLASHONLY note\n- [[y]] — ZZSLASHONLY page\n',
+    );
+    const r = runHook('hypo-lookup.mjs', { prompt: 'ZZSLASHONLY' }, { HYPO_DIR: `${dir}/` });
+    const ctx = JSON.stringify(JSON.parse(r.stdout));
+    assert.ok(ctx.includes('SLASHPAGECANARY'), `the page is a hit: ${ctx}`);
+    assert.ok(!ctx.includes('SLASHENTRYCANARY'), `entry body injected: ${ctx}`);
+  });
+});
+
 // ── A2: STALE marker at lookup injection ─────────────────────────────────────
 suite('hypo-lookup.mjs — STALE marker at injection (A2)');
 

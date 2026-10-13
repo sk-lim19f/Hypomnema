@@ -160,8 +160,9 @@ These are the recurring terms used in the rest of the README.
 | SoT ("source of truth") | The single file you edit; projections derive from it, never the other way around |
 | hook | A script Claude Code runs automatically on a lifecycle event (e.g. `SessionStart`, `Stop`) |
 | lifecycle event | A point Claude Code surfaces to plugins: session opens, prompt submitted, tool used, compact requested, session ends, etc. |
-| `hot.md` | Per-project cache: "what just happened" (most recent session highlights) |
-| `session-state.md` | Per-project cache: "what's next" (the resume payload for the next session) |
+| session entry | One file per session close under `projects/<name>/sessions/`: a summary plus one update per track. The source of truth for `hot.md` and `session-state.md`, and never deleted |
+| `hot.md` | Generated view: "what just happened" (the most recent session summaries), built from the session entries |
+| `session-state.md` | Generated view: "what's next" (the resume payload for the next session), built from the session entries |
 | `.hypoignore` | Glob patterns that exclude paths from every content-injection hook and from `ingest`; a privacy boundary |
 | `.hyposcanignore` | Glob patterns that exclude paths from catalog scans only (`lint`, `stats`, `query`, `verify`, `doctor`); not a privacy boundary, a matched path still gets committed and read by hooks |
 | observability score | A per-session metric (search / ingest / feedback activity) that measures whether the wiki is actually being used |
@@ -209,11 +210,13 @@ Once installed, you stop _managing_ the wiki. It just accumulates.
 
 ### 4. Why a `hot.md` cache for resume
 
-The most expensive part of a paused project isn't redoing the work, it's rebuilding context. Reading `session-log/` from scratch costs minutes and tokens; reading a one-page `hot.md` costs neither. So we cache the most recent state explicitly: the root `hot.md` pointer table is a projection rebuilt from every project's own `hot.md` on both `SessionStart` and `Stop`, never hand-edited, while each project's own `hot.md` is written by crystallize; both get injected on `SessionStart`. Resume is O(1).
+The most expensive part of a paused project isn't redoing the work, it's rebuilding context. Reading `session-log/` from scratch costs minutes and tokens; reading a one-page `hot.md` costs neither. So we cache the most recent state explicitly. Each session close writes one **session entry** to `projects/<name>/sessions/`, and three files are generated from the entries: the root `hot.md` pointer table, and each project's `hot.md` and `session-state.md`. The hooks rebuild them on both `SessionStart` and `Stop`, and they get injected on `SessionStart`. Resume reads the session entries and renders the views from them, so its cost grows with the number of entries rather than staying at two file reads. Because every session writes its own file, two sessions that close at the same time no longer overwrite each other.
 
-The root `hot.md` is a generated file, not a place to edit by hand. Whatever you type into it will be replaced the next time a hook rebuilds the projection (the next `SessionStart` or `Stop`), because the projection has no way to tell "content worth keeping" from "content in the way": there's no general-purpose compare-and-swap for a file rename, and your editor doesn't honor the advisory lock the hook takes. The first time the projection overwrites content it doesn't recognize as its own, it backs that content up next to the file as `hot.md.pre-projection-backup.md` (or `-2.md`, `-3.md`, ... if more than one has piled up), so nothing is silently discarded. But that backup is a best-effort save, not a safety guarantee: a save that lands mid-rewrite, or an editor that saves in place, can still leave a partial or missing copy. Treat it as a rescue net, not a place to write.
+The three generated files are not a place to edit by hand, and they are not committed (the vault `.gitignore` lists them), so each machine builds its own from the entries it has pulled. Whatever you type into one will be replaced the next time a hook rebuilds it (the next `SessionStart` or `Stop`), because the generator has no way to tell "content worth keeping" from "content in the way": there's no general-purpose compare-and-swap for a file rename, and your editor doesn't honor the advisory lock the hook takes. The first time it overwrites content it doesn't recognize as its own, it backs that content up under `.cache/backups/` (for example `.cache/backups/hot.md.pre-projection-backup.md`, or `-2.md`, `-3.md`, ... if more than one has piled up), so nothing is silently discarded. But that backup is a best-effort save, not a safety guarantee: a save that lands mid-rewrite, or an editor that saves in place, can still leave a partial or missing copy. Treat it as a rescue net, not a place to write.
 
-Don't copy a backup back into the root `hot.md`. The next hook run will just replace it again. Instead: open the backup, read it, move whatever's worth keeping into the right project's `projects/<slug>/hot.md` or a standalone page (you decide which project it belongs to, the hook can't), then delete the backup. To see how many have piled up across the vault, list them from the vault root: `ls hot.md.pre-projection-backup*.md`.
+To change what a generated file says, close a session with the new text. To keep a note that every session of a project should see, write it in `projects/<name>/notes.md`: that file is yours, it is not generated, and it is injected with the project's views. Don't copy a backup back into a generated file. Open the backup, read it, move whatever's worth keeping into `projects/<slug>/notes.md` or a standalone page (you decide which project it belongs to, the hook can't), then delete the backup. To see how many have piled up, list them from the vault root: `ls -R .cache/backups`.
+
+Entries under `sessions/` are never deleted. The generated `hot.md` shows the latest few summaries and links the rest. [Session entries and the move to them](#session-entries-and-moving-an-existing-vault) covers existing vaults.
 
 ### 5. Why a feedback → behavior pipeline
 
@@ -251,15 +254,15 @@ Nine commands cover the full capture → retrieval → consolidation cycle.
 
 | Hook | Event | Role |
 |---|---|---|
-| `hypo-close-guard.mjs` | `PreToolUse` | When a Write/Edit/MultiEdit looks like a session-close write and the transcript carries no close signal from you, ask before it lands |
-| `hypo-session-start.mjs` | `SessionStart` | `git pull --ff-only`, rebuild the root `hot.md` projection, inject `hot.md` / `session-state.md` |
+| `hypo-close-guard.mjs` | `PreToolUse` | Denies a direct Write/Edit/MultiEdit to a generated session view (root `hot.md`, a project's `hot.md` or `session-state.md`) or to a session entry (`projects/<p>/sessions/*.md`) |
+| `hypo-session-start.mjs` | `SessionStart` | `git pull --ff-only`, rebuild the generated session views (root `hot.md`, and each project's `hot.md` and `session-state.md`) from `projects/*/sessions/`, inject them |
 | `hypo-first-prompt.mjs` | `UserPromptSubmit` | Marker-based one-shot request for a resume line on the first prompt (10-min TTL). It does not re-read `hot.md` |
 | `hypo-lookup.mjs` | `UserPromptSubmit` | BM25 top-3 HIT inject / MISS → closest-slug signal |
 | `hypo-compact-guard.mjs` | `UserPromptSubmit` | Detect a typed `/compact` or `/clear` and report an incomplete session close. It never blocks the compact |
 | `hypo-cwd-change.mjs` | `CwdChanged` | Build a notice from the matching project's `hot.md` (see the transmission note below) |
 | `hypo-file-watch.mjs` | `FileChanged` | Build a notice for a changed wiki file (honors `.hypoignore`); nothing in this package registers watch paths, so on a stock install the event has no trigger here at all (see the transmission note below) |
 | `hypo-auto-stage.mjs` | `PostToolUse(Write/Edit/MultiEdit)` | Auto-stage wiki-file edits |
-| `hypo-stop.mjs` | `Stop` | The only registered `Stop` hook. Runs four stages in order, not in parallel: rebuild the root `hot.md` projection (`SessionStart` calls the same generator), record session metadata for the observability score and auto-resume signaling, commit + pull + push, then, after the user signals wrap-up, block `Stop` on a substantial session with no verified close and hand back the `crystallize.mjs --mark-session-closed` command (with uncommitted changes or work still in flight it asks whether to close now instead) |
+| `hypo-stop.mjs` | `Stop` | The only registered `Stop` hook. Runs four stages in order, not in parallel: rebuild the generated session views (`SessionStart` calls the same generator), record session metadata for the observability score and auto-resume signaling, commit + pull + push, then, after the user signals wrap-up, block `Stop` on a substantial session with no verified close and hand back the `crystallize.mjs --mark-session-closed` command (with uncommitted changes or work still in flight it asks whether to close now instead) |
 | `hypo-personal-check.mjs` | `PreCompact` | Surfaces an unfinished session-close, an uncommitted or unpushed wiki, malformed `hot.md`, or lint blockers as a `systemMessage`; it never blocks `/compact`. Session close is still enforced elsewhere: `hypo-stop.mjs`'s crystallize stage blocks on a substantial session with no verified close, and `--mark-session-closed` still refuses the marker on a red gate |
 | `hypo-session-end.mjs` | `SessionEnd` | Write a SessionEnd marker so SessionStart can detect `source=clear` recovery |
 | `hypo-web-fetch-ingest.mjs` | `PostToolUse(WebFetch/WebSearch)` | Inject a `/hypo:ingest` nudge into `additionalContext` after a WebFetch (URL redacted of query/hash/userinfo) or a WebSearch |
@@ -362,13 +365,29 @@ Do not store here:
 ├── projects/            ← project artifacts and session logs
 │   ├── _template/       ← scaffold copied when a new project is created
 │   └── <name>/
-│       ├── hot.md
-│       ├── session-state.md
+│       ├── sessions/         ← one entry per session close (the source, never deleted)
+│       ├── notes.md          ← notes every session shares (yours, optional)
+│       ├── hot.md            ← generated from sessions/, not committed
+│       ├── session-state.md  ← generated from sessions/, not committed
 │       └── session-log/
 ├── journal/             ← daily / weekly / monthly entries
 ├── sources/             ← raw ingested sources (never edit)
-└── .cache/              ← runtime state (gitignored): session scope, parked proposals, sync status
+└── .cache/              ← runtime state (gitignored): session scope, parked proposals, sync status, backups of overwritten generated files
 ```
+
+### Session entries and moving an existing vault
+
+A session close writes `projects/<name>/sessions/<date>-<close_id>.md`. Root `hot.md` and each project's `hot.md` and `session-state.md` are generated from those entries and never committed. Shared notes go in `projects/<name>/notes.md`.
+
+- **A new vault** starts on session entries.
+- **An existing vault without a git remote** moves by itself at its first session start after the upgrade.
+- **An existing vault with a git remote** does not move by itself. Upgrade every machine that uses the vault first, then run `/hypo:upgrade --migrate-sessions` once on one machine. It records the move and pushes it right away, so run it only when every machine is upgraded. Until then, session start tells you about it at most once a day.
+
+Before the move, a close on the new version writes entries only. The generated files stay at their old content and don't change, and session start and `/hypo:resume` show the old files as the starting point with the new entries on top.
+
+A machine that skipped the upgrade is affected after it pulls the move. Its `hot.md` and `session-state.md` disappear, its session start has nothing to inject, its closes are never recorded (the close receipt fails), it can't read `sessions/`, and an unpushed change there that edits those files stops its sync. Upgrade it and run `/hypo:doctor`, which reports recent traces of an older machine.
+
+To go back to the flat files, run the bundled `scripts/session-entries.mjs rollback --at=<commit>`: `node "${CLAUDE_PLUGIN_ROOT}/scripts/session-entries.mjs" rollback --at=<commit>` from Claude Code on a plugin install, or `node "$(npm root -g)/hypomnema/scripts/session-entries.mjs" rollback --at=<commit>` on an npm install. It writes flat `hot.md` and `session-state.md` files rendered from the entries as they were at that commit, tracks them again, and adds a marker file (`.hypo-session-entries-off`) in one new commit. Nothing under `sessions/` is deleted. Entries added after that commit are not in the flat files, a project created after it gets no flat file at all, old-version machines still can't read `sessions/`, and the same text can appear both in an entry and in a flat file. A project whose entries all belong to one machine's `machine:` scope gets flat files tagged with that `visibility_scope`. A project that mixes scopes loses its `machine:` entries from the flat files, and the command prints which projects and how many entries. While the marker is there no hook moves the vault again. The next sync pushes the rollback, so every machine on this vault switches back to the flat files. A machine still on an older version overwrites its local `hot.md` and `session-state.md` when it pulls the rollback, so copy them aside on that machine first (or upgrade it first). The marker carries what re-enabling needs, so don't delete it by hand. To turn session entries back on, run `/hypo:upgrade --migrate-sessions`.
 
 ---
 
@@ -434,7 +453,7 @@ No external services. No API keys. No vector databases.
 
 If you are Claude (or another coding agent) operating a Hypomnema wiki, these are the ground rules.
 
-The wiki is the single source of truth. Everything the user asked you to remember about their work is markdown under the wiki root, and you read it before answering from recollection. `projects/<name>/hot.md` holds the background for one project, `projects/<name>/session-state.md` holds what to do next, and `/hypo:resume` loads both. The `hot.md` at the wiki root is a different file: a pointer table of which projects are active.
+The wiki is the single source of truth. Everything the user asked you to remember about their work is markdown under the wiki root, and you read it before answering from recollection. `projects/<name>/hot.md` holds the background for one project and `projects/<name>/session-state.md` holds what to do next. Both are generated views, so use `/hypo:resume` rather than reading `session-state.md` directly: it reads the session entries and renders both views, and before the move to session entries the flat file on disk can lag the newer closes that `/hypo:resume` includes. The `hot.md` at the wiki root is a different file: a pointer table of which projects are active.
 
 Keep no second copy of that state. `MEMORY.md` and the `<learned_behaviors>` block inside `~/.claude/CLAUDE.md` look like your own memory, but they are one-way projections that Hypomnema derives from `pages/feedback/`. Record a correction with `/hypo:feedback` and let the sync regenerate them. Edit a projection by hand and the next sync stops on it as a conflict instead of merging it, because nothing can tell which side is now the truth; reconciling it back into the feedback page becomes your job. The one exception is a hand edit that already matches what the wiki would write, which the next `--write` takes over. To keep the wiki version of a conflicted block instead, run `hypomnema feedback-sync --import-target-change --from=<target>` first to save a copy of the edit as a draft, then `hypomnema feedback-sync --accept-wiki=<slug>`. And a wiki fact you stash somewhere only you can see never reaches the user's other machines at all.
 

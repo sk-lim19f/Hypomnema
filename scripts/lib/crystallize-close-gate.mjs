@@ -1,6 +1,9 @@
-import { existsSync, statSync } from 'fs';
-import { join } from 'path';
-import { extractTouchedWikiFilesWithTrust } from '../../hooks/hypo-shared.mjs';
+import {
+  extractTouchedWikiFilesWithTrust,
+  nonNfcProjectDir,
+  nonNfcProjectMessage,
+  resolveProjectDirName,
+} from '../../hooks/hypo-shared.mjs';
 
 // ── session-close hard gate ───────────────────────────────────────────────────
 // The marker attests "the USER closed this session". Its evidence transcript is
@@ -20,12 +23,19 @@ import { extractTouchedWikiFilesWithTrust } from '../../hooks/hypo-shared.mjs';
 // projects/<slug> is a hard error so the override never silently resolves to an
 // all-missing status (which a reader would misread as "exists but incomplete").
 export function requireProjectDir(args, slug) {
-  const projectDir = join(args.hypoDir, 'projects', slug);
-  if (!existsSync(projectDir) || !statSync(projectDir).isDirectory()) {
-    const msg = `--project "${slug}" does not exist as a directory (no projects/${slug}/ directory)`;
+  // NFC lookup: the directory keeps its on-disk spelling, and `args.project` is rewritten to it so
+  // every later join and slug comparison uses that spelling.
+  const onDisk = resolveProjectDirName(args.hypoDir, slug);
+  if (onDisk === null) {
+    const decomposed = nonNfcProjectDir(args.hypoDir, slug);
+    const msg =
+      decomposed !== null
+        ? `--project "${slug}": ${nonNfcProjectMessage(decomposed)}`
+        : `--project "${slug}" does not exist as a directory (no projects/${slug}/ directory)`;
     console.log(args.json ? JSON.stringify({ ok: false, error: msg }, null, 2) : `✗ ${msg}`);
     process.exit(1);
   }
+  if (args.project === slug) args.project = onDisk;
 }
 
 // When the global gate's own discovery (hot.md pointer table + today
@@ -52,7 +62,10 @@ export function deriveTouchedProject(hypoDir, transcriptPath) {
   const slugs = new Set();
   for (const f of files) {
     const m = /^projects\/([^/]+)\//.exec(f);
-    if (m && existsSync(join(hypoDir, 'projects', m[1]))) slugs.add(m[1]);
+    // Through the resolver, so a file path in a non-project directory or a decomposed spelling
+    // never counts as a project, and the slug is the on-disk NFC name.
+    const slug = m && resolveProjectDirName(hypoDir, m[1]);
+    if (slug) slugs.add(slug);
   }
   return slugs.size === 1 ? [...slugs][0] : null;
 }

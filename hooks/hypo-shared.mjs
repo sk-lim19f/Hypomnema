@@ -11,6 +11,7 @@ import {
   writeFileSync,
   existsSync,
   statSync,
+  lstatSync,
   appendFileSync,
   mkdirSync,
   rmSync,
@@ -20,13 +21,32 @@ import {
   unlinkSync,
   linkSync,
 } from 'fs';
-import { join, relative, basename, dirname, isAbsolute } from 'path';
+import { join, relative, basename, dirname, isAbsolute, sep, resolve as resolvePath } from 'path';
 import { homedir, hostname, tmpdir } from 'os';
 import { spawnSync } from 'child_process';
 import { randomBytes, createHash } from 'crypto';
 import { fileURLToPath } from 'url';
-import { atomicWrite } from './atomic-write.mjs';
+import { atomicWrite, fsyncDir } from './atomic-write.mjs';
 import { isValidSessionId } from './proposal-store.mjs';
+import {
+  GITIGNORE_BLOCK,
+  LEGACY_TRACK_ID,
+  NEXT_UP_HEADINGS,
+  buildLegacyBaselines,
+  generatedViewSlug,
+  isGeneratedViewPath,
+  isSessionEntryPath,
+  isSessionProjectDir,
+  isValidProjectName,
+  mergeAdditiveGitignore,
+  missingBlockLines,
+  narrowestVisibilityScope,
+  parseSessionEntry,
+  projectNameProblem,
+  scopeVisible,
+  sessionViewPathsOf,
+  nfcRenameCommands,
+} from './session-entries.mjs';
 
 const HOME = homedir();
 
@@ -462,6 +482,25 @@ function remainingSpawnTimeoutMs(deadline) {
   return Number.isSafeInteger(remaining) && remaining > 0 ? remaining : 0;
 }
 
+// True when `git status --porcelain -z` output names a path that is not a lock artifact.
+// `-uall` is what makes this sound: without it a directory holding only a lock file shows
+// as one untracked directory entry and the artifact cannot be told from real work. A
+// rename or copy record is followed by its source path as a bare record.
+function porcelainHasDirt(stdout) {
+  const records = (stdout || '').split('\0');
+  for (let i = 0; i < records.length; i++) {
+    const rec = records[i];
+    if (!rec) continue;
+    const xy = rec.slice(0, 2);
+    if (xy[0] === 'R' || xy[1] === 'R' || xy[0] === 'C' || xy[1] === 'C') {
+      i++;
+      if (records[i] && !isUntrackedLockArtifact(xy, records[i])) return true;
+    }
+    if (!isUntrackedLockArtifact(xy, rec.slice(3))) return true;
+  }
+  return false;
+}
+
 // `opts.deadline` is optional (session-close-scope-boundary spec §5): when
 // omitted, both spawns run exactly as before, no timeout, no status/error
 // check on the second one. hypo-compact-guard.mjs is the only caller that
@@ -481,7 +520,7 @@ export function hypoIsClean(dir = HYPO_DIR, opts = {}) {
     }
     const porcelain = spawnSync(
       'git',
-      ['-C', dir, 'status', '--porcelain'],
+      ['--no-optional-locks', '-C', dir, 'status', '--porcelain', '-uall', '-z'],
       t1 === undefined ? { encoding: 'utf-8' } : { encoding: 'utf-8', timeout: t1 },
     );
     if (porcelain.error || porcelain.status !== 0)
@@ -491,7 +530,7 @@ export function hypoIsClean(dir = HYPO_DIR, opts = {}) {
         ahead: false,
         reason: `git check failed in ${dir}`,
       };
-    const uncommitted = porcelain.stdout.trim() !== '';
+    const uncommitted = porcelainHasDirt(porcelain.stdout);
 
     const t2 = remainingSpawnTimeoutMs(deadline);
     if (t2 === 0) {
@@ -504,7 +543,7 @@ export function hypoIsClean(dir = HYPO_DIR, opts = {}) {
     }
     const aheadRes = spawnSync(
       'git',
-      ['-C', dir, 'status', '--branch', '--porcelain'],
+      ['--no-optional-locks', '-C', dir, 'status', '--branch', '--porcelain'],
       t2 === undefined ? { encoding: 'utf-8' } : { encoding: 'utf-8', timeout: t2 },
     );
     // Only enforced when a deadline is in play. Without one this spawn cannot
@@ -574,6 +613,9 @@ export function hypoIsClean(dir = HYPO_DIR, opts = {}) {
  * together run twice as long as intended). Omitted, both spawns run exactly
  * as before — precompactGateStatus's own call (`:3874`) does not pass one.
  */
+// Read-only status calls here pass --no-optional-locks: a plain `git status` may take
+// .git/index.lock to refresh the index, and outside the vault commit lock that collides
+// with another close's `git add` ("index.lock: File exists").
 export function gitDirtyFiles(dir = HYPO_DIR, opts = {}) {
   const { deadline } = opts;
   const t1 = remainingSpawnTimeoutMs(deadline);
@@ -594,7 +636,7 @@ export function gitDirtyFiles(dir = HYPO_DIR, opts = {}) {
   if (t2 === 0) return [];
   const porcelain = spawnSync(
     'git',
-    ['-C', dir, 'status', '--porcelain', '-uall', '-z'],
+    ['--no-optional-locks', '-C', dir, 'status', '--porcelain', '-uall', '-z'],
     t2 === undefined ? { encoding: 'utf-8' } : { encoding: 'utf-8', timeout: t2 },
   );
   if (porcelain.error || porcelain.status !== 0) return [];
@@ -617,9 +659,9 @@ export function gitDirtyFiles(dir = HYPO_DIR, opts = {}) {
       fromFile = records[i] || null;
     }
     const rel = toDirRelative(file);
-    if (rel) out.push(rel);
+    if (rel && !isUntrackedLockArtifact(xy, rel)) out.push(rel);
     const relFrom = toDirRelative(fromFile);
-    if (relFrom) out.push(relFrom);
+    if (relFrom && !isUntrackedLockArtifact(xy, relFrom)) out.push(relFrom);
   }
   return out;
 }
@@ -717,8 +759,9 @@ export function hotMdIsClean(dir = HYPO_DIR) {
 // ── strict session-close verification ────────────────────────────
 // spec §5.2.7 / §8.3 (updated 2026-05-15): session-close = steps 1~6 of the
 // 11-step crystallize checklist (synthesis is steps 7~11). The hard gate
-// (sessionCloseFileStatus) confirms the 4 mandatory files: session-state.md,
-// project hot.md, session-log/YYYY-MM-DD.md, and log.md. Root hot.md is NOT
+// (sessionCloseFileStatus) confirms the close files: this close's own session
+// entry (projects/<p>/sessions/<date>-<close id>.md), session-log/YYYY-MM-DD.md, and
+// log.md. The generated session-state.md and project hot.md are not close files. Root hot.md is NOT
 // one of them: it became a hook-generated projection, so the close no longer
 // writes it and the gate no longer checks it (see the note at the
 // checkUpdated calls in sessionCloseFileStatus for why its `updated:` field
@@ -1221,14 +1264,9 @@ export function collectProjectWorkingDirs(hypoDir) {
   // existsSync is true for a regular file too, and it says nothing about
   // permissions, so readdirSync here can still throw ENOTDIR or EACCES. It
   // used to, and the caller that matters is SessionStart's cwd-to-project
-  // resolution, which runs long before the projection writer. An unguarded
-  // throw there took the whole hook to its top-level catch, which meant the
-  // projection's own scanError branch (the one that tells a person WHICH
-  // directory to fix) could never be reached on the real hook path: it was
-  // dead code for exactly the inputs it existed to report. Degrade to "no
-  // projects" instead. Resolving cwd to a project is a convenience, and the
-  // projection scan re-reads this same directory moments later and surfaces
-  // the real failure with its own notice.
+  // resolution, which runs long before the view writer. An unguarded throw
+  // there took the whole hook to its top-level catch. Degrade to "no projects"
+  // instead. Resolving cwd to a project is a convenience.
   let slugs;
   try {
     slugs = readdirSync(projectsDir);
@@ -1265,20 +1303,50 @@ export function collectProjectWorkingDirs(hypoDir) {
   return out;
 }
 
-// One place that answers "is this string a slug naming a real project directory?".
-// Both resolveGateProjectOverride (a caller-supplied --project) and the gate's
-// mustEvaluate filter (slugs arriving from a transcript or a marker) need it, and
-// having the grammar in two inline copies is the duplication this release spent a
-// codex round removing elsewhere. Not exported: scripts/ has its own validator,
-// and importing that here would invert the one-way hooks/ <- scripts/ dependency.
-function isProjectSlugDirectory(hypoDir, slug) {
-  if (typeof slug !== 'string' || !/^[A-Za-z0-9._-]+$/.test(slug)) return false;
-  if (/^\.+$/.test(slug) || !/[A-Za-z0-9]/.test(slug)) return false;
+// One place that answers "is this string a slug naming a real project directory?" and, if so,
+// which directory name it is on disk. Both resolveGateProjectOverride (a caller-supplied
+// --project) and the gate's mustEvaluate filter (slugs arriving from a transcript or a marker)
+// need it. The grammar is session-entries' isValidProjectName, the one rule every gate shares.
+// Names are compared in NFC: a payload name typed in NFD finds a directory stored in NFC (and the
+// reverse) even on a filesystem that compares bytes. The returned name is the one on disk, so
+// callers join paths and compare slugs with the spelling the directory really has. A directory
+// whose on-disk spelling is not NFC resolves to null: git on macOS reports NFC paths, so every
+// supplied-path match, entry project and gate slug built from that name would miss. Callers that
+// can say why ask nonNfcProjectDir. Exported for scripts/, which resolves its own payload and
+// --project names through it.
+function findProjectDir(hypoDir, slug) {
+  if (!isValidProjectName(slug)) return null;
+  const want = slug.normalize('NFC');
   try {
-    return statSync(join(hypoDir, 'projects', slug)).isDirectory();
+    const names = readdirSync(join(hypoDir, 'projects'));
+    const hit = names.includes(slug) ? slug : names.find((n) => n.normalize('NFC') === want);
+    return hit !== undefined && statSync(join(hypoDir, 'projects', hit)).isDirectory() ? hit : null;
   } catch {
-    return false;
+    return null;
   }
+}
+
+export function resolveProjectDirName(hypoDir, slug) {
+  const hit = findProjectDir(hypoDir, slug);
+  return hit !== null && projectNameProblem(hit) === null ? hit : null;
+}
+
+// The on-disk name when `slug` finds a project directory spelled in a non-NFC form, else null.
+// This is the reason resolveProjectDirName returned null for a name that does exist.
+export function nonNfcProjectDir(hypoDir, slug) {
+  const hit = findProjectDir(hypoDir, slug);
+  return hit !== null && projectNameProblem(hit) === 'not-nfc' ? hit : null;
+}
+
+// The refusal text for a non-NFC project directory, with the command that fixes it. APFS treats the
+// NFC and NFD spellings as one name, and rename respells the directory in one move.
+export function nonNfcProjectMessage(onDisk) {
+  const [command] = nfcRenameCommands(onDisk);
+  return (
+    `projects/${onDisk} is spelled in decomposed (NFD) Unicode, and git reports project paths ` +
+    `precomposed (NFC), so the close cannot match its files. Rename projects/${onDisk} to its NFC ` +
+    `spelling first: ${command}`
+  );
 }
 
 // session-close-scope-boundary spec §2: the one place that turns a caller-
@@ -1292,8 +1360,8 @@ function isProjectSlugDirectory(hypoDir, slug) {
 // CLI itself parses it (parseArgs + requireProjectDir); a value that arrives
 // via a hook payload or apply's JSON body never passes through that. So this
 // re-validates from scratch — same charset rule as project-create.mjs's
-// isValidProjectName, duplicated rather than imported because hooks/ cannot
-// import scripts/ (dependency direction is one-way) — plus a directory
+// isValidProjectName, imported from session-entries.mjs, the one place that
+// owns the rule — plus a directory
 // existence check. Either failure returns null, the same as "no project was
 // given": a garbage slug must never narrow the gate's scope, only a real one
 // may (spec success criterion: "opts.projectOverride 가 없는 slug 이면 게이트가
@@ -1315,7 +1383,7 @@ function isProjectSlugDirectory(hypoDir, slug) {
 // @returns {string|null}
 export function resolveGateProjectOverride(hypoDir, { project = null, sessionCwd = null } = {}) {
   if (project) {
-    return isProjectSlugDirectory(hypoDir, project) ? project : null;
+    return resolveProjectDirName(hypoDir, project);
   }
   return pickProjectByCwd(collectProjectWorkingDirs(hypoDir), sessionCwd, {
     rejectAmbiguous: true,
@@ -1466,88 +1534,34 @@ function pickByCwd(hypoDir, slugs, cwd) {
   });
 }
 
-// ── root hot.md projection ──────────────────────────────────────────────────
-// Root hot.md stops being a file Claude edits and becomes a deterministic
-// projection of `projects/<slug>/hot.md`: whoever reads it (resolveActiveProject,
-// closeCandidateSlugs, SessionStart's injection) gets a table built fresh off
-// disk, never a hand-maintained one that can drop a row or go stale. The row
-// set comes ONLY from a directory scan, never from parsing the previous root
-// file: that old parse (hypo-hot-rebuild.mjs's retired parsePointerRows) is
-// exactly what let a manually deleted row stay deleted forever.
-//
-// Three functions, split on purpose: scanRootHotProjectionSources does the
-// one directory walk and reports what it saw, INCLUDING whether the walk
-// itself failed; formatRootHotProjection turns scanned rows into the
-// canonical markdown, pure and disk-free; renderRootHotProjection composes
-// the two into the same pure string generator every existing caller already
-// expects, so a scan error there still resolves to "no rows" exactly like
-// before (out of scope for this pure entry point: see writeRootHotProjection
-// for the one caller that DOES act on scanError). writeRootHotProjection is
-// the only thing that ever touches disk, skipping the write entirely when the
-// projection is byte-identical to what is already there (so a no-op run
-// never dirties the file's mtime or trips a git diff), and refusing to write
-// at all when the scan itself failed (a transient read error must not commit
-// an empty/partial table over real content).
+// ── generated view bookkeeping ───────────────────────────────────────────────
+// The generated views (`projects/<p>/hot.md`, `projects/<p>/session-state.md` and the root
+// `hot.md`) are rendered and written by `hooks/session-views.mjs`. What stays here is what that
+// writer and the pull resolution share: the backup path calculation below, the recovery sentence
+// a notice carries, and the one-time read of the old root projection's ownership hash.
 
-const ROOT_HOT_PROJECTS_TEMPLATE_SLUG = '_template';
-
-// This exact sentence has been part of every generated root hot.md since the
-// projection shipped (separately pinned by 'generated body text is pinned' in
-// tests/session-hooks.test.mjs), so its presence on disk is proof the file is
-// already projection-owned and safe to overwrite without a backup. Its
-// absence means a hand-authored file, or one from before this projection
-// existed. See writeRootHotProjection's migration-backup step below.
-const ROOT_HOT_PROJECTION_MARKER = 'generated projection of `projects/*/hot.md`';
-
-// Sits next to hot.md itself so a person who opens the vault root finds it
-// without hunting: `hot.md.pre-projection-backup.md`. Written every time
-// writeRootHotProjection sees content it does not own (readRootHotProjectionOwnership's
-// hash comparison, not a one-shot marker check), and there is no cap: each
-// unowned write that finds the plain suffix already taken gets its own
-// numbered path from nextRootHotBackupPath, without limit.
+// File-name suffix of a view backup, kept under `.cache/backups/` (see VIEW_BACKUP_DIR_REL):
+// `.cache/backups/hot.md.pre-projection-backup.md`. Every backup of bytes the generator did not
+// write gets its own numbered path from nextGeneratedBackupPath, without limit.
 export const ROOT_HOT_BACKUP_SUFFIX = '.pre-projection-backup.md';
 
-// Root-anchored (leading `/`) so this only ever matches the backup sitting
-// next to hot.md itself, never an unrelated file elsewhere in the vault that
-// happens to share the tail of the name. The trailing `*` covers every
-// variant nextRootHotBackupPath can produce: the plain suffix, a `-2`/`-3`/...
-// counter, and the timestamp fallback.
-const ROOT_HOT_BACKUP_GITIGNORE_PATTERN = '/hot.md.pre-projection-backup*.md';
-
-// minor fix: atomicWrite's own temp file for a backup write
-// (`<backupPath>.<pid>.<random>.tmp`, see atomic-write.mjs) carries the exact
-// same hand-authored bytes the backup above protects, but the pattern above
-// only matches the FINAL `.md` name. A kill or power loss between that temp
-// write and its rename leaves the temp sitting unignored: no cleanup runs
-// on the next start, and nothing reads or removes it, so `git add -A`
-// exposes it. The glob's `*` matches the `.md` in the middle too (gitignore
-// globs don't stop at `.`, only at `/`), so this one pattern covers the temp
-// name for every backupPath variant nextRootHotBackupPath can produce.
-const ROOT_HOT_BACKUP_TMP_GITIGNORE_PATTERN = '/hot.md.pre-projection-backup*.tmp';
-
 /**
- * The one recovery sentence for a hand-authored root hot.md that just got
- * backed up before a projection write replaced it (major fix, codex 3rd-tier
- * finding 6). Naming the backup file alone is not a recovery path: copying
- * it back onto root hot.md just gets it replaced again on the next rebuild.
- * Three writers can trigger this backup: SessionStart's own direct write,
- * the Stop-hook rebuild (hypo-hot-rebuild.mjs), and project-create's own
- * `writeRootHotProjection` call. Before this fix only SessionStart's
- * own write site carried the guidance half of the message; the Stop-hook's
- * health notice and project-create's warnings named the filename alone,
- * with no route back to the content. One formatter, used by all three, so
- * they cannot drift into three different wordings of the same advice (and
- * so a future fourth call site gets the full message by construction,
- * not by remembering to copy it). Matches the longer version already
- * carried in both READMEs; do not change the wording without updating those
- * too.
- * @param {string} backupPath absolute path to the migration backup
+ * The one recovery sentence for a generated view whose unowned bytes were just backed up before
+ * the generator replaced them. Naming the backup file alone is not a recovery path: copying it
+ * back onto the view just gets it replaced again on the next write. One formatter for every
+ * writer, so they cannot drift into different wordings of the same advice.
+ * @param {string} viewRelPath the view's vault-relative path (`hot.md`, `projects/<p>/hot.md`, ...)
+ * @param {string} backupPath absolute path to the backup
  * @returns {string}
  */
-export function rootHotBackupRecoveryNotice(backupPath) {
+export function rootHotBackupRecoveryNotice(viewRelPath, backupPath) {
+  // A project view names its own project; the root `hot.md` has none to name, so the placeholder
+  // is written to be read as one.
+  const project = generatedViewSlug(viewRelPath) ?? '<프로젝트>';
   return (
-    `루트 hot.md 의 이전 내용을 ${basename(backupPath)} 로 백업했습니다 (손으로 편집한 내용이 있었습니다). ` +
-    `루트로 되돌리지 마세요. 다음 훅 실행이 다시 덮어씁니다. 열어 본 뒤 남길 내용을 projects/<slug>/hot.md 나 별도 페이지로 옮기고 백업은 지우세요.`
+    `생성 파일 \`${viewRelPath}\`에 생성기가 쓰지 않은 내용이 있어 \`${backupPathForNotice(backupPath)}\`에 보관했습니다. ` +
+    '구버전 Hypomnema(같은 기계의 다른 설치일 수 있습니다)나 사람이 쓴 내용으로 보입니다. 자동으로 합치지 않았습니다. ' +
+    `남길 내용은 다음 close의 요약이나 \`projects/${project}/notes.md\`로 옮기세요.`
   );
 }
 
@@ -1558,19 +1572,14 @@ function sha256Hex(content) {
 }
 
 /**
- * Durable "did WE write the bytes currently on disk" state, read from
- * `.cache/`. Replaces a plain `ROOT_HOT_PROJECTION_MARKER` substring check: a
- * hand-authored hot.md that happens to quote that exact sentence (copied out
- * of documentation, for instance) used to read as "already ours" under the
- * substring check and skip the backup step outright, destroying real content
- * with nothing left to recover it from. A hash of the exact bytes this
- * function itself last wrote cannot collide by accident the way a fixed
- * sentence can. Missing or corrupt state resolves to "no prior hash": the
- * safe direction, since the only cost is one extra (harmless, since it is
- * never lost) backup on the next write, never a silently skipped one.
+ * The hash the old root `hot.md` projection last wrote, from `.cache/`. Nothing writes this file
+ * any more: the view writer reads it once, as the starting ownership of `hot.md` when it has no
+ * `generated-views.json` yet, so a vault upgraded from the projection does not back up bytes the
+ * old writer itself produced. Missing or corrupt state resolves to "no prior hash": the safe
+ * direction, since the only cost is one extra backup.
  * @returns {{lastHash: string|null}}
  */
-function readRootHotProjectionOwnership(hypoDir) {
+export function readRootHotProjectionOwnership(hypoDir) {
   const path = join(hypoDir, '.cache', ROOT_HOT_PROJECTION_STATE_FILENAME);
   if (!existsSync(path)) return { lastHash: null };
   try {
@@ -1581,146 +1590,12 @@ function readRootHotProjectionOwnership(hypoDir) {
   }
 }
 
-/** Best-effort: a failure here only costs one extra backup on the NEXT
- * write (ownership falls back to "no prior hash"), never a lost one. */
-function writeRootHotProjectionOwnership(hypoDir, hash) {
-  try {
-    atomicWrite(
-      join(hypoDir, '.cache', ROOT_HOT_PROJECTION_STATE_FILENAME),
-      JSON.stringify({ lastHash: hash }),
-    );
-  } catch {
-    // see doc comment above
-  }
-}
-
-// n1 fix (3rd-round codex review): a per-SESSION companion to the global
-// ownership state above. The global hash only proves "SOME session's write
-// is what is on disk right now": any session's writeRootHotProjection call
-// updates it, including one that runs AFTER this session claimed 'hot.md'
-// but BEFORE this session's own Stop. A vault has exactly one root hot.md,
-// so two sessions across DIFFERENT projects race it constantly (measured
-// against 349 real sessions: 2081 overlapping pairs). Without this,
-// hypo-auto-commit.mjs's rootHotProjectionIsCurrent check read "disk matches
-// the last write" as true and staged a SIBLING session's bytes into this
-// session's commit, content this session never produced. Each session's own
-// receipt records the exact digest ITS OWN write last produced, so the
-// commit-time check below can require BOTH the global hash and this
-// session's own receipt to agree with the current disk bytes.
-const ROOT_HOT_PROJECTION_RECEIPT_FILENAME = 'root-hot-projection-receipt.json';
-
-function rootHotProjectionReceiptPath(hypoDir, sessionId) {
-  return join(sessionCacheDir(hypoDir, sessionId), ROOT_HOT_PROJECTION_RECEIPT_FILENAME);
-}
-
-/**
- * Read the digest THIS session's own write last recorded. Missing, corrupt,
- * or no session_id all resolve to `null`: the safe direction, since the
- * only cost of a false `null` is this session's legitimate write sitting
- * uncommitted for one extra Stop (see rootHotProjectionIsCurrent below),
- * never a wrongly staged write.
- * @returns {{digest: string|null}}
- */
-function readRootHotProjectionReceipt(hypoDir, sessionId) {
-  if (!sessionId) return { digest: null };
-  const path = rootHotProjectionReceiptPath(hypoDir, sessionId);
-  if (!existsSync(path)) return { digest: null };
-  try {
-    const parsed = JSON.parse(readFileSync(path, 'utf-8'));
-    return { digest: typeof parsed?.digest === 'string' ? parsed.digest : null };
-  } catch {
-    return { digest: null };
-  }
-}
-
-/**
- * Best-effort, same shape as writeRootHotProjectionOwnership: a failure here
- * only costs THIS session's own write not being recognized as current at ITS
- * OWN Stop (a missing/stale receipt reads as "not proven mine" and excludes
- * hot.md from this round's commit), never a lost write. The bytes are
- * already durable on disk either way, and the next SessionStart/Stop that
- * runs a write re-establishes both records. No-op without a session_id:
- * there is no per-session file to write one to.
- */
-function writeRootHotProjectionReceipt(hypoDir, sessionId, digest) {
-  if (!sessionId) return;
-  try {
-    atomicWrite(rootHotProjectionReceiptPath(hypoDir, sessionId), JSON.stringify({ digest }));
-  } catch {
-    // see doc comment above
-  }
-}
-
-/** Does the CURRENT on-disk hot.md match the bytes this function itself last
- * wrote? See readRootHotProjectionOwnership for why this replaced a
- * substring check on ROOT_HOT_PROJECTION_MARKER. Exported: hypo-auto-commit.mjs's
- * scoped-commit wrapper re-runs this at commit time (see
- * rootHotProjectionIsCurrent below) rather than trusting a session's
- * touched-paths claim alone. */
-export function ownershipMatches(hypoDir, current) {
-  const { lastHash } = readRootHotProjectionOwnership(hypoDir);
-  return !!lastHash && sha256Hex(current) === lastHash;
-}
-
-/**
- * Whether the bytes CURRENTLY on disk at the vault's root hot.md are exactly
- * what writeRootHotProjection itself last wrote or confirmed. This is the
- * commit-time half of the blocker fix in r5-w1.md: 'hot.md' can sit in a
- * session's touched-paths set without this session's own write having
- * actually landed there (a scanError that never clears the pre-write claim,
- * a lock-timeout on the post-write record, or simply a claim made before a
- * human's own edit lands mid-session): the claim only ever proves intent,
- * never the bytes on disk at commit time. hypo-auto-commit.mjs's scoped-commit
- * wrapper calls this immediately before staging, so a stale claim over
- * content this session did not actually write is excluded there no matter
- * how or why it went stale, instead of enumerating every write-outcome
- * branch and remembering to revoke the claim on each one. A staged content
- * this rejects is not lost: the next SessionStart or Stop that manages a
- * successful scan runs writeRootHotProjection again, which backs up
- * non-owned content through this SAME check before overwriting it, exactly
- * like any other external edit.
- *
- * n1 fix (3rd-round codex review): the global ownership check alone only
- * proves SOME session's write produced the current bytes, never that THIS
- * session's did: a sibling session's write between this session's claim and
- * its own Stop updates the global hash to the SIBLING's digest, and the old
- * global-only check read that as "current" and staged the sibling's bytes
- * into this session's commit. `sessionId` is now required to also prove
- * OWNERSHIP: this session's own receipt (see writeRootHotProjectionReceipt)
- * must independently match the current disk digest, not just the global
- * record every session's write shares.
- * @param {string} hypoDir
- * @param {string|null|undefined} sessionId the session about to stage hot.md
- * @returns {boolean} true when there is no root hot.md at all (nothing to
- *   protect against) or its bytes hash-match both the global ownership hash
- *   AND this session's own last-recorded receipt; false when it exists, is
- *   readable, and either does not match, is unreadable, or `sessionId` never
- *   recorded a matching receipt, none of which can prove THIS session
- *   produced what is on disk right now.
- */
-export function rootHotProjectionIsCurrent(hypoDir, sessionId) {
-  const hotPath = join(hypoDir, 'hot.md');
-  if (!existsSync(hotPath)) return true;
-  let content;
-  try {
-    content = readFileSync(hotPath, 'utf-8');
-  } catch {
-    return false; // unreadable: cannot prove it is ours, so do not stage it
-  }
-  if (!ownershipMatches(hypoDir, content)) return false;
-  const { digest } = readRootHotProjectionReceipt(hypoDir, sessionId);
-  return !!digest && digest === sha256Hex(content);
-}
-
 /**
  * First unused backup path for `hotPath`: the plain suffix if free, else a
- * numbered variant. Before this, a SECOND external overwrite arriving after
- * the first migration backup already existed was silently destroyed --
- * writeRootHotProjection saw the fixed backup filename already taken, skipped
- * the backup step entirely, and overwrote hot.md anyway. Every later
- * non-owned overwrite now gets its own place to land instead.
+ * numbered variant, so every later non-owned overwrite gets its own place
+ * to land instead of finding the plain name taken and skipping the backup.
  */
-function nextRootHotBackupPath(hotPath) {
+function nextGeneratedBackupPath(hotPath) {
   const plain = `${hotPath}${ROOT_HOT_BACKUP_SUFFIX}`;
   if (!existsSync(plain)) return plain;
   const stem = ROOT_HOT_BACKUP_SUFFIX.slice(0, -'.md'.length); // '.pre-projection-backup'
@@ -1734,8 +1609,26 @@ function nextRootHotBackupPath(hotPath) {
   return `${hotPath}${stem}-${Date.now()}.md`;
 }
 
+// Where view backups live, relative to the vault: `.cache/backups/<view relPath>.pre-projection-backup*.md`.
+// Never next to the view: before the migration ignore block lands, and after a rollback, no pattern
+// ignores that name, so a blanket `git add -A` would stage a backup holding a person's notes.
+// `.cache/` is ignored by every vault `.gitignore` this plugin writes.
+export const VIEW_BACKUP_DIR_REL = join('.cache', 'backups');
+
 /**
- * Back `content` up next to `hotPath`, unless a backup already holds exactly
+ * The part of a backup path that a notice shows: from `.cache/backups/` on, so the reader can open
+ * it from the vault root. A path from before the move (next to the view) shows its file name.
+ */
+export function backupPathForNotice(backupPath) {
+  const marker = `${VIEW_BACKUP_DIR_REL}${sep}`;
+  const at = backupPath.lastIndexOf(marker);
+  return at === -1 ? basename(backupPath) : backupPath.slice(at).split(sep).join('/');
+}
+
+/**
+ * Back `content` up under `.cache/backups/` (see `VIEW_BACKUP_DIR_REL`) for `viewPath` (any
+ * generated view's absolute path inside `hypoDir`, not only the root hot.md: the session view
+ * writer and the pull resolution use the same function), unless a backup already holds exactly
  * these bytes.
  *
  * minor fix: the backup and the `.gitignore` update run BEFORE the write that
@@ -1747,7 +1640,7 @@ function nextRootHotBackupPath(hotPath) {
  * makes the retry converge instead: one backup per distinct content, however
  * many times the write after it fails.
  *
- * Reuses nextRootHotBackupPath's candidate order, so the paths checked here
+ * Reuses nextGeneratedBackupPath's candidate order, so the paths checked here
  * are exactly the ones a fresh backup could occupy, and an unreadable
  * candidate counts as "not a match" (the safe direction: one extra copy, not
  * a skipped one).
@@ -1756,13 +1649,21 @@ function nextRootHotBackupPath(hotPath) {
  * projection write after it would still succeed. Failing the whole directory
  * cannot tell "the backup ran and failed" from "the backup never ran", since
  * the projection write fails there too.
+ * `content` is a string or a Buffer (bytes that may not be text).
  * @returns {string} the backup path now holding `content`, fresh or reused
  */
-function backUpOnce(hotPath, content, testHooks) {
+export function backUpGeneratedPath(hypoDir, viewPath, content, testHooks) {
+  const rel = relative(hypoDir, viewPath);
+  if (rel === '' || rel.startsWith('..') || isAbsolute(rel)) {
+    throw new Error(`backup target is outside the vault: ${viewPath}`);
+  }
+  const hotPath = join(hypoDir, VIEW_BACKUP_DIR_REL, rel);
   const stem = ROOT_HOT_BACKUP_SUFFIX.slice(0, -'.md'.length);
   const holdsContent = (candidate) => {
     try {
-      return readFileSync(candidate, 'utf-8') === content;
+      return readFileSync(candidate).equals(
+        Buffer.isBuffer(content) ? content : Buffer.from(content, 'utf-8'),
+      );
     } catch {
       return false; // unreadable: cannot prove it already holds these bytes
     }
@@ -1778,19 +1679,19 @@ function backUpOnce(hotPath, content, testHooks) {
       if (holdsContent(candidate)) return candidate;
     }
   }
-  const fresh = nextRootHotBackupPath(hotPath);
+  const fresh = nextGeneratedBackupPath(hotPath);
   testHooks?.beforeBackupWrite?.(fresh);
-  atomicWrite(fresh, content);
+  // Durable: the archive record that names this backup is written next, and the clearing step
+  // removes the original after that. A power loss must not keep the record and lose the backup.
+  atomicWrite(fresh, content, { durable: true });
   return fresh;
 }
 
 /**
  * Append `pattern` to the vault's own `.gitignore` when it is not already
- * there. NOT best-effort: called right before the FIRST backup write of a
- * migration (see writeRootHotProjection), and a failure here propagates like
- * the backup write's own failure does: a backup file git can see and
- * auto-commit is not a backup, it is a leak, so the write that would create
- * one must never proceed once this step has been skipped by a thrown error.
+ * there. NOT best-effort: a caller about to write a file git must never see
+ * calls this first and lets a thrown error stop that write, since a file git can
+ * see and auto-commit is a leak, not a private copy.
  * @returns {boolean} true when the file was actually changed
  */
 export function ensureVaultGitignorePattern(hypoDir, pattern) {
@@ -1804,537 +1705,1570 @@ export function ensureVaultGitignorePattern(hypoDir, pattern) {
   return true;
 }
 
-/**
- * Scan `projects/*\/hot.md` and report both the rows and whether the scan
- * itself succeeded. Rows come only from directories that carry a `hot.md`: a
- * project without one yet gets no row, since the table's link column would
- * otherwise point at a file that does not exist (a broken wikilink under
- * lint). `_template` is never a row.
- *
- * `projects/` itself not existing is NOT a scan error: a fresh vault has no
- * projects dir yet, and an empty row set is the honest answer for that case.
- * `scanError` is reserved for `projects/` existing but `readdirSync` failing
- * (permission error, transient I/O): the one case that used to collapse into
- * the same empty array as "no projects yet," letting a transient read failure
- * render (and, through writeRootHotProjection, WRITE) an empty table over a
- * populated one. A per-project `hot.md` that exists but fails to read is
- * narrower: the directory walk itself succeeded, so the row is kept with a
- * blank date (same as before) plus a warning instead of a silently blanked
- * date.
- *
- * Per row: display name is always the slug, never that project's frontmatter
- * `title`: a project's `title` is that page's own heading text (things like
- * `hot: hypomnema` or `security-backoffice: Hot Cache`), not a name a human
- * chose to read in this table's Project column. An earlier version of this
- * function read `title` here on the mistaken belief that it would agree with
- * the slug; measured against a real vault it rewrote the Project column on 15
- * of 38 rows for no actual information gain. Date is that project's
- * frontmatter `updated`, left BLANK (never defaulted to today) when absent,
- * unreadable, OR not a well-formed `YYYY-MM-DD` string: a malformed value
- * (`stale`, `2026-9-1`, a YAML-parsed non-string) is left blank rather than
- * passed through, because it would otherwise flow unvalidated into a raw
- * string compare (`r.date > max` below) where a token like `"stale"` sorts
- * ahead of every real ISO date, and into the root file's own frontmatter
- * `updated:` (formatRootHotProjection takes the max of every row's date),
- * leaving a token like `stale` sitting in that field for as long as this
- * project's row stays malformed. Root hot.md's `updated:` is the max of the
- * project rows, not the date the file itself was last rewritten. That is why
- * sessionCloseFileStatus no longer checks this field against today's date:
- * a sibling project's later row would otherwise fail a close that did
- * everything right. The test 'n1: root hot.md must not be reported stale by a
- * sibling project whose row date is the max' pins that exemption.
- * A malformed value surfacing to a human at all is left to
- * `hypo:lint`'s wave-3 project-file checks, out of this wave's scope; this
- * function's job is only to keep the bad token from leaking into ANYTHING it
- * generates. Rows sort by date
- * descending, blank dates last, ties broken by slug ascending, so two
- * machines scanning the same tree produce byte-identical output.
- * @param {string} hypoDir
- * @returns {{rows: Array<{slug: string, date: string}>, scanError: boolean, warnings: string[]}}
- */
-export function scanRootHotProjectionSources(hypoDir) {
-  const projectsDir = join(hypoDir, 'projects');
-  const rows = [];
-  const warnings = [];
-  let scanError = false;
-  if (existsSync(projectsDir)) {
-    let entries = [];
-    try {
-      entries = readdirSync(projectsDir);
-    } catch (err) {
-      scanError = true;
-      warnings.push(`projects/ 디렉터리를 읽지 못했습니다: ${err?.message ?? String(err)}`);
-      entries = [];
-    }
-    for (const slug of entries) {
-      if (slug === ROOT_HOT_PROJECTS_TEMPLATE_SLUG) continue;
-      const hotPath = join(projectsDir, slug, 'hot.md');
-      // Read directly instead of gating on existsSync first: existsSync folds
-      // EVERY stat failure (a permission error, not just "genuinely absent")
-      // into `false`, which used to delete this project's row from the table
-      // exactly like a real ENOENT would, with no warning at all. Only ENOENT
-      // (and ENOTDIR, a parent segment turning out not to be a directory)
-      // means "no hot.md here yet". Every other error (EACCES, EIO, ...)
-      // keeps the row with a blank date and a warning, same as a read failure
-      // that happens after a successful existsSync always did.
-      let content = '';
-      let present = true;
-      try {
-        content = readFileSync(hotPath, 'utf-8');
-      } catch (err) {
-        if (err?.code === 'ENOENT' || err?.code === 'ENOTDIR') {
-          present = false;
-        } else {
-          warnings.push(
-            `projects/${slug}/hot.md 를 읽지 못해 날짜를 비웠습니다: ${err?.message ?? String(err)}`,
-          );
-          content = '';
-        }
-      }
-      if (!present) continue;
-      const rawDate = parseFrontmatterField(content, 'updated');
-      const date = /^\d{4}-\d{2}-\d{2}$/.test(rawDate || '') ? rawDate : '';
-      rows.push({ slug, date });
-    }
-  }
-  return { rows: sortRootHotRows(rows), scanError, warnings };
-}
+// ── vault git path helpers ───────────────────────────────────────────────────
+// The vault may be a subdirectory of a larger repository. `<rev>:./<path>` makes
+// git resolve the path from the vault; `update-index --cacheinfo` and other
+// repository-root paths take `vaultGitPrefix` in front instead.
 
-/**
- * Sort scanned rows date descending, blank dates last, ties broken by slug
- * ascending, so two directory scans of the same tree agree on row order
- * regardless of what order the filesystem itself handed the entries back in.
- * Mutates and returns `rows`.
- *
- * The slug tie-break is defence in depth, and a mutation test could not pin
- * it while this lived inline inside the scan loop above: on this machine
- * (macOS, APFS), readdirSync returns entries already sorted even when the
- * filesystem itself does not (measured 2026-09-17: same directory, raw order
- * "bb zz aa mm", readdirSync order "aa bb mm zz"), so a real directory scan
- * on this machine always hands this function slug-ascending input, and a
- * stable sort keeps that order with or without the tie-break. That ordering
- * is not guaranteed elsewhere: a filesystem like ext4 with `dir_index`
- * enabled returns entries in hash order, not name order, so the tie-break
- * is load-bearing there even though it never fires on this machine's tests.
- * Extracted into its own function so a test can
- * call it directly against a fixed adversarial input order instead of going
- * through a live scan. The date comparator's two other axes were always
- * reachable through a scan (flipping descending to ascending, or swapping the
- * blank-date placement, each reddens `row order` regardless of input order).
- * @param {Array<{slug: string, date: string}>} rows
- * @returns {Array<{slug: string, date: string}>}
- */
-export function sortRootHotRows(rows) {
-  return rows.sort((a, b) => {
-    if (a.date !== b.date) {
-      if (!a.date) return 1;
-      if (!b.date) return -1;
-      return b.date.localeCompare(a.date);
-    }
-    return a.slug.localeCompare(b.slug);
+const vaultGit = (hypoDir, args, extra = {}) =>
+  spawnSync('git', ['-C', hypoDir, ...args], {
+    encoding: 'utf-8',
+    timeout: 30000,
+    maxBuffer: 64 * 1024 * 1024,
+    ...extra,
   });
+
+/** `<rev>:./<relPath>`: a `git show` / `cat-file` argument resolved from the vault. */
+export function revPathArg(rev, relPath) {
+  return `${rev}:./${relPath}`;
 }
 
 /**
- * Format already-scanned rows into the canonical root hot.md markdown. Pure:
- * never touches disk. Frontmatter `updated:` is the max row date (or '' when
- * every row is dateless), never today: a today value would make the same
- * tree produce different bytes on different days, which is the one property
- * this projection exists to have. That also means this field is not the date
- * the file itself was last rewritten, which is why the session-close gate
- * exempts it. See the note where sessionCloseFileStatus stops short of
- * checking the root file, and the test that pins that exemption.
- *
- * Exported for one reason beyond `renderRootHotProjection`: `scripts/init.mjs`
- * writes `formatRootHotProjection([])` straight into a brand-new vault as its
- * root hot.md. There is no template copy to drift from it any more. If init
- * wrote anything else, the first SessionStart would see bytes it did not
- * write, back them up, and tell the person their hand edits were preserved,
- * in a vault nobody has edited yet. tests/init.test.mjs pins that init's
- * output is exactly this function's.
- * @param {Array<{slug: string, date: string}>} rows
- * @returns {string}
+ * Whether HEAD's tree has `relPath`: `'present'`, `'absent'` (also when the
+ * repository has no commit yet), or `'error'` when git could not answer (no
+ * repository, a broken one). A caller that would act on "absent" must not read an
+ * error as one.
  */
-export function formatRootHotProjection(rows) {
-  const tableRows = rows
-    .map((r) => `| ${r.slug} | ${r.date} | [[projects/${r.slug}/hot]] |`)
-    .join('\n');
-  const updated = rows.reduce((max, r) => (r.date && r.date > max ? r.date : max), '');
-
-  return `---
-title: "Hot Cache: Pointer"
-type: reference
-updated: ${updated}
-tags: [wiki, operations]
----
-
-# Hot Cache
-
-> Read at session start → navigate to the relevant project session-state.md and hot.md.
-> This "Active Projects" table is a ${ROOT_HOT_PROJECTION_MARKER}, rebuilt at every session start and stop. Update session-state.md and hot.md in the relevant project instead: a hand edit to this table is overwritten by the next session.
-
-## Active Projects
-
-| Project | Last Session | Hot Cache |
-|---|---|---|
-${tableRows}
-
-## Session Start Checklist
-
-1. Check this file for the relevant project link
-2. Read \`projects/<name>/session-state.md\` for next tasks if it exists
-3. Read \`projects/<name>/hot.md\` for project background
-`;
+export function headPathState(hypoDir, relPath) {
+  const r = vaultGit(hypoDir, ['ls-tree', '--name-only', 'HEAD', '--', relPath]);
+  if (!r.error && r.status === 0) return r.stdout.length > 0 ? 'present' : 'absent';
+  // A repository with no commit yet (unborn HEAD) has no path in HEAD at all.
+  const head = vaultGit(hypoDir, ['rev-parse', '--verify', '-q', 'HEAD']);
+  const repo = vaultGit(hypoDir, ['rev-parse', '--git-dir']);
+  return !head.error && head.status === 1 && repo.status === 0 ? 'absent' : 'error';
 }
 
-/**
- * Build the canonical root hot.md content by scanning `projects/*\/hot.md`.
- * Pure: reads disk, never writes, and stays a plain string return so every
- * existing caller/test keeps working unchanged. A scan error (see
- * scanRootHotProjectionSources) resolves to an empty row set here, same as
- * before this split: this entry point has no way to signal "the scan
- * failed" to a caller that only wants a string. writeRootHotProjection below
- * is the one caller that needs that signal and gets it directly from
- * scanRootHotProjectionSources instead of through this function.
- * @param {string} hypoDir
- * @returns {string}
- */
-export function renderRootHotProjection(hypoDir) {
-  const { rows } = scanRootHotProjectionSources(hypoDir);
-  return formatRootHotProjection(rows);
+/** Whether HEAD's tree has `relPath` (a blob or a tree). False with no HEAD or no repository. */
+export function pathInHead(hypoDir, relPath) {
+  return headPathState(hypoDir, relPath) === 'present';
 }
 
-/**
- * Regenerate root hot.md and write it only when the bytes actually changed.
- *
- * The lock-free body. Every caller goes through writeRootHotProjection below,
- * which holds the vault commit lock around this whole function; see there for
- * why the lock has to cover the read as well as the write.
- *
- * Called from both hypo-session-start.mjs (SessionStart, before the file is
- * read by resolveActiveProject/closeCandidateSlugs/the injection below) and
- * hypo-hot-rebuild.mjs (Stop). Both hooks calling the same function is the
- * point: there is exactly one generator, not two copies that can drift.
- *
- * A scan error (projects/ directory exists but cannot be read) skips the
- * write entirely and leaves whatever is already on disk untouched: see
- * scanRootHotProjectionSources.
- *
- * The FIRST time this overwrites a file whose bytes do not match what this
- * function itself last wrote (a hand-authored hot.md, one written before
- * this projection existed, or ANY later external overwrite, per
- * ownershipMatches), the existing bytes are backed up next to it
- * (nextRootHotBackupPath: the plain `hot.md` + ROOT_HOT_BACKUP_SUFFIX name if
- * free, else a numbered variant, so a second external overwrite after the
- * first migration backup still lands somewhere instead of being silently
- * destroyed) before the projection is written. Immediately before that FIRST
- * backup write, the vault's own `.gitignore` is made to cover the backup
- * filename pattern if it does not already (ensureVaultGitignorePattern): a
- * backup file that a scoped auto-commit can see and push is a leak of
- * whatever secret a person's uncommitted manual notes held, not a backup.
- * Neither the gitignore update nor the backup write is best-effort: a
- * failure in either throws out of this function (both call sites already
- * wrap this in try/catch), which aborts the write, so a person's unsaved
- * content is never replaced without somewhere ignored-and-recoverable to
- * find it. Every write after the first sees the ownership hash already
- * match and skips this step, and an existing backup file is never
- * overwritten by a later one.
- * major fix (TOCTOU): the ownership check above reads `hotPath` once, then
- * this function still has to run ensureVaultGitignorePattern and the backup
- * write (both real I/O against OTHER files) before it ever gets to the
- * rename that actually replaces `hotPath`. A human's own save can land in
- * that gap: it would be read as "ours" by the stale `current` and vanish
- * with no backup, since atomic rename only ever protects against a reader
- * seeing a torn write, never against this compare-then-replace race. This
- * function re-reads `hotPath` a second time, immediately before the
- * replacing write, and folds ANY bytes that appeared in that gap into the
- * backup too. That shrinks the race to the two lines directly around the
- * final `atomicWrite` call below (a read and a rename with nothing else in
- * between), which is as far as this can be narrowed without an advisory
- * lock that a person's own editor or shell would not honor anyway (see the
- * major finding in r5-w1.md for why that is not pursued here).
- * @param {string} hypoDir
- * @param {{ beforeFinalWrite?: (hotPath: string) => void, beforeBackupWrite?: (backupPath: string) => void }} [testHooks]
- *   `beforeBackupWrite` is test-only too: see backUpOnce.
- *   `beforeFinalWrite` is test-only: called with `hotPath` right after the
- *   second read below and before the final `atomicWrite`, so a test can
- *   write NEW bytes to `hotPath` at exactly the point a real concurrent
- *   writer would need to land in to be missed: genuine two-process timing
- *   inside one synchronous call cannot be reproduced deterministically
- *   otherwise. Production callers never pass this.
- * @param {string|null} [sessionId] n1 fix: when given, this call's own
- *   digest is recorded as THIS session's receipt (see
- *   writeRootHotProjectionReceipt), so rootHotProjectionIsCurrent can later
- *   tell this session's own write apart from a sibling session's. Omitted by
- *   every caller that does not need commit-time attribution (most existing
- *   tests, a direct `--json` CLI run).
- * @returns {{written: boolean, scanError: boolean, lockTimeout: boolean, backedUp: boolean, backupPath: string|null, gitignoreUpdated: boolean, warnings: string[], content: string|null}}
- *   content is the bytes now on disk (whether this call wrote them or they
- *   were already there), null only on a scanError. Callers that need to hash
- *   what actually landed (hypo-hot-rebuild.mjs's advanceBase) use this
- *   instead of a second, separate scan that could observe different bytes if
- *   a sibling session writes a project's hot.md in between the two scans.
- *   `lockTimeout` is true only on the wrapper's own refusal (see
- *   writeRootHotProjection below): nothing was read, written, or recorded.
- */
-function writeRootHotProjectionUnlocked(hypoDir, testHooks, sessionId) {
-  const { rows, scanError, warnings } = scanRootHotProjectionSources(hypoDir);
-  if (scanError) {
-    return {
-      written: false,
-      scanError: true,
-      lockTimeout: false,
-      backedUp: false,
-      backupPath: null,
-      gitignoreUpdated: false,
-      warnings,
-      content: null,
-    };
-  }
-  const projection = formatRootHotProjection(rows);
-  const hotPath = join(hypoDir, 'hot.md');
-  // BLOCKER fix: only a genuinely absent file (ENOENT) may be treated as "no
-  // prior content to protect". Any other read failure (permissions,
-  // transient I/O) used to fold into the same `null` and skip the backup
-  // step below outright, reproducing the exact data-loss the backup exists
-  // to prevent. Throwing here (rather than returning a sentinel) reuses the
-  // try/catch both call sites already wrap this function in.
-  let current = null;
+/** The vault's path inside its repository (`vault/`, or `''` at the top or outside a repository). */
+export function vaultGitPrefix(hypoDir) {
+  const r = vaultGit(hypoDir, ['rev-parse', '--show-prefix']);
+  return r.status === 0 ? r.stdout.replace(/\r?\n$/, '') : '';
+}
+
+// ── session projects and migration state ─────────────────────────────────────
+// Defined here, not in session-views.mjs (which re-exports them), because the
+// close gate in this file needs them and session-views imports this file.
+
+/** Present in HEAD's tree when the vault was rolled back to the old flat files on purpose. */
+export const SESSION_ENTRIES_OFF_MARKER = '.hypo-session-entries-off';
+
+const statIs = (path, kind) => {
   try {
-    current = readFileSync(hotPath, 'utf-8');
+    return kind === 'dir' ? statSync(path).isDirectory() : statSync(path).isFile();
+  } catch {
+    return false;
+  }
+};
+
+// A file or a symlink (dangling or not) sits at the path. `git add` stages both, and `statIs`
+// follows links, so a dangling one would read as absent.
+const isFileOrLink = (path) => {
+  try {
+    const st = lstatSync(path);
+    return st.isFile() || st.isSymbolicLink();
+  } catch {
+    return false;
+  }
+};
+
+/**
+ * Slugs of the `projects/` children that are session projects, in code-unit order. A vault with no
+ * `projects/` directory has none (`[]`). Any other read error (EACCES, EIO) throws: an empty list
+ * must mean "no projects", never "could not look", or a root table rendered from it would silently
+ * drop every row.
+ */
+export function listSessionProjects(hypoDir) {
+  let names;
+  try {
+    names = readdirSync(join(hypoDir, 'projects'));
   } catch (err) {
-    if (err?.code !== 'ENOENT') throw err;
-    current = null;
+    if (err?.code === 'ENOENT' || err?.code === 'ENOTDIR') return [];
+    throw err;
   }
-  if (current === projection) {
-    // Establish/refresh ownership even on a no-op write: a vault upgrading
-    // onto this fix has a genuinely-owned hot.md but no prior recorded hash
-    // yet, and this is the cheap place to record one without risking a
-    // spurious backup on the NEXT real write. Best-effort by design (see
-    // writeRootHotProjectionOwnership): a failure here just costs one
-    // extra harmless backup later, never a lost one.
-    writeRootHotProjectionOwnership(hypoDir, sha256Hex(projection));
-    // n1 fix: a no-op still confirms this session's OWN projection algorithm
-    // produced exactly what is on disk right now, so it is legitimate for
-    // this session to also record a receipt for it: the bytes are not
-    // borrowed from whichever session wrote them first, they are identical
-    // regardless of who computed them.
-    writeRootHotProjectionReceipt(hypoDir, sessionId, sha256Hex(projection));
-    return {
-      written: false,
-      scanError: false,
-      lockTimeout: false,
-      backedUp: false,
-      backupPath: null,
-      gitignoreUpdated: false,
-      warnings,
-      content: projection,
-    };
-  }
-  let backedUp = false;
-  let backupPath = null;
-  let gitignoreUpdated = false;
-  const ensureBackupIgnored = () => {
-    // Both patterns, not best-effort either: see the doc comment above --
-    // the second covers atomicWrite's own temp file for the backup write
-    // itself (minor fix, r5-w1.md), which would otherwise carry the same
-    // hand-authored bytes unignored if this process is killed between that
-    // temp write and its rename.
-    const a = ensureVaultGitignorePattern(hypoDir, ROOT_HOT_BACKUP_GITIGNORE_PATTERN);
-    const b = ensureVaultGitignorePattern(hypoDir, ROOT_HOT_BACKUP_TMP_GITIGNORE_PATTERN);
-    return a || b;
-  };
-  if (current !== null && !ownershipMatches(hypoDir, current)) {
-    gitignoreUpdated = ensureBackupIgnored();
-    backupPath = backUpOnce(hotPath, current, testHooks);
-    backedUp = true;
-  }
-  // major fix (TOCTOU narrowing): re-read right before the write that
-  // actually replaces `hotPath`, rather than trusting the `current` read
-  // from above (see this function's own doc comment for why). Anything
-  // that differs from `current` gets its own backup here too, so a save
-  // landing during ensureBackupIgnored/the backup write above is still
-  // caught instead of silently discarded by the rename below. `testHooks`
-  // fires BEFORE this read (a no-op in production) so a test can write new
-  // bytes at exactly the point this read needs to observe them; in
-  // production nothing runs between `current`'s read above and this one.
-  //
-  // What this re-read is NOT: a safety boundary. It is best-effort salvage,
-  // and calling it "a race narrowed to microseconds" overstates it. Work
-  // still happens after this read: the `.gitignore` update and the backup
-  // write below both run against other files, and atomicWrite itself writes a
-  // whole temp file before the rename. A person's save landing anywhere in
-  // there is still replaced with no copy kept, and an editor that saves in
-  // place (truncate, then write) can leave a partial file for this read to
-  // back up, so even a salvaged backup is not guaranteed to hold a complete
-  // document. Nothing here can close that: POSIX rename has no general
-  // compare-and-swap ("replace only if the bytes are still X"), and an
-  // editor honors no advisory lock this file could take. The real fix is to
-  // stop sharing one pathname between a generated file and a hand-edited
-  // one, which this change does not do.
-  testHooks?.beforeFinalWrite?.(hotPath);
-  let latest = current;
-  try {
-    latest = readFileSync(hotPath, 'utf-8');
-  } catch (err) {
-    if (err?.code !== 'ENOENT') throw err;
-    latest = null;
-  }
-  if (latest !== current && latest !== null && !ownershipMatches(hypoDir, latest)) {
-    if (!gitignoreUpdated) gitignoreUpdated = ensureBackupIgnored();
-    backupPath = backUpOnce(hotPath, latest, testHooks);
-    backedUp = true;
-  }
-  // atomicWrite, not writeFileSync: this write now happens at BOTH
-  // SessionStart and Stop (previously Stop-only), so two sessions starting
-  // around the same time can race this write against each other. A plain
-  // writeFileSync truncates before writing its new bytes, so a reader
-  // (another SessionStart's read of hot.md, or hypo-file-watch, if it ever
-  // gains a trigger) could observe a torn/empty file mid-write; atomicWrite
-  // (temp file + rename) never exposes that state. log.md's append path
-  // (deriveRootLogEntries below) already uses atomicWrite for the same
-  // reason.
-  atomicWrite(hotPath, projection);
-  writeRootHotProjectionOwnership(hypoDir, sha256Hex(projection));
-  writeRootHotProjectionReceipt(hypoDir, sessionId, sha256Hex(projection)); // n1 fix
-  return {
-    written: true,
-    scanError: false,
-    lockTimeout: false,
-    backedUp,
-    backupPath,
-    gitignoreUpdated,
-    warnings,
-    content: projection,
-  };
+  return names
+    .filter((slug) => {
+      const dir = join(hypoDir, 'projects', slug);
+      return (
+        statIs(dir, 'dir') &&
+        isSessionProjectDir({
+          slug,
+          hasIndex: statIs(join(dir, 'index.md'), 'file'),
+          hasSessions: statIs(join(dir, 'sessions'), 'dir'),
+        })
+      );
+    })
+    .sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
 }
 
 /**
- * The locked entry point every caller uses. Holds the vault commit lock
- * (vaultCommitLockTarget, the same one hypo-auto-commit.mjs and
- * crystallize.mjs's apply take around stage+commit) across the WHOLE
- * projection write: the first read of hot.md, the ownership check, the
- * backup, the replacing rename, and the ownership/receipt records.
- *
- * BLOCKER fix: without this the writer took no lock at all, so a sibling
- * session's rename could land between hypo-auto-commit.mjs's ownership and
- * receipt check and the `git add` that follows it, inside the auto-commit's
- * own lock hold. The sibling's bytes then went into THIS session's commit
- * looking like a normal update, and the touched record that would have
- * flagged it was gone. One lock shared by the writer and the commit fence is
- * what makes that check mean anything at commit time. The receipt check
- * stays regardless: it is the fail-closed half for everything this lock
- * cannot cover (a lock we failed to take, a person's editor, another tool).
- *
- * The lock is NOT reentrant, so nothing inside `writeRootHotProjectionUnlocked`
- * may take it again, and a caller that already holds it must call the
- * unlocked form instead, as claimAndWriteRootHotProjection (below) does.
- * hypo-session-start.mjs takes it for its own `git pull` and releases it
- * before calling claimAndWriteRootHotProjection,
- * hypo-hot-rebuild.mjs (Stop) runs before hypo-auto-commit.mjs rather than
- * inside it, and scripts/lib/project-create.mjs holds no lock.
- *
- * A lock timeout is NOT an error here: it returns `lockTimeout: true` with
- * `written: false` and a warning row, so the caller can say the pointer table
- * was left as-is and move on. Throwing would turn a busy vault into a failed
- * `project-create`, and waiting longer would eat a SessionStart's 30s budget
- * for a file the session can still read the previous version of.
- * @param {string} hypoDir
- * @param {{ beforeFinalWrite?: (hotPath: string) => void, beforeBackupWrite?: (backupPath: string) => void }} [testHooks]
- * @param {string|null} [sessionId]
- * @returns {{written: boolean, scanError: boolean, lockTimeout: boolean, backedUp: boolean, backupPath: string|null, gitignoreUpdated: boolean, warnings: string[], content: string|null}}
+ * The generated view paths git tracks. `source: 'index'` (default) is `git ls-files`, `'head'` is
+ * `git ls-tree -r HEAD`. Filtered by `isGeneratedViewPath`, never by a pathspec (`*` crosses `/`).
+ * Throws when git cannot answer: an empty list must always mean "nothing tracked".
  */
-export function writeRootHotProjection(hypoDir, testHooks, sessionId) {
+export function listTrackedGeneratedViews(hypoDir, { source = 'index' } = {}) {
+  if (source !== 'head' && source !== 'index') {
+    throw new Error(`listTrackedGeneratedViews: source must be 'head' or 'index', got ${source}`);
+  }
+  const args =
+    source === 'head' ? ['ls-tree', '-r', '-z', '--name-only', 'HEAD'] : ['ls-files', '-z'];
+  const r = vaultGit(hypoDir, args);
+  if (r.status !== 0) throw new Error(`git ${args[0]} failed: ${String(r.stderr).trim()}`);
+  return r.stdout.split('\0').filter((p) => isGeneratedViewPath(p));
+}
+
+/**
+ * The generated views HEAD tracks in a vault that counts as migrated: what a push must not hand to
+ * other machines, and what `doctor` reports with the `git rm --cached` remedy. "Migrated" is either
+ * the upstream carrying the `.gitignore` block with HEAD having taken it in (`@{u}` is an ancestor
+ * of HEAD, so a copy that has not pulled yet is not judged), or HEAD's own `.gitignore` holding the
+ * whole block (the only reading a vault with no remote has). The off marker in HEAD is a rollback
+ * on purpose, where tracking the flat files is the intended state: it is judged by presence only,
+ * its content is never read. Throws when git cannot list the tracked paths. `[]` means nothing to
+ * report.
+ */
+export function listRetrackedViews(hypoDir) {
+  if (pathInHead(hypoDir, SESSION_ENTRIES_OFF_MARKER)) return [];
+  const caughtUp =
+    upstreamIsMigrated(hypoDir) &&
+    vaultGit(hypoDir, ['merge-base', '--is-ancestor', '@{u}', 'HEAD']).status === 0;
+  if (!caughtUp) {
+    const shown = vaultGit(hypoDir, ['show', revPathArg('HEAD', '.gitignore')]);
+    const missing = shown.status === 0 ? missingBlockLines(shown.stdout, GITIGNORE_BLOCK) : null;
+    if (!missing || missing.length) return [];
+  }
+  return listTrackedGeneratedViews(hypoDir, { source: 'head' });
+}
+
+// A `.git` in `dir` or a parent, a directory or the file a linked worktree or submodule has. Both
+// the path as given and its real path are walked: a vault reached through a symlink to a
+// subdirectory of a repository has its `.git` above the real path, not above the link.
+function hasGitEntry(dir) {
+  const starts = [resolvePath(dir)];
   try {
-    return withFileLock(
-      vaultCommitLockTarget(hypoDir),
-      () => writeRootHotProjectionUnlocked(hypoDir, testHooks, sessionId),
-      // Read per call, not at module load, so a test can force a fast
-      // timeout on a lock it holds itself (same env var hypo-auto-commit.mjs
-      // reads for the same lock).
-      { timeoutMs: Number(process.env.HYPO_VAULT_LOCK_TIMEOUT_MS) || 5000 },
+    starts.push(realpathSync(dir));
+  } catch {
+    // unresolvable: the path as given is all there is
+  }
+  for (const start of starts) {
+    for (let d = start; ; d = dirname(d)) {
+      if (existsSync(join(d, '.git'))) return true;
+      if (dirname(d) === d) break;
+    }
+  }
+  return false;
+}
+
+/**
+ * True for a vault that is not a git repository and has no `.git` entry in it or any parent. Such a
+ * vault tracks nothing, so `migrationState` calls it `migrated`, and its old `hot.md` and
+ * `session-state.md` are moved to baseline entries by the generator instead of a migration commit.
+ * Git failing to answer while the entry is there is not this (the vault may well track views).
+ */
+export function vaultHasNoGit(hypoDir) {
+  return (
+    vaultGit(hypoDir, ['rev-parse', '--is-inside-work-tree']).status !== 0 && !hasGitEntry(hypoDir)
+  );
+}
+
+/**
+ * `'migrated' | 'not-migrated' | 'opted-out' | 'incomplete-block'`, read from HEAD's tree only (the real index is not
+ * consulted: a migration commit moves HEAD and the index together). The off marker in HEAD is
+ * `opted-out`; the `.gitignore` block in HEAD plus no tracked generated view in HEAD is
+ * `migrated`; a `.gitignore` in HEAD that has the block's first line but lacks one of its pattern
+ * lines is `incomplete-block` (a hand edit or a bad merge: nothing treats it as `migrated`, and
+ * migration waits for the user to restore it); anything else, including git failing to answer, is
+ * `not-migrated`. Only a vault with
+ * no `.git` entry in it or any parent (`hasGitEntry`) tracks nothing and counts as `migrated`: when
+ * git cannot say whether the directory is a work tree (not installed, dubious ownership, a timeout,
+ * a broken config) but the entry is there, the vault may well track views, so it is `not-migrated`.
+ */
+export function migrationState(hypoDir) {
+  if (vaultGit(hypoDir, ['rev-parse', '--is-inside-work-tree']).status !== 0) {
+    return hasGitEntry(hypoDir) ? 'not-migrated' : 'migrated';
+  }
+  if (pathInHead(hypoDir, SESSION_ENTRIES_OFF_MARKER)) return 'opted-out';
+  const shown = vaultGit(hypoDir, ['show', revPathArg('HEAD', '.gitignore')]);
+  const missing = shown.status === 0 ? missingBlockLines(shown.stdout, GITIGNORE_BLOCK) : null;
+  if (missing === null) return 'not-migrated';
+  if (missing.length) return 'incomplete-block';
+  try {
+    return listTrackedGeneratedViews(hypoDir, { source: 'head' }).length === 0
+      ? 'migrated'
+      : 'not-migrated';
+  } catch {
+    return 'not-migrated';
+  }
+}
+
+// Paths per git call in `localChangesOn`: a pathspec per path on the command line stays under the
+// argument-size limit of the platform however many paths a migration commit touches.
+const LOCAL_CHANGES_CHUNK = 500;
+
+/**
+ * Which of `relPaths` carry uncommitted changes: `{staged, unstaged}`. `staged` is where the index
+ * differs from HEAD, `unstaged` where the working tree differs from the index (so a path staged and
+ * then edited again is in both). Each path is a literal pathspec of its own, so `*` and `:` in a
+ * name mean themselves. Untracked files are not changes here. When git cannot answer (no HEAD, not
+ * a repository) every path is reported in both lists: this decides whether it is safe to start, so
+ * the failure must land on the side that stops. The paths go to git in groups of `chunkSize`
+ * (default 500) and the answers are joined; a group git cannot answer counts as all changed.
+ */
+export function localChangesOn(hypoDir, relPaths, { chunkSize = LOCAL_CHANGES_CHUNK } = {}) {
+  const staged = [];
+  const unstaged = [];
+  for (let i = 0; i < relPaths.length; i += chunkSize) {
+    const group = relPaths.slice(i, i + chunkSize);
+    const specs = literalSpecs(group);
+    const names = (args) => {
+      const r = vaultGit(hypoDir, args);
+      return r.status === 0 ? r.stdout.split('\0').filter(Boolean) : null;
+    };
+    staged.push(
+      ...(names(['diff', '--cached', '--name-only', '-z', '--relative', 'HEAD', '--', ...specs]) ??
+        group),
     );
+    unstaged.push(...(names(['diff', '--name-only', '-z', '--relative', '--', ...specs]) ?? group));
+  }
+  return { staged, unstaged };
+}
+
+// ── catching up with a migration commit ──────────────────────────────────────
+// Another machine's migration (or rollback) commit changes paths this machine may hold local edits
+// on. git then refuses to fast-forward or merge, and reports no unmerged path, so no conflict
+// resolution would ever see it. `clearGeneratedPathsBlockingPull` clears that block first and sets
+// the bytes it removes aside; `shareLegacyBytes` publishes them afterwards as additional baseline
+// entries so a memory that lived only on this machine reaches the others. None of these takes the
+// vault commit lock: the caller holds it, and the lock is not reentrant.
+
+const PULL_ARCHIVE_REL = join('.cache', 'pull-archive.json');
+const GENERATED_VIEWS_RECORD_REL = join('.cache', 'generated-views.json');
+const ISO_DAY_RE = /^\d{4}-\d{2}-\d{2}/;
+const BASELINE_FILE_RE = /-baseline-[0-9a-f]{16}\.md$/;
+
+function gitOut(hypoDir, args) {
+  const r = vaultGit(hypoDir, args);
+  return r.status === 0 ? r.stdout : null;
+}
+
+/**
+ * The files Hypomnema keeps under `.cache/` (a view backup, the ownership record, the pull archive)
+ * that a `git add -A` would stage because no ignore rule covers them, as paths relative to the vault.
+ * `[]` means every one is ignored, or there is no repository (nothing to stage). A repository whose
+ * check-ignore fails or answers with another code counts as nothing ignored. The
+ * block this plugin writes ignores `/.cache/`, but a vault with its own `.gitignore` may not, and
+ * the backups hold a person's own notes. Callers write nothing under `.cache/` while this is not
+ * empty. A tracked path counts as not ignored, which is the safe side. A vault that ignores only
+ * individual cache files is deferred too: the backups sit at paths no such rule names.
+ */
+export function unignoredCachePaths(hypoDir) {
+  // `.cache/` itself, plus a backup path as deep as the ones `backUpGeneratedPath` writes, so a
+  // rule that names a few files (or one directory level) does not pass for ignoring the tree.
+  return unignoredPaths(hypoDir, [
+    '.cache/',
+    '.cache/backups/projects/probe/hot.md.pre-projection-backup.md',
+    '.cache/pull-archive.json',
+    '.cache/generated-views.json',
+  ]);
+}
+
+/**
+ * The paths of `paths` (relative to the vault) that git would NOT ignore, judged by the effective
+ * rules in one `git check-ignore --stdin -z` call. A tracked path counts as not ignored. When git
+ * cannot answer, inside a repository every path counts as not ignored (that is not proof of an
+ * ignore rule); outside one there is nothing to stage and the answer is `[]`.
+ */
+export function unignoredPaths(hypoDir, paths) {
+  if (!paths.length) return [];
+  const r = vaultGit(hypoDir, ['check-ignore', '--stdin', '-z'], {
+    input: paths.map((p) => `${p}\0`).join(''),
+  });
+  if (r.status !== 0 && r.status !== 1) {
+    return vaultGit(hypoDir, ['rev-parse', '--is-inside-work-tree']).status === 0 ? paths : [];
+  }
+  const ignored = new Set(String(r.stdout).split('\0'));
+  return paths.filter((p) => !ignored.has(p));
+}
+
+/** The notice that goes with a deferral because `unignoredCachePaths` was not empty. */
+export function cacheNotIgnoredNotice(paths) {
+  return (
+    `.gitignore가 ${paths.join(', ')}를 무시하지 않아 백업과 기록을 쓰지 않고 미뤘습니다 ` +
+    '(그대로 쓰면 git add -A가 개인 메모가 든 백업을 스테이징합니다). ' +
+    '.gitignore가 `/.cache/`를 무시하도록 고치면(줄을 추가하거나 뒤의 `!` 규칙을 지웁니다) 다음 시도에서 진행됩니다.'
+  );
+}
+
+// `git show <rev>:./<path>` as text, `null` when git cannot produce it (no such path or revision).
+function gitShowText(hypoDir, rev, relPath) {
+  const r = spawnSync('git', ['-C', hypoDir, 'show', revPathArg(rev, relPath)], {
+    encoding: 'utf-8',
+    timeout: 30000,
+    maxBuffer: 64 * 1024 * 1024,
+  });
+  return r.status === 0 ? r.stdout : null;
+}
+
+function readTextOrNull(path) {
+  try {
+    return readFileSync(path, 'utf-8');
   } catch (err) {
-    if (err?.code !== 'ELOCKTIMEOUT') throw err;
-    return rootHotLockTimeoutResult();
+    if (err?.code === 'ENOENT') return null;
+    throw err;
   }
 }
 
-function rootHotLockTimeoutResult() {
+const literalSpecs = (paths) => paths.map((p) => `:(literal)${p}`);
+
+// A project is hidden by `.hypoignore` when its session entries are (isIgnored's second look
+// covers a pattern on either view path or on the project directory). The generator, the migration
+// and the catch-up all ask this one question.
+export const projectHiddenByHypoignore = (hypoDir, slug, patterns) =>
+  patterns.length > 0 &&
+  isIgnored(join(hypoDir, 'projects', slug, 'sessions', 'x.md'), hypoDir, patterns);
+
+const isAncestorOfHead = (hypoDir, sha) =>
+  vaultGit(hypoDir, ['merge-base', '--is-ancestor', sha, 'HEAD']).status === 0;
+
+/**
+ * `.cache/generated-views.json` = {views: {relPath: sha256}}: the bytes the generator last wrote at
+ * each generated path. Returns `{views, state}` with `state` `'ok'`, `'missing'` (no file) or
+ * `'invalid'` (unreadable, not JSON, or `views` not an object); `views` is `{}` unless `'ok'`.
+ * Entries whose value is not a string are dropped. The generator and the catch-up share this one
+ * reader, so "did we write these bytes" has one answer.
+ */
+export function readGeneratedViewsRecord(hypoDir) {
+  let raw;
+  try {
+    raw = readFileSync(join(hypoDir, GENERATED_VIEWS_RECORD_REL), 'utf-8');
+  } catch (err) {
+    return { views: {}, state: err?.code === 'ENOENT' ? 'missing' : 'invalid' };
+  }
+  try {
+    const views = JSON.parse(raw)?.views;
+    if (views === null || typeof views !== 'object' || Array.isArray(views))
+      throw new Error('shape');
+    return {
+      views: Object.fromEntries(Object.entries(views).filter(([, v]) => typeof v === 'string')),
+      state: 'ok',
+    };
+  } catch {
+    return { views: {}, state: 'invalid' };
+  }
+}
+
+const LEGACY_MOVE_PENDING_REL = join('.cache', 'legacy-move-pending.json');
+
+/**
+ * The slugs of the projects whose move of old `hot.md` / `session-state.md` into baseline entries
+ * (a vault with no git) has not happened yet: hidden by `.hypoignore` or stopped by a name clash
+ * when the first pass ran. A missing or unreadable file is the empty set.
+ */
+export function readLegacyMovePending(hypoDir) {
+  try {
+    const slugs = JSON.parse(readFileSync(join(hypoDir, LEGACY_MOVE_PENDING_REL), 'utf-8'))?.slugs;
+    return new Set(Array.isArray(slugs) ? slugs.filter((x) => typeof x === 'string') : []);
+  } catch {
+    return new Set();
+  }
+}
+
+/** Save the set `readLegacyMovePending` reads; an empty set removes the file. */
+export function writeLegacyMovePending(hypoDir, slugs) {
+  if (slugs.size === 0) rmSync(join(hypoDir, LEGACY_MOVE_PENDING_REL), { force: true });
+  else
+    atomicWrite(
+      join(hypoDir, LEGACY_MOVE_PENDING_REL),
+      JSON.stringify({ slugs: [...slugs].sort() }),
+    );
+}
+
+/** Save `views` (`{relPath: sha256}`) as the ownership record. The one writer of the file `readGeneratedViewsRecord` reads. */
+export function writeGeneratedViewsRecord(hypoDir, views) {
+  atomicWrite(join(hypoDir, GENERATED_VIEWS_RECORD_REL), JSON.stringify({ views }));
+}
+
+/**
+ * `{relPath: sha256}` read from an off marker's text. A marker written before the hashes existed
+ * (one line) has none, and so does a missing or unreadable one: `{}`. Only a line shaped exactly
+ * like the ones a rollback writes (`<sha256>  <path>`) counts.
+ */
+export function offMarkerHashes(text) {
+  const out = {};
+  for (const line of String(text ?? '').split('\n')) {
+    // A marker recommitted with CRLF bytes (autocrlf off) leaves one `\r` on every line.
+    const m = /^([0-9a-f]{64}) {2}(.+)$/.exec(line.replace(/\r$/, ''));
+    if (m) out[m[2]] = m[1];
+  }
+  return out;
+}
+
+/**
+ * Re-enabling after a rollback: the flat files the rollback committed are the generator's own
+ * rendering, so the ownership record takes the marker's hash for every path whose bytes in HEAD
+ * still match it. The writer then replaces them without a backup, and the clearing step does not
+ * call the root `hot.md` someone's own writing. Bytes edited after the rollback match no hash and
+ * stay foreign. Called while HEAD still holds the marker, by the one step both the re-enabling
+ * machine and a machine pulling the re-enable commit run. `beforeWrite` runs before the record is
+ * written (the cache-ignored check). Returns the claimed paths.
+ */
+export function claimRolledBackViews(hypoDir, beforeWrite = () => {}) {
+  const marked = offMarkerHashes(gitShowText(hypoDir, 'HEAD', SESSION_ENTRIES_OFF_MARKER));
+  const { views, state } = readGeneratedViewsRecord(hypoDir);
+  const claimed = Object.entries(marked)
+    .filter(([rel, hash]) => {
+      const text = gitShowText(hypoDir, 'HEAD', rel);
+      return text !== null && sha256Hex(text) === hash && views[rel] !== hash;
+    })
+    .map(([rel]) => rel);
+  if (!claimed.length) return claimed;
+  beforeWrite();
+  // A record that does not exist yet starts from the old root projection's hash, as the writer does.
+  const { lastHash } = readRootHotProjectionOwnership(hypoDir);
+  if (state === 'missing' && lastHash) views['hot.md'] ??= lastHash;
+  for (const rel of claimed) views[rel] = marked[rel];
+  writeGeneratedViewsRecord(hypoDir, views);
+  return claimed;
+}
+
+/**
+ * Whether the branch's upstream already carries the session-entries `.gitignore` block, read from
+ * `@{u}`'s tree (a failed `pull --ff-only` has still fetched it). False without an upstream. It
+ * answers "is the remote migrated", not "does the incoming range need the clearing step": a rollback
+ * commit leaves it false. The entry decision for a catch-up is `incomingChangesViewTracking`.
+ */
+export function upstreamIsMigrated(hypoDir) {
+  const shown = gitShowText(hypoDir, '@{u}', '.gitignore');
+  const first = GITIGNORE_BLOCK.split('\n')[0];
+  return shown !== null && shown.split('\n').some((l) => l.trim() === first);
+}
+
+/**
+ * Whether taking in `targetRev` adds or removes tracking of any generated view path (`hot.md`,
+ * `projects/<p>/hot.md`, `projects/<p>/session-state.md`), read from git: the paths `targetRev`
+ * changes since its merge-base with HEAD, status `A` or `D`. This is what decides whether a
+ * catch-up needs `clearGeneratedPathsBlockingPull` first. A migration commit removes tracking and a
+ * rollback commit adds it back (git then overwrites an ignored local file without a word), so both
+ * directions count; `upstreamIsMigrated` sees only the first. A revision git cannot read or diff
+ * counts as touching, because the clearing step then reports the failure itself.
+ */
+export function incomingChangesViewTracking(hypoDir, targetRev) {
+  return viewTrackingChangedSince(hypoDir, targetRev, targetRev);
+}
+
+/**
+ * The same question for our side: whether the commits HEAD holds beyond its merge-base with
+ * `targetRev` add or remove tracking of a generated view path (a migration made on this machine and
+ * not pushed yet). `pullRemote` asks both sides before it merges.
+ */
+export function outgoingChangesViewTracking(hypoDir, targetRev) {
+  return viewTrackingChangedSince(hypoDir, targetRev, 'HEAD');
+}
+
+// `side` is the revision whose changes since the merge-base of HEAD and `targetRev` are judged.
+function viewTrackingChangedSince(hypoDir, targetRev, side) {
+  const base = gitOut(hypoDir, ['merge-base', 'HEAD', targetRev])?.trim();
+  if (!base) return true;
+  const diff = gitOut(hypoDir, [
+    'diff',
+    '--no-renames',
+    '--name-status',
+    '-z',
+    '--relative',
+    base,
+    side,
+  ]);
+  if (diff === null) return true;
+  const tokens = diff.split('\0').filter(Boolean);
+  for (let i = 0; i + 1 < tokens.length; i += 2) {
+    if ('AD'.includes(tokens[i][0]) && isGeneratedViewPath(tokens[i + 1])) return true;
+  }
+  return false;
+}
+
+// `.cache/pull-archive.json`: {v: 2, stage: 'archived'|'merged', targetSha, gitignoreLines,
+// views: [{relPath, kind: 'stage'|'worktree', backupPath, sha256, companionRev, run}],
+// localOnly: [{relPath, kind, backupPath}], unowned: [{relPath, kind, backupPath}],
+// cleared: [{relPath, backupPath}], gitignoreSaved: [{relPath: '.gitignore', kind, backupPath}]}.
+// `run` numbers the clearing runs that fed the record: the views of one run (and kind) are one
+// state of the machine and pair up in a baseline. The four lists after `views` are what the
+// clearing step set aside besides the views, written before it removes anything. A record from
+// before they existed lacks them (read as empty, and a view without `run` as run 0). A record of
+// any other shape counts as no record.
+function readPullArchive(hypoDir) {
+  let rec;
+  try {
+    rec = JSON.parse(readFileSync(join(hypoDir, PULL_ARCHIVE_REL), 'utf-8'));
+  } catch {
+    return null;
+  }
+  const okView = (v) =>
+    v && ['relPath', 'backupPath', 'sha256'].every((k) => typeof v[k] === 'string');
+  const okItem = (v) => v && ['relPath', 'backupPath'].every((k) => typeof v[k] === 'string');
+  const items = (key) => (Array.isArray(rec[key]) ? rec[key].filter(okItem) : []);
+  if (
+    rec?.v !== 2 ||
+    !['archived', 'merged'].includes(rec.stage) ||
+    typeof rec.targetSha !== 'string' ||
+    !Array.isArray(rec.views) ||
+    !Array.isArray(rec.gitignoreLines)
+  ) {
+    return null;
+  }
   return {
-    written: false,
-    scanError: false,
-    lockTimeout: true,
-    backedUp: false,
-    backupPath: null,
-    gitignoreUpdated: false,
-    warnings: [
-      'root hot.md: 다른 세션이 저장소 잠금을 쥐고 있어 이번에는 갱신하지 않았습니다 (이전 내용을 그대로 둡니다).',
-    ],
-    content: null,
+    v: 2,
+    stage: rec.stage,
+    targetSha: rec.targetSha,
+    gitignoreLines: rec.gitignoreLines.filter((l) => typeof l === 'string'),
+    views: rec.views.filter(okView),
+    localOnly: items('localOnly'),
+    unowned: items('unowned'),
+    cleared: items('cleared'),
+    gitignoreSaved: items('gitignoreSaved'),
+  };
+}
+
+// Durable, and only ever called after every backup it names was written durably: nothing is
+// removed from the index or the working tree until this record is on disk.
+const writePullArchive = (hypoDir, rec) =>
+  atomicWrite(join(hypoDir, PULL_ARCHIVE_REL), `${JSON.stringify(rec, null, 2)}\n`, {
+    durable: true,
+  });
+
+// Line endings as git stores them: `core.autocrlf=true` checks a file out with CRLF, so a working
+// tree text and the HEAD blob of the same file only match once both are read this way.
+const lfText = (t) => (typeof t === 'string' ? t.replace(/\r\n/g, '\n') : t);
+
+const viewKey = (v) => `${v.relPath}\0${v.kind}\0${v.sha256}`;
+
+function mergeViews(...lists) {
+  const seen = new Map();
+  for (const v of lists.flat()) if (!seen.has(viewKey(v))) seen.set(viewKey(v), v);
+  return [...seen.values()];
+}
+
+// The same merge for the set-aside lists (`localOnly`, `unowned`, `cleared`, `gitignoreSaved`),
+// keyed by the backup, so a retry that finds an entry again does not list it twice and one that
+// does not find it any more (the file is already gone) does not lose it.
+function mergeItems(...lists) {
+  const seen = new Map();
+  for (const v of lists.flat()) {
+    const key = `${v.relPath}\0${v.kind ?? 'worktree'}\0${v.backupPath}`;
+    if (!seen.has(key)) seen.set(key, v);
+  }
+  return [...seen.values()];
+}
+
+/**
+ * The notices for what the clearing step set aside besides the views: an ignored project's old
+ * files (`localOnly`), a root `hot.md` nobody vouched for (`unowned`), an untracked file in a path
+ * the merge adds as tracked (`cleared`). Each names its backup. Entries whose `backupPath` is in
+ * `announced` are skipped: a caller that already told the user about this run's entries passes
+ * them, so the resume of the same record does not say it twice.
+ */
+export function setAsideNotices(
+  hypoDir,
+  { localOnly = [], unowned = [], cleared = [] },
+  announced = [],
+) {
+  const done = new Set(announced);
+  const fresh = (list) => list.filter((v) => !done.has(v.backupPath));
+  const notices = [];
+  for (const { relPath, backupPath } of fresh(localOnly)) {
+    const proj = generatedViewSlug(relPath) ?? relPath;
+    notices.push(
+      `무시 프로젝트 ${proj}의 옛 세션 현황을 ${relative(hypoDir, backupPath)}에 보관했습니다. 이 기억은 공유되지 않습니다.`,
+    );
+  }
+  for (const { relPath, backupPath } of fresh(unowned))
+    notices.push(rootHotBackupRecoveryNotice(relPath, backupPath));
+  for (const { relPath, backupPath } of fresh(cleared)) {
+    notices.push(
+      `${relPath}는 이행 커밋이 추적 파일로 더하는 경로라 치웠습니다. 원래 내용은 ${relative(hypoDir, backupPath)}에 있습니다.`,
+    );
+  }
+  return notices;
+}
+
+// The notice lines for everything the clearing step sets aside, views included: where each backup
+// is. `clearBlockingPaths` makes them durable before it removes anything, and `undoClearedPaths`
+// takes the same lines back out once every path is back in place.
+function clearingNoticeLines(hypoDir, moved) {
+  const views = (moved.archived ?? []).map(
+    ({ relPath, kind, backupPath }) =>
+      `${relPath}의 이 기계 쪽 ${kind === 'stage' ? '스테이징본' : '작업 트리본'}을 ${relative(hypoDir, backupPath)}에 보관했습니다.`,
+  );
+  return [...views, ...setAsideNotices(hypoDir, moved)];
+}
+
+/**
+ * Append the lines of `lines` that the working-tree `.gitignore` does not have, at the end (the
+ * file stays uncommitted). Lines are compared without a trailing `\r`, so a CRLF file does not get
+ * the same line again. A line only counts as present when it sits at or after the last `!` line:
+ * ignore rules are order sensitive, so a pattern that appears above a later negation does not
+ * apply any more, and appending it again is what puts it back in force. Returns the lines it added.
+ */
+export function restoreGitignoreLines(hypoDir, lines) {
+  const path = join(hypoDir, '.gitignore');
+  const current = readTextOrNull(path) ?? '';
+  const bare = (l) => l.replace(/\r$/, '');
+  const all = current.split('\n').map(bare);
+  const lastNegation = all.findLastIndex((l) => l.trimStart().startsWith('!'));
+  const have = new Set(all.slice(Math.max(lastNegation, 0)));
+  const missing = [...new Set(lines)].filter((l) => !have.has(bare(l)));
+  if (!missing.length) return [];
+  const lead = current === '' || current.endsWith('\n') ? '' : '\n';
+  atomicWrite(path, `${current}${lead}${missing.join('\n')}\n`);
+  return missing;
+}
+
+/** Mark the archive record `merged`: the caller's merge landed. No record, no change. */
+export function markPullArchiveMerged(hypoDir) {
+  const rec = readPullArchive(hypoDir);
+  if (rec) writePullArchive(hypoDir, { ...rec, stage: 'merged' });
+}
+
+/**
+ * The step before `merge --ff-only <targetRev>` or `pull --no-rebase` takes in a migration (or
+ * rollback) commit: clear what would block it, without ever migrating this machine. Returns
+ * `{ok, deferred?, reason?, notice?, backups[], archived[], localOnly[], unowned[], cleared[], gitignoreLines[], gitignoreSaved[]}`.
+ * A stopped run (`ok: false`) reports everything it had moved up to that point in the same lists,
+ * so the caller can take it back.
+ *
+ * The paths looked at are the ones `targetRev` changes since its merge-base with HEAD (so a
+ * diverged history counts only what is coming in). A local change on any of them that is not a
+ * generated view or `.gitignore` stops everything (`reason: 'other-dirty'`), and so does a
+ * `.gitignore` edit that is not a pure addition (`deferred: 'gitignore'`); both leave the vault
+ * untouched. Otherwise: an ignored project's generated paths that `targetRev` deletes are backed
+ * up even when clean (the merge deletes them from the working tree), and go to `localOnly[]`
+ * only; every blocked generated path gets its working-tree bytes, and its staged bytes when
+ * staged, backed up and listed in `archived[]`;
+ * staged target paths are unstaged; the blocked paths are restored to HEAD (or removed when HEAD
+ * lacks them); and a path `targetRev` adds as tracked that exists here untracked is cleared
+ * (backed up unless its bytes are what this machine's generator last wrote), because git
+ * overwrites such a file silently. A cleared path with a backup is listed in `cleared[]`
+ * (`{relPath, backupPath}`), not in `archived[]`: it is not a view this machine meant to keep, so
+ * it is never shared as a baseline, and `undoClearedPaths` still puts it back. `gitignoreLines` are the uncommitted `.gitignore` additions the
+ * caller appends back after the merge (`restoreGitignoreLines`). `gitignoreSaved[]` holds the exact
+ * working-tree and staged bytes of a blocked `.gitignore` (`{relPath, kind, backupPath}`, backed up
+ * like a view), which `undoClearedPaths` puts back when the merge does not happen.
+ *
+ * Before anything is removed or unstaged, everything set aside (`archived`, `localOnly`, `unowned`,
+ * `cleared`, `gitignoreSaved`, the lines) is written to `.cache/pull-archive.json`, so a crash at
+ * any later point leaves a record that names every backup. The lists also carry what an earlier
+ * run that stopped had recorded, merged by backup path.
+ *
+ * The root `hot.md` that `targetRev` deletes while it is clean is the one path nobody else
+ * touches: its bytes are copied to `unowned[]` (`{relPath, kind, backupPath}`, not part of
+ * `backups[]`) unless the generator record or the old root projection state says this machine
+ * wrote them. Hashes and comparisons against HEAD ignore the line-ending difference
+ * (`\r\n` is read as `\n`), because `core.autocrlf=true` checks the file out with CRLF.
+ *
+ * Only bytes are moved, never a deletion. A blocked view path the user had deleted (in the working
+ * tree or the index) has no bytes to back up, and the clearing step brings it back from HEAD.
+ *
+ * Just before the unstage, and again before the restore, every blocked path's working-tree bytes
+ * and index blob are read again and compared with what the backup took (and a cleared untracked
+ * file with the bytes just backed up). A difference means another process wrote meanwhile: nothing
+ * more is changed and `{ok: false, deferred: 'concurrent-change'}` comes back.
+ *
+ * `testHooks.beforeUnstage` runs before the first of those comparisons, `testHooks.afterArchive`
+ * after the archive record is written and the stage is released, before the second (and before any
+ * working-tree path is restored). `testHooks.beforeBackupWrite` goes to the backups.
+ */
+export function clearGeneratedPathsBlockingPull(hypoDir, targetRev, opts = {}) {
+  try {
+    return clearBlockingPaths(hypoDir, targetRev, opts);
+  } catch (err) {
+    if (err?.message === CACHE_NOT_IGNORED && err.result) return err.result;
+    throw err;
+  }
+}
+
+// The generated view paths that exist as files in the working tree: the root `hot.md` and the two
+// views of every session project. Tracked or not; the caller judges.
+function generatedViewPathsOnDisk(hypoDir) {
+  return [
+    'hot.md',
+    ...listSessionProjects(hypoDir).flatMap((slug) =>
+      ['hot.md', 'session-state.md'].map((n) => `projects/${slug}/${n}`),
+    ),
+  ].filter((rel) => isGeneratedViewPath(rel) && statIs(join(hypoDir, rel), 'file'));
+}
+
+// Adds the vault paths `relPaths` to the repository's local exclude file (never the committed
+// `.gitignore`, which would publish a hidden project's name). The patterns are relative to the
+// repository root, so a vault inside a larger repository gets its prefix. Only lines not already
+// there are appended. Returns false when the file could not be written.
+function excludeLocally(hypoDir, relPaths) {
+  if (!relPaths.length) return true;
+  const r = vaultGit(hypoDir, ['rev-parse', '--git-path', 'info/exclude']);
+  if (r.status !== 0) return false;
+  const file = resolvePath(hypoDir, r.stdout.replace(/\r?\n$/, ''));
+  const prefix = vaultGitPrefix(hypoDir);
+  try {
+    const have = new Set(existsSync(file) ? readFileSync(file, 'utf-8').split(/\r?\n/) : []);
+    const add = relPaths
+      .map((p) => `/${prefix}${p}`.replace(/[\\*?[]/g, '\\$&').replace(/ $/, '\\ '))
+      .filter((line) => !have.has(line));
+    if (!add.length) return true;
+    mkdirSync(dirname(file), { recursive: true });
+    const old = existsSync(file) ? readFileSync(file, 'utf-8') : '';
+    appendFileSync(file, `${old.length > 0 && !old.endsWith('\n') ? '\n' : ''}${add.join('\n')}\n`);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// Thrown by `clearBlockingPaths` (carrying its stop result) at the first write under `.cache/` when
+// no ignore rule covers it, so a vault with nothing to set aside never meets the check.
+const CACHE_NOT_IGNORED = 'cache-not-ignored';
+
+function clearBlockingPaths(hypoDir, targetRev, opts) {
+  const { testHooks } = opts;
+  // What has been moved so far. Every stop reports all of it, so the caller can undo it.
+  const backups = [];
+  let localOnly = [];
+  let unowned = [];
+  let cleared = [];
+  let archived = [];
+  let gitignoreLines = [];
+  let gitignoreSaved = [];
+  // Owned views removed without a backup (the generator wrote those bytes); a failed move writes
+  // them back from here.
+  const ownedRemoved = [];
+  const stop = (extra) => ({
+    ok: false,
+    backups,
+    archived,
+    localOnly,
+    unowned,
+    cleared,
+    gitignoreLines,
+    gitignoreSaved,
+    ownedRemoved,
+    ...extra,
+  });
+
+  // 1. A previous run that stopped before the merge: put its `.gitignore` lines back and carry its
+  // archived bytes into this run. The `.gitignore` write is a restore, so it is safe before the
+  // checks below.
+  const prior = readPullArchive(hypoDir);
+  const recovered =
+    prior && prior.stage === 'archived' && !isAncestorOfHead(hypoDir, prior.targetSha)
+      ? prior
+      : null;
+  // The exact `.gitignore` bytes of that run come back first (guarded like any undo). The lines are
+  // the fallback for a record that has none or whose bytes could not be put back (that entry is
+  // carried on); appended after an exact restore they would put a staged-only line in the working tree.
+  let carriedGitignore = [];
+  if (recovered) {
+    let exactBack = false;
+    if (recovered.gitignoreSaved.length) {
+      exactBack = undoClearedPaths(
+        hypoDir,
+        { gitignoreSaved: recovered.gitignoreSaved },
+        { keepRecord: true },
+      ).ok;
+      if (!exactBack) carriedGitignore = recovered.gitignoreSaved;
+    }
+    if (!exactBack) restoreGitignoreLines(hypoDir, recovered.gitignoreLines);
+  }
+
+  const targetSha = gitOut(hypoDir, ['rev-parse', '--verify', '--quiet', `${targetRev}^{commit}`]);
+  const headSha = gitOut(hypoDir, ['rev-parse', '--verify', '--quiet', 'HEAD^{commit}']);
+  if (!targetSha || !headSha) return stop({ reason: 'revision-unreadable' });
+  const target = targetSha.trim();
+  const head = headSha.trim();
+
+  // 1b. Backups and the archive go under `.cache/`: no byte is moved while a `git add -A` would
+  // stage them. The check runs just before the first of those writes (`cacheGate`), so a vault
+  // with nothing to set aside is not held back by it. Nothing was written yet except the restore
+  // of step 1.
+  let cacheChecked = false;
+  const cacheGate = () => {
+    if (cacheChecked) return;
+    const unignored = unignoredCachePaths(hypoDir);
+    if (!unignored.length) {
+      cacheChecked = true;
+      return;
+    }
+    throw Object.assign(new Error(CACHE_NOT_IGNORED), {
+      result: stop({
+        deferred: 'cache-not-ignored',
+        reason: 'cache-not-ignored',
+        notice: cacheNotIgnoredNotice(unignored),
+      }),
+    });
+  };
+
+  // 2. What `target` brings in.
+  const base = gitOut(hypoDir, ['merge-base', 'HEAD', target])?.trim();
+  if (!base) return stop({ reason: 'no-merge-base' });
+  const diff = gitOut(hypoDir, [
+    'diff',
+    '--no-renames',
+    '--name-status',
+    '-z',
+    '--relative',
+    base,
+    target,
+  ]);
+  if (diff === null) return stop({ reason: 'diff-failed' });
+  const tokens = diff.split('\0').filter(Boolean);
+  const incoming = [];
+  for (let i = 0; i + 1 < tokens.length; i += 2) {
+    incoming.push({ status: tokens[i][0], path: tokens[i + 1] });
+  }
+  const targetPaths = incoming.map((c) => c.path);
+
+  // 3. Which of them carry local changes. Anything but generated views and `.gitignore` is not
+  // ours to move.
+  const changes = localChangesOn(hypoDir, targetPaths);
+  const staged = new Set(changes.staged);
+  const dirty = new Set([...changes.staged, ...changes.unstaged]);
+  const blocked = targetPaths.filter((p) => dirty.has(p));
+  if (blocked.some((p) => p !== '.gitignore' && !isGeneratedViewPath(p))) {
+    return stop({ reason: 'other-dirty' });
+  }
+
+  // 4. `.gitignore`: only a pure addition (stage and working tree alike) can be set aside. A staged
+  // one is not set aside at all: the merge would take it out of the index and the lines come back
+  // to the working tree only, so a person's stage boundary would be gone and the backup the notice
+  // names deleted. It waits until they commit or unstage it.
+  if (staged.has('.gitignore') && blocked.includes('.gitignore')) {
+    return stop({
+      deferred: 'gitignore',
+      reason: 'gitignore-staged',
+      notice:
+        '스테이징해 둔 .gitignore 변경이 있어 이행 커밋을 받지 못했습니다. 그 변경을 커밋하거나 스테이징을 풀면 다음 동기화에서 받습니다',
+    });
+  }
+  if (blocked.includes('.gitignore')) {
+    const headText = gitShowText(hypoDir, 'HEAD', '.gitignore') ?? '';
+    const targetText = gitShowText(hypoDir, target, '.gitignore') ?? '';
+    const stageText = staged.has('.gitignore')
+      ? (gitShowText(hypoDir, ':0', '.gitignore') ?? '')
+      : headText;
+    const added = [];
+    for (const text of [readTextOrNull(join(hypoDir, '.gitignore')) ?? '', stageText]) {
+      if (!mergeAdditiveGitignore(headText, text, targetText).ok) {
+        return stop({
+          deferred: 'gitignore',
+          reason: 'gitignore-not-additive',
+          notice:
+            '스테이징됐거나 커밋되지 않은 .gitignore 변경이 순수 추가가 아니어서 이행 커밋을 받지 못했습니다. 그 변경을 커밋하거나 되돌리세요',
+        });
+      }
+      const own = mergeAdditiveGitignore(headText, text, headText);
+      added.push(...own.merged.slice(headText.length).split('\n').filter(Boolean));
+    }
+    gitignoreLines = [...new Set(added)];
+  }
+
+  const patterns = loadHypoIgnore(hypoDir);
+  const hidden = (relPath) => {
+    const slug = generatedViewSlug(relPath);
+    return slug !== null && projectHiddenByHypoignore(hypoDir, slug, patterns);
+  };
+  const fresh = [];
+  // The number of this run among those that fed the record; see the record's comment.
+  const run = Math.max(0, ...(prior?.views ?? []).map((v) => v.run ?? 0)) + 1;
+  const backUp = (relPath, kind, text) => {
+    cacheGate();
+    const backupPath = backUpGeneratedPath(hypoDir, join(hypoDir, relPath), text, testHooks);
+    backups.push(backupPath);
+    return { relPath, kind, backupPath };
+  };
+
+  // 5. An ignored project's generated path that `target` deletes: the merge removes it from the
+  // working tree even when clean, so keep a local copy. It is never shared.
+  for (const { status, path } of incoming) {
+    if (status !== 'D' || !hidden(path) || dirty.has(path)) continue;
+    const text = readTextOrNull(join(hypoDir, path)) ?? gitShowText(hypoDir, 'HEAD', path);
+    if (text !== null) localOnly.push(backUp(path, 'worktree', text));
+  }
+
+  // 5a. A range that removes the off marker re-enables the entries: the flat files the rollback
+  // committed are generator bytes (the marker names their hashes), not someone's own writing.
+  if (incoming.some((c) => c.status === 'D' && c.path === SESSION_ENTRIES_OFF_MARKER)) {
+    claimRolledBackViews(hypoDir, cacheGate);
+  }
+
+  // 5b. The root `hot.md` is a generated path too, and a clean one that `target` deletes goes with
+  // the merge. Bytes that neither the generator record nor the old root projection state vouches
+  // for are someone's own writing: keep a copy and say so (`unowned[]`). Bytes that are exactly
+  // what HEAD tracks need no copy either: the merge keeps HEAD in the history, so nothing is lost
+  // (the first move of a vault has no ownership record yet, and every clean old file reads as
+  // unvouched without this). A re-enable range (it removes the off marker) gets no such vouch: the
+  // rollback committed the flat file, so HEAD tracks it and the merge replaces it with the generated
+  // view, and a person's rolled-back writing would be lost without the copy.
+  const reenabling = incoming.some(
+    (c) => c.status === 'D' && c.path === SESSION_ENTRIES_OFF_MARKER,
+  );
+  if (incoming.some((c) => c.status === 'D' && c.path === 'hot.md') && !dirty.has('hot.md')) {
+    const text = readTextOrNull(join(hypoDir, 'hot.md'));
+    if (text !== null) {
+      const sha = sha256Hex(lfText(text));
+      const inHead = gitShowText(hypoDir, 'HEAD', 'hot.md');
+      const vouched = [
+        readGeneratedViewsRecord(hypoDir).views['hot.md'],
+        readRootHotProjectionOwnership(hypoDir).lastHash,
+        inHead === null || reenabling ? null : sha256Hex(lfText(inHead)),
+      ];
+      if (!vouched.includes(sha)) {
+        cacheGate();
+        const backupPath = backUpGeneratedPath(hypoDir, join(hypoDir, 'hot.md'), text, testHooks);
+        unowned.push({ relPath: 'hot.md', kind: 'worktree', backupPath });
+      }
+    }
+  }
+
+  // 6. Blocked generated paths: the working-tree bytes, and the staged bytes of a staged path.
+  // `snapshot` is what every blocked path (`.gitignore` too) held when its backup was taken: the
+  // unstage and the restore below run only while the bytes still match it (`drifted`).
+  const snapshot = new Map(
+    blocked.map((p) => [
+      p,
+      { work: readTextOrNull(join(hypoDir, p)), index: gitShowText(hypoDir, ':0', p) },
+    ]),
+  );
+  for (const path of blocked.filter(isGeneratedViewPath)) {
+    const versions = [];
+    const { work, index } = snapshot.get(path);
+    if (work !== null) versions.push(['worktree', work]);
+    const stagedText = staged.has(path) ? index : null;
+    if (stagedText !== null) versions.push(['stage', stagedText]);
+    for (const [kind, text] of versions) {
+      const where = backUp(path, kind, text);
+      if (hidden(path)) localOnly.push(where);
+      else fresh.push({ ...where, sha256: sha256Hex(text), companionRev: head, run });
+    }
+  }
+  // The `.gitignore` of a blocked run: its exact working-tree and staged bytes, so a failed move can
+  // put them back as they were (the lines in `gitignoreLines` are all the merge's success keeps).
+  if (blocked.includes('.gitignore')) {
+    const { work, index } = snapshot.get('.gitignore');
+    if (work !== null) gitignoreSaved.push(backUp('.gitignore', 'worktree', work));
+    if (staged.has('.gitignore') && index !== null) {
+      gitignoreSaved.push(backUp('.gitignore', 'stage', index));
+    }
+  }
+  // 6b. A path `target` adds as tracked, held here as an untracked file: git overwrites it without a
+  // word (rollback commits do this to every view), so it is moved out below. Its bytes are backed up
+  // now, with everything else, so the record written next knows them before anything is removed.
+  // A range that brings the off marker is a rollback: its commit tracks the flat files of the
+  // projects that existed at its point only. The generated views of any other project (one made
+  // since) stay on disk, untracked and no longer ignored once the block is gone, and a `git add -A`
+  // would publish them. They are cleared with the rest: dropped when they hold what this machine's
+  // generator wrote, backed up first otherwise. A path a person staged is left alone.
+  const owned = readGeneratedViewsRecord(hypoDir).views;
+  const rollsBack = incoming.some((c) => c.status === 'A' && c.path === SESSION_ENTRIES_OFF_MARKER);
+  const added = incoming.filter((c) => c.status === 'A').map((c) => c.path);
+  const sweep = rollsBack
+    ? generatedViewPathsOnDisk(hypoDir).filter(
+        (p) => !added.includes(p) && !hidden(p) && gitShowText(hypoDir, ':0', p) === null,
+      )
+    : [];
+  // A hidden project's local views are not swept: the rollback commit drops the ignore block, so
+  // they would show up untracked and a `git add -A` would publish them. They stay on disk and go
+  // into this clone's own exclude file.
+  const hiddenLocal = rollsBack
+    ? generatedViewPathsOnDisk(hypoDir).filter(
+        (p) => !added.includes(p) && hidden(p) && gitShowText(hypoDir, ':0', p) === null,
+      )
+    : [];
+  if (!excludeLocally(hypoDir, hiddenLocal)) return stop({ reason: 'exclude-write-failed' });
+  const untracked = [];
+  for (const path of [...added.filter(isGeneratedViewPath), ...sweep]) {
+    if (blocked.includes(path)) continue;
+    if (pathInHead(hypoDir, path)) continue;
+    const text = readTextOrNull(join(hypoDir, path));
+    if (text === null) continue;
+    if (owned[path] !== sha256Hex(text)) {
+      const { backupPath } = backUp(path, 'worktree', text);
+      cleared.push({ relPath: path, backupPath });
+    }
+    untracked.push({ path, text });
+  }
+  archived = mergeViews(recovered?.views ?? [], fresh);
+  localOnly = mergeItems(recovered?.localOnly ?? [], localOnly);
+  unowned = mergeItems(recovered?.unowned ?? [], unowned);
+  cleared = mergeItems(recovered?.cleared ?? [], cleared);
+  gitignoreSaved = mergeItems(carriedGitignore, gitignoreSaved);
+  const anySetAside = [archived, localOnly, unowned, cleared, gitignoreSaved, gitignoreLines].some(
+    (list) => list.length,
+  );
+  if (prior || anySetAside) {
+    cacheGate();
+    try {
+      writePullArchive(hypoDir, {
+        v: 2,
+        stage: 'archived',
+        targetSha: target,
+        gitignoreLines: [...new Set([...(prior?.gitignoreLines ?? []), ...gitignoreLines])],
+        views: mergeViews(prior?.views ?? [], archived),
+        localOnly: mergeItems(prior?.localOnly ?? [], localOnly),
+        unowned: mergeItems(prior?.unowned ?? [], unowned),
+        cleared: mergeItems(prior?.cleared ?? [], cleared),
+        gitignoreSaved,
+      });
+    } catch {
+      return stop({ reason: 'archive-write-failed' });
+    }
+    // The notice naming every backup is on disk before anything is removed or unstaged: a stop at
+    // any later point (a kill included) leaves the next SessionStart something to show. Delivery
+    // can repeat a line the caller prints too. No notice, no clearing.
+    const lines = clearingNoticeLines(hypoDir, { archived, localOnly, unowned, cleared });
+    if (lines.length && !writeRootHotHealthNotice(hypoDir, lines.join('\n'))) {
+      return stop({ reason: 'notice-write-failed' });
+    }
+  }
+  // The vault's own writers are shut out by the vault commit lock the caller holds, so a change
+  // since the snapshot came from another Hypomnema process that does not take it, or a person.
+  // Either way this run changes nothing more and the bytes stay where they are. ponytail: an
+  // external editor can still save between this re-read and the git command right after it; that
+  // window (milliseconds) is accepted, a compare-and-swap does not exist for a working tree.
+  const changedSince = () => ({
+    deferred: 'concurrent-change',
+    reason: 'changed-during-clear',
+    notice:
+      '이행 커밋을 받는 도중 생성 파일이나 인덱스가 바뀌어 아무것도 더 바꾸지 않고 미뤘습니다. 다음 동기화에서 다시 시도합니다',
+  });
+  const read = (p) => {
+    try {
+      return readTextOrNull(join(hypoDir, p));
+    } catch {
+      return undefined; // unreadable counts as changed
+    }
+  };
+  const drifted = (afterUnstage) =>
+    blocked.some((p) => {
+      const was = snapshot.get(p);
+      const index = afterUnstage && staged.has(p) ? gitShowText(hypoDir, 'HEAD', p) : was.index;
+      return read(p) !== was.work || gitShowText(hypoDir, ':0', p) !== index;
+    });
+  testHooks?.beforeUnstage?.();
+  if (drifted(false)) return stop(changedSince());
+  const unstage = blocked.filter((p) => staged.has(p));
+  if (
+    unstage.length &&
+    vaultGit(hypoDir, ['reset', '-q', '--', ...literalSpecs(unstage)]).status !== 0
+  ) {
+    return stop({ reason: 'unstage-failed' });
+  }
+  testHooks?.afterArchive?.();
+  if (drifted(true)) return stop(changedSince());
+
+  // 7. Put the working tree where `target` can land. Bytes of a blocked path are already backed
+  // up. A path HEAD lacks is removed instead of restored.
+  const restore = blocked.filter((p) => pathInHead(hypoDir, p));
+  for (const p of blocked.filter((q) => !restore.includes(q)))
+    rmSync(join(hypoDir, p), { force: true });
+  // The untracked files of 6b go now, each only while it still holds the bytes that were backed up.
+  for (const { path, text } of untracked) {
+    if (read(path) !== text) return stop(changedSince());
+    rmSync(join(hypoDir, path), { force: true });
+    if (!cleared.some((c) => c.relPath === path)) ownedRemoved.push({ relPath: path, text });
+  }
+  if (restore.length) {
+    const r = vaultGit(hypoDir, ['checkout', 'HEAD', '--', ...literalSpecs(restore)]);
+    if (r.status !== 0) {
+      return stop({ reason: 'checkout-failed' });
+    }
+  }
+  return {
+    ok: true,
+    backups,
+    archived,
+    localOnly,
+    unowned,
+    cleared,
+    gitignoreLines,
+    gitignoreSaved,
+    ownedRemoved,
   };
 }
 
 /**
- * SessionStart's root hot.md write: claim 'hot.md' in this session's
- * touched-paths set and write the projection inside ONE hold of the vault
- * lock. Lock order is vault, then per-session (the claim), the same order
- * hypo-auto-commit.mjs takes them in.
+ * Take back what `clearGeneratedPathsBlockingPull` moved when the merge it was clearing for did not
+ * happen. `moved` is its result. Each archived, local-only or cleared path gets its bytes back: a
+ * working-tree path is rewritten only when it is absent or still holds what HEAD holds (bytes that
+ * landed since are not overwritten; a CRLF checkout of HEAD's bytes counts as holding them), a
+ * staged one is put back in the index only when the index entry still equals HEAD's
+ * (`hash-object -w`, then `update-index --cacheinfo`, with the vault's prefix in front). The
+ * backup bytes are written as they are. When every path is back, the backup files made for them
+ * (and for `unowned[]`) and `.cache/pull-archive.json` (when anything was set aside) are deleted;
+ * otherwise those stay for the next catch-up to carry. `keepRecord` leaves the record in place (the
+ * clearing step uses it to take back a stopped run's `.gitignore` bytes while that record lives on).
+ * `moved.gitignoreSaved[]` is the exact `.gitignore` bytes, put back with the same guards as a
+ * view: a working tree that is absent or at HEAD, an index entry that is at HEAD. A `.gitignore`
+ * written since is left alone, with a notice naming the backup.
  *
- * The claim used to be taken before the lock. A Stop for the same session_id
- * (the same session run by two processes) could take the vault lock in that
- * gap, find hot.md claimed but still clean, commit nothing, and retire the
- * claim. The write that followed then left hot.md dirty with no claim, so the
- * checkpoint gate read it as ownerless and let the close through. Inside the
- * lock, a Stop either runs entirely before the claim or waits until the write
- * has landed.
- *
- * Kept from the unlocked sequence: a failed claim skips the write
- * (`claimFailed: true`, `result: null`), and a write that throws drops the
- * claim only when this call is the one that added it, before the lock is
- * released, then rethrows. A vault lock timeout now returns before any claim
- * is made, so there is nothing to drop.
- *
- * `testHooks.afterClaim` runs right after a successful claim, still inside
- * the lock (a no-op in production); the rest of `testHooks` goes to the
- * writer as with writeRootHotProjection.
- *
- * @param {string} hypoDir
- * @param {string|null|undefined} sessionId
- * @param {{ afterClaim?: () => void, beforeFinalWrite?: (hotPath: string) => void, beforeBackupWrite?: (backupPath: string) => void }} [testHooks]
- * @returns {{claimFailed: boolean, result: ReturnType<typeof writeRootHotProjection>|null}}
+ * Only bytes come back, never a deletion: a view path the user had deleted before the clearing step
+ * had no bytes to back up, the clearing step restored it from HEAD, and nothing here deletes it
+ * again. The generated views are rebuilt from the entries, so the file returns either way.
+ * Returns `{ok, notices[]}`; a path that could not be put back has a notice naming its backup.
  */
-export function claimAndWriteRootHotProjection(hypoDir, sessionId, testHooks) {
-  // Checked before the lock: without a session_id the claim can only fail,
-  // and a busy vault must not turn that into a lock-timeout notice instead.
-  if (!sessionId) return { claimFailed: true, result: null };
+export function undoClearedPaths(hypoDir, moved, { keepRecord = false } = {}) {
+  const seen = new Set();
+  const dedupe = (v) => {
+    const key = `${v.relPath}\0${v.kind}\0${v.backupPath}`;
+    return !seen.has(key) && seen.add(key);
+  };
+  const items = [...(moved.archived ?? []), ...(moved.localOnly ?? [])].filter(dedupe);
+  const all = [
+    ...items,
+    ...(moved.cleared ?? []).map((c) => ({ ...c, kind: 'worktree' })).filter(dedupe),
+    ...(moved.gitignoreSaved ?? []).filter(dedupe),
+  ];
+  const prefix = vaultGitPrefix(hypoDir);
+  const notices = [];
+  const lenient = (path) => {
+    try {
+      return readTextOrNull(path);
+    } catch {
+      return undefined; // unreadable: neither absent nor equal to anything
+    }
+  };
+  const indexSha = (relPath) => {
+    const out = gitOut(hypoDir, ['ls-files', '-s', '--', ...literalSpecs([relPath])]);
+    return out?.split(/\s+/)[1] ?? null;
+  };
+  const putBack = ({ relPath, kind, backupPath }, bytes) => {
+    if (kind === 'stage') {
+      const blob = vaultGit(hypoDir, ['hash-object', '-w', '--stdin'], { input: bytes });
+      if (blob.status !== 0) return false;
+      const sha = blob.stdout.trim();
+      const now = indexSha(relPath);
+      if (now === sha) return true;
+      const head = gitOut(hypoDir, [
+        'rev-parse',
+        '--verify',
+        '--quiet',
+        revPathArg('HEAD', relPath),
+      ]);
+      if (now !== (head?.trim() ?? null)) return false;
+      return (
+        vaultGit(hypoDir, [
+          'update-index',
+          '--add',
+          '--cacheinfo',
+          `100644,${sha},${prefix}${relPath}`,
+        ]).status === 0
+      );
+    }
+    const abs = join(hypoDir, relPath);
+    const now = lenient(abs);
+    if (now === bytes) return true;
+    if (now !== null && lfText(now) !== lfText(gitShowText(hypoDir, 'HEAD', relPath))) return false;
+    // Durable: the backup this was read from is deleted below, and a power loss must not keep the
+    // delete while losing these bytes.
+    atomicWrite(abs, bytes, { durable: true });
+    return true;
+  };
+  let allBack = true;
+  // A view the generator wrote and the clearing step removed has no backup: write it back when the
+  // path is still absent (a file there now is someone's, and rendering rebuilds the view anyway).
+  for (const { relPath, text } of moved.ownedRemoved ?? []) {
+    try {
+      if (lenient(join(hypoDir, relPath)) === null) {
+        atomicWrite(join(hypoDir, relPath), text, { durable: true });
+      }
+    } catch {
+      // rendering writes it again
+    }
+  }
+  for (const item of all) {
+    const bytes = lenient(item.backupPath);
+    let back = false;
+    if (typeof bytes === 'string') {
+      try {
+        back = putBack(item, bytes);
+      } catch {
+        back = false;
+      }
+    }
+    if (!back) {
+      allBack = false;
+      notices.push(
+        `${item.relPath}를 원래대로 되돌리지 못했습니다. 보관한 내용은 ${item.backupPath}에 있습니다.`,
+      );
+    }
+  }
+  if (allBack) {
+    // Every path is back where it was, so the lines naming the backups are retracted before the
+    // backups go. A stop in between leaves a notice for a backup that is still there.
+    if (!keepRecord) {
+      retractRootHotHealthNotice(hypoDir, clearingNoticeLines(hypoDir, moved).join('\n'));
+    }
+    // Each deletion is synced before the next step relies on it: a power loss that replays the
+    // backup removal but not the record removal would leave a record naming a backup that is gone.
+    const syncDir = (dir) => {
+      if (existsSync(dir)) fsyncDir(dir);
+    };
+    // The record goes first: a stop in between leaves a backup nobody names, not a record that
+    // names a backup that is gone.
+    if (!keepRecord && all.length + (moved.unowned ?? []).length > 0) {
+      const record = join(hypoDir, PULL_ARCHIVE_REL);
+      rmSync(record, { force: true });
+      syncDir(dirname(record));
+    }
+    const backups = [...all, ...(moved.unowned ?? [])].map((v) => v.backupPath);
+    for (const backupPath of backups) rmSync(backupPath, { force: true });
+    for (const dir of new Set(backups.map((b) => dirname(b)))) syncDir(dir);
+  }
+  return { ok: allBack, notices };
+}
+
+/**
+ * The date of a baseline built from a project's old `hot.md` and `session-state.md` (`texts`, the
+ * bytes the baseline holds): the larger `updated:` of the two, else the day git last changed either
+ * file, else the local day of `hot.md`'s mtime (`session-state.md`'s when `hot.md` is not on
+ * disk), else today. Every step after the first reads the vault, not the bytes, so one pair of
+ * bytes gets a different date on two machines only when neither has `updated:` and git has never
+ * seen the files. mtime comes before today because today would turn the same bytes into a
+ * different baseline on a different day.
+ * The generator's virtual baseline, the migration and the catch-up all date a baseline here.
+ */
+export function legacyBaselineDate(hypoDir, slug, texts) {
+  const updated = texts
+    .map((t) => ISO_DAY_RE.exec(frontmatterUpdated(t) ?? '')?.[0])
+    .filter(Boolean)
+    .sort();
+  if (updated.length) return updated.at(-1);
+  const names = ['hot', 'session-state'];
+  const committed = names
+    .map((name) => {
+      const out = gitOut(hypoDir, [
+        'log',
+        '-1',
+        '--format=%cd',
+        '--date=short',
+        '--',
+        `:(literal)projects/${slug}/${name}.md`,
+      ]);
+      return out === null ? null : ISO_DAY_RE.exec(out.trim())?.[0];
+    })
+    .filter(Boolean)
+    .sort();
+  if (committed.length) return committed.at(-1);
+  const pad = (n) => String(n).padStart(2, '0');
+  const day = (d) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+  for (const name of names) {
+    try {
+      return day(statSync(join(hypoDir, 'projects', slug, `${name}.md`)).mtime);
+    } catch {
+      // not on disk: try the other file
+    }
+  }
+  return day(new Date());
+}
+
+// Write `text` at `abs` unless something is already there (a link fails on an existing name, so
+// a concurrent writer is never overwritten). 'same' when the existing bytes are these bytes.
+function publishNoClobber(abs, text) {
+  const tmp = `${abs}.${process.pid}.${randomBytes(4).toString('hex')}.tmp`;
+  atomicWrite(tmp, text);
   try {
-    return withFileLock(
-      vaultCommitLockTarget(hypoDir),
-      () => {
-        const claim = claimProjectionWrite(hypoDir, sessionId, ['hot.md']);
-        if (!claim.ok) return { claimFailed: true, result: null };
-        testHooks?.afterClaim?.();
-        try {
-          return {
-            claimFailed: false,
-            result: writeRootHotProjectionUnlocked(hypoDir, testHooks, sessionId),
-          };
-        } catch (err) {
-          // No write happened, so a claim this call added would let whatever
-          // another session or a person writes to hot.md next be committed
-          // as this session's change. An earlier invocation's claim on the
-          // same (resumed) session_id is left alone.
-          if (claim.added) clearTouchedPaths(hypoDir, sessionId, ['hot.md']);
-          throw err;
+    linkSync(tmp, abs);
+    return 'published';
+  } catch (err) {
+    if (err?.code !== 'EEXIST') throw err;
+    return readTextOrNull(abs) === text ? 'same' : 'conflict';
+  } finally {
+    rmSync(tmp, { force: true });
+  }
+}
+
+// A scope as the duplicate check compares it: absent, empty and `shared` are one value.
+const scopeKey = (scope) => {
+  const v = String(scope ?? '').trim();
+  return v === '' ? 'shared' : v;
+};
+
+// The baseline entries HEAD already has for `slug`, parsed: [{summary, legacy, scope}].
+function committedBaselines(hypoDir, slug) {
+  const dir = `projects/${slug}/sessions/`;
+  const listed = gitOut(hypoDir, ['ls-tree', '--name-only', '-z', 'HEAD', dir]);
+  const found = [];
+  for (const name of (listed ?? '').split('\0').filter((n) => BASELINE_FILE_RE.test(n))) {
+    const text = gitShowText(hypoDir, 'HEAD', `${dir}${name.split('/').at(-1)}`);
+    const parsed = text === null ? null : parseSessionEntry(text);
+    if (parsed?.ok) {
+      found.push({
+        summary: parsed.entry.summary,
+        legacy: parsed.entry.bodies[LEGACY_TRACK_ID],
+        bodies: JSON.stringify(parsed.entry.bodies),
+        scope: scopeKey(parsed.entry.visibilityScope),
+      });
+    }
+  }
+  return found;
+}
+
+/**
+ * Publish the old generated-file bytes `archived` set aside as additional baseline entries
+ * (`projects/<p>/sessions/<date>-baseline-<h16>.md`) in one commit, so a memory that only this
+ * machine held reaches the others. `archived` is `[{relPath, kind, backupPath, sha256,
+ * companionRev}]`; the bytes come from `backupPath` (a missing or changed backup is skipped with a
+ * notice). The root `hot.md` and `.hypoignore`d projects are skipped. Per project, one pair
+ * (`hot.md` text, `session-state.md` text) is built per run and kind (`run` is 0 when absent), and
+ * once for every distinct version of a path within one, so a path archived in two runs with
+ * different bytes yields a baseline for each; the side that was not archived comes from
+ * `companionRev`'s tree. A pair is not made when HEAD already has a baseline whose summary
+ * and state sections (the `legacy` body, or every body of a split state file) are byte-equal to it
+ * and the same scope (frontmatter included, so a changed
+ * `machine_note` is a different memory, and the same text under another scope is another baseline).
+ * The scope of an entry is the narrowest of the old file's, HEAD's `index.md` and the working
+ * tree's, so an uncommitted edit of `index.md` can narrow what is committed but never widen it.
+ * A path whose file is already there with the same bytes (published, not yet
+ * committed) is committed without being written again. Returns `{created: [relPath], skipped:
+ * [relPath], unresolved: [archived member], notices: [string]}`. `unresolved` holds the members
+ * whose bytes could not be shared yet (a missing or changed backup, a conflicting destination
+ * file); a caller that deletes its record must keep them. The caller holds the
+ * vault commit lock.
+ */
+export function shareLegacyBytes(hypoDir, archived) {
+  const created = [];
+  const skipped = [];
+  const notices = [];
+  const unresolved = [];
+  const patterns = loadHypoIgnore(hypoDir);
+  const projects = new Map();
+  // Per project, the archived members behind each old text, so a baseline that cannot be written
+  // names the members to retry.
+  const members = new Map();
+  for (const el of archived ?? []) {
+    const slug = generatedViewSlug(el?.relPath ?? '');
+    if (slug === null || projectHiddenByHypoignore(hypoDir, slug, patterns)) {
+      skipped.push(el?.relPath);
+      // The root hot.md never becomes a baseline, so its set-aside bytes stay in the backup
+      // alone; say where, as the clean-and-deleted case does.
+      if (el?.relPath === 'hot.md' && el.backupPath) {
+        notices.push(rootHotBackupRecoveryNotice(el.relPath, el.backupPath));
+      }
+      continue;
+    }
+    const text = (() => {
+      try {
+        return readFileSync(el.backupPath, 'utf-8');
+      } catch {
+        return null;
+      }
+    })();
+    if (text === null || (el.sha256 && sha256Hex(text) !== el.sha256)) {
+      skipped.push(el.relPath);
+      unresolved.push(el);
+      notices.push(
+        `${el.relPath}의 백업(${el.backupPath})이 없거나 달라져 추가 기준선을 만들지 않았습니다.`,
+      );
+      continue;
+    }
+    // One group per run and kind: the versions of both files that one clearing run set aside.
+    // Another run's version of the same path is a version of its own and gets its own baseline.
+    const groups = projects.get(slug) ?? new Map();
+    projects.set(slug, groups);
+    const run = Number.isInteger(el.run) ? el.run : 0;
+    const kind = el.kind === 'stage' ? 'stage' : 'worktree';
+    const groupKey = `${run}\0${kind === 'stage' ? 1 : 0}`;
+    const group = groups.get(groupKey) ?? {
+      sort: [run, kind === 'stage' ? 1 : 0],
+      hot: [],
+      state: [],
+    };
+    groups.set(groupKey, group);
+    const list = el.relPath.endsWith('/hot.md') ? group.hot : group.state;
+    if (!list.includes(text)) list.push(text);
+    group.rev ??= el.companionRev;
+    const memberKey = `${list === group.hot ? 'hot' : 'state'}\0${text}`;
+    const byText = members.get(slug) ?? new Map();
+    members.set(slug, byText);
+    byText.set(memberKey, [...(byText.get(memberKey) ?? []), el]);
+  }
+
+  const toCommit = [];
+  for (const [slug, groups] of projects) {
+    const pairs = new Map();
+    const ordered = [...groups.values()].sort(
+      (a, b) => a.sort[0] - b.sort[0] || a.sort[1] - b.sort[1],
+    );
+    for (const group of ordered) {
+      // Only what this group set aside becomes a baseline. The side it did not set aside comes
+      // from `companionRev`'s tree for the date alone: that file is not this machine's memory, and
+      // a baseline of it would be a stale copy of the other machine's bytes.
+      const companion = (name, list, i) =>
+        list[i] ??
+        (group.rev ? gitShowText(hypoDir, group.rev, `projects/${slug}/${name}.md`) : null) ??
+        '';
+      for (let i = 0; i < Math.max(group.hot.length, group.state.length); i++) {
+        const pair = {
+          hotText: group.hot[i] ?? '',
+          stateText: group.state[i] ?? '',
+          dateTexts: [companion('hot', group.hot, i), companion('session-state', group.state, i)],
+        };
+        pairs.set(JSON.stringify([pair.hotText, pair.stateText]), pair);
+      }
+    }
+    // The working tree's `index.md` can only narrow what HEAD's says: an uncommitted edit that
+    // widens the scope must not publish old text to the other machines before it is committed.
+    const indexScope = narrowestVisibilityScope([
+      readVisibilityScope(gitShowText(hypoDir, 'HEAD', `projects/${slug}/index.md`) ?? ''),
+      readVisibilityScope(readTextOrNull(join(hypoDir, 'projects', slug, 'index.md')) ?? ''),
+    ]);
+    let existing = null;
+    for (const { hotText, stateText, dateTexts } of pairs.values()) {
+      // One entry per old file, each with its own scope.
+      const builtPair = buildLegacyBaselines({
+        hotText,
+        stateText,
+        date: legacyBaselineDate(hypoDir, slug, dateTexts),
+        project: slug,
+        scopes: {
+          index: indexScope.scope,
+          hot: readVisibilityScope(hotText),
+          state: readVisibilityScope(stateText),
+        },
+        legacyDone: false,
+      });
+      for (const built of builtPair) {
+        const mine = parseSessionEntry(built.text).entry;
+        existing ??= committedBaselines(hypoDir, slug);
+        const rel = `projects/${slug}/sessions/${built.fileName}`;
+        // A baseline made before the split held both files in one entry, so the section of this
+        // kind is what is compared, not the whole entry.
+        const scope = scopeKey(mine.visibilityScope);
+        // An earlier build wrote a state file whole, as one `legacy` body, even when it has track
+        // sections. The same bytes are the same memory: a split copy beside it would bring back
+        // the tracks that were finished there.
+        const unsplitBody = (stateText ?? '').replace(/\r\n/g, '\n');
+        const same =
+          built.kind === 'hot'
+            ? (e) => e.scope === scope && e.summary === mine.summary
+            : (e) =>
+                e.scope === scope &&
+                (e.bodies === JSON.stringify(mine.bodies) ||
+                  e.bodies === JSON.stringify({ [LEGACY_TRACK_ID]: unsplitBody }));
+        if (existing.some(same)) {
+          skipped.push(rel);
+          continue;
         }
-      },
-      { timeoutMs: Number(process.env.HYPO_VAULT_LOCK_TIMEOUT_MS) || 5000 },
-    );
-  } catch (err) {
-    if (err?.code !== 'ELOCKTIMEOUT') throw err;
-    return { claimFailed: false, result: rootHotLockTimeoutResult() };
+        if (publishNoClobber(join(hypoDir, rel), built.text) === 'conflict') {
+          skipped.push(rel);
+          unresolved.push(
+            ...(members
+              .get(slug)
+              ?.get(`${built.kind}\0${built.kind === 'hot' ? hotText : stateText}`) ?? []),
+          );
+          notices.push(`${rel}에 다른 내용의 파일이 이미 있어 추가 기준선을 쓰지 않았습니다.`);
+          continue;
+        }
+        toCommit.push(rel);
+        // A later pair in this run can name the same file (two groups with one hot text): it is
+        // taken now, not published twice.
+        existing.push({
+          summary: mine.summary,
+          legacy: mine.bodies[LEGACY_TRACK_ID],
+          bodies: JSON.stringify(mine.bodies),
+          scope,
+        });
+        notices.push(
+          built.kind === 'state'
+            ? `이 기계에만 있던 옛 세션 현황을 추가 기준선 ${rel}로 기록했습니다. legacy 트랙에 머리가 여럿 보일 수 있습니다.`
+            : `이 기계에만 있던 옛 hot.md를 추가 기준선 ${rel}로 기록했습니다. 최근 세션 요약에 따로 보일 수 있습니다.`,
+        );
+      }
+    }
   }
+  if (toCommit.length) {
+    const result = commitWikiChanges(hypoDir, toCommit);
+    if (!result.committed) {
+      notices.push(`추가 기준선을 커밋하지 못했습니다: ${result.reason ?? '이유 미상'}`);
+    }
+    created.push(...toCommit);
+  }
+  return { created, skipped, unresolved: [...new Set(unresolved)], notices };
+}
+
+/**
+ * Finish what a catch-up merge left behind: a record whose `stage` is `merged`, or whose
+ * `targetSha` is already an ancestor of HEAD (the merge landed, the rest did not run). Puts the
+ * archived `.gitignore` lines back, shares the archived bytes, and deletes the record once every
+ * baseline it made is in HEAD and nothing was left unshared (otherwise the record keeps only the
+ * unshared views). It names the backup of every local-only, unowned and cleared entry
+ * the record holds, except those whose backup path is in `announced`. A record that is still
+ * `archived` with a target HEAD does not contain is the next catch-up's to recover and is left
+ * alone. Independent of the migration state. Returns `{resumed, created, notices}`.
+ */
+export function resumePullArchive(hypoDir, { announced = [] } = {}) {
+  const rec = readPullArchive(hypoDir);
+  if (!rec || (rec.stage !== 'merged' && !isAncestorOfHead(hypoDir, rec.targetSha))) {
+    return { resumed: false, created: [], notices: [] };
+  }
+  restoreGitignoreLines(hypoDir, rec.gitignoreLines);
+  // The merge landed, so the lines above are all of the `.gitignore` that carries over.
+  for (const { backupPath } of rec.gitignoreSaved) rmSync(backupPath, { force: true });
+  const shared = shareLegacyBytes(hypoDir, rec.views);
+  const notices = [...shared.notices, ...setAsideNotices(hypoDir, rec, announced)];
+  // The record is the only other place that names these backups, and every branch below may drop
+  // or shrink it. Their lines are in the notice store first, announced ones included (the caller's
+  // copy lives in memory), or the record stays as it is for the next run. A line can show twice.
+  const durable = [...shared.notices, ...setAsideNotices(hypoDir, rec)];
+  if (durable.length && !writeRootHotHealthNotice(hypoDir, durable.join('\n'))) {
+    return {
+      resumed: true,
+      created: shared.created,
+      notices: [
+        ...notices,
+        `알림을 저장하지 못해 보관 기록(${PULL_ARCHIVE_REL})을 지우지 않고 남겼습니다. 다음 실행이 이어서 처리합니다.`,
+      ],
+    };
+  }
+  // A backup the record names that is not on disk (a crash lost it) means nothing was shared for
+  // that entry, so "no baseline was created" must not read as "nothing left to do".
+  const lost = [...rec.views, ...rec.localOnly, ...rec.unowned, ...rec.cleared].filter(
+    (v) => !existsSync(v.backupPath),
+  );
+  if (lost.length) {
+    // A view that was shared and is in HEAD is done; the kept record holds only the unresolved
+    // ones, as in the branch below. A baseline not in HEAD yet keeps the whole record for a retry.
+    if (
+      shared.unresolved.length < rec.views.length &&
+      shared.created.every((rel) => pathInHead(hypoDir, rel))
+    ) {
+      writePullArchive(hypoDir, { ...rec, views: shared.unresolved });
+    }
+    notices.push(
+      `보관 기록이 가리키는 백업 파일이 없어 기록을 지우지 않고 남겼습니다: ${lost.map((v) => `${v.relPath} (${v.backupPath})`).join(', ')}. 내용을 확인한 뒤 ${PULL_ARCHIVE_REL}를 직접 지우세요.`,
+    );
+  } else if (!shared.created.every((rel) => pathInHead(hypoDir, rel))) {
+    notices.push(
+      '추가 기준선이 아직 커밋되지 않아 보관 기록을 남겼습니다. 다음 실행이 이어서 처리합니다.',
+    );
+  } else if (shared.unresolved.length) {
+    // The merge landed and the lines above are back, so only the members that could not be shared
+    // are left to retry. Their backups stay on disk; the set-aside lists were announced above.
+    writePullArchive(hypoDir, {
+      ...rec,
+      stage: 'merged',
+      gitignoreLines: [],
+      views: shared.unresolved,
+      localOnly: [],
+      unowned: [],
+      cleared: [],
+      gitignoreSaved: [],
+    });
+    notices.push(
+      `공유하지 못한 보관 항목이 있어 기록(${PULL_ARCHIVE_REL})에 그것만 남겼습니다: ${shared.unresolved.map((v) => v.relPath).join(', ')}. 다음 실행이 다시 시도합니다.`,
+    );
+  } else {
+    rmSync(join(hypoDir, PULL_ARCHIVE_REL), { force: true });
+  }
+  return { resumed: true, created: shared.created, notices };
 }
 
 const ROOT_HOT_HEALTH_NOTICE_FILENAME = 'root-hot-projection-notice.json';
@@ -2345,9 +3279,12 @@ const ROOT_HOT_HEALTH_NOTICE_FILENAME = 'root-hot-projection-notice.json';
  * suppressed (`{ suppressOutput: true }`), so a failure there is otherwise
  * invisible to the user until they go looking at stderr. Best-effort like
  * every other cache write in this file: a hook must not fail Stop over a
- * notice file.
+ * notice file. A notice nobody has read yet is kept and the new message is added after it, one
+ * line at a time (a line already pending is kept once, so a multi-line message repeats nothing).
  * @param {string} hypoDir
  * @param {string} message
+ * @returns {boolean} whether the notice is on disk. Most callers ignore it; a caller that is about
+ *   to replace the only copy of someone's bytes (a view or an index entry) stops when it is false.
  */
 export function writeRootHotHealthNotice(hypoDir, message) {
   const path = join(hypoDir, '.cache', ROOT_HOT_HEALTH_NOTICE_FILENAME);
@@ -2357,11 +3294,28 @@ export function writeRootHotHealthNotice(hypoDir, message) {
     // otherwise let this brand-new notice be deleted by a reader that read
     // the OLD one, or read half-written bytes from atomicWrite's rename).
     withFileLock(path, () => {
-      atomicWrite(path, JSON.stringify({ message, ts: Date.now() }));
+      // A notice nobody has read yet is kept: a second writer before the next SessionStart (a
+      // staged-version backup, then an index warning, in one Stop) must not erase the first.
+      let pending = '';
+      try {
+        const parsed = JSON.parse(readFileSync(path, 'utf-8'));
+        if (typeof parsed?.message === 'string') pending = parsed.message;
+      } catch {
+        // no notice yet, or an unreadable one: start over
+      }
+      const lines = pending ? pending.split('\n') : [];
+      for (const line of String(message).split('\n')) if (!lines.includes(line)) lines.push(line);
+      // Durable: a caller that gets true goes on to replace the only copy of someone's bytes, so the
+      // notice naming the backup has to survive a power loss the backup itself survives.
+      atomicWrite(path, JSON.stringify({ message: lines.join('\n'), ts: Date.now() }), {
+        durable: true,
+      });
     });
+    return true;
   } catch {
     // best-effort: losing the notice is strictly better than crashing Stop
     // over it.
+    return false;
   }
 }
 
@@ -2409,6 +3363,35 @@ export function consumeRootHotHealthNotice(hypoDir) {
     // lock-timeout path in this file: the notice just waits for the next
     // reader instead of being lost.
     return null;
+  }
+}
+
+/**
+ * Take lines back out of the pending notice: the ones `message` holds, nothing else. For a notice
+ * written ahead of a move that was then taken back, so it does not name backups that are gone.
+ * The file goes when no line is left. Best-effort like the writer; returns whether it succeeded.
+ */
+export function retractRootHotHealthNotice(hypoDir, message) {
+  const path = join(hypoDir, '.cache', ROOT_HOT_HEALTH_NOTICE_FILENAME);
+  if (!existsSync(path)) return true;
+  const drop = new Set(String(message).split('\n'));
+  try {
+    withFileLock(path, () => {
+      let pending;
+      try {
+        pending = JSON.parse(readFileSync(path, 'utf-8')).message;
+      } catch {
+        return;
+      }
+      if (typeof pending !== 'string') return;
+      const lines = pending.split('\n').filter((l) => !drop.has(l));
+      if (lines.length === pending.split('\n').length) return;
+      if (!lines.length) unlinkSync(path);
+      else atomicWrite(path, JSON.stringify({ message: lines.join('\n'), ts: Date.now() }));
+    });
+    return true;
+  } catch {
+    return false;
   }
 }
 
@@ -2476,85 +3459,275 @@ export function resolveActiveProject(hypoDir, cwd = null) {
   return null;
 }
 
-/**
- * Strict session-close verification (spec §5.2.7 / §8.3).
- * Confirms the memory files a session close must touch were updated today:
- *   - projects/<project>/session-state.md       — frontmatter `updated:` is today
- *   - projects/<project>/hot.md                 — frontmatter `updated:` is today
- *   - hot.md (root)                             — frontmatter `updated:` is today
- *   - projects/<project>/session-log/YYYY-MM-DD.md — has a `## [today]` heading
- *     (daily shard; legacy YYYY-MM.md is still accepted as fallback)
- *   - log.md                                    — has a `## [today] session | <project>` entry
- * The log.md check is project-scoped so a session close left incomplete for
- * project A can't be masked by a fresh close of project B (and vice versa).
- * open-questions.md (file #5) is conditional and not gated.
- *
- * `projectOverride` (same-date-tie fix): when the caller already holds the
- * authoritative project being closed (e.g. crystallize apply derives it from
- * `payload.project`), it passes that slug so verification checks the SAME
- * project it just wrote — instead of re-deriving via resolveActiveProject(),
- * which on a same-date root-hot.md tie can resolve a DIFFERENT project and
- * false-fail a completed close. When omitted, behavior is byte-identical to the
- * legacy single-arg version (resolve from root hot.md).
- *
- * @param {string} hypoDir
- * @param {{projectOverride?: string|null}} [opts]
- * @returns {{ok: boolean, project: string|null, dates: string[], stale: string[], missing: string[]}}
- */
-export function sessionCloseFileStatus(hypoDir, { projectOverride = null } = {}) {
-  const dates = freshDates();
-  const project = projectOverride || resolveActiveProject(hypoDir);
-  if (!project) {
-    return {
-      ok: false,
-      project: null,
-      dates,
-      stale: [],
-      missing: ['hot.md (no active project in pointer table)'],
-      sessionLogEvidence: null,
-    };
+// The session entries of `project` on disk whose file name starts with one of `dates`.
+export function datedEntryPaths(hypoDir, project, dates) {
+  let names = [];
+  try {
+    names = readdirSync(join(hypoDir, 'projects', project, 'sessions'));
+  } catch {
+    return [];
   }
+  return names
+    .filter((n) => isSessionEntryPath(`projects/${project}/sessions/${n}`))
+    .filter((n) => dates.includes(n.slice(0, 10)) && n[10] === '-')
+    .sort()
+    .map((n) => `projects/${project}/sessions/${n}`);
+}
 
-  const stale = []; // exists but not updated this session
-  const missing = []; // file does not exist
+// The entry file of one close id in `project`, found by name on disk:
+// `<date>-<closeId>.md`, the date being whatever the close was first published with.
+export function entryPathOfClose(hypoDir, project, closeId) {
+  let names = [];
+  try {
+    names = readdirSync(join(hypoDir, 'projects', project, 'sessions'));
+  } catch {
+    return null;
+  }
+  const name = names
+    .filter((n) => /^\d{4}-\d{2}-\d{2}-/.test(n) && n === `${n.slice(0, 10)}-${closeId}.md`)
+    .sort()[0];
+  return name ? `projects/${project}/sessions/${name}` : null;
+}
 
-  const checkUpdated = (relPath) => {
-    const full = join(hypoDir, relPath);
-    if (!existsSync(full)) {
-      missing.push(relPath);
-      return;
+// sha256 of a file's raw bytes, null when it cannot be read.
+function fileSha256(absPath) {
+  try {
+    return createHash('sha256').update(readFileSync(absPath)).digest('hex');
+  } catch {
+    return null;
+  }
+}
+
+// A close id is `<sessionId>-<openedAtIndex>` (closeIdFor), so the pin that holds its local proof
+// is the one of the session id in front of the last `-`.
+const sessionIdOfClose = (closeId) => closeId.replace(/-\d+$/, '');
+
+// Whether `text` parses as the entry `relPath` names: that close id, that project
+// folder, that date, and (when it carries one) the session the close id belongs
+// to. A file name is easy to type or copy, so a name alone proves nothing.
+function entryMatchesPath(text, relPath) {
+  const m = /^projects\/([^/]+)\/sessions\/(\d{4}-\d{2}-\d{2})-(.+-\d+)\.md$/.exec(relPath);
+  if (!m) return false;
+  const [, project, date, closeId] = m;
+  const parsed = parseSessionEntry(text);
+  if (!parsed.ok) return false;
+  const e = parsed.entry;
+  if (e.closeId !== closeId || e.project !== project || e.date !== date) return false;
+  return e.sessionId === null || e.sessionId === sessionIdOfClose(closeId);
+}
+
+// A session entry another session published that no commit holds yet: a file not in
+// HEAD whose name carries a close id of a different session. That session's own close
+// commits it, so a gate of this session neither blocks on it nor tells anyone to
+// commit or revert it (it is the only copy of that session's summary). An entry
+// already in HEAD and since modified is not new, and git failing to answer is not
+// "absent": both stay blocking. The file must also be the entry its path names
+// (entryMatchesPath).
+export function isForeignUncommittedEntry(hypoDir, relPath, sessionId) {
+  if (!isValidSessionId(sessionId) || !isSessionEntryPath(relPath)) return false;
+  const m = /^projects\/[^/]+\/sessions\/\d{4}-\d{2}-\d{2}-(.+-\d+)\.md$/.exec(relPath);
+  if (!m) return false;
+  const owner = sessionIdOfClose(m[1]);
+  if (owner === sessionId || !isValidSessionId(owner)) return false;
+  let text;
+  try {
+    text = readFileSync(join(hypoDir, relPath), 'utf-8');
+  } catch {
+    return false;
+  }
+  if (!entryMatchesPath(text, relPath)) return false;
+  return headPathState(hypoDir, relPath) === 'absent';
+}
+
+const FOREIGN_ENTRY_NOTICE = (f) =>
+  `${f} is another session's new session entry, not committed yet. That session's close ` +
+  `commits it, so do not commit or revert it here (다른 세션 close 의 원본이다. 그 세션의 ` +
+  `커밋이 실패해 남은 것이면 그 세션이 close 를 다시 실행해야 동기화된다)`;
+
+// Where a session keeps the session-log appends its closes made, one record each:
+// `{path, beforeLen, beforeSha256, addedLen, addedSha256, closeId}`.
+function shardAppendsPath(hypoDir, sessionId) {
+  return join(sessionCacheDir(hypoDir, sessionId), 'shard-appends.json');
+}
+
+function readShardAppends(path) {
+  try {
+    const parsed = JSON.parse(readFileSync(path, 'utf-8'));
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Record that this session's close appends the text `added` to the session-log shard
+ * `relPath`, whose text is `before`. The caller holds the shard lock and calls this
+ * before writing: an append nobody recorded blocks every other session's gate, while
+ * a record whose write then failed matches no bytes. Never throws.
+ *
+ * @returns {boolean} false when the record could not be written
+ */
+export function recordShardAppend(hypoDir, sessionId, relPath, before, added, closeId = null) {
+  if (!isValidSessionId(sessionId)) return false;
+  const b = Buffer.from(before, 'utf-8');
+  const a = Buffer.from(added, 'utf-8');
+  const path = shardAppendsPath(hypoDir, sessionId);
+  try {
+    withFileLock(path, () => {
+      const list = readShardAppends(path);
+      list.push({
+        path: posixPath(relPath),
+        beforeLen: b.length,
+        beforeSha256: sha256Hex(b),
+        addedLen: a.length,
+        addedSha256: sha256Hex(a),
+        closeId,
+      });
+      atomicWrite(path, JSON.stringify(list));
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Take back the record `recordShardAppend` wrote for one append, once the append itself
+ * has been restored (the close's commit did not land). Left behind, the record would
+ * license the same bytes added later by hand as that close's own. Only a record that
+ * matches the path, the close id and both hashes goes; other records stay. Never throws.
+ *
+ * @returns {boolean} false when the records could not be rewritten (no matching record is
+ *   true: there was nothing to remove)
+ */
+export function removeShardAppend(hypoDir, sessionId, relPath, before, added, closeId = null) {
+  if (!isValidSessionId(sessionId)) return true;
+  const path = shardAppendsPath(hypoDir, sessionId);
+  if (!existsSync(path)) return true;
+  const beforeSha256 = sha256Hex(Buffer.from(before, 'utf-8'));
+  const addedSha256 = sha256Hex(Buffer.from(added, 'utf-8'));
+  try {
+    return withFileLock(path, () => {
+      const list = readShardAppends(path);
+      const kept = list.filter(
+        (r) =>
+          !(
+            r?.path === posixPath(relPath) &&
+            r.closeId === closeId &&
+            r.beforeSha256 === beforeSha256 &&
+            r.addedSha256 === addedSha256
+          ),
+      );
+      if (kept.length !== list.length) atomicWrite(path, JSON.stringify(kept));
+      return true;
+    });
+  } catch {
+    return false;
+  }
+}
+
+// Every other session's recorded appends to `relPath`.
+// ponytail: one small file read per session directory; index the records by shard if
+// a vault ever keeps thousands of session directories.
+function foreignShardAppends(hypoDir, relPath, sessionId) {
+  const own = sessionCacheDir(hypoDir, sessionId);
+  const root = dirname(own);
+  let dirs = [];
+  try {
+    dirs = readdirSync(root);
+  } catch {
+    return [];
+  }
+  return dirs
+    .filter((d) => join(root, d) !== own)
+    .flatMap((d) => readShardAppends(join(root, d, 'shard-appends.json')))
+    .filter(
+      (r) =>
+        r?.path === relPath &&
+        Number.isInteger(r.beforeLen) &&
+        Number.isInteger(r.addedLen) &&
+        r.addedLen > 0,
+    );
+}
+
+// A session-log shard other sessions are appending to: in HEAD, and the bytes on disk
+// are HEAD's bytes followed by appends other sessions' closes recorded
+// (recordShardAppend), one after another, byte for byte. Two closes of one project
+// share the day's shard, so the later close's heading sits uncommitted while the
+// earlier close's marker gate still runs. A byte no other session recorded (a hand
+// edit, this session's own append, a close that died before recording) keeps the
+// shard blocking, and so does an index entry that is neither HEAD nor HEAD plus some
+// of those appends (a staged edit or deletion). A shard this session recorded counts
+// only when the bytes it recorded are the ones HEAD holds (its own write committed),
+// the same retirement commitTouchedPaths applies.
+export function isForeignAppendOnlyShard(hypoDir, relPath, sessionId) {
+  if (!isValidSessionId(sessionId) || !CLOSE_FILE_RE.test(relPath)) return false;
+  const head = headBlob(hypoDir, relPath);
+  if (!head) return false;
+  let disk;
+  try {
+    disk = readFileSync(join(hypoDir, relPath));
+  } catch {
+    return false;
+  }
+  if (disk.length < head.length || !disk.subarray(0, head.length).equals(head)) return false;
+  const records = foreignShardAppends(hypoDir, relPath, sessionId);
+  const ends = [head.length]; // HEAD, then HEAD plus each whole recorded append
+  for (let pos = head.length; pos < disk.length; ) {
+    const before = sha256Hex(disk.subarray(0, pos));
+    const r = records.find(
+      (x) =>
+        x.beforeLen === pos &&
+        x.beforeSha256 === before &&
+        pos + x.addedLen <= disk.length &&
+        sha256Hex(disk.subarray(pos, pos + x.addedLen)) === x.addedSha256,
+    );
+    if (!r) return false;
+    pos += r.addedLen;
+    ends.push(pos);
+  }
+  const touched = readTouchedPathsStrict(hypoDir, sessionId);
+  if (touched.state === 'locked' || touched.state === 'unreadable') return false;
+  // The bytes this session recorded writing, when it wrote this shard. They must be
+  // HEAD's, or HEAD's up to a line end: a pathspec commit (`--only`) reads each path
+  // from the work tree twice, so another close's append landing between the two
+  // reads is committed along with this one's.
+  let own = null;
+  if (touched.paths.map(posixPath).includes(relPath)) {
+    const hashes = readTouchedHashesFile(touchedHashesPath(hypoDir, sessionId));
+    if (!Object.hasOwn(hashes, relPath)) return false;
+    own = hashes[relPath];
+    let committed = sha256Hex(head) === own;
+    // One hash per line end: a day's shard is a few hundred lines at most.
+    for (let end = head.indexOf(10); !committed && end !== -1; end = head.indexOf(10, end + 1)) {
+      committed = sha256Hex(head.subarray(0, end + 1)) === own;
     }
-    let content;
-    try {
-      content = readFileSync(full, 'utf-8');
-    } catch {
-      missing.push(relPath);
-      return;
-    }
-    if (!dates.includes(frontmatterUpdated(content))) stale.push(relPath);
-  };
+    if (!committed) return false;
+  }
+  // The index: HEAD, HEAD plus recorded appends another close is staging right now,
+  // or (the same race) the shorter bytes this session's committed write left there.
+  const index = headBlob(hypoDir, relPath, { index: true });
+  if (!index) return false;
+  if (ends.some((e) => e === index.length && disk.subarray(0, e).equals(index))) return true;
+  return own !== null && sha256Hex(index) === own;
+}
 
-  checkUpdated(join('projects', project, 'session-state.md'));
-  checkUpdated(join('projects', project, 'hot.md'));
-  // Root hot.md is deliberately not checked here. Its `updated:` is a max
-  // across every project row (see formatRootHotProjection), not this project's
-  // own date, so a sibling project's later row would push the field past today
-  // and stale-flag a session that did everything right. The pointer table is a
-  // projection the hooks regenerate; it is not a file this close writes.
-  // Pinned by 'n1: root hot.md must not be reported stale by a sibling project
-  // whose row date is the max' in tests/session-hooks.test.mjs.
+const FOREIGN_APPEND_NOTICE = (f) =>
+  `${f} differs from its committed version only by lines added after it, or only in the ` +
+  `index, and this session did not write them (most likely another session's close, still ` +
+  `committing), so do not commit or revert it here (다른 세션이 덧붙이고 있는 session-log ` +
+  `샤드다. 그 세션의 close 가 커밋한다)`;
 
-  // session-log: daily shard, with legacy monthly fallback: must
-  // carry a today-dated heading in whichever file holds it. Daily-first read
-  // order short-circuits on the small shard. When no match is found, the gap is
-  // reported under the canonical daily shard for the local date (dates[0]).
-  let sessionLogOk = false;
-  // The candidate that actually satisfied freshness, captured so a caller
-  // that must certify a SPECIFIC committed version (a close receipt) knows
-  // which of the (up to) four local/UTC × daily/monthly candidates is the
-  // one this check actually trusted, rather than re-deriving (and possibly
-  // picking a DIFFERENT one, since `closeFileTargetsForProject` recomputes
-  // both dates independently) which file to prove.
+// The session-log and log.md half of a close check, for one project and the dates its close
+// counts under. Pushes into `stale`/`missing` and returns the session-log file that carried the
+// heading (`{path, date}`), or null.
+function checkCloseLogs(hypoDir, project, dates, stale, missing) {
+  // session-log: daily shard, with legacy monthly fallback: must carry a heading for one of
+  // `dates` in whichever file holds it. Daily-first read order short-circuits on the small shard.
+  // When no match is found, the gap is reported under the canonical daily shard for dates[0].
+  // The candidate that actually satisfied the check is returned so a caller that must certify a
+  // SPECIFIC committed version (a close receipt) knows which of the (up to) four local/UTC ×
+  // daily/monthly candidates this check trusted, rather than re-deriving it.
   let sessionLogEvidence = null;
   for (const date of dates) {
     for (const rel of sessionLogReadCandidates(project, date)) {
@@ -2567,19 +3740,18 @@ export function sessionCloseFileStatus(hypoDir, { projectOverride = null } = {})
         continue;
       }
       if (hasSessionLogHeading(content, date)) {
-        sessionLogOk = true;
         sessionLogEvidence = { path: rel, date };
         break;
       }
     }
-    if (sessionLogOk) break;
+    if (sessionLogEvidence) break;
   }
-  if (!sessionLogOk) {
+  if (!sessionLogEvidence) {
     const logRel = sessionLogShardPath(project, dates[0]);
     (existsSync(join(hypoDir, logRel)) ? stale : missing).push(logRel);
   }
 
-  // log.md: must carry a today-dated `session` entry for the resolved project.
+  // log.md: must carry a `session` entry for the project on one of `dates`.
   const logFull = join(hypoDir, 'log.md');
   if (!existsSync(logFull)) {
     missing.push('log.md');
@@ -2593,6 +3765,156 @@ export function sessionCloseFileStatus(hypoDir, { projectOverride = null } = {})
     const logFresh = content && dates.some((d) => hasLogEntry(content, d, project));
     if (content && !logFresh) stale.push('log.md');
   }
+  return sessionLogEvidence;
+}
+
+/** Notice for a project whose session-log shows a close today but whose `sessions/` has no entry for it. */
+export const LEGACY_CLOSE_NOTICE_TYPE = 'close-legacy';
+
+/**
+ * Notice, on a session-scope check, that the project has no session-log heading or log.md line
+ * under the entry's date. It is a notice and not a gap: the heading and line carry no close id,
+ * so whatever the check finds there may belong to another close of the same day, and a close is
+ * proven by its own entry alone.
+ */
+export const CLOSE_LOGS_MISSING_NOTICE_TYPE = 'close-logs-missing';
+
+/**
+ * Session-close verification (spec §5.2.7 / §8.3). A close writes one entry
+ * `projects/<p>/sessions/<date>-<closeId>.md`, a session-log heading and a
+ * log.md `## [<date>] session | <p>` line. The generated views (`hot.md`,
+ * `session-state.md`) are proof of nothing and are not read.
+ *
+ * `opts.scope` is required and picks what is proven:
+ *   'session'  THIS close, `opts.closeId` (the key is required, a null value is
+ *              "no close to prove" and reads as missing). Its entry must be in
+ *              HEAD's tree; for a `.hypoignore` project, which never commits
+ *              it, the entry's disk bytes must hash to the close pin's
+ *              `localProofs[closeId]` instead. Either way those bytes must be
+ *              the entry the path names (entryMatchesPath): another close's
+ *              entry committed under this close's name proves nothing. Another
+ *              close's entry, even one of the same session, proves nothing.
+ *              The session-log heading and log.md line are NOT part of this proof:
+ *              they carry no close id, so a same-day heading of another close would
+ *              pass for this one. They are looked up under the entry's own date (a close
+ *              committed before midnight still reads right after it) and a gap
+ *              comes back as a `close-logs-missing` notice, never in `stale`/`missing`.
+ *              `sessionLogEvidence` is null for this scope.
+ *   'global'   any close of the project today: an entry dated today on disk,
+ *              plus today's session-log heading and log.md line. A project with
+ *              today's heading and no entry dated today was closed by a writer
+ *              that predates entries (an older install, or by hand): that is
+ *              not a gap, and in a migrated vault it is reported as a
+ *              `close-legacy` notice.
+ * A missing or unknown scope throws: a call that forgot it must not fall back
+ * to the weaker global answer.
+ *
+ * `projectOverride`: the project to check; when omitted, the active project
+ * resolved from root hot.md (recency).
+ *
+ * @param {string} hypoDir
+ * @param {{scope: 'session'|'global', closeId?: string|null, projectOverride?: string|null}} opts
+ * @returns {{ok: boolean, project: string|null, dates: string[], stale: string[], missing: string[],
+ *   sessionLogEvidence: {path: string, date: string}|null, entry: string|null,
+ *   notices: {type: string, project: string, reason: string}[]}}
+ */
+export function sessionCloseFileStatus(hypoDir, opts) {
+  const scope = opts?.scope;
+  if (scope !== 'session' && scope !== 'global') {
+    throw new Error(`sessionCloseFileStatus: scope must be 'session' or 'global', got ${scope}`);
+  }
+  if (scope === 'session' && !('closeId' in opts)) {
+    throw new Error("sessionCloseFileStatus: scope 'session' requires a closeId key");
+  }
+  const project = opts.projectOverride || resolveActiveProject(hypoDir);
+  const notices = [];
+  if (!project) {
+    return {
+      ok: false,
+      project: null,
+      dates: freshDates(),
+      stale: [],
+      missing: ['hot.md (no active project in pointer table)'],
+      sessionLogEvidence: null,
+      entry: null,
+      notices,
+    };
+  }
+
+  const stale = []; // exists but does not prove the close
+  const missing = []; // does not exist
+  let dates = freshDates();
+  let entry = null;
+  let sessionLogEvidence = null;
+
+  if (scope === 'session') {
+    const closeId = opts.closeId;
+    entry = closeId ? entryPathOfClose(hypoDir, project, closeId) : null;
+    if (!entry) {
+      missing.push(
+        closeId
+          ? `projects/${project}/sessions/<date>-${closeId}.md`
+          : `projects/${project}/sessions/ (this session has no close entry to prove)`,
+      );
+    } else {
+      dates = [entry.split('/').pop().slice(0, 10)];
+      const ignorePatterns = loadHypoIgnore(hypoDir);
+      if (ignorePatterns.length > 0 && isIgnored(join(hypoDir, entry), hypoDir, ignorePatterns)) {
+        const proof = readClosePin(hypoDir, sessionIdOfClose(closeId)).localProofs[closeId];
+        let text = null;
+        try {
+          text = readFileSync(join(hypoDir, entry), 'utf-8');
+        } catch {
+          // unreadable: no proof
+        }
+        if (
+          !proof ||
+          proof.entryRelPath !== entry ||
+          proof.entrySha256 !== fileSha256(join(hypoDir, entry)) ||
+          !entryMatchesPath(text, entry)
+        ) {
+          stale.push(entry);
+        }
+      } else {
+        const blob = headBlob(hypoDir, entry);
+        if (!blob || !entryMatchesPath(blob.toString('utf-8'), entry)) stale.push(entry);
+      }
+      const logStale = [];
+      const logMissing = [];
+      checkCloseLogs(hypoDir, project, dates, logStale, logMissing);
+      if (logStale.length > 0 || logMissing.length > 0) {
+        notices.push({
+          type: CLOSE_LOGS_MISSING_NOTICE_TYPE,
+          project,
+          reason:
+            `${project}: no session-log heading or log.md line dated ${dates[0]} was found (` +
+            [...logMissing.map((f) => `${f} missing`), ...logStale.map((f) => `${f} stale`)].join(
+              ', ',
+            ) +
+            `). 로그는 이 close의 증명에 쓰지 않습니다. 로그 줄이 빠졌는지 확인하세요`,
+        });
+      }
+    }
+  } else {
+    const todays = datedEntryPaths(hypoDir, project, dates);
+    entry = todays[0] ?? null;
+    sessionLogEvidence = checkCloseLogs(hypoDir, project, dates, stale, missing);
+    if (!entry) {
+      if (sessionLogEvidence) {
+        if (migrationState(hypoDir) === 'migrated') {
+          notices.push({
+            type: LEGACY_CLOSE_NOTICE_TYPE,
+            project,
+            reason:
+              `${project}: today's session-log has a close heading but projects/${project}/sessions/ ` +
+              `has no entry dated today. 구버전 Hypomnema나 손으로 쓴 close로 보입니다. 그 기계를 업그레이드하세요.`,
+          });
+        }
+      } else {
+        missing.push(`projects/${project}/sessions/${dates[0]}-<close id>.md`);
+      }
+    }
+  }
 
   return {
     ok: stale.length === 0 && missing.length === 0,
@@ -2601,6 +3923,8 @@ export function sessionCloseFileStatus(hypoDir, { projectOverride = null } = {})
     stale,
     missing,
     sessionLogEvidence,
+    entry,
+    notices,
   };
 }
 
@@ -2635,36 +3959,30 @@ function rootHotRows(hypoDir) {
   ].map((m) => ({ slug: m[3], date: m[2] || '' }));
 }
 
-// Candidate slugs the global gate must consider: real project dirs (with a
-// session-state.md, skip _template) ∪ slugs in a today-dated `## [today] session
-// | P` log.md entry ∪ slugs in a today-dated root hot.md row. The log/row unions
+// Candidate slugs the global gate must consider: the session projects
+// (listSessionProjects: a `projects/` child with an index.md or a sessions/
+// directory, never _template) ∪ slugs in a today-dated `## [today] session | P`
+// log.md entry ∪ slugs in a today-dated root hot.md row. The log/row unions
 // catch a dangling close whose own project files are missing —
-// sessionCloseFileStatus(projectOverride) reports those as `missing` correctly.
+// sessionCloseFileStatus reports those as `missing` correctly.
 function closeCandidateSlugs(hypoDir, dates) {
-  const slugs = new Set();
   const projectsDir = join(hypoDir, 'projects');
-  if (existsSync(projectsDir)) {
-    let entries = [];
-    try {
-      entries = readdirSync(projectsDir);
-    } catch {
-      // Swallowing this is the same shape as the fail-open hasTornCloseIntent
-      // was hardened out of (a judgment that could not be made reading as
-      // "nothing found"), and it is deliberate only because this is one of
-      // THREE unioned sources, not the whole answer: an unreadable projects/
-      // still leaves today's log.md entries and today's root hot.md rows to
-      // name the same slug. A close goes unnoticed only when all three miss it
-      // at once. Signalling the uncertainty instead would mean carrying a
-      // scanError out through sessionCloseGlobalStatus, whose result is read
-      // in five places, so it is a separate change rather than a line here.
-      // If you are adding a FOURTH source or removing one of the other two,
-      // this comment stops being true and the gate needs the scanError.
-      entries = [];
-    }
-    for (const p of entries) {
-      if (p === '_template') continue;
-      if (existsSync(join(projectsDir, p, 'session-state.md'))) slugs.add(p);
-    }
+  // An unreadable projects/ reads as no project here. Swallowing that is the
+  // same shape as the fail-open hasTornCloseIntent was hardened out of (a
+  // judgment that could not be made reading as "nothing found"), and it is
+  // deliberate only because this is one of THREE unioned sources, not the
+  // whole answer: an unreadable projects/ still leaves today's log.md entries
+  // and today's root hot.md rows to name the same slug. A close goes unnoticed
+  // only when all three miss it at once. Signalling the uncertainty instead
+  // would mean carrying a scanError out through sessionCloseGlobalStatus, whose
+  // result is read in five places, so it is a separate change rather than a
+  // line here. If you are adding a FOURTH source or removing one of the other
+  // two, this comment stops being true and the gate needs the scanError.
+  let slugs;
+  try {
+    slugs = new Set(listSessionProjects(hypoDir));
+  } catch {
+    slugs = new Set();
   }
   for (const r of rootHotRows(hypoDir)) {
     if (r.date && dates.includes(r.date)) slugs.add(r.slug);
@@ -2711,19 +4029,16 @@ function closeCandidateSlugs(hypoDir, dates) {
 //     the "next tasks" section (a cross-block incident: editing one project's
 //     tracker bumped session-state and blocked an unrelated project's /compact).
 //   - project hot.md `updated:`    — project-create stamps the template `updated: today`.
-//   - root hot.md ROW date:         project-create inserts a today-dated row. Root
-//     hot.md's row set is now a directory-scan projection (renderRootHotProjection):
-//     a row's date is that project's own hot.md `updated:`, left BLANK rather than
-//     defaulted to today when absent or malformed.
+//   - root hot.md ROW date:         generated from the session entries (the date of the
+//     project's newest entry), left BLANK rather than defaulted to today.
 // (Root hot.md *frontmatter* was already never a signal: it is shared, and it is
-// now the MAX row date across the projection, never today.)
+// the MAX row date across the generated table, never today.)
 //
-// Tradeoff (documented, accepted): apply writes session-state.md FIRST, then the
-// project files, then the session-log + log entry. A process crash before the
-// session-log write leaves a torn close that this gate no longer flags. Accepted:
-// a torn close never reached apply's ok=true so it wrote no marker;
-// the surviving session-state is the resume pointer the next session overwrites;
-// what is lost is a narrative log entry, not continuity.
+// Tradeoff (documented, accepted): apply writes the session entry FIRST, then the
+// session-log + log entry. A process crash before the session-log write leaves a
+// torn close that this gate no longer flags. Accepted: a torn close never reached
+// apply's ok=true so it wrote no marker; the surviving entry is what the next
+// session reads; what is lost is a narrative log entry, not continuity.
 function hasTodayCloseActivity(hypoDir, project, dates) {
   for (const d of dates) {
     for (const rel of sessionLogReadCandidates(project, d)) {
@@ -2783,7 +4098,10 @@ export function sessionCloseGlobalStatus(hypoDir, opts = {}) {
   // (`runMarkSessionClosed` and `runMarkerPhase`); the reader is
   // `markerCoversArtifact` in `scripts/doctor.mjs`.
   if (opts.projectOverride) {
-    const s = sessionCloseFileStatus(hypoDir, { projectOverride: opts.projectOverride });
+    const s = sessionCloseFileStatus(hypoDir, {
+      scope: 'global',
+      projectOverride: opts.projectOverride,
+    });
     return {
       ok: s.ok,
       projects: s.project
@@ -2795,6 +4113,7 @@ export function sessionCloseGlobalStatus(hypoDir, opts = {}) {
       project: s.project,
       stale: s.stale,
       missing: s.missing,
+      notices: s.notices,
     };
   }
   const dates = freshDates();
@@ -2811,9 +4130,9 @@ export function sessionCloseGlobalStatus(hypoDir, opts = {}) {
   // existsSync alone would admit a file, or a traversal like '..', from a
   // malformed marker or transcript slug and turn it into a surprise blocker.
   // Same slug grammar the CLI and resolveGateProjectOverride validate against.
-  const mustEvaluate = [...(opts.mustEvaluate || [])].filter((p) =>
-    isProjectSlugDirectory(hypoDir, p),
-  );
+  const mustEvaluate = [...(opts.mustEvaluate || [])]
+    .map((p) => resolveProjectDirName(hypoDir, p))
+    .filter((p) => p !== null);
   // The fallback decision reads REAL today activity only. Letting mustEvaluate
   // populate it would mean an attributed slug suppresses the "this session closed
   // nothing at all" branch, and that branch is a fail-closed guard the partition
@@ -2830,7 +4149,7 @@ export function sessionCloseGlobalStatus(hypoDir, opts = {}) {
   // `verified_scope` names the recency project instead of the requested one is
   // unreachable, not merely fail-safe — do not write code defending that state.
   if (activeCandidates.length === 0) {
-    const legacy = sessionCloseFileStatus(hypoDir);
+    const legacy = sessionCloseFileStatus(hypoDir, { scope: 'global' });
     return {
       ok: legacy.ok,
       projects: legacy.project
@@ -2842,6 +4161,7 @@ export function sessionCloseGlobalStatus(hypoDir, opts = {}) {
       project: legacy.project,
       stale: legacy.stale,
       missing: legacy.missing,
+      notices: legacy.notices,
     };
   }
 
@@ -2856,14 +4176,26 @@ export function sessionCloseGlobalStatus(hypoDir, opts = {}) {
   const primary = recency && todayActive.includes(recency) ? recency : todayActive[0];
   const ordered = [primary, ...todayActive.filter((p) => p !== primary)];
 
+  const notices = [];
   const projects = ordered.map((p) => {
-    const s = sessionCloseFileStatus(hypoDir, { projectOverride: p });
+    const s = sessionCloseFileStatus(hypoDir, { scope: 'global', projectOverride: p });
+    notices.push(...s.notices);
     return { project: p, ok: s.ok, stale: s.stale, missing: s.missing };
   });
   const ok = projects.every((x) => x.ok);
   const stale = [...new Set(projects.flatMap((x) => x.stale))];
   const missing = [...new Set(projects.flatMap((x) => x.missing))];
-  return { ok, projects, dates, fallback: false, primary, project: primary, stale, missing };
+  return {
+    ok,
+    projects,
+    dates,
+    fallback: false,
+    primary,
+    project: primary,
+    stale,
+    missing,
+    notices,
+  };
 }
 
 // ── derivable-artifact auto-derive: root log.md session entry ──────────────────
@@ -3001,6 +4333,29 @@ function isPidAlive(pid) {
     return err.code === 'EPERM';
   }
 }
+
+/**
+ * Is this porcelain record a file `withFileLock` leaves on disk while a close works: the lock
+ * itself (`<target>.lock`) or a waiter's staging file (`<target>.lock.<16 hex>.tmp`, present
+ * for the whole wait)? Both are transient and untracked, and a vault's `.gitignore` may not
+ * list either (an old vault lacks `*.lock`, the maintainer's does not ignore the staging
+ * file), so the dirty-tree judgments (`hypoIsClean`, `gitDirtyFiles`, and the SessionStart
+ * and resume copies) skip them rather than let one close's lock read as another close's
+ * uncommitted work. Only the two files a close locks inside the tracked tree qualify: the
+ * root `log.md` and a project's `session-log/<file>.md` shard (every other lock a close
+ * takes lives under the gitignored `.cache/`). A person's own untracked `notes.md.lock` or
+ * `pages/x.lock` stays dirty, and so does a tracked `*.lock` file that is edited, renamed or
+ * deleted (only an untracked record, `??`, can be an artifact).
+ * The one rule all four callers share. Matches on the vault-relative path.
+ * @param {string} xy the two-character porcelain status of the record
+ * @param {string} path
+ */
+export function isUntrackedLockArtifact(xy, path) {
+  return xy === '??' && CLOSE_LOCK_ARTIFACT.test(path);
+}
+
+const CLOSE_LOCK_ARTIFACT =
+  /^(?:log\.md|projects\/[^/]+\/session-log\/[^/]+\.md)\.lock(?:\.[0-9a-f]{16}\.tmp)?$/;
 
 /**
  * Run `fn` while holding an exclusive lock on `<targetPath>.lock`.
@@ -3216,7 +4571,7 @@ export function deriveRootLogEntries(hypoDir) {
   for (const slug of todayActive) {
     // Guard: only the log.md entry may be the gap; an otherwise-incomplete close
     // must keep blocking (do not mask missing authored files).
-    const st = sessionCloseFileStatus(hypoDir, { projectOverride: slug });
+    const st = sessionCloseFileStatus(hypoDir, { scope: 'global', projectOverride: slug });
     const problems = [...st.stale, ...st.missing];
     if (!(problems.length === 1 && problems[0] === 'log.md')) continue;
 
@@ -3333,6 +4688,48 @@ export function classifySyncOp(op) {
 }
 
 /**
+ * The short text a sync failure record keeps from git's stderr. The first non-empty line is not
+ * enough: a refused merge says "would be overwritten by merge" and lists the paths on the lines
+ * after it, and a refused push opens with `To <url>`, with the rejection two lines further down.
+ * Both are kept here (the blocking paths, `non-fast-forward`), capped so a record stays one line.
+ *
+ * @param {unknown} error raw stderr/stdout
+ * @returns {string}
+ */
+export function summarizeSyncError(error) {
+  const lines = String(error || '')
+    .split('\n')
+    .map((l) => l.trim())
+    .filter(Boolean);
+  const first = (lines[0] || 'unknown error').slice(0, 200);
+  const blocked = lines.findIndex((l) => /would be overwritten by (merge|checkout)/i.test(l));
+  if (blocked >= 0) {
+    const paths = [];
+    for (const l of lines.slice(blocked + 1)) {
+      if (/^(please|aborting|error:|hint:)/i.test(l)) break;
+      paths.push(l);
+    }
+    if (paths.length) {
+      const shown = paths.slice(0, 5).join(', ');
+      const more = paths.length > 5 ? ` (+${paths.length - 5} more)` : '';
+      return `${lines[blocked].slice(0, 120)} ${shown}${more}`.slice(0, 400);
+    }
+    return lines[blocked].slice(0, 200);
+  }
+  const rejected = lines.find((l) =>
+    /\[(remote )?rejected\]|non-fast-forward|fetch first/i.test(l),
+  );
+  if (rejected) {
+    const behind = /non-fast-forward|fetch first/i.test(rejected);
+    return `push rejected${behind ? ' as non-fast-forward (the remote moved)' : ''}: ${rejected}`.slice(
+      0,
+      300,
+    );
+  }
+  return first;
+}
+
+/**
  * Append a sync failure entry. Best-effort — never throws, since a failed
  * failure-log must not break the Stop hook that calls it.
  *
@@ -3341,21 +4738,16 @@ export function classifySyncOp(op) {
  *   merge conflict was detected and aborted (the tree was left clean at the
  *   local commit); 'conflict-unresolved' = the abort itself failed and the tree
  *   may still be half-merged (rare). See syncRemote.
- * @param {string} error  raw stderr/stdout; first non-empty line is kept
+ * @param {string} error  raw stderr/stdout; kept as `summarizeSyncError` shortens it
  */
 export function appendSyncFailure(hypoDir, op, error) {
   try {
     const cacheDir = join(hypoDir, '.cache');
     if (!existsSync(cacheDir)) mkdirSync(cacheDir, { recursive: true });
-    const firstLine =
-      String(error || '')
-        .split('\n')
-        .map((l) => l.trim())
-        .find(Boolean) || 'unknown error';
     const entry = {
       timestamp: new Date().toISOString(),
       op,
-      error: firstLine.slice(0, 200),
+      error: summarizeSyncError(error),
       host: hostname(),
     };
     appendFileSync(syncStatePath(hypoDir), JSON.stringify(entry) + '\n');
@@ -3367,71 +4759,746 @@ export function appendSyncFailure(hypoDir, op, error) {
 const syncGit = (hypoDir, ...args) =>
   spawnSync('git', ['-C', hypoDir, ...args], { encoding: 'utf-8', timeout: 30000 });
 
+// ── resolving a sync conflict (pullRemote) ───────────────────────────────────
+// A pull that stops on a conflict Hypomnema can settle without a person is finished here: a
+// generated view path with a modify/delete conflict (an old install changed a view the migration
+// untracked) and a `.gitignore` both sides only added lines to. Everything else is aborted as
+// before. The caller holds the vault commit lock (the lock is not reentrant, so nothing here takes it).
+
+// The two merge records live under the git directory, never in the vault tree. A vault whose
+// `.gitignore` lacks `.cache/` would otherwise get no record at all, and a merge a killed run left
+// open would stay unrecognized for good. Git never stages anything under its own directory.
+// `--absolute-git-dir` is this worktree's own directory (`.git/worktrees/<name>` in a linked
+// worktree, where `MERGE_HEAD` lives too); `--git-path` would send a name git does not know to the
+// directory every worktree shares, and two worktrees would overwrite each other's record.
+const MERGE_OWNED_FILE = 'hypo-merge-owned.json';
+const MERGE_INTENT_FILE = 'hypo-merge-intent.json';
+
+/** Absolute path of `name` under the vault's git directory, or `null` when git cannot say. */
+function gitDirFile(hypoDir, name) {
+  const r = vaultGit(hypoDir, ['rev-parse', '--absolute-git-dir']);
+  const dir = r.status === 0 ? r.stdout.replace(/\r?\n$/, '') : '';
+  return dir ? join(dir, name) : null;
+}
+
+function readGitDirJson(hypoDir, name) {
+  try {
+    return JSON.parse(readFileSync(gitDirFile(hypoDir, name), 'utf-8'));
+  } catch {
+    return null;
+  }
+}
+
+function writeGitDirJson(hypoDir, name, rec, pretty = false) {
+  const path = gitDirFile(hypoDir, name);
+  if (!path) throw new Error('git directory unknown');
+  atomicWrite(path, `${JSON.stringify(rec, null, pretty ? 2 : 0)}\n`, { durable: true });
+}
+
+function removeGitDirFile(hypoDir, name) {
+  try {
+    const path = gitDirFile(hypoDir, name);
+    if (path) rmSync(path, { force: true });
+  } catch {
+    // best-effort: a leftover record only counts while a `MERGE_HEAD` it names is open
+  }
+}
+
+// `hypo-merge-owned.json`: {v: 1, mergeHead, indexDigest, resolvedPaths: [{relPath, kind:
+// 'modify-delete'|'gitignore', backupPath?, backupSha256?, mergedSha256?}]}. Written before the
+// first resolving git command, and again with `indexDigest` (sha256 of `git ls-files -s`) once the
+// resolution is applied, so a merge left open by a killed run can be told from one a person started.
+function readMergeOwned(hypoDir) {
+  const rec = readGitDirJson(hypoDir, MERGE_OWNED_FILE);
+  const ok =
+    rec?.v === 1 &&
+    typeof rec.mergeHead === 'string' &&
+    Array.isArray(rec.resolvedPaths) &&
+    (rec.indexDigest === null || typeof rec.indexDigest === 'string');
+  return ok ? rec : null;
+}
+
+const writeMergeOwned = (hypoDir, rec) => writeGitDirJson(hypoDir, MERGE_OWNED_FILE, rec, true);
+const clearMergeOwned = (hypoDir) => removeGitDirFile(hypoDir, MERGE_OWNED_FILE);
+
+// `hypo-merge-intent.json`: {v: 1, phase: 'pull', head, target, fingerprint?}. Written (durably) just
+// before the merge command runs, which is whenever HEAD is behind the upstream (git may
+// fast-forward), so a `MERGE_HEAD` a killed run left with no resolution record can be told from one
+// a person opened: it names the HEAD and the upstream commit this run was about to merge.
+// `fingerprint` ({index, files}) is added right after the merge command returned with a merge
+// open: the sha256 of `git ls-files -s` and of each unmerged worktree file at that moment. The
+// intent alone only proves which merge started; the fingerprint is what proves nobody has touched
+// it since (a person's staged resolution changes it). It is deleted once no `MERGE_HEAD` is left.
+function readMergeIntent(hypoDir) {
+  const rec = readGitDirJson(hypoDir, MERGE_INTENT_FILE);
+  const ok =
+    rec?.v === 1 &&
+    rec.phase === 'pull' &&
+    typeof rec.head === 'string' &&
+    typeof rec.target === 'string';
+  return ok ? rec : null;
+}
+
+const clearMergeIntent = (hypoDir) => removeGitDirFile(hypoDir, MERGE_INTENT_FILE);
+
+const mergeIntentExists = (hypoDir) => {
+  const path = gitDirFile(hypoDir, MERGE_INTENT_FILE);
+  return path !== null && existsSync(path);
+};
+
+function fileSha256OrNull(path) {
+  try {
+    return createHash('sha256').update(readFileSync(path)).digest('hex');
+  } catch {
+    return null;
+  }
+}
+
 /**
- * The tree-mutating half of a sync: `git pull --no-rebase`, plus the abort
- * that keeps the working tree from being left half-merged.
+ * `{index, files: {relPath: sha256|null}}` for the merge now open: the index digest and the worktree
+ * bytes of every unmerged path. `null` when git cannot give the index digest.
+ */
+function mergeFingerprint(hypoDir, unmergedPaths) {
+  const index = indexDigestOf(hypoDir);
+  if (index === null) return null;
+  const files = {};
+  for (const relPath of [...unmergedPaths].sort()) {
+    files[relPath] = fileSha256OrNull(join(hypoDir, relPath));
+  }
+  return { index, files };
+}
+
+const sameFingerprint = (a, b) =>
+  a !== null &&
+  b !== null &&
+  typeof a === 'object' &&
+  typeof b === 'object' &&
+  a.index === b.index &&
+  JSON.stringify(a.files) === JSON.stringify(b.files);
+
+/** Record the post-merge fingerprint in the intent (a kill before this leaves the merge to a person). */
+function recordMergeFingerprint(hypoDir, unmergedPaths) {
+  try {
+    const intent = readMergeIntent(hypoDir);
+    const fingerprint = intent && mergeFingerprint(hypoDir, unmergedPaths);
+    if (intent && fingerprint) {
+      writeGitDirJson(hypoDir, MERGE_INTENT_FILE, { ...intent, fingerprint });
+    }
+  } catch {
+    // no fingerprint: the merge is then left to a person
+  }
+}
+
+/** `{state: 'present', sha}`, `{state: 'absent'}` or `{state: 'error'}` for `MERGE_HEAD`. */
+function mergeHeadState(hypoDir) {
+  const r = vaultGit(hypoDir, ['rev-parse', '-q', '--verify', 'MERGE_HEAD']);
+  if (r.status === 0) return { state: 'present', sha: r.stdout.trim() };
+  return { state: r.status === 1 ? 'absent' : 'error' };
+}
+
+function indexDigestOf(hypoDir) {
+  const r = vaultGit(hypoDir, ['ls-files', '-s']);
+  return r.status === 0 ? sha256Hex(r.stdout) : null;
+}
+
+/** `Map<path, Set<stage>>` of the unmerged index entries, or `null` when git cannot answer. */
+function unmergedEntries(hypoDir) {
+  const r = vaultGit(hypoDir, ['ls-files', '-u', '-z']);
+  if (r.status !== 0) return null;
+  const byPath = new Map();
+  for (const rec of r.stdout.split('\0').filter(Boolean)) {
+    const m = /^\d+ [0-9a-f]+ ([123])\t([\s\S]*)$/.exec(rec);
+    if (!m) return null;
+    byPath.set(m[2], (byPath.get(m[2]) ?? new Set()).add(Number(m[1])));
+  }
+  return byPath;
+}
+
+/**
+ * Is the vault repo in the middle of a git operation a person has to finish first?
+ * Returns `null` when it is not (or git cannot answer), else `{state, detail}` where `state` is
+ * `merge`, `rebase`, `am`, `cherry-pick`, `revert` or `unmerged` and `detail` is a plain sentence naming
+ * what to do. A commit that names paths (`--only`) fails during any of these, so a writer that
+ * commits has to refuse before it writes.
+ */
+export function vaultOperationInProgress(hypoDir) {
+  const gitPathExists = (name) => {
+    const r = vaultGit(hypoDir, ['rev-parse', '--git-path', name]);
+    const p = r.status === 0 ? r.stdout.replace(/\r?\n$/, '') : '';
+    return p ? existsSync(resolvePath(hypoDir, p)) : false;
+  };
+  const refExists = (name) => vaultGit(hypoDir, ['rev-parse', '-q', '--verify', name]).status === 0;
+  const unfinished = (what, finish, abort) =>
+    `${what} is unfinished: finish it (${finish}) or abort it (${abort})`;
+  if (refExists('MERGE_HEAD')) {
+    return { state: 'merge', detail: unfinished('a merge', 'git commit', 'git merge --abort') };
+  }
+  // `git am` keeps its state in `rebase-apply/` too; only its `applying` file tells it from a rebase,
+  // and `git rebase --continue` refuses while an am is in progress.
+  if (gitPathExists('rebase-apply/applying')) {
+    return {
+      state: 'am',
+      detail: unfinished('a git am', 'git am --continue', 'git am --abort'),
+    };
+  }
+  if (gitPathExists('rebase-merge') || gitPathExists('rebase-apply')) {
+    return {
+      state: 'rebase',
+      detail: unfinished('a rebase', 'git rebase --continue', 'git rebase --abort'),
+    };
+  }
+  if (refExists('CHERRY_PICK_HEAD')) {
+    return {
+      state: 'cherry-pick',
+      detail: unfinished('a cherry-pick', 'git cherry-pick --continue', 'git cherry-pick --abort'),
+    };
+  }
+  if (refExists('REVERT_HEAD')) {
+    return {
+      state: 'revert',
+      detail: unfinished('a revert', 'git revert --continue', 'git revert --abort'),
+    };
+  }
+  const unmerged = unmergedEntries(hypoDir);
+  if (unmerged && unmerged.size > 0) {
+    const first = [...unmerged.keys()].slice(0, 3).join(', ');
+    return {
+      state: 'unmerged',
+      detail: `${unmerged.size} path(s) have unresolved conflicts (${first}): resolve and stage them, or abort the operation that left them`,
+    };
+  }
+  return null;
+}
+
+/**
+ * Settle the open conflict when every unmerged path is one of the two kinds Hypomnema resolves:
+ * (a) a generated view path that one side modified and the other deleted (stages 1+2 or 1+3), or
+ * (b) `.gitignore` with all three stages where `mergeAdditiveGitignore(:1, :2, :3)` is `ok`.
+ * (a) backs the modified side's stage up (whichever side it is), lists it in the pull archive for
+ * `shareLegacyBytes`, and removes the path from the index; (b) writes and stages the merged bytes.
+ * The merge commit is not made here (`finishOwnedMerge` does it). Returns `{ok, notices, rollback}`;
+ * `ok: false` means nothing was resolved and the records it wrote are taken back (the backups stay),
+ * so the caller aborts the merge as it always did. `rollback` takes the records back after a later
+ * failure. `testHooks.beforeBackupWrite` goes to the backups.
+ */
+function resolveSyncConflict(hypoDir, byPath, { testHooks } = {}) {
+  const plan = [];
+  for (const [relPath, stages] of byPath) {
+    const key = [...stages].sort().join('');
+    if (isGeneratedViewPath(relPath) && (key === '12' || key === '13')) {
+      plan.push({ kind: 'modify-delete', relPath, stage: key === '12' ? 2 : 3 });
+    } else if (relPath === '.gitignore' && key === '123') {
+      const [base, ours, theirs] = [1, 2, 3].map((n) => gitShowText(hypoDir, `:${n}`, relPath));
+      if ([base, ours, theirs].includes(null)) return { ok: false, notices: [] };
+      const merged = mergeAdditiveGitignore(base, ours, theirs);
+      if (!merged.ok) return { ok: false, notices: [] };
+      plan.push({ kind: 'gitignore', relPath, merged: merged.merged });
+    } else {
+      return { ok: false, notices: [] };
+    }
+  }
+  if (!plan.length) return { ok: false, notices: [] };
+  // The backups and the pull archive go under `.cache/`: write none of them while `git add -A` would stage them.
+  const unignored = unignoredCachePaths(hypoDir);
+  if (unignored.length) return { ok: false, notices: [cacheNotIgnoredNotice(unignored)] };
+  const merge = mergeHeadState(hypoDir);
+  const head = gitOut(hypoDir, ['rev-parse', '--verify', '--quiet', 'HEAD'])?.trim();
+  if (merge.state !== 'present' || !head) return { ok: false, notices: [] };
+
+  const archivePath = join(hypoDir, PULL_ARCHIVE_REL);
+  let priorRaw = null;
+  try {
+    priorRaw = readTextOrNull(archivePath);
+  } catch {
+    return { ok: false, notices: [] };
+  }
+  const rollback = () => {
+    clearMergeOwned(hypoDir);
+    try {
+      if (priorRaw === null) rmSync(archivePath, { force: true });
+      else atomicWrite(archivePath, priorRaw);
+    } catch {
+      // the record then still names backups that exist: the next catch-up carries it
+    }
+  };
+  try {
+    const prior = readPullArchive(hypoDir);
+    // One state of the machine per run: these versions are committed ones, not the dirty files of an
+    // earlier clearing run, so they pair up among themselves.
+    const run = Math.max(0, ...(prior?.views ?? []).map((v) => v.run ?? 0)) + 1;
+    const views = [];
+    const resolvedPaths = [];
+    for (const item of plan) {
+      if (item.kind === 'gitignore') {
+        resolvedPaths.push({
+          relPath: item.relPath,
+          kind: 'gitignore',
+          mergedSha256: sha256Hex(item.merged),
+        });
+        continue;
+      }
+      const bytes = gitShowText(hypoDir, `:${item.stage}`, item.relPath);
+      if (bytes === null) throw new Error(`stage ${item.stage} of ${item.relPath} is unreadable`);
+      const backupPath = backUpGeneratedPath(
+        hypoDir,
+        join(hypoDir, item.relPath),
+        bytes,
+        testHooks,
+      );
+      const sha256 = sha256Hex(bytes);
+      // Stage 2 is ours: the other side (theirs) deleted, so its tree has nothing and the companion
+      // file comes from our pre-merge HEAD. Stage 3 is theirs: the companion comes from MERGE_HEAD.
+      // Both are commit ids, because the name `MERGE_HEAD` is gone once the merge commit exists.
+      const companionRev = item.stage === 2 ? head : merge.sha;
+      views.push({
+        relPath: item.relPath,
+        kind: 'worktree',
+        backupPath,
+        sha256,
+        companionRev,
+        run,
+      });
+      resolvedPaths.push({
+        relPath: item.relPath,
+        kind: 'modify-delete',
+        backupPath,
+        backupSha256: sha256,
+      });
+    }
+    if (views.length) {
+      writePullArchive(hypoDir, {
+        v: 2,
+        stage: 'archived',
+        targetSha: merge.sha,
+        gitignoreLines: prior?.gitignoreLines ?? [],
+        views: mergeViews(prior?.views ?? [], views),
+        localOnly: prior?.localOnly ?? [],
+        unowned: prior?.unowned ?? [],
+        cleared: prior?.cleared ?? [],
+        gitignoreSaved: prior?.gitignoreSaved ?? [],
+      });
+    }
+    const owned = { v: 1, mergeHead: merge.sha, indexDigest: null, resolvedPaths };
+    writeMergeOwned(hypoDir, owned);
+
+    const removals = plan.filter((p) => p.kind === 'modify-delete').map((p) => p.relPath);
+    if (
+      removals.length &&
+      vaultGit(hypoDir, ['rm', '--cached', '-q', '--', ...literalSpecs(removals)]).status !== 0
+    ) {
+      throw new Error('git rm --cached failed');
+    }
+    for (const item of plan.filter((p) => p.kind === 'gitignore')) {
+      atomicWrite(join(hypoDir, item.relPath), item.merged);
+      if (vaultGit(hypoDir, ['add', '--', ...literalSpecs([item.relPath])]).status !== 0) {
+        throw new Error('git add .gitignore failed');
+      }
+    }
+    if (unmergedEntries(hypoDir)?.size !== 0) throw new Error('unmerged paths remain');
+    const indexDigest = indexDigestOf(hypoDir);
+    if (indexDigest === null) throw new Error('index digest unreadable');
+    writeMergeOwned(hypoDir, { ...owned, indexDigest });
+  } catch {
+    rollback();
+    return { ok: false, notices: [] };
+  }
+  return { ok: true, notices: [], rollback };
+}
+
+/**
+ * Finish a merge Hypomnema started and a killed run left open: `MERGE_HEAD` exists and
+ * the owned record (`hypo-merge-owned.json` in the git directory) names it. Called first in `pullRemote`. Returns `{state, notices}`:
+ *   - `'none'`: no merge is open (a leftover owned record is deleted). Carry on with the sync.
+ *   - `'finished'`: the merge commit was made, the archived bytes were shared (`resumePullArchive`)
+ *     and the owned record was deleted.
+ *   - `'external'`: a merge is open that this code did not start (no record, or one that names
+ *     another `MERGE_HEAD`: a person, `git pull`, Obsidian Git). Nothing is touched.
+ *   - `'stuck'`: it is ours but is not safe to finish, and nothing is touched: the index has
+ *     entries the resolution did not stage (`indexDigest` differs), an unmerged path remains, a
+ *     recorded backup is gone or changed, the merged `.gitignore` is not what was recorded, a view
+ *     is still in the index, or the commit failed.
+ * The index digest check is what keeps `git commit --no-edit` from sweeping a path another session
+ * staged in between into the merge commit.
+ */
+export function finishOwnedMerge(hypoDir) {
+  const owned = readMergeOwned(hypoDir);
+  const merge = mergeHeadState(hypoDir);
+  if (merge.state === 'error') {
+    return {
+      state: 'external',
+      notices: ['git이 진행 중인 merge 여부를 답하지 못해 동기화를 건너뛰었습니다.'],
+    };
+  }
+  if (merge.state === 'absent') {
+    if (owned) clearMergeOwned(hypoDir);
+    clearMergeIntent(hypoDir);
+    return { state: 'none', notices: [] };
+  }
+  if (!owned || owned.mergeHead !== merge.sha) {
+    // A pull of ours that was killed after the merge started and before any resolution record: the
+    // intent names this very HEAD and `MERGE_HEAD`, and its fingerprint says the merge is still as
+    // the merge command left it. Only then is it taken back, as the old code did. A merge that
+    // differs from the fingerprint holds somebody's work (a staged resolution), so it stays.
+    // ponytail: a person who merges the same upstream commit by hand at the same HEAD while a
+    // stale intent exists would not match the fingerprint either; a kill between the merge command
+    // and the fingerprint write leaves an untouched merge to a person, who gets the notice below.
+    const intent = readMergeIntent(hypoDir);
+    const head = gitOut(hypoDir, ['rev-parse', '--verify', '--quiet', 'HEAD'])?.trim();
+    if (intent && intent.target === merge.sha && intent.head === head) {
+      const unmerged = unmergedEntries(hypoDir);
+      const untouched =
+        unmerged !== null &&
+        sameFingerprint(intent.fingerprint ?? null, mergeFingerprint(hypoDir, unmerged.keys()));
+      if (!untouched) {
+        return {
+          state: 'external',
+          notices: [
+            intent.fingerprint
+              ? '끊긴 동기화가 남긴 merge에 사람이 해소한 내용이나 스테이징한 변경이 있어 그대로 두고 동기화를 건너뛰었습니다. git status를 보고 git merge --continue나 git merge --abort로 먼저 끝내세요.'
+              : '끊긴 동기화가 남긴 것으로 보이는 merge가 있지만 그 시점의 상태 기록이 없어 사람의 해소가 섞였는지 알 수 없습니다. 그대로 두고 동기화를 건너뛰었으니 git status를 보고 git merge --continue나 git merge --abort로 먼저 끝내세요.',
+          ],
+        };
+      }
+      const abort = vaultGit(hypoDir, ['merge', '--abort']);
+      if (abort.status === 0 && unmergedEntries(hypoDir)?.size === 0) {
+        clearMergeOwned(hypoDir);
+        clearMergeIntent(hypoDir);
+        return {
+          state: 'none',
+          notices: ['끊긴 동기화가 남긴 merge를 취소하고 동기화를 다시 시도합니다.'],
+        };
+      }
+      return {
+        state: 'stuck',
+        notices: [
+          '끊긴 동기화가 남긴 merge를 취소하지 못했습니다. git status를 보고 git merge --abort로 끝내세요.',
+        ],
+      };
+    }
+    return {
+      state: 'external',
+      notices: [
+        '진행 중인 merge가 있어 동기화를 건너뛰었습니다. git status를 보고 git merge --continue나 git merge --abort로 먼저 끝내세요.',
+      ],
+    };
+  }
+  const stuck = (why) => ({
+    state: 'stuck',
+    notices: [
+      `Hypomnema가 시작한 merge를 끝내지 못했습니다: ${why}. git status를 보고 git merge --continue나 git merge --abort로 끝내세요.`,
+    ],
+  });
+  const unmerged = unmergedEntries(hypoDir);
+  if (unmerged === null) return stuck('git ls-files -u가 실패했습니다');
+  if (unmerged.size)
+    return stuck(`해소되지 않은 경로가 남았습니다 (${[...unmerged.keys()].join(', ')})`);
+  for (const r of owned.resolvedPaths) {
+    if (r.kind === 'modify-delete') {
+      let bytes = null;
+      try {
+        bytes = readFileSync(r.backupPath, 'utf-8');
+      } catch {
+        // missing: reported below
+      }
+      if (bytes === null || sha256Hex(bytes) !== r.backupSha256) {
+        return stuck(`${r.relPath}의 백업(${r.backupPath})이 없거나 달라졌습니다`);
+      }
+      const tracked = vaultGit(hypoDir, ['ls-files', '--', ...literalSpecs([r.relPath])]);
+      if (tracked.status !== 0 || tracked.stdout.trim()) {
+        return stuck(`${r.relPath}가 아직 인덱스에 있습니다`);
+      }
+    } else if (r.kind === 'gitignore') {
+      const staged = gitShowText(hypoDir, ':0', r.relPath);
+      if (staged === null || sha256Hex(staged) !== r.mergedSha256) {
+        return stuck(`${r.relPath}의 인덱스 내용이 기록한 합친 결과와 다릅니다`);
+      }
+    } else {
+      return stuck(`알 수 없는 기록 종류입니다 (${r.kind})`);
+    }
+  }
+  // Killed between the first record and the second: the resolution may be half applied, and there
+  // is no digest to compare the index with.
+  if (owned.indexDigest === null) {
+    return stuck(
+      '해소를 하던 중 끊겨 인덱스 기록이 없습니다(아직 커밋된 것이 없어 git merge --abort는 안전합니다)',
+    );
+  }
+  if (indexDigestOf(hypoDir) !== owned.indexDigest) {
+    return {
+      state: 'stuck',
+      notices: [
+        '끝나지 않은 동기화가 있고 그 사이 스테이징된 변경이 있어 자동으로 이어 가지 않았습니다. git status를 보고 git merge --continue나 git merge --abort로 끝내세요.',
+      ],
+    };
+  }
+  const commit = vaultGit(hypoDir, ['commit', '--no-edit', '-q']);
+  if (commit.status !== 0) {
+    // The whole stderr: a vault pre-commit hook that rejects the merge says why there.
+    const why = String(commit.stderr)
+      .trim()
+      .replace(/\s*\n\s*/g, ' / ')
+      .slice(0, 600);
+    return stuck(`git commit 실패: ${why}`);
+  }
+  const resumed = resumePullArchive(hypoDir);
+  clearMergeOwned(hypoDir);
+  clearMergeIntent(hypoDir);
+  const backups = owned.resolvedPaths
+    .filter((r) => r.kind === 'modify-delete')
+    .map((r) => backupPathForNotice(r.backupPath));
+  const summary =
+    `동기화 충돌을 자동으로 해소했습니다: ${owned.resolvedPaths.map((r) => r.relPath).join(', ')}.` +
+    (backups.length ? ` 수정된 쪽 내용은 ${backups.join(', ')}에 보관했습니다.` : '') +
+    (resumed.created.length ? ` 추가 기준선: ${resumed.created.join(', ')}.` : '');
+  return { state: 'finished', notices: [summary, ...resumed.notices] };
+}
+
+// Append `notices` to the health notice the next SessionStart shows (the one-slot file
+// `writeRootHotHealthNotice` owns), keeping what an earlier writer left there. Read and write sit
+// under the file lock `writeRootHotHealthNotice` and the reader take, and a line already in the
+// message is not added again, so a notice that repeats on every sync does not pile up.
+function leaveSyncNotice(hypoDir, notices) {
+  const lines = notices.flatMap((n) => n.split('\n')).filter(Boolean);
+  if (!lines.length) return;
+  const path = join(hypoDir, '.cache', ROOT_HOT_HEALTH_NOTICE_FILENAME);
+  try {
+    withFileLock(path, () => {
+      let earlier = '';
+      try {
+        const message = JSON.parse(readFileSync(path, 'utf-8')).message;
+        if (typeof message === 'string') earlier = message;
+      } catch {
+        // none, or unreadable: nothing to keep
+      }
+      const have = new Set(earlier.split('\n'));
+      const fresh = [...new Set(lines)].filter((l) => !have.has(l));
+      if (!fresh.length) return;
+      atomicWrite(
+        path,
+        JSON.stringify({ message: [earlier, ...fresh].filter(Boolean).join('\n'), ts: Date.now() }),
+      );
+    });
+  } catch {
+    // best-effort, like every notice write: a hook must not fail Stop over it
+  }
+}
+
+/**
+ * The tree-mutating half of a sync: `git fetch` and `git merge @{u}` (a pull made of its two
+ * halves, so the fetch runs once), plus the abort that keeps the working tree from being left
+ * half-merged.
  *
  * Split out of syncRemote (review r5-w4 major 2) so a caller can hold the
  * vault commit lock across this and NOT across the push. This half has to
  * stay inside the lock: it rewrites files another session could be reading,
  * staging, or committing at the same moment. See hypo-auto-commit.mjs for the
- * other side of that split.
+ * other side of that split. A caller must hold that lock (it is not reentrant,
+ * and the baseline commit this makes runs inside it).
  *
- * Failure policy (v1.4 "sync hardening"), unchanged by the split:
+ * Order of work:
+ *   1. `finishOwnedMerge`: a merge Hypomnema left open is finished first; a merge somebody else
+ *      left open stops this sync (notice only, `deferred: 'external'`).
+ *   2. `resumePullArchive`: archived bytes whose merge already landed are shared.
+ *   3. `git fetch` (one failure is recorded as the 'pull' failure and the sync stops there, with no
+ *      merge). When the incoming range changes generated view tracking (a migration or a
+ *      rollback commit) or the upstream is migrated, and HEAD does not hold `@{u}`,
+ *      `clearGeneratedPathsBlockingPull` sets aside what would block the merge. A deferral
+ *      (`.gitignore` not a pure addition, `.cache/` not ignored, a concurrent change) skips the
+ *      pull: notice only. Any other stop is taken back and the pull runs, so git reports its own
+ *      failure. A pull that then fails takes the cleared bytes back (`undoClearedPaths`).
+ *   4. `git merge --no-edit @{u}`, and the conflict policy below. When either side adds or
+ *      removes generated view tracking across the merge (`incomingChangesViewTracking`,
+ *      `outgoingChangesViewTracking`), the merge runs with `-X rename-threshold=100%`: otherwise
+ *      git pairs the view the migration deleted with the baseline entry that holds its bytes, and an
+ *      old machine's edit of that view lands as a content merge on the shared baseline file (a
+ *      conflict on a `sessions/` path, or a silent change of a content-named file) instead of a
+ *      modify/delete conflict on the view. When HEAD does not hold `@{u}`, the merge is announced
+ *      first by `hypo-merge-intent.json` in the git directory, which lets a later run take back a merge a killed run
+ *      left open before it had any resolution record (`finishOwnedMerge`). After a merge that
+ *      landed, `resumePullArchive` shares what was set aside. The flag applies to the whole merge,
+ *      so during the one-time migration merge a page that one side renamed and edited while the
+ *      other side edited it ends as modify/delete, and the sync aborts for a manual merge. The
+ *      merge is `git merge`, which ignores `pull.ff` (it honors `merge.ff`), unlike the old
+ *      `git pull --no-rebase`.
+ *
+ * Failure policy (v1.4 "sync hardening"):
  *   - clean fast-forward / conflict-free merge → `{pulled: true}`, caller pushes.
- *   - MERGE CONFLICT (`git pull --no-rebase` leaves unmerged paths): abort the
- *     merge so the tree returns to the just-committed local state ("ours"),
- *     record op='conflict', and report `{conflict: true}` so the caller does
+ *   - MERGE CONFLICT (`git merge` leaves unmerged paths): when every unmerged path is a
+ *     generated view with a modify/delete conflict, or a `.gitignore` both sides only added lines
+ *     to, resolve it and finish the merge (`resolveSyncConflict`, `finishOwnedMerge`) →
+ *     `{pulled: true}`. Otherwise abort the merge so the tree returns to the just-committed local
+ *     state ("ours"), record op='conflict', and report `{conflict: true}` so the caller does
  *     NOT push (a diverged branch cannot fast-forward, so the push would only
  *     add a noisy second failure). No data is lost: ours stays committed
  *     locally, "theirs" stays on the remote, and the divergence is surfaced by
- *     session-start + doctor until the user merges manually. Inline
- *     auto-resolution (preserving the losing version as a `.conflict-*`
- *     sibling) is deferred.
+ *     session-start + doctor until the user merges manually.
  *   - non-conflict pull failure (network/auth: no unmerged paths) → record
- *     op='pull' and report `{pulled: false, conflict: false}`; the caller still
- *     pushes, since a transient pull blip should not block an otherwise
- *     pushable commit.
+ *     op='pull' and report `{pulled: false, conflict: false}`. The caller does not push either:
+ *     a push after a failed or deferred pull only adds a second failure that hides the cause
+ *     (the last record is what the next SessionStart shows).
+ *
+ * `notices` (always an array) are also left for the next SessionStart. `deferred` is set only when
+ * this sync skipped the pull on purpose; `leaveNotices: false` leaves them to a caller that
+ * shows them itself. `testHooks`: `afterMergeStarted` (runs right after the merge command
+ * returns), `afterResolveBeforeCommit` (runs after a conflict is resolved, before its merge
+ * commit), and what `clearGeneratedPathsBlockingPull` and
+ * `backUpGeneratedPath` take.
  *
  * Best-effort: never throws. A sync failure must not break the Stop hook. A
- * throw is reported as `{pulled: false, conflict: false}`, which lets the
- * caller attempt the push, exactly as the combined function did.
+ * throw is recorded as a pull failure and reported as `{pulled: false, conflict: false}`. A throw
+ * never aborts an open merge (a killed run leaves the same state).
  *
  * @param {string} hypoDir
- * @returns {{pulled: boolean, conflict: boolean}}
+ * @param {{testHooks?: object, leaveNotices?: boolean}} [opts]
+ * @returns {{pulled: boolean, conflict: boolean, notices: string[], deferred?: string}}
  */
-export function pullRemote(hypoDir) {
+export function pullRemote(hypoDir, { testHooks, leaveNotices = true } = {}) {
   const git = (...args) => syncGit(hypoDir, ...args);
+  const notices = [];
+  const done = (result) => {
+    // The intent only matters while a merge it announced is open.
+    if (mergeIntentExists(hypoDir) && mergeHeadState(hypoDir).state === 'absent') {
+      clearMergeIntent(hypoDir);
+    }
+    if (leaveNotices) leaveSyncNotice(hypoDir, notices);
+    return { ...result, notices };
+  };
+  // A deferral skips the pull on purpose; it is recorded like a failed pull so doctor shows it, and
+  // so the last record names the cause even when the deferral came without a notice.
+  const defer = (why, note) => {
+    appendSyncFailure(hypoDir, 'pull', note || `pull deferred: ${why}`);
+    return done({ pulled: false, conflict: false, deferred: why });
+  };
+  // What the clearing step moved. A pull that does not land takes it back.
+  let pre = null;
+  const takeBack = () => {
+    const moved = pre
+      ? pre.archived.length +
+        pre.localOnly.length +
+        pre.unowned.length +
+        pre.cleared.length +
+        pre.gitignoreSaved.length +
+        pre.ownedRemoved.length
+      : 0;
+    if (moved > 0) notices.push(...undoClearedPaths(hypoDir, pre).notices);
+    pre = null;
+  };
   try {
-    const pull = git('pull', '--no-rebase', '-q');
-    if (pull.status === 0) {
+    const owned = finishOwnedMerge(hypoDir);
+    notices.push(...owned.notices);
+    if (owned.state === 'finished') {
       recordSyncSuccess(hypoDir, 'pull');
-      return { pulled: true, conflict: false };
+      return done({ pulled: true, conflict: false });
+    }
+    if (owned.state !== 'none') return defer(owned.state, owned.notices[0]);
+    notices.push(...resumePullArchive(hypoDir).notices);
+
+    const fetch = git('fetch', '-q');
+    if (fetch.status !== 0) {
+      appendSyncFailure(hypoDir, 'pull', fetch.stderr || fetch.stdout);
+      return done({ pulled: false, conflict: false });
+    }
+    const behind =
+      git('rev-parse', '--verify', '-q', '@{u}').status === 0 &&
+      git('merge-base', '--is-ancestor', '@{u}', 'HEAD').status !== 0;
+    const incomingMoves = behind && incomingChangesViewTracking(hypoDir, '@{u}');
+    const canCatchUp = behind && (upstreamIsMigrated(hypoDir) || incomingMoves);
+    // A side that adds or removes view tracking needs exact renames only (see the docblock).
+    const exactRenames = behind && (incomingMoves || outgoingChangesViewTracking(hypoDir, '@{u}'));
+    if (canCatchUp) {
+      pre = clearGeneratedPathsBlockingPull(hypoDir, '@{u}', { testHooks });
+      if (!pre.ok) {
+        const { deferred, notice } = pre;
+        takeBack();
+        if (deferred) {
+          if (notice) notices.push(notice);
+          return defer(deferred, notice);
+        }
+        // Any other stop (another file is dirty, a revision git cannot read): pull anyway and let
+        // git report its own failure.
+      } else if (pre.backups.length) {
+        const where = [...new Set(pre.backups.map(backupPathForNotice))].join(', ');
+        notices.push(`이행 커밋을 받으려고 이 기계의 옛 세션 현황 변경을 ${where}에 보관했습니다.`);
+      }
+    }
+
+    if (behind) {
+      const head = gitOut(hypoDir, ['rev-parse', '--verify', '--quiet', 'HEAD'])?.trim();
+      const target = gitOut(hypoDir, ['rev-parse', '--verify', '--quiet', '@{u}'])?.trim();
+      if (head && target) {
+        try {
+          writeGitDirJson(hypoDir, MERGE_INTENT_FILE, { v: 1, phase: 'pull', head, target });
+        } catch {
+          // no intent: a merge left open by a kill is then left to a person
+        }
+      }
+    }
+    const pull = git(
+      'merge',
+      '-q',
+      '--no-edit',
+      ...(exactRenames ? ['-X', 'rename-threshold=100%'] : []),
+      '@{u}',
+    );
+    if (pull.status !== 0 && mergeHeadState(hypoDir).state === 'present') {
+      recordMergeFingerprint(hypoDir, unmergedEntries(hypoDir)?.keys() ?? []);
+    }
+    testHooks?.afterMergeStarted?.();
+    if (pull.status === 0) {
+      notices.push(...resumePullArchive(hypoDir).notices);
+      recordSyncSuccess(hypoDir, 'pull');
+      return done({ pulled: true, conflict: false });
     }
     // A merge conflict leaves unmerged index entries; a network/auth failure
     // leaves none. Only the former must be aborted to keep the tree clean.
-    const unmerged = git('ls-files', '-u');
-    const hasConflict = unmerged.status === 0 && (unmerged.stdout || '').trim().length > 0;
-    if (hasConflict) {
+    const unmerged = unmergedEntries(hypoDir);
+    if (unmerged !== null && unmerged.size > 0) {
+      const resolved = resolveSyncConflict(hypoDir, unmerged, { testHooks });
+      notices.push(...resolved.notices);
+      if (resolved.ok) {
+        testHooks?.afterResolveBeforeCommit?.();
+        const finished = finishOwnedMerge(hypoDir);
+        if (finished.state === 'finished') {
+          notices.push(...finished.notices);
+          recordSyncSuccess(hypoDir, 'pull');
+          return done({ pulled: true, conflict: false });
+        }
+        // Our own resolution could not be committed: abort like any other conflict.
+        resolved.rollback();
+      }
       // Abort to return the tree to the just-committed local state. Verify the
       // abort actually cleaned up: if it fails (filesystem/concurrent-mutation
       // edge), the tree may still be half-merged, so record that distinctly
-      // ('conflict-unresolved') rather than masking it as a clean abort.
+      // ('conflict-unresolved') rather than masking it as a clean abort. Only a
+      // clean abort lets the cleared bytes go back: into a half-merged tree they
+      // stay in their backups, and the archive record names them.
       const abort = git('merge', '--abort');
-      const stillUnmerged = git('ls-files', '-u');
-      const aborted = abort.status === 0 && (stillUnmerged.stdout || '').trim().length === 0;
+      const aborted = abort.status === 0 && unmergedEntries(hypoDir)?.size === 0;
+      if (aborted) takeBack();
       appendSyncFailure(
         hypoDir,
         aborted ? 'conflict' : 'conflict-unresolved',
         pull.stderr || pull.stdout,
       );
-      return { pulled: false, conflict: true };
+      return done({ pulled: false, conflict: true });
+    }
+    // No merge was open when this run began (`finishOwnedMerge` said so), so a `MERGE_HEAD` now is
+    // this merge stopped before its commit (a `pre-merge-commit` hook that rejects): take it back,
+    // or the next sync would find it and wait for a person.
+    const stopped = mergeHeadState(hypoDir).state === 'present';
+    if (
+      !stopped ||
+      (git('merge', '--abort').status === 0 && unmergedEntries(hypoDir)?.size === 0)
+    ) {
+      takeBack();
     }
     appendSyncFailure(hypoDir, 'pull', pull.stderr || pull.stdout);
-    return { pulled: false, conflict: false };
-  } catch {
-    // best-effort: never break the Stop hook
-    return { pulled: false, conflict: false };
+    return done({ pulled: false, conflict: false });
+  } catch (err) {
+    // best-effort: never break the Stop hook. The record keeps a caller that does not push after a
+    // failed pull from going quiet.
+    appendSyncFailure(hypoDir, 'pull', `pull stopped: ${err?.message ?? String(err)}`);
+    return done({ pulled: false, conflict: false });
   }
 }
 
@@ -3505,7 +5572,7 @@ export function resolvePushTarget(hypoDir, oid) {
  * Runs OUTSIDE the vault commit lock (review r5-w4 major 2). Holding the lock
  * across a network round trip made one session's Stop own the vault for up to
  * a minute, and a sibling SessionStart needs that same lock twice (its own
- * `git pull` and the root hot.md projection write), each with a 5s timeout,
+ * `git pull` and the generated view write), each with a 5s timeout,
  * out of a 30s hook budget.
  *
  * The earlier justification for putting the push outside the lock was that
@@ -3517,7 +5584,7 @@ export function resolvePushTarget(hypoDir, oid) {
  *     program that git runs inside this `git push`, with the working tree and
  *     the index right there. A user whose pre-push builds, formats, or stages
  *     anything is mutating the vault from outside the lock, racing the
- *     projection write and the commit fence exactly as a pull would. This is
+ *     view write and the commit fence exactly as a pull would. This is
  *     not theoretical: tests/session-hooks.test.mjs observes the lock boundary
  *     THROUGH a pre-push hook, so the mechanism is exercised on every run.
  *     `--no-verify` would close it and is deliberately not used: it overrides
@@ -3526,8 +5593,8 @@ export function resolvePushTarget(hypoDir, oid) {
  *     real means either pushing from a scratch clone or taking the lock back
  *     across the network, both bigger than this fix.
  *
- * Callers must not call this after a pullRemote that reported `conflict`:
- * pushing from a diverged branch only records a second, redundant failure.
+ * Callers must not call this after a pullRemote that did not report `pulled` (a conflict, a
+ * deferral or a failure): pushing then only records a second failure over the real cause.
  *
  * Best-effort: never throws.
  *
@@ -3563,13 +5630,15 @@ export function pushRemote(hypoDir, target) {
 }
 
 /**
- * Pull + push the wiki against its remote, guaranteeing the working tree is
- * never left half-merged.
+ * Pull + push the wiki against its remote. A conflict is aborted in the same run, so the working
+ * tree normally is not left half-merged. A run killed mid-merge, or an abort git cannot complete
+ * (`conflict-unresolved`), leaves a merge open; the next `pullRemote` takes it back or reports it
+ * (`finishOwnedMerge`).
  *
- * The two halves in their original order, for every caller that does not hold
- * the vault commit lock and so has no reason to care where the boundary is.
- * hypo-auto-commit.mjs does hold it and calls pullRemote/pushRemote itself;
- * see there. The ordering guarantee lives here as well as there: a conflicting
+ * The two halves in their original order, for a caller that holds the vault
+ * commit lock around the whole thing (`pullRemote` needs it, and the push then
+ * runs inside it too). hypo-auto-commit.mjs holds it for the pull only and
+ * calls pullRemote/pushRemote itself; see there. The ordering guarantee lives here as well as there: a conflicting
  * pull returns before the push, so a diverged branch is never pushed from.
  *
  * Best-effort: never throws. A sync failure must not break the Stop hook.
@@ -3580,6 +5649,7 @@ export function pushRemote(hypoDir, target) {
 export function syncRemote(hypoDir) {
   const { pulled, conflict } = pullRemote(hypoDir);
   if (conflict) return { pulled: false, pushed: false, conflict: true };
+  if (!pulled) return { pulled: false, pushed: false, conflict: false };
   // Resolved here rather than left to the push: the target is what makes the
   // push unambiguous, and a caller of this combined form has no other place to
   // decide it. HEAD right after the pull, which is what a bare `git push` would
@@ -3600,19 +5670,16 @@ export function syncRemote(hypoDir) {
 // Sources that feed the accumulator:
 //   - hypo-auto-stage.mjs (PostToolUse): every Write/Edit/MultiEdit to a file
 //     under the vault.
-//   - hypo-hot-rebuild.mjs (Stop, runs BEFORE auto-commit): hot.md and log.md,
-//     which are hook-generated, not user Write/Edit — without this a scope
-//     built from Write/Edit alone would drop them from the scoped commit.
+//   - hypo-hot-rebuild.mjs (Stop, runs BEFORE auto-commit): log.md, which is
+//     hook-generated, not user Write/Edit — without this a scope built from
+//     Write/Edit alone would drop it from the scoped commit. The generated
+//     views are never claimed: they are not committed at all.
 //
 // No session_id → never accumulate, and never fall back to a shared "default"
 // bucket: a path recorded under the wrong key could leak between sessions.
 
-/** Directory holding one session's cache artifacts: touched-paths.json and,
- * since the n1 fix above, root-hot-projection-receipt.json. Neither is
- * cleaned up when a session ends normally or dies mid-session, same as
- * every other file already living here before this fix. An abandoned
- * receipt from a crashed session is inert: nothing ever reads it again,
- * since no other session shares that same session_id to look it up under. */
+/** Directory holding one session's cache artifacts (touched-paths.json and
+ * friends). Not cleaned up when a session ends normally or dies mid-session. */
 function sessionCacheDir(hypoDir, sessionId) {
   return join(hypoDir, '.cache', 'sessions', sanitizeSessionId(sessionId));
 }
@@ -3650,9 +5717,9 @@ function readTouchedPathsFile(path) {
  * Accumulate vault-relative touched paths for `sessionId`. Best-effort in the
  * sense that it never throws, but no longer silent about it: it now reports
  * whether the accumulation actually landed, because a caller that treats a
- * write as accounted-for the moment it calls this (root hot.md's projection
- * writers, see hypo-session-start.mjs / hypo-hot-rebuild.mjs) needs to know
- * when that assumption was wrong. A lock-timeout or write failure used to be
+ * write as accounted-for the moment it calls this (the hook-generated log.md
+ * entries, see hypo-hot-rebuild.mjs) needs to know when that assumption was
+ * wrong. A lock-timeout or write failure used to be
  * indistinguishable from success: the write would go through, this would
  * swallow the error, and the file would sit dirty with nothing in ANY
  * session's touched-paths set to bring it into an auto-commit, orphaned
@@ -3676,9 +5743,7 @@ function readTouchedPathsFile(path) {
  *   the caller cannot assume this path is in ANY session's touched-paths set.
  */
 /**
- * Shared read-merge-write body for accumulating touched paths, factored out
- * so `recordTouchedPaths` and `claimProjectionWrite` cannot drift on the
- * merge itself, only on what each reports about the outcome. Runs OUTSIDE
+ * Shared read-merge-write body for accumulating touched paths. Runs OUTSIDE
  * any lock; every caller wraps it in `withFileLock(path, ...)`.
  *
  * A corrupt/unreadable file (`readTouchedPathsFile` returns `null`) is
@@ -3689,9 +5754,7 @@ function readTouchedPathsFile(path) {
  * `readTouchedPathsFile`).
  *
  * @returns {{added: boolean}} whether at least one of `incoming` was NOT
- *   already present in the set before this call, the bit a pre-write claim
- *   needs to tell "I just claimed this" from "this was already claimed",
- *   e.g. by an earlier SessionStart invocation in the same resumed session.
+ *   already present in the set before this call.
  */
 function mergeIncomingTouchedPaths(hypoDir, sessionId, incoming, hashFor) {
   const path = touchedPathsPath(hypoDir, sessionId);
@@ -3724,8 +5787,8 @@ function mergeIncomingTouchedPaths(hypoDir, sessionId, incoming, hashFor) {
  * touched-paths set live: `{ "<vault-relative path>": "<sha256 hex>" | null }`,
  * `null` meaning the file did not exist when it was recorded. A separate file
  * rather than a new shape for touched-paths.json, so every reader of that
- * array (hypo-close-guard.mjs parses it itself) keeps working unchanged, and a
- * set written before hashes existed simply has no entry here.
+ * array keeps working unchanged, and a set written before hashes existed
+ * simply has no entry here.
  *
  * What the hash is for: the set records that this session wrote a path, not
  * which bytes. When a clear after a successful commit fails, the stale claim
@@ -3763,11 +5826,19 @@ function vaultFileHash(hypoDir, relPath) {
  * (or there is no HEAD to read). `./` makes git resolve the path from the
  * vault, which may sit below the repository root. */
 function headFileHash(hypoDir, relPath) {
-  const r = spawnSync('git', ['-C', hypoDir, 'cat-file', 'blob', `HEAD:./${relPath}`], {
+  const blob = headBlob(hypoDir, relPath);
+  return blob ? sha256Hex(blob) : null;
+}
+
+/** A vault path's blob in HEAD (or, with `index`, in the index at stage 0) as a
+ * Buffer, `null` when git cannot give it. */
+export function headBlob(hypoDir, relPath, { index = false } = {}) {
+  const spec = `${index ? ':0' : 'HEAD'}:./${relPath}`;
+  const r = spawnSync('git', ['-C', hypoDir, 'cat-file', 'blob', spec], {
     timeout: 30000,
     maxBuffer: 64 * 1024 * 1024,
   });
-  return r.status === 0 && r.stdout ? sha256Hex(r.stdout) : null;
+  return r.status === 0 && r.stdout ? r.stdout : null;
 }
 
 /** Whether a hash was recorded for `relPath` and the bytes on disk no longer
@@ -3813,57 +5884,6 @@ export function recordTouchedPaths(hypoDir, sessionId, relPaths) {
     // false return is what lets a caller decide whether to trust this write
     // as accounted for.
     return false;
-  }
-}
-
-/**
- * Fail-closed pre-claim for a write that MUST have a session to be
- * accounted for, unlike recordTouchedPaths' every other caller. The generic
- * function above returns `true` on a missing session_id, correct for a
- * best-effort accumulate (there is nothing to accumulate, so nothing failed),
- * but the root-hot-projection pre-claim (hypo-session-start.mjs /
- * hypo-hot-rebuild.mjs) uses that same `true` to decide whether to go ahead
- * and write hot.md at all. A missing session_id there must not read as
- * "claimed": it would let hot.md be rewritten with no session's
- * touched-paths set able to ever bring the change into a commit, an orphan
- * write no different from a genuine lock-timeout, just for a different
- * reason. Every other property (locking, dedup, atomic merge) is identical;
- * this only tightens the missing-session_id case to `false`.
- *
- * Returns `added` alongside the old boolean (now `ok`) so a caller that must
- * later UNDO a failed write (hypo-session-start.mjs's SessionStart, on a
- * `writeRootHotProjection` lock-timeout or thrown failure) can tell "this
- * call is the one that put the claim there" from "the claim was already
- * sitting in this session's touched-paths set before this call ran", the
- * second case is a SECOND SessionStart on the same (resumed) session_id,
- * where an earlier invocation's still-unresolved claim must survive this
- * invocation's own failure, not be swept away by it.
- *
- * @param {string} hypoDir
- * @param {string|null|undefined} sessionId
- * @param {string|string[]} relPaths
- * @returns {{ok: boolean, added: boolean}}
- */
-export function claimProjectionWrite(hypoDir, sessionId, relPaths) {
-  if (!sessionId) return { ok: false, added: false };
-  const incoming = (Array.isArray(relPaths) ? relPaths : [relPaths]).filter(
-    (p) => typeof p === 'string' && p.length > 0,
-  );
-  if (incoming.length === 0) return { ok: true, added: false };
-  const path = touchedPathsPath(hypoDir, sessionId);
-  try {
-    // No hash for a projection claim: it is taken BEFORE the write, so the
-    // bytes it will cover are not known yet, and a hash refreshed after the
-    // write could itself fail and leave the claim looking drifted over this
-    // session's own write. Root hot.md's ownership is checked per session by
-    // its receipt at Stop instead (rootHotProjectionIsCurrent). Deleting the
-    // entry also drops a hash an earlier Edit of the same path left behind.
-    const { added } = withFileLock(path, () =>
-      mergeIncomingTouchedPaths(hypoDir, sessionId, incoming, () => undefined),
-    );
-    return { ok: true, added };
-  } catch {
-    return { ok: false, added: false };
   }
 }
 
@@ -4109,8 +6129,8 @@ export function clearTouchedPaths(hypoDir, sessionId, paths) {
  * still blocking as a known, unresolved session write, instead of reading as
  * "resolved" because their siblings committed. Everything else is retired,
  * including a claim that was already clean at Stop time or that the caller
- * deliberately left out of the scope (the root hot.md projection claim when
- * its bytes are not this session's own): keeping those would let a path
+ * deliberately left out of the scope (a generated view path, which
+ * `commitWikiChanges` never commits): keeping those would let a path
  * another session later edits be blocked on, or swept into, this session's
  * next commit. A `commitFn` that reports no `ignoredPaths` (an older or
  * test-only stand-in for `commitWikiChanges`) keeps nothing, the plain
@@ -4155,8 +6175,8 @@ export function commitTouchedPaths(hypoDir, sessionId, commitFn) {
       //     path. Kept, so the checkpoint gate still blocks on it and says
       //     why (readTouchedPathsDrifted), instead of the path reading as
       //     ownerless.
-      // A path with no recorded hash (a set from before hashes existed, a
-      // projection claim, an unreadable file) goes into the scope as before.
+      // A path with no recorded hash (a set from before hashes existed, an
+      // unreadable file) goes into the scope as before.
       const hashes = readTouchedHashesFile(touchedHashesPath(hypoDir, sessionId));
       const scope = [];
       const driftKept = [];
@@ -4217,11 +6237,335 @@ export function vaultCommitLockTarget(hypoDir) {
   return join(hypoDir, '.cache', 'vault-commit');
 }
 
+// `.cache/auto-staged.json`: {<vault path>: {blob, headBlob}} for the blob hypo-auto-stage staged for
+// a path and the blob HEAD held for that path at that moment (`null` when HEAD had none). `.cache/`
+// is gitignored, so it never syncs or commits. Writers hold the vault commit lock (the auto-stage
+// hook and commitWikiChanges' caller), and the update takes the file's own lock too.
+function autoStagedPath(hypoDir) {
+  return join(hypoDir, '.cache', 'auto-staged.json');
+}
+
+// `.cache/index-reconcile.json`: {<vault path>: {index, head}} for a commit's post-commit reset: the
+// index blob the reset is meant to replace, and the blob HEAD held for the path before the commit.
+// Written before the commit, dropped when the reset succeeded or the commit was refused, and kept
+// when the reset failed, so the next commitWikiChanges can finish it (only if HEAD moved).
+function indexReconcilePath(hypoDir) {
+  return join(hypoDir, '.cache', 'index-reconcile.json');
+}
+
+// A missing or unreadable record is `{}`.
+function readCacheRecord(path) {
+  try {
+    const parsed = JSON.parse(readFileSync(path, 'utf-8'));
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function updateCacheRecord(path, mutate) {
+  withFileLock(path, () => {
+    // An unreadable record starts over: a lost entry only means one more backup later.
+    const record = readCacheRecord(path);
+    mutate(record);
+    // An empty record is no file, so a commit that leaves nothing to remember leaves no trace in a
+    // vault whose `.gitignore` has no `.cache/` line.
+    if (Object.keys(record).length === 0) rmSync(path, { force: true });
+    else atomicWrite(path, JSON.stringify(record));
+  });
+}
+
+/** The recorded auto-stage blobs. A missing or unreadable record is `{}`: nothing is skipped. */
+export function readAutoStagedRecord(hypoDir) {
+  return readCacheRecord(autoStagedPath(hypoDir));
+}
+
+/**
+ * Remember that hypo-auto-stage staged `blob` for `relPath` while HEAD held `headBlob` for it, so a
+ * commit does not back it up.
+ */
+export function recordAutoStagedBlob(hypoDir, relPath, blob, headBlob) {
+  updateCacheRecord(autoStagedPath(hypoDir), (record) => {
+    record[relPath] = { blob, headBlob: headBlob ?? null };
+  });
+}
+
+/**
+ * The one rule for "this staged blob is hypo-auto-stage's own, not a person's": `record` names
+ * `blob` for `relPath`, and HEAD's blob for the path (`headBlob`, `null` when HEAD has none) is
+ * still the one recorded with it. Once HEAD moves the record is stale (a person may have staged the
+ * same bytes since), and an entry in the old string format has no HEAD blob to compare, so neither
+ * is trusted. The auto-stage hook and `backUpStagedVersions` both decide through this.
+ */
+export function isAutoStagedBlob(record, relPath, blob, headBlob) {
+  const entry = record?.[relPath];
+  return (
+    !!entry &&
+    typeof entry === 'object' &&
+    entry.blob === blob &&
+    entry.headBlob === (headBlob ?? null)
+  );
+}
+
+/**
+ * A staged deletion: HEAD has the path and the index holds no entry for it at any stage (a `git rm`).
+ * The auto-stage hook leaves such a path alone, and the commit says so when it replaces the deletion.
+ * @param {string|null} headBlob HEAD's blob for the path, `null` when HEAD has none
+ * @param {boolean} indexed whether the index has an entry for the path at any stage
+ */
+export function isStagedDeletion(headBlob, indexed) {
+  return headBlob != null && !indexed;
+}
+
+/**
+ * The stage-0 index blob and HEAD's blob for one vault path (`null` when absent; an unborn HEAD has
+ * no blobs), and whether the index has an entry for it at any stage. `null` for the whole result
+ * when git cannot answer about the index.
+ * @returns {{index: string|null, head: string|null, indexed: boolean}|null}
+ */
+export function indexAndHeadBlobs(hypoDir, relPath) {
+  const ls = vaultGit(hypoDir, ['ls-files', '-s', '--', relPath]);
+  if (ls.error || ls.status !== 0) return null;
+  const tree = vaultGit(hypoDir, ['ls-tree', 'HEAD', '--', relPath]);
+  return {
+    index: /^\d+ ([0-9a-f]+) 0\t/m.exec(ls.stdout || '')?.[1] ?? null,
+    head:
+      !tree.error && tree.status === 0
+        ? (/^\d+ blob ([0-9a-f]+)\t/m.exec(tree.stdout || '')?.[1] ?? null)
+        : null,
+    indexed: (ls.stdout || '').trim() !== '',
+  };
+}
+
+// Forget the entries of paths a commit just took, so the record holds only paths still pending.
+// Best-effort: HEAD moving with the commit makes a leftover entry untrusted anyway.
+function dropAutoStagedBlobs(hypoDir, relPaths) {
+  try {
+    if (!Object.keys(readAutoStagedRecord(hypoDir)).some((p) => relPaths.includes(p))) return;
+    updateCacheRecord(autoStagedPath(hypoDir), (record) => {
+      for (const p of relPaths) delete record[p];
+    });
+  } catch {
+    // keep the commit result; the record is a cache
+  }
+}
+
+// Journal for the post-commit reset (see `indexReconcilePath`). Both writes are best-effort: a
+// journal that cannot be written only means a failed reset has no retry, as it had none before.
+// An entry already there is an earlier failed reset still waiting for its retry, and it is kept:
+// the stale index is that entry's, not this call's. Returns the paths this call newly wrote, the
+// only ones its own refusal may take back out.
+function journalIndexBlobs(hypoDir, blobs) {
+  const written = [];
+  try {
+    updateCacheRecord(indexReconcilePath(hypoDir), (record) => {
+      written.length = 0;
+      for (const [path, entry] of Object.entries(blobs)) {
+        if (record[path] && typeof record[path] === 'object') continue;
+        record[path] = entry;
+        written.push(path);
+      }
+    });
+  } catch {
+    return [];
+  }
+  return written;
+}
+
+function dropIndexJournal(hypoDir, relPaths) {
+  try {
+    updateCacheRecord(indexReconcilePath(hypoDir), (record) => {
+      for (const p of relPaths) delete record[p];
+    });
+  } catch {
+    // best-effort
+  }
+}
+
+// Finish a post-commit reset that failed earlier. A journaled path is stale residue of that commit,
+// and is reset to HEAD, only when all three hold: its index blob is still the journaled one (any
+// other blob was staged by a person since), HEAD's blob for it is no longer the one recorded before
+// the commit (the commit landed; a refused or interrupted one never moved HEAD, and then the index
+// is the person's), and the index differs from HEAD. Every entry is dropped except those whose
+// reset itself failed, and that failure comes back as a warning for the caller to forward. The
+// caller holds the vault commit lock.
+// @returns {string|undefined} the warning when a reset failed
+function reconcileStaleIndex(hypoDir) {
+  const journal = readCacheRecord(indexReconcilePath(hypoDir));
+  const paths = Object.keys(journal);
+  if (paths.length === 0) return undefined;
+  const ls = vaultGit(hypoDir, ['ls-files', '-s', '-z', '--', ...paths]);
+  if (ls.error || ls.status !== 0) return undefined; // keep the entries for the next call
+  const index = new Map();
+  for (const rec of (ls.stdout || '').split('\0')) {
+    const m = /^\d+ ([0-9a-f]+) 0\t([\s\S]*)$/.exec(rec);
+    if (m) index.set(m[2], m[1]);
+  }
+  const head = new Map();
+  const tree = vaultGit(hypoDir, ['ls-tree', '-r', '-z', 'HEAD', '--', ...paths]);
+  if (tree.error || tree.status !== 0) return undefined; // HEAD unreadable: decide next call
+  for (const rec of tree.stdout.split('\0')) {
+    const m = /^\d+ blob ([0-9a-f]+)\t([\s\S]*)$/.exec(rec);
+    if (m) head.set(m[2], m[1]);
+  }
+  const stale = paths.filter((p) => {
+    const entry = journal[p];
+    const now = head.get(p) ?? null;
+    return (
+      !!entry &&
+      typeof entry === 'object' &&
+      index.get(p) === entry.index &&
+      now !== (entry.head ?? null) &&
+      index.get(p) !== now
+    );
+  });
+  const reset =
+    stale.length > 0 ? vaultGit(hypoDir, ['reset', '-q', 'HEAD', '--', ...stale]) : { status: 0 };
+  dropIndexJournal(hypoDir, reset.status === 0 ? paths : paths.filter((p) => !stale.includes(p)));
+  if (reset.status === 0) return undefined;
+  return `the index of ${stale.join(', ')} was not brought to HEAD after an earlier commit (${(reset.stderr || '').trim() || 'unknown'}); run \`git reset -q HEAD -- ${stale.map(shellQuote).join(' ')}\` before any plain git commit`;
+}
+
+// A path for a POSIX shell command line: bare when it has only safe characters, else in single
+// quotes with each embedded single quote written as `'\''`.
+function shellQuote(path) {
+  return /^[A-Za-z0-9_@%+=:,./-]+$/.test(path) ? path : `'${path.replace(/'/g, "'\\''")}'`;
+}
+
 /** `projects/<slug>/...` → `<slug>`; anything else → its first path segment. */
 function projectOfPath(relPath) {
   const parts = relPath.split('/');
   if (parts[0] === 'projects' && parts.length > 1 && parts[1]) return parts[1];
   return parts[0] || relPath;
+}
+
+/**
+ * Save every version a person staged for one of `commitScope` that the commit is about to replace:
+ * the stage-0 index blob that is neither HEAD's blob for the path (for a rename's destination, the
+ * source path's HEAD blob counts too), nor the work tree's blob, which is what gets committed, nor
+ * the blob hypo-auto-stage recorded for the path (`isAutoStagedBlob`: only while HEAD's blob for the
+ * path is still the one recorded with it).
+ * Each lands under `.cache/backups/staged/<path>` through `backUpGeneratedPath`, so a retry that
+ * finds the same bytes already saved reuses that file. Throws when a blob cannot be read or the
+ * backup cannot be written or announced; the caller then commits nothing. The health notice for a
+ * backup is written right after the backup, before the caller stages anything, so a later failure
+ * cannot leave a saved version nobody was told about.
+ * @param {string} hypoDir
+ * @param {string[]} commitScope vault-relative paths about to be staged and committed
+ * @param {Map<string, string>} renamedFrom rename destination -> source path
+ * @param {string} lsStaged `git ls-files -s -z --full-name` output for `commitScope`
+ * @param {(f: string) => string|null} toVaultRelative repository path -> vault path
+ * @param {Map<string, string>} head vault path -> HEAD's blob, for `commitScope` (none on an unborn HEAD)
+ * @returns {{path: string, backupPath: string}[]}
+ */
+function backUpStagedVersions(hypoDir, commitScope, renamedFrom, lsStaged, toVaultRelative, head) {
+  const staged = new Map(); // vault path -> stage-0 blob
+  const indexed = new Set(); // vault paths with an index entry at any stage
+  for (const rec of (lsStaged || '').split('\0')) {
+    const any = /^\d+ [0-9a-f]+ \d\t([\s\S]*)$/.exec(rec);
+    const anyRel = any && toVaultRelative(any[1]);
+    if (anyRel) indexed.add(anyRel);
+    const m = /^\d+ ([0-9a-f]+) 0\t([\s\S]*)$/.exec(rec);
+    const rel = m && toVaultRelative(m[2]);
+    if (rel) staged.set(rel, m[1]);
+  }
+
+  // A staged deletion (`git rm`) of a path that is back in the work tree: the add below puts the new
+  // content over it and the commit takes that. HEAD keeps the old bytes, so nothing is lost, but
+  // the deletion is gone from the index afterwards, so the notice says how to redo it. A plain
+  // rename's source is skipped by the work-tree check: `git mv` leaves no file there. A file that
+  // reappears at a renamed-away source does replace that staged deletion, so it is announced too.
+  for (const path of commitScope) {
+    if (
+      !isStagedDeletion(head.get(path) ?? null, indexed.has(path)) ||
+      !isFileOrLink(join(hypoDir, path))
+    )
+      continue;
+    const noticed = writeRootHotHealthNotice(
+      hypoDir,
+      `index 에 올려 둔 ${path} 의 삭제를 새 파일 내용이 대신해, 이어지는 커밋에는 새 내용이 들어갑니다(커밋이 실패하거나 커밋할 것이 없으면 삭제는 index 에 그대로 남습니다). ` +
+        `이전 내용은 HEAD 이력에 남아 있습니다. 파일을 지우려면 커밋 뒤에 \`git rm -- ${shellQuote(path)}\` 를 다시 실행하세요.`,
+    );
+    if (!noticed)
+      throw new Error(`the notice for the staged deletion of ${path} could not be written`);
+  }
+  if (staged.size === 0) return [];
+
+  // `hash-object` applies the same attribute filters `git add` does, so equal bytes hash equal. A
+  // failed hash leaves the work tree blob unknown, which only makes the comparison save more.
+  const onDisk = [...staged.keys()].filter((p) => statIs(join(hypoDir, p), 'file'));
+  const work = new Map();
+  if (onDisk.length > 0) {
+    const hashed = vaultGit(hypoDir, ['hash-object', '--', ...onDisk]);
+    const lines = hashed.status === 0 ? hashed.stdout.split('\n').filter(Boolean) : [];
+    if (lines.length === onDisk.length) onDisk.forEach((p, i) => work.set(p, lines[i]));
+  }
+
+  // The blob hypo-auto-stage itself staged for a path is Claude's own write, not a person's. With
+  // no record, a stale one or one that cannot be read, nothing is skipped and the blob is saved.
+  const autoStaged = readAutoStagedRecord(hypoDir);
+  const toSave = [...staged].filter(
+    ([path, blob]) =>
+      !(
+        blob === head.get(path) ||
+        blob === head.get(renamedFrom.get(path)) ||
+        blob === work.get(path) ||
+        isAutoStagedBlob(autoStaged, path, blob, head.get(path) ?? null)
+      ),
+  );
+  // The backups hold a person's own bytes: none is written while a `git add -A` would stage them.
+  // The commit is refused here, before anything is staged, and their stage stays where it is.
+  if (toSave.length > 0) {
+    const unignored = unignoredCachePaths(hypoDir);
+    if (unignored.length > 0) {
+      const noticed = writeRootHotHealthNotice(
+        hypoDir,
+        `${cacheNotIgnoredNotice(unignored)} 올려 둔 버전은 index 에 그대로 남고 커밋은 미뤄졌습니다.`,
+      );
+      throw new Error(
+        `.cache/ is not ignored (${unignored.join(', ')}), so no backup is written${noticed ? '' : ' and the notice could not be written'}`,
+      );
+    }
+  }
+  const saved = [];
+  for (const [path, blob] of toSave) {
+    const content = spawnSync('git', ['-C', hypoDir, 'cat-file', 'blob', blob], {
+      timeout: 30000,
+      maxBuffer: 64 * 1024 * 1024,
+    });
+    if (content.status !== 0)
+      throw new Error(
+        `git cat-file failed for ${path}: ${String(content.stderr).trim() || 'unknown'}`,
+      );
+    const backupPath = backUpGeneratedPath(hypoDir, join(hypoDir, 'staged', path), content.stdout);
+    // The commit that follows holds the work tree bytes, so this backup is the only copy of the
+    // person's version. The notice goes out now, not after the commit.
+    const noticed = writeRootHotHealthNotice(
+      hypoDir,
+      `index 에 올려 둔 ${path} 의 버전이 작업 파일과 달라 ${backupPathForNotice(backupPath)} 로 백업했습니다. ` +
+        '이어지는 커밋에는 작업 파일 내용이 들어갑니다(커밋이 실패하거나 커밋할 것이 없으면 올려 둔 버전은 index 에 그대로 남습니다). ' +
+        '열어 본 뒤 필요한 내용을 반영하고 백업은 지우세요.',
+    );
+    if (!noticed) throw new Error(`the notice for the backup of ${path} could not be written`);
+    saved.push({ path, backupPath });
+  }
+  return saved;
+}
+
+// The paths a commit just took whose index entry is another blob than the one journaled before it
+// and still differs from HEAD: staged after the commit by something else, and left staged. Names
+// them in a durable notice. Returns the message instead when the notice could not be written, so the
+// caller's warning carries it.
+function noticeStagedAfterCommit(hypoDir, git, kept) {
+  if (kept.length === 0) return undefined;
+  const differing = git('diff', '--cached', '--name-only', '--relative', '-z', '--', ...kept);
+  const paths =
+    differing.status === 0 ? (differing.stdout || '').split('\0').filter(Boolean) : kept;
+  if (paths.length === 0) return undefined;
+  const message =
+    `커밋 직후 ${paths.join(', ')} 의 index 에 다른 내용이 올라와 HEAD 로 되돌리지 않고 그대로 두었습니다(post-commit 훅 같은 것이 올렸을 수 있습니다). ` +
+    `필요 없으면 \`git reset -q HEAD -- ${paths.map(shellQuote).join(' ')}\` 로 되돌리세요.`;
+  return writeRootHotHealthNotice(hypoDir, message) ? undefined : message;
 }
 
 /**
@@ -4236,6 +6580,8 @@ function projectOfPath(relPath) {
  * whole tree. `paths` absent/empty is a clean no-op (`scoped: 0`), not an
  * error and not a whole-tree fallback — this is how a caller with nothing to
  * contribute (e.g. no session_id, so nothing was accumulated) skips cleanly.
+ * It still finishes an earlier commit's failed index reset (`reconcileStaleIndex`) and reports a
+ * failure of that as `indexWarning`.
  *
  * The authoritative scope is INTERSECT(paths, currently-changed): a stale
  * entry (already committed elsewhere, or never actually changed) is dropped
@@ -4248,8 +6594,9 @@ function projectOfPath(relPath) {
  * SUCCESS, not failure — the caller's tree is already in the state it wanted.
  *
  * @param {string} hypoDir
- * @param {string[]} [paths] vault-relative paths this caller wrote/owns this close
- * @returns {{committed: boolean, scoped?: number, sha?: string|null, committedPaths?: string[], ignoredPaths?: string[], reason?: string}}
+ * @param {string[]} [paths] vault-relative paths this caller wrote/owns this close. Generated view
+ *   paths (`isGeneratedViewPath`) are dropped from it before anything else.
+ * @returns {{committed: boolean, scoped?: number, sha?: string|null, committedPaths?: string[], ignoredPaths?: string[], stagedBackups?: {path: string, backupPath: string}[], reason?: string, indexWarning?: string}}
  *   committed:true when a commit was created OR nothing needed committing
  *   (scoped:0 in the latter case); committed:false (with reason) on a real
  *   failure: not a git repo, or git status/add/commit erroring. `sha` is the
@@ -4264,8 +6611,22 @@ function projectOfPath(relPath) {
  *   the supplied paths that ARE dirty but were kept out of the commit only
  *   because `.hypoignore` matches them, so a caller clearing a per-session
  *   pending-write set (Stop's `commitTouchedPaths`) can keep exactly those as
- *   unresolved. A stale or already-clean supplied path is never listed:
- *   nothing about it is left unresolved.
+ *   unresolved. A path is also listed there when it is the destination of a
+ *   rename whose source is a generated view: that pair is left out whole.
+ *   A stale or already-clean supplied path is never listed: nothing about it
+ *   is left unresolved. On a failed add or commit the index entries of this
+ *   call's paths are put back as they were (the `reason` says so when that
+ *   fails too). After a commit every committed path's index entry is the new
+ *   HEAD, except one that something staged after the commit (its blob is not the one journaled before
+ *   it): that stays staged and a health notice names it. A version a person had staged for a committed path, when it differs
+ *   from HEAD's and from the bytes committed, is saved first under
+ *   `.cache/backups/staged/`: `stagedBackups` names each `{path, backupPath}`
+ *   and a health notice, written right after each backup, says so. When nothing ends up to commit
+ *   the saved entries are put back in the index (a person's stage is not cleared by a no-op). A
+ *   staged deletion (`git rm`) of a committed path whose file is back in the work tree is replaced
+ *   by the new content, with a notice that says how to redo the deletion. `indexWarning` is present
+ *   only when a commit landed but index entries could not be brought to HEAD afterwards: its own
+ *   paths', or those of an earlier commit whose reset this call retried and failed again.
  */
 export function commitWikiChanges(hypoDir, paths) {
   const git = (...args) =>
@@ -4273,11 +6634,25 @@ export function commitWikiChanges(hypoDir, paths) {
   if (git('rev-parse', '--is-inside-work-tree').status !== 0)
     return { committed: false, reason: `not a git repository: ${hypoDir}` };
 
+  // A generated view (`hot.md`, `projects/<p>/hot.md`, `projects/<p>/session-state.md`) is rendered
+  // on every machine and never committed here, whether a caller names it or not. The migration and
+  // the rollback commit views through their own path, not this function.
   const supplied = new Set(
-    (Array.isArray(paths) ? paths : []).filter((p) => typeof p === 'string' && p.length > 0),
+    (Array.isArray(paths) ? paths : []).filter(
+      (p) => typeof p === 'string' && p.length > 0 && !isGeneratedViewPath(p),
+    ),
   );
+
+  // A reset that failed after an earlier commit is finished first, while the caller's vault lock is
+  // held, so this call's own scope starts from an index that matches HEAD. It runs before the
+  // empty-scope return too: an idle Stop is the retry for a reset that failed, and its warning
+  // comes back on every outcome that follows.
+  const reconcileWarning = reconcileStaleIndex(hypoDir);
+  const withWarning = (outcome) =>
+    reconcileWarning ? { ...outcome, indexWarning: reconcileWarning } : outcome;
+
   if (supplied.size === 0)
-    return { committed: true, scoped: 0, committedPaths: [], ignoredPaths: [] };
+    return withWarning({ committed: true, scoped: 0, committedPaths: [], ignoredPaths: [] });
 
   // `-z`: NUL-separated records with verbatim paths — no surrounding quotes and
   // no octal escaping, so non-ASCII paths (Korean page names are normal input
@@ -4305,7 +6680,8 @@ export function commitWikiChanges(hypoDir, paths) {
   const ignorePatterns = loadHypoIgnore(hypoDir);
   const scoped = []; // pathspec for `git add -A` — worktree/index paths only
   const commitScope = []; // pathspec for the final diff/commit --only (superset)
-  const ignoredPaths = []; // supplied, dirty, but excluded by .hypoignore
+  const ignoredPaths = []; // supplied, dirty, but kept out of the commit on purpose
+  const renamedFrom = new Map(); // rename destination -> its source path
   const records = (porcelain.stdout || '').split('\0');
   for (let i = 0; i < records.length; i++) {
     const rec = records[i];
@@ -4324,7 +6700,14 @@ export function commitWikiChanges(hypoDir, paths) {
     }
     if (!file) continue;
     if (!supplied.has(file)) continue; // out of this caller's scope
-    if (ignorePatterns.length > 0 && isIgnored(join(hypoDir, file), hypoDir, ignorePatterns)) {
+    // The source half of a rename is a generated view: committing the pair would commit the view's
+    // deletion, which this function never does. The whole pair stays out, and it stays reported as
+    // unresolved so a caller clearing a pending set does not retire a path that was not committed.
+    if (isRename && fromFile && isGeneratedViewPath(fromFile)) {
+      ignoredPaths.push(file);
+      continue;
+    }
+    if (isExcludedFromCommit(hypoDir, file, ignorePatterns)) {
       ignoredPaths.push(file);
       continue;
     }
@@ -4339,29 +6722,120 @@ export function commitWikiChanges(hypoDir, paths) {
     // any files"), only to the commit's pathspec. A copy's `from` is
     // independently-owned, still-existing content, so it is NOT auto-pulled
     // in at all: the caller must name it explicitly if it wants it in scope.
-    if (isRename && fromFile) commitScope.push(fromFile);
+    if (isRename && fromFile) {
+      commitScope.push(fromFile);
+      renamedFrom.set(file, fromFile);
+    }
   }
   if (scoped.length === 0 && commitScope.length === 0)
-    return { committed: true, scoped: 0, committedPaths: [], ignoredPaths };
+    return withWarning({ committed: true, scoped: 0, committedPaths: [], ignoredPaths });
+
+  // A held `index.lock` (another git process mid-operation, or a stale one) would fail the staging
+  // below, and the restore after a failure needs the same lock. Stop here, before anything is saved
+  // or staged, so the reason names the lock and the caller keeps its pending scope for the next try.
+  const indexPath = git('rev-parse', '--git-path', 'index');
+  if (indexPath.status !== 0)
+    return { committed: false, reason: `git rev-parse --git-path index failed in ${hypoDir}` };
+  const indexLock = `${resolvePath(hypoDir, (indexPath.stdout || '').trim())}.lock`;
+  if (existsSync(indexLock))
+    return {
+      committed: false,
+      reason: `git index is locked (${indexLock}): another git process is running, or the lock is stale`,
+    };
+
+  // The real index entries of this call's paths before it stages anything, so a
+  // failed add or commit can put them back. Left staged, they would ride along
+  // with the next plain `git commit` anyone runs in this tree (a new session
+  // entry included). `--full-name` because `--index-info` reads repository-root
+  // paths. A crash between the add and the restore still leaves them staged.
+  const before = git('ls-files', '-s', '-z', '--full-name', '--', ...commitScope);
+  if (before.status !== 0)
+    return {
+      committed: false,
+      reason: `git ls-files failed: ${(before.stderr || '').trim() || 'unknown'}`,
+    };
+  // HEAD's blob for each path of the scope before this call touches anything (an unborn HEAD has
+  // none). The post-commit journal records it, and the staged-version backup reads it too.
+  const headTree = git('ls-tree', '-r', '-z', 'HEAD', '--', ...commitScope);
+  const headBlobs = new Map();
+  if (headTree.status === 0) {
+    for (const rec of (headTree.stdout || '').split('\0')) {
+      const m = /^\d+ blob ([0-9a-f]+)\t([\s\S]*)$/.exec(rec);
+      if (m) headBlobs.set(m[2], m[1]);
+    }
+  }
+  // A failed tree read on a HEAD that exists leaves the pre-commit blobs unknown: no journal then.
+  const headKnown =
+    headTree.status === 0 || git('rev-parse', '--verify', '-q', 'HEAD').status !== 0;
+  let journaled = []; // the journal entries this call newly wrote (a refusal takes only these back)
+  const restoreIndex = () => {
+    const removed = git('update-index', '--force-remove', '--', ...commitScope);
+    return removed.status === 0 && before.stdout
+      ? spawnSync('git', ['-C', hypoDir, 'update-index', '-z', '--index-info'], {
+          input: before.stdout,
+          encoding: 'utf-8',
+          timeout: 30000,
+        })
+      : removed;
+  };
+  const failed = (reason) => {
+    const restored = restoreIndex();
+    // Whatever the outcome, no commit landed, so the journal has nothing to finish.
+    dropIndexJournal(hypoDir, journaled);
+    if (restored.status !== 0)
+      return {
+        committed: false,
+        reason: `${reason}; the index was not restored: ${(restored.stderr || '').trim() || 'unknown'}`,
+      };
+    return { committed: false, reason };
+  };
+
+  // Staging puts the work tree bytes over whatever a person had staged for a path, and the commit
+  // takes the same bytes. A staged version that is neither HEAD's nor the work tree's would be gone
+  // from the index afterwards, and from HEAD too, so it is saved before anything is staged.
+  let stagedBackups;
+  try {
+    stagedBackups = backUpStagedVersions(
+      hypoDir,
+      commitScope,
+      renamedFrom,
+      before.stdout,
+      toVaultRelative,
+      headBlobs,
+    );
+  } catch (err) {
+    return {
+      committed: false,
+      reason: `could not save a version staged in the index before committing: ${err?.message ?? String(err)}`,
+    };
+  }
 
   if (scoped.length > 0) {
     const add = git('add', '-A', '--', ...scoped);
     if (add.status !== 0)
-      return {
-        committed: false,
-        reason: `git add failed: ${(add.stderr || '').trim() || 'unknown'}`,
-      };
+      return failed(`git add failed: ${(add.stderr || '').trim() || 'unknown'}`);
   }
 
   // Re-derive from what actually landed in the index, bounded by the SAME
-  // pathspec (commitScope, the rename-aware superset of `scoped`) — this step
+  // pathspec (commitScope, the rename-aware superset of `scoped`): this step
   // must not widen back to whole-tree either, or another session's already-
   // staged file would slip into the commit here.
   // `--relative`: name the staged paths from the vault, like everything above.
   const staged = git('diff', '--cached', '--name-only', '--relative', '-z', '--', ...commitScope);
+  if (staged.status !== 0)
+    return failed(`git diff --cached failed: ${(staged.stderr || '').trim() || 'unknown'}`);
   const stagedFiles = (staged.stdout || '').split('\0').filter(Boolean);
-  if (stagedFiles.length === 0)
-    return { committed: true, scoped: 0, committedPaths: [], ignoredPaths };
+  if (stagedFiles.length === 0) {
+    // Nothing differs from HEAD, but the add above may have put the work tree bytes over a version
+    // a person staged for one of these paths. No commit takes their place, so put the entries back.
+    const restored = restoreIndex();
+    if (restored.status !== 0)
+      return {
+        committed: false,
+        reason: `nothing to commit, and the index was not restored: ${(restored.stderr || '').trim() || 'unknown'}`,
+      };
+    return withWarning({ committed: true, scoped: 0, committedPaths: [], ignoredPaths });
+  }
 
   const projects = new Set(stagedFiles.map(projectOfPath));
   const today = new Date().toISOString().slice(0, 10);
@@ -4369,7 +6843,7 @@ export function commitWikiChanges(hypoDir, paths) {
 
   // `git commit --only -- <paths>` (first use of --only in this repo): commits
   // ONLY the staged changes under this pathspec, ignoring anything else
-  // staged in the index — e.g. another session's own staged-but-uncommitted
+  // staged in the index, e.g. another session's own staged-but-uncommitted
   // work sharing this working tree. A bare `git commit -m` would sweep in
   // every staged path, defeating the whole point of the scoped set above.
   //
@@ -4379,14 +6853,66 @@ export function commitWikiChanges(hypoDir, paths) {
   // output would silently drop the `from` path again and reproduce the
   // exact `--only`-leaves-the-deletion-staged residue this function's rename
   // handling exists to avoid (verified). `stagedFiles` still governs the
-  // empty-scope check and the N/M count above — both correct as "how many
+  // empty-scope check and the N/M count above, both correct as "how many
   // logical changes", where a rename is rightly one.
+  // Journal first: the index blobs the post-commit reset below is meant to replace. If that reset
+  // fails, the next call finishes it (`reconcileStaleIndex`).
+  const added = new Map();
+  for (const rec of (git('ls-files', '-s', '-z', '--', ...commitScope).stdout || '').split('\0')) {
+    const m = /^\d+ ([0-9a-f]+) 0\t([\s\S]*)$/.exec(rec);
+    if (m) added.set(m[2], m[1]);
+  }
+  if (headKnown) {
+    journaled = journalIndexBlobs(
+      hypoDir,
+      Object.fromEntries(
+        [...added].map(([path, blob]) => [
+          path,
+          { index: blob, head: headBlobs.get(path) ?? null },
+        ]),
+      ),
+    );
+  }
   const commit = git('commit', '--only', '-m', msg, '--', ...commitScope);
   if (commit.status !== 0)
-    return {
-      committed: false,
-      reason: `git commit failed: ${(commit.stderr || '').trim() || 'unknown'}`,
-    };
+    return failed(`git commit failed: ${(commit.stderr || '').trim() || 'unknown'}`);
+  // `--only` reads each path from the work tree twice, once into the real index
+  // and once into the commit. Another close appending in between leaves HEAD with
+  // the append and the real index without it, and the next plain `git commit`
+  // anyone runs would then take the append back out of HEAD. Bring these paths'
+  // index entries to HEAD while the caller still holds the vault lock. Every
+  // committed path ends with index == HEAD, so a later write to it shows as an
+  // unstaged change only, and a merge that touches it is not refused.
+  //
+  // Only a path whose index blob is still the one journaled before the commit is reset. Any other
+  // blob was staged after that by something else (a person's post-commit hook, say) and is theirs:
+  // it stays, and a notice names it. An index that cannot be read resets nothing: which blob each
+  // path holds is unknown, so a reset could take away someone else's stage. The journal stays, and
+  // the next call's reconcile resets only a path whose index still holds the journaled blob.
+  const after = git('ls-files', '-s', '-z', '--', ...commitScope);
+  const indexRead = after.status === 0;
+  const indexNow = new Map();
+  for (const rec of (after.stdout || '').split('\0')) {
+    const m = /^\d+ ([0-9a-f]+) 0\t([\s\S]*)$/.exec(rec);
+    if (m) indexNow.set(m[2], m[1]);
+  }
+  const resetScope = indexRead
+    ? commitScope.filter((p) => (indexNow.get(p) ?? null) === (added.get(p) ?? null))
+    : [];
+  const kept = indexRead ? commitScope.filter((p) => !resetScope.includes(p)) : [];
+  const sync =
+    resetScope.length > 0 ? git('reset', '-q', 'HEAD', '--', ...resetScope) : { status: 0 };
+  dropAutoStagedBlobs(hypoDir, commitScope);
+  // The reset brought these paths to HEAD, which also settles an older entry for the same path.
+  if (indexRead && sync.status === 0 && headKnown) dropIndexJournal(hypoDir, [...added.keys()]);
+  const ownWarning = !indexRead
+    ? `the index of the committed paths could not be read after the commit (${(after.stderr || '').trim() || 'unknown'}); nothing was reset, and the next commit call finishes it`
+    : sync.status === 0
+      ? undefined
+      : `the index of the committed paths was not brought to HEAD (${(sync.stderr || '').trim() || 'unknown'}); run \`git reset -q HEAD -- ${resetScope.map(shellQuote).join(' ')}\` before any plain git commit`;
+  const keptWarning = noticeStagedAfterCommit(hypoDir, git, kept);
+  const indexWarning =
+    [reconcileWarning, ownWarning, keptWarning].filter(Boolean).join('\n') || undefined;
   // MAJOR fix: name the commit this call just created. A caller that has to
   // tell a user how to take it back (close-gate-store.mjs's
   // hostTagWarningWithUndo) cannot derive it afterwards: on a shared vault
@@ -4403,6 +6929,8 @@ export function commitWikiChanges(hypoDir, paths) {
     sha,
     committedPaths: stagedFiles,
     ignoredPaths,
+    ...(indexWarning ? { indexWarning } : {}),
+    ...(stagedBackups.length > 0 ? { stagedBackups } : {}),
   };
 }
 
@@ -4876,6 +7404,214 @@ export function sessionClosedMarkerPath(hypoDir, sessionId) {
   return join(hypoDir, '.cache', `session-closed-${sanitizeSessionId(sessionId)}.marker`);
 }
 
+// ── close pin: one close id per close request ───────────────────────────────
+// `.cache/close-pin/<sessionId>.json` remembers which close id a session's
+// open close request writes under, so every retry of that request lands on the
+// same session entry. It is not kept in the close journal: `clearJournal` wipes
+// that file as soon as the commit lands, and a retry after a failed receipt
+// would lose the id.
+//
+// Shape: `{v: 2, pending, lastResolved, resolvedByProject, localProofs}`.
+//   pending            `{closeId, openedAtIndex, entryRelPath, entrySha256s}` of the
+//                      close in flight, or null
+//   lastResolved       the closeId of the last close that finished, or null
+//   resolvedByProject  `{project: closeId}`, the last finished close per project its
+//                      entry went to. One session can close several projects in turn,
+//                      and each one is proven by its own close, not by the last one.
+//                      A pin written before this field existed reads as `{}`.
+//   localProofs        `{closeId: {entryRelPath, entrySha256}}`, never cleared on resolution
+//
+// The functions below sit here, not in close-gate-store.mjs or
+// close-journal.mjs, because both import this file: `sessionProofCloseId`
+// (called by the PreCompact gate in this file) would otherwise close an import
+// cycle. That is also why nothing here calls `closeGateStatus`; callers pass
+// its answers in.
+
+const EMPTY_CLOSE_PIN = Object.freeze({
+  pending: null,
+  lastResolved: null,
+  resolvedByProject: {},
+  localProofs: {},
+});
+const emptyClosePin = () => ({ ...EMPTY_CLOSE_PIN, resolvedByProject: {}, localProofs: {} });
+
+/** `<hypoDir>/.cache/close-pin/<sessionId>.json`, or null for an id unsafe as a filename. */
+export function closePinPath(hypoDir, sessionId) {
+  if (!isValidSessionId(sessionId)) return null;
+  return join(hypoDir, '.cache', 'close-pin', `${sessionId}.json`);
+}
+
+function wellFormedClosePin(pin) {
+  if (!pin || typeof pin !== 'object' || Array.isArray(pin) || pin.v !== 2) return false;
+  const { pending, lastResolved, resolvedByProject, localProofs } = pin;
+  if (pending !== null) {
+    if (!pending || typeof pending !== 'object' || Array.isArray(pending)) return false;
+    if (!isValidSessionId(pending.closeId)) return false;
+    if (!Number.isSafeInteger(pending.openedAtIndex) || pending.openedAtIndex < 0) return false;
+    if (pending.entryRelPath !== null && typeof pending.entryRelPath !== 'string') return false;
+    if (
+      !Array.isArray(pending.entrySha256s) ||
+      !pending.entrySha256s.every((h) => typeof h === 'string')
+    ) {
+      return false;
+    }
+  }
+  if (lastResolved !== null && !isValidSessionId(lastResolved)) return false;
+  if (resolvedByProject !== undefined) {
+    if (!resolvedByProject || typeof resolvedByProject !== 'object') return false;
+    if (Array.isArray(resolvedByProject)) return false;
+    if (!Object.values(resolvedByProject).every((id) => isValidSessionId(id))) return false;
+  }
+  if (!localProofs || typeof localProofs !== 'object' || Array.isArray(localProofs)) return false;
+  return Object.values(localProofs).every(
+    (p) =>
+      p &&
+      typeof p === 'object' &&
+      typeof p.entryRelPath === 'string' &&
+      typeof p.entrySha256 === 'string',
+  );
+}
+
+/**
+ * Read the pin. An absent, unreadable, wrongly shaped or older-format (`v: 1`)
+ * file reads as an empty pin, never as a throw: a pin that cannot be trusted
+ * must not block a close, it just means no id is pinned yet.
+ *
+ * @returns {{pending: object|null, lastResolved: string|null, resolvedByProject: object, localProofs: object}}
+ */
+export function readClosePin(hypoDir, sessionId) {
+  const path = closePinPath(hypoDir, sessionId);
+  if (!path) return emptyClosePin();
+  try {
+    const parsed = JSON.parse(readFileSync(path, 'utf-8'));
+    if (wellFormedClosePin(parsed)) {
+      const { pending, lastResolved, resolvedByProject = {}, localProofs } = parsed;
+      return { pending, lastResolved, resolvedByProject, localProofs };
+    }
+  } catch {
+    // absent or unparseable: same answer as a malformed file
+  }
+  return emptyClosePin();
+}
+
+/**
+ * Write the pin durably (temp file, fsync, rename). Throws on any failure and
+ * on an id unsafe as a filename: the pin must be on disk before the entry it
+ * names is published, so a write that did not land has to stop the caller.
+ */
+export function writeClosePin(hypoDir, sessionId, pin) {
+  const path = closePinPath(hypoDir, sessionId);
+  if (!path) throw new Error(`close pin refused for unsafe session id: ${String(sessionId)}`);
+  atomicWrite(
+    path,
+    JSON.stringify({
+      v: 2,
+      pending: pin.pending ?? null,
+      lastResolved: pin.lastResolved ?? null,
+      resolvedByProject: pin.resolvedByProject ?? {},
+      localProofs: pin.localProofs ?? {},
+    }),
+    { durable: true },
+  );
+}
+
+/**
+ * Retire a `pending` that the recorded resolution already covers. Pure.
+ *
+ * A close resolves in two steps (resolution record first, then `pending`
+ * moves to `lastResolved`); a crash between them leaves `pending` standing,
+ * and the next close request would reuse its id and adopt the entry the
+ * earlier close already committed. `resolvedAtIndex` is a record COUNT and
+ * `openedAtIndex` a 0-based position, so `<` is "the resolution includes that
+ * signal". Do not change it to `<=` (see `closeGateStatus` for the same base
+ * difference). `resolvedAtIndex` is `null` when no usable resolution exists.
+ */
+export function normalizeClosePin(pin, resolvedAtIndex) {
+  if (pin.pending && resolvedAtIndex !== null && pin.pending.openedAtIndex < resolvedAtIndex) {
+    return retireClosePending(pin);
+  }
+  return pin;
+}
+
+// The project a session entry path belongs to, null for any other path.
+function projectOfEntryPath(relPath) {
+  const p = posixPath(relPath);
+  return isSessionEntryPath(p) ? p.split('/')[1] : null;
+}
+
+/**
+ * `pending` finished: it becomes `lastResolved`, and the last resolved close of
+ * the project its entry went to. A pending that never recorded an entry path
+ * names no project and only moves to `lastResolved`. Pure.
+ */
+export function retireClosePending(pin) {
+  const { closeId, entryRelPath } = pin.pending;
+  const project = entryRelPath ? projectOfEntryPath(entryRelPath) : null;
+  return {
+    ...pin,
+    pending: null,
+    lastResolved: closeId,
+    resolvedByProject: {
+      ...(pin.resolvedByProject ?? {}),
+      ...(project ? { [project]: closeId } : {}),
+    },
+  };
+}
+
+/**
+ * The close id that proves THIS session's close, for a verdict site that
+ * cannot write (PreCompact gate, `--check-session-close`, `--mark-session-closed`).
+ *
+ * `closeOpen` is "a close signal is open and unresolved right now" and
+ * `resolvedAtIndex` the resolution position, both read off `closeGateStatus`
+ * by the caller (this file cannot call it, see the note above). Both keys are
+ * required: a call that forgot one would silently take the weaker branch.
+ * The pin is normalized in memory only; this function never writes.
+ *
+ * With `opts.project` the answer is the close that proves THAT project, since
+ * one session can close several projects in turn:
+ *   pending in this project, or with no entry yet    its closeId
+ *   otherwise, closeOpen                             null (a new request is open:
+ *                                                    no earlier close vouches for it)
+ *   otherwise                                        resolvedByProject[project], or
+ *                                                    lastResolved when its entry is in
+ *                                                    this project (a pin written before
+ *                                                    resolvedByProject), or null
+ * Without it (no production caller; kept for the session-wide question):
+ *   pending exists            its closeId
+ *   no pending, closeOpen     null
+ *   no pending, !closeOpen    lastResolved, or null
+ *
+ * @param {{closeOpen: boolean, resolvedAtIndex: number|null, project?: string}} opts
+ * @returns {string|null}
+ */
+export function sessionProofCloseId(hypoDir, sessionId, opts) {
+  if (!opts || typeof opts.closeOpen !== 'boolean') {
+    throw new Error('sessionProofCloseId requires a boolean closeOpen');
+  }
+  if (!(opts.resolvedAtIndex === null || Number.isSafeInteger(opts.resolvedAtIndex))) {
+    throw new Error('sessionProofCloseId requires resolvedAtIndex (a number or null)');
+  }
+  const pin = normalizeClosePin(readClosePin(hypoDir, sessionId), opts.resolvedAtIndex);
+  const { project } = opts;
+  if (project === undefined) {
+    if (pin.pending) return pin.pending.closeId;
+    return opts.closeOpen ? null : pin.lastResolved;
+  }
+  if (pin.pending) {
+    const rel = pin.pending.entryRelPath;
+    if (!rel || projectOfEntryPath(rel) === project) return pin.pending.closeId;
+  }
+  if (opts.closeOpen) return null;
+  const byProject = Object.hasOwn(pin.resolvedByProject, project)
+    ? pin.resolvedByProject[project]
+    : null;
+  if (byProject) return byProject;
+  return pin.lastResolved && entryPathOfClose(hypoDir, project, pin.lastResolved)
+    ? pin.lastResolved
+    : null;
+}
+
 // verified_scope (session-close-scope-boundary spec §3) records the scope the
 // gate ABOVE this write actually verified, not merely the attribution the
 // marker's `projects` field carries — those can diverge whenever a gate run
@@ -4905,7 +7641,7 @@ export function normalizeVerifiedScope(verifiedScope) {
 
 /**
  * Persist a per-session close proof. Caller MUST verify
- * `sessionCloseFileStatus(hypoDir).ok` before invoking — this helper does NOT
+ * `sessionCloseFileStatus(hypoDir, ...).ok` before invoking: this helper does NOT
  * re-check; that's the writer's contract (crystallize.mjs).
  *
  * Best-effort: stderr debug line on failure, no exception propagation.
@@ -4930,9 +7666,8 @@ export function writeSessionClosedMarker(hypoDir, sessionId, info = {}) {
   try {
     const cacheDir = join(hypoDir, '.cache');
     if (!existsSync(cacheDir)) mkdirSync(cacheDir, { recursive: true });
-    // scope distinguishes a project close (the 4 mandatory files were verified
-    // fresh) from a log-only close (a non-project session, no project
-    // attribution). Readers (precompactGateStatus / --check-session-close) key
+    // scope distinguishes a project close (its close files were verified) from a
+    // log-only close (a non-project session, no project attribution). Readers (precompactGateStatus / --check-session-close) key
     // the gate semantics on this field, so it must be recorded.
     const scope = info.scope === 'log-only' ? 'log-only' : 'project';
     // v4 attribution discriminator (session-close attribution). `projects` is the evidence-based
@@ -5273,15 +8008,16 @@ export function extractTouchedWikiFiles(transcriptPath, hypoDir) {
  * path `crystallize.mjs --apply-session-close` writes these from inside a Bash
  * call, so they never surface as Edit/Write file_paths — they must seed the
  * scoped-lint set explicitly or a close-introduced error would escape the gate.
- * Mirrors the file list in sessionCloseFileStatus.
+ * Mirrors what sessionCloseFileStatus reads: today's session entries, the
+ * session-log evidence file, and the two root files.
  */
 export function closeFileTargets(hypoDir) {
   const out = new Set(['hot.md', 'log.md']);
   const project = resolveActiveProject(hypoDir);
   if (project) {
-    out.add(`projects/${project}/session-state.md`);
-    out.add(`projects/${project}/hot.md`);
-    out.add(sessionLogScopePath(hypoDir, project, freshDates()[0]));
+    const dates = freshDates();
+    for (const e of datedEntryPaths(hypoDir, project, dates)) out.add(e);
+    out.add(sessionLogScopePath(hypoDir, project, dates[0]));
   }
   return out;
 }
@@ -5294,16 +8030,15 @@ export function closeFileTargets(hypoDir) {
  * what sessionCloseFileStatus actually checks across a local/UTC date boundary.
  */
 // The lint-scope target set for ONE project's close: the shared root files
-// (hot.md / log.md) plus that project's mandatory close files — session-state,
-// project hot, and each fresh date's session-log evidence file. Used both by
+// (hot.md / log.md) plus that project's mandatory close files: today's session
+// entries and each fresh date's session-log evidence file. Used both by
 // `--check-session-close --project=<slug>` (a project-scoped diagnostic — see
 // precompactGateStatus opts.projectOverride) and as the per-project building
 // block of closeFileTargetsGlobal, so the two scopes stay identical per project.
 export function closeFileTargetsForProject(hypoDir, slug) {
   const dates = freshDates();
   const out = new Set(['hot.md', 'log.md']);
-  out.add(`projects/${slug}/session-state.md`);
-  out.add(`projects/${slug}/hot.md`);
+  for (const e of datedEntryPaths(hypoDir, slug, dates)) out.add(e);
   // Scope to the file each date's freshness is PROVEN by (daily shard or, via
   // fallback, the legacy monthly), so a corrupt evidence file can't pass the
   // gate while its lint error is demoted to an out-of-scope notice.
@@ -5382,14 +8117,16 @@ export function isUnderProjectDirs(file, slugs) {
 
 /**
  * The session-close FILES of some project, as a path matcher. Used to attribute a
- * close to a session: a transcript that edited `projects/<slug>/session-state.md`
- * (or that project's hot.md / a session-log shard) is evidence THIS session was
- * closing <slug>. Any other file under `projects/<slug>/` is NOT evidence — merely
+ * close to a session: a transcript that edited one of `projects/<slug>/`'s
+ * session-log shards is evidence THIS session was closing <slug>. The project's
+ * `hot.md` and `session-state.md` are generated views now, which a close never
+ * edits (close-guard refuses a Write/Edit there), so an edit to one is not a
+ * close signal. Any other file under `projects/<slug>/` is NOT evidence: merely
  * editing a page or an ADR there says nothing about whose close is whose, and
  * treating it as attribution would re-block a session for a project it only read
  * around in (codex design review).
  */
-const CLOSE_FILE_RE = /^projects\/([^/]+)\/(session-state\.md|hot\.md|session-log\/[^/]+\.md)$/;
+const CLOSE_FILE_RE = /^projects\/([^/]+)\/session-log\/[^/]+\.md$/;
 
 /** Slugs whose close files this session edited directly (Write/Edit tool_use). */
 function projectsFromTouchedCloseFiles(transcriptPath, hypoDir) {
@@ -5430,8 +8167,12 @@ export function resolveCloseScope(hypoDir, opts = {}, marker = null) {
   // that project's stale close block an unrelated close today (codex round 2,
   // reproduced with a 24h-old marker). The returned Set carries `direct` as a
   // property so the caller does not re-derive it, and the transcript is parsed once.
-  const scope = new Set(opts.closeScope || []);
-  for (const p of projectsFromTouchedCloseFiles(opts.transcriptPath, hypoDir)) scope.add(p);
+  // Every slug enters the sets in NFC: valid project directories are NFC and NFD ones are refused, so
+  // NFC is the key the evaluation targets and `scope.has(p.project)` use. A transcript path spelled
+  // in NFD would otherwise make this session's own project look foreign.
+  const nfc = (p) => (typeof p === 'string' ? p.normalize('NFC') : p);
+  const scope = new Set((opts.closeScope || []).map(nfc));
+  for (const p of projectsFromTouchedCloseFiles(opts.transcriptPath, hypoDir)) scope.add(nfc(p));
   // Marker attribution (session-close attribution). A v4 marker carries `projects` — the
   // evidence-based set it closed (never recency) — trusted directly. A pre-v4
   // legacy marker carries only `project` with no provenance, and that value may be
@@ -5451,12 +8192,12 @@ export function resolveCloseScope(hypoDir, opts = {}, marker = null) {
   // also narrows sessionCloseGlobalStatus's own evaluation and turns off the
   // partition below), while this one only widens the set the partition demotes
   // everything outside of.
-  if (opts.attributionScope) scope.add(opts.attributionScope);
+  if (opts.attributionScope) scope.add(nfc(opts.attributionScope));
   // Snapshot the direct signals BEFORE the marker union below widens the set.
   scope.direct = new Set(scope);
 
   if (Array.isArray(marker?.projects)) {
-    for (const p of marker.projects) if (p) scope.add(p);
+    for (const p of marker.projects) if (p) scope.add(nfc(p));
   }
   return scope;
 }
@@ -5513,8 +8254,15 @@ export function resolveCloseScope(hypoDir, opts = {}, marker = null) {
  * catching a session whose own project close was never started. Unmatched/ambiguous
  * cwd yields a best-effort notice, not a block. apply never passes it (its launch
  * cwd may differ from the authoritative payload.project).
+ * That check proves THIS session's close (sessionCloseFileStatus scope
+ * 'session'), so it needs the close id the session's close pin names, which
+ * depends on whether a new close signal is open: `opts.closeOpen`
+ * (`closeGateStatus(...).ok`) and `opts.resolvedAtIndex`
+ * (`closeGateStatus(...).resolvedAtIndex`). The caller computes both, the same
+ * way it injects `opts.closeMarker`: close-gate-store.mjs imports this module.
+ * A call that reaches the check without them throws (sessionProofCloseId).
  *
- * @param {{lintScope?: Iterable<string>, transcriptPath?: string|null, claudeHome?: string, projectOverride?: string|null, attributionScope?: string|null, sessionCwd?: string|null, sessionId?: string|null, closeMarker?: object|null, logOnly?: boolean, closeScope?: string[]}} [opts]
+ * @param {{lintScope?: Iterable<string>, transcriptPath?: string|null, claudeHome?: string, projectOverride?: string|null, attributionScope?: string|null, sessionCwd?: string|null, sessionId?: string|null, closeMarker?: object|null, logOnly?: boolean, closeScope?: string[], closeOpen?: boolean, resolvedAtIndex?: number|null}} [opts]
  * @returns {{ok: boolean, close: object, blockers: {type:string,reason:string}[], notices: {type:string,reason:string,file?:string}[], driftTargets: string[], skipped: {lint:boolean, feedback:boolean}}}
  */
 export function precompactGateStatus(hypoDir, opts = {}) {
@@ -5688,7 +8436,41 @@ export function precompactGateStatus(hypoDir, opts = {}) {
             readTouchedPathsDrifted(hypoDir, opts.sessionId).map(posixPath),
           );
           const ignorePatterns = loadHypoIgnore(hypoDir);
+          // A session entry of a `.hypoignore` project is never committed by
+          // anything, so it is dirty for good and would refuse every close of
+          // that project. This session's own one is proven by its close pin's
+          // local proof instead (the receipt checks the same bytes); another
+          // session's is that session's to prove. Only an own entry whose bytes
+          // no longer match its proof still blocks, below.
+          const provenLocal = new Set(
+            Object.values(readClosePin(hypoDir, opts.sessionId).localProofs)
+              .filter((p) => fileSha256(join(hypoDir, p.entryRelPath)) === p.entrySha256)
+              .map((p) => posixPath(p.entryRelPath)),
+          );
           for (const f of dirty) {
+            const pf = posixPath(f);
+            if (
+              ignorePatterns.length > 0 &&
+              isSessionEntryPath(pf) &&
+              isIgnored(join(hypoDir, f), hypoDir, ignorePatterns) &&
+              (provenLocal.has(pf) || !touchedSet.has(pf))
+            ) {
+              notices.push({
+                type: 'local-entry',
+                file: f,
+                reason: provenLocal.has(pf)
+                  ? `${f} stays out of git (.hypoignore); this session's close pin proves its bytes`
+                  : `${f} stays out of git (.hypoignore) and belongs to another session's close`,
+              });
+              continue;
+            }
+            if (isForeignAppendOnlyShard(hypoDir, pf, opts.sessionId)) {
+              // Ahead of the touched-set check: the shard this session's close
+              // committed stays in its set until Stop, and the later close of the
+              // same project appends to it before this marker gate is done.
+              notices.push({ type: 'foreign-append', file: f, reason: FOREIGN_APPEND_NOTICE(f) });
+              continue;
+            }
             if (touchedSet.has(posixPath(f))) {
               // A touched file .hypoignore keeps out of every commit stays
               // dirty forever on its own: say how to get out. A file whose
@@ -5705,6 +8487,10 @@ export function precompactGateStatus(hypoDir, opts = {}) {
                 file: f,
                 reason: `this session's own write is still uncommitted: ${f}${ignoredHint}`,
               });
+            } else if (isForeignUncommittedEntry(hypoDir, pf, opts.sessionId)) {
+              // Two sessions closing one project at once: the other one's entry
+              // is published and its commit has not landed yet.
+              notices.push({ type: 'foreign-entry', file: f, reason: FOREIGN_ENTRY_NOTICE(f) });
             } else if (inClosedProject(posixPath(f))) {
               blockers.push({
                 type: 'git',
@@ -5791,7 +8577,22 @@ export function precompactGateStatus(hypoDir, opts = {}) {
       // its source instead: applyOverwrites re-stages index.md on the retry
       // path (crystallize-close-apply.mjs), so the file this branch used to
       // demote is now in the close's own commit scope and never reaches here.
-      const rest = dirty.filter((f) => !isForeign(f));
+      // Another session's entry still waiting for its own commit, or its
+      // append to a shared session-log shard, is not this session's to commit,
+      // inside the scoped project or not (the checkpoint branch above demotes
+      // both the same way).
+      const foreignEntries = dirty.filter(
+        (f) => !isForeign(f) && isForeignUncommittedEntry(hypoDir, posixPath(f), opts.sessionId),
+      );
+      const foreignAppends = dirty.filter(
+        (f) =>
+          !isForeign(f) &&
+          !foreignEntries.includes(f) &&
+          isForeignAppendOnlyShard(hypoDir, posixPath(f), opts.sessionId),
+      );
+      const rest = dirty.filter(
+        (f) => !isForeign(f) && !foreignEntries.includes(f) && !foreignAppends.includes(f),
+      );
       if (rest.length > 0) {
         blockers.push({
           type: 'git',
@@ -5805,11 +8606,36 @@ export function precompactGateStatus(hypoDir, opts = {}) {
           reason: `uncommitted changes outside this session's scope: ${f}`,
         });
       }
+      for (const f of foreignEntries) {
+        notices.push({ type: 'foreign-entry', file: f, reason: FOREIGN_ENTRY_NOTICE(f) });
+      }
+      for (const f of foreignAppends) {
+        notices.push({ type: 'foreign-append', file: f, reason: FOREIGN_APPEND_NOTICE(f) });
+      }
     } else if (!sessionTouchTrusted) {
       blockers.push({ type: 'git', reason: git.reason });
     } else {
-      const mine = dirty.filter((f) => closeAccountableScope.has(posixPath(f)));
-      const foreign = dirty.filter((f) => !closeAccountableScope.has(posixPath(f)));
+      // closeAccountableScope holds every entry of today in the project, the
+      // other sessions' too, and the day's session-log shard they all append
+      // to, so a foreign entry still waiting for its commit and a foreign
+      // append are taken out here like in the scoped branch above.
+      const foreignEntries = dirty.filter((f) =>
+        isForeignUncommittedEntry(hypoDir, posixPath(f), opts.sessionId),
+      );
+      const foreignAppends = dirty.filter(
+        (f) =>
+          !foreignEntries.includes(f) &&
+          isForeignAppendOnlyShard(hypoDir, posixPath(f), opts.sessionId),
+      );
+      for (const f of foreignEntries) {
+        notices.push({ type: 'foreign-entry', file: f, reason: FOREIGN_ENTRY_NOTICE(f) });
+      }
+      for (const f of foreignAppends) {
+        notices.push({ type: 'foreign-append', file: f, reason: FOREIGN_APPEND_NOTICE(f) });
+      }
+      const demoted = (f) => foreignEntries.includes(f) || foreignAppends.includes(f);
+      const mine = dirty.filter((f) => closeAccountableScope.has(posixPath(f)) && !demoted(f));
+      const foreign = dirty.filter((f) => !closeAccountableScope.has(posixPath(f)) && !demoted(f));
       if (mine.length > 0) {
         blockers.push({
           type: 'git',
@@ -5873,6 +8699,8 @@ export function precompactGateStatus(hypoDir, opts = {}) {
       // partition still treats them as this session's, not foreign debt.
       mustEvaluate: attributedScope.direct,
     });
+    // A project that a pre-entry writer closed today: never a blocker, only said.
+    for (const n of close.notices || []) notices.push(n);
 
     // Attribute the close debt before blocking on it. An incomplete close belongs
     // to whichever session performed it; charging it to an unrelated session is the
@@ -5977,7 +8805,22 @@ export function precompactGateStatus(hypoDir, opts = {}) {
       rejectAmbiguous: true,
     });
     if (cwdProject) {
-      const s = sessionCloseFileStatus(hypoDir, { projectOverride: cwdProject });
+      // THIS session's close, proven by its own close id: a fresh close of the
+      // same project by another session, or this session's earlier close while
+      // a new close request is open, does not count.
+      const s = sessionCloseFileStatus(hypoDir, {
+        scope: 'session',
+        closeId: sessionProofCloseId(hypoDir, opts.sessionId, {
+          closeOpen: opts.closeOpen,
+          resolvedAtIndex: opts.resolvedAtIndex,
+          project: cwdProject,
+        }),
+        projectOverride: cwdProject,
+      });
+      // The notices of the session-scope check (a project with no log lines under the
+      // entry's date) belong to the gate result: a caller that reads only `notices[]` would
+      // never see them otherwise.
+      for (const n of s.notices || []) notices.push(n);
       if (!s.ok) {
         // ALWAYS emit the typed close-cwd blocker when the cwd project's close is
         // incomplete — never suppress it as a duplicate of the global `close`
@@ -6311,8 +9154,11 @@ export function readChecklist(today) {
 
 // ── session-state schema ───────────────────────────────────────────────────
 
-/** Accepted heading aliases for the "next task" section in session-state.md. */
-export const SESSION_STATE_NEXT_HEADINGS = ['다음 이어받기', '다음 작업', 'Next Up', 'Next'];
+/**
+ * Accepted heading aliases for the "next task" section in session-state.md. The list lives in
+ * session-entries.mjs (the baseline split reads it too); this is the name lint imports.
+ */
+export const SESSION_STATE_NEXT_HEADINGS = NEXT_UP_HEADINGS;
 
 // ── misc helpers ───────────────────────────────────────────────────────────
 
@@ -7789,10 +10635,14 @@ export function computeSessionGrowth(hypoDir) {
     // newline/quote-strip parser left octal escapes in place, so Korean page
     // names silently failed the `pages/`·`projects/` scope match and dropped
     // out of the growth count.
-    const porcelain = spawnSync('git', ['-C', hypoDir, 'status', '--porcelain', '-uall', '-z'], {
-      encoding: 'utf-8',
-      timeout: 5000,
-    });
+    const porcelain = spawnSync(
+      'git',
+      ['--no-optional-locks', '-C', hypoDir, 'status', '--porcelain', '-uall', '-z'],
+      {
+        encoding: 'utf-8',
+        timeout: 5000,
+      },
+    );
     if (porcelain.status !== 0) return empty;
     let addedPages = 0,
       updatedPages = 0;
@@ -7874,6 +10724,30 @@ function _globToRegex(glob) {
   );
 }
 
+/**
+ * Whether `commitWikiChanges` leaves this vault-relative path out of every commit because
+ * `.hypoignore` matches it. The one place that rule is composed: the commit and the
+ * session close's take-back of uncommitted appends both ask it. `patterns` lets a caller
+ * that already loaded the list skip a second read.
+ */
+export function isExcludedFromCommit(hypoDir, relPath, patterns = loadHypoIgnore(hypoDir)) {
+  return patterns.length > 0 && isIgnored(join(hypoDir, relPath), hypoDir, patterns);
+}
+
+/**
+ * Whether git's own ignore rules (`.gitignore`, `info/exclude`, `core.excludesFile`) keep this
+ * vault-relative path out of every commit. `git check-ignore` leaves tracked files out of its
+ * answer, so only an untracked, matched path is true. `commitWikiChanges` never sees such a
+ * path (`git status` does not list it), so it is not folded into `isExcludedFromCommit`.
+ * Exit 0 is ignored; 1 and any error (128) read as not ignored.
+ */
+export function isIgnoredByGit(hypoDir, relPath) {
+  const r = spawnSync('git', ['-C', hypoDir, 'check-ignore', '-q', '--', relPath], {
+    timeout: 30000,
+  });
+  return r.status === 0;
+}
+
 export function loadHypoIgnore(hypoDir) {
   const ignorePath = join(hypoDir, '.hypoignore');
   if (!existsSync(ignorePath)) return [];
@@ -7883,7 +10757,20 @@ export function loadHypoIgnore(hypoDir) {
     .filter((l) => l && !l.startsWith('#'));
 }
 
+// A session entry (`projects/<p>/sessions/<file>.md`) is ignored when the pattern list ignores the
+// entry itself or either generated view of its project: the entry is the source of those views,
+// so a project hidden from git by its view paths must not leak through its source files.
+// scripts/lib/hypo-ignore.mjs carries the same second look; keep the two in step.
 export function isIgnored(filePath, hypoDir, patterns) {
+  if (matchesIgnorePatterns(filePath, hypoDir, patterns)) return true;
+  const views = sessionViewPathsOf(relative(hypoDir, filePath).replace(/\\/g, '/'));
+  return (
+    views !== null &&
+    views.some((view) => matchesIgnorePatterns(join(hypoDir, view), hypoDir, patterns))
+  );
+}
+
+function matchesIgnorePatterns(filePath, hypoDir, patterns) {
   const rel = relative(hypoDir, filePath).replace(/\\/g, '/');
   const base = basename(filePath);
   for (const pattern of patterns) {
@@ -7932,44 +10819,37 @@ export function currentDevice() {
   return host || 'unknown';
 }
 
-// Extract the top-level `visibility_scope` from a page's raw content. Mirrors
-// scripts/lib/frontmatter.mjs normalization (top-level only, first-wins, strip a
-// whitespace-led trailing YAML comment, strip surrounding quotes) rather than
-// importing it: hooks deploy to ~/.claude/hooks/ with no external imports. The
-// five consumers must call this instead of a local last-wins/no-comment parser,
-// else a `machine:devA # note` value fails to match on its own machine. Returns
-// '' when absent (which scopeVisible treats as shared).
-export function readVisibilityScope(raw) {
+// A top-level frontmatter scalar from a page's raw content: top-level only, first-wins, a
+// whitespace-led trailing YAML comment and surrounding quotes stripped. Mirrors
+// scripts/lib/frontmatter.mjs normalization rather than importing it: hooks deploy to
+// ~/.claude/hooks/ with no external imports. `null` when the key is absent. Every key read this
+// way (`visibility_scope`, `entry_scope`) goes through here, so they cannot drift apart.
+export function frontmatterScalar(raw, key) {
   const m = String(raw || '').match(/^---\r?\n([\s\S]*?)\r?\n---/);
-  if (!m) return '';
+  if (!m) return null;
   for (const line of m[1].split(/\r?\n/)) {
     if (/^\s/.test(line) || /^-(\s|$)/.test(line)) continue; // nested / list item
     const idx = line.indexOf(':');
     if (idx < 0) continue;
-    if (line.slice(0, idx).trim() !== 'visibility_scope') continue;
+    if (line.slice(0, idx).trim() !== key) continue;
     return line
       .slice(idx + 1)
       .trim()
       .replace(/\s+#.*$/, '')
       .replace(/^["']|["']$/g, '');
   }
-  return '';
+  return null;
+}
+
+// Extract the top-level `visibility_scope` from a page's raw content. The five consumers must
+// call this instead of a local last-wins/no-comment parser, else a `machine:devA # note` value
+// fails to match on its own machine. Returns '' when absent (which scopeVisible treats as shared).
+export function readVisibilityScope(raw) {
+  return frontmatterScalar(raw, 'visibility_scope') ?? '';
 }
 
 // The single visibility decision, shared by lookup / query / file-watch /
-// page-usage / crystallize. `scopeValue` is a readVisibilityScope() output,
-// `device` a currentDevice() output. Prefix dispatch, fail-open on anything
-// unrecognized so the field is purely additive:
-//   ''/'shared'       → visible (the implicit default of every pre-existing page)
-//   'machine:<owner>' → visible only on the owning machine. Empty owner
-//                       (`machine:`) hides everywhere: '' can never equal
-//                       currentDevice()'s non-empty fallback.
-//   'agent:<id>'      → visible; value space reserved, no writer yet (forward-compat)
-//   anything else     → visible (fail-open)
-export function scopeVisible(scopeValue, device) {
-  const v = String(scopeValue || '').trim();
-  if (v === '' || v === 'shared') return true;
-  if (v.startsWith('machine:')) return v.slice('machine:'.length) === device;
-  if (v.startsWith('agent:')) return true;
-  return true;
-}
+// page-usage / crystallize. Its definition lives in session-entries.mjs, which
+// the generated views need and which cannot import this file; re-exported here
+// so every existing caller keeps its import.
+export { scopeVisible };

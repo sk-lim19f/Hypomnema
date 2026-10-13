@@ -761,9 +761,11 @@ export function readAppliedHash(hypoDir, sessionId, relPath) {
 // it, and nothing here needs to prove anything about it.
 
 /**
- * The overwrite targets crystallize replaces wholesale. `project` may be
- * null when cwd resolves to no project; the two project-scoped paths are then
- * omitted and close falls back to proposal for them.
+ * The overwrite targets crystallize replaces wholesale: `pages/open-questions.md`
+ * only. A close writes a project's state as a new original entry under
+ * `projects/<p>/sessions/`, and `hot.md`/`session-state.md` are generated from
+ * those, so none of them is a shared whole-file overwrite any more. `project` is
+ * accepted for callers that still pass it and is not used.
  *
  * The root `hot.md` is deliberately NOT here. Snapshotting it made the hooks'
  * own regeneration look like a foreign edit, so a close parked a `base-mismatch`
@@ -773,10 +775,5 @@ export function readAppliedHash(hypoDir, sessionId, relPath) {
  * out of the hooks.
  */
 export function overwriteTargets(project) {
-  const targets = [join('pages', 'open-questions.md')];
-  if (project) {
-    targets.unshift(join('projects', project, 'session-state.md'));
-    targets.unshift(join('projects', project, 'hot.md'));
-  }
-  return targets;
+  return [join('pages', 'open-questions.md')];
 }

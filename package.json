@@ -22,6 +22,7 @@
     "scripts/rename.mjs",
     "scripts/resume.mjs",
     "scripts/session-audit.mjs",
+    "scripts/session-entries.mjs",
     "scripts/stats.mjs",
     "scripts/uninstall.mjs",
     "scripts/upgrade.mjs",

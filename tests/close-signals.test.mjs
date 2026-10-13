@@ -34,6 +34,7 @@ import {
   partitionLintScope,
   resolveTranscriptBySessionId,
   staleMarkerFor,
+  todayLocal,
   withTmpDir,
 } from './helpers.mjs';
 
@@ -3708,14 +3709,30 @@ test('partitionLintScope: scope membership is separator-normalized (Windows path
   assert.equal(notice.length, 0);
 });
 
-test('closeFileTargets: returns the 5 mandatory close files for the active project', () => {
+// The close targets are the files a close PROVES itself by: root hot.md / log.md, today's
+// session entries of the project, and its session-log shard. The generated views
+// (session-state.md, hot.md of the project) are rebuilt from the entries and prove
+// nothing, so they stay out even when they exist on disk. An entry of an older date
+// is out too, which tells "today's entry" from "any entry".
+test("closeFileTargets: today's entry, root files and session-log are targets; generated views and older entries are not", () => {
   withTmpDir((dir) => {
-    writeFileSync(join(dir, 'hot.md'), '| proj | 2026-06-07 | [[projects/proj/hot]] |\n');
+    const today = todayLocal();
+    writeFileSync(join(dir, 'hot.md'), `| proj | ${today} | [[projects/proj/hot]] |\n`);
+    mkdirSync(join(dir, 'projects', 'proj', 'sessions'), { recursive: true });
+    const todayEntry = `projects/proj/sessions/${today}-s-today-0.md`;
+    const oldEntry = 'projects/proj/sessions/2020-01-01-s-old-0.md';
+    for (const rel of [todayEntry, oldEntry])
+      writeFileSync(join(dir, rel), '---\ntype: session-entry\n---\n');
+    for (const view of ['session-state.md', 'hot.md']) {
+      writeFileSync(join(dir, 'projects', 'proj', view), `---\nupdated: ${today}\n---\n`);
+    }
     const t = closeFileTargets(dir);
     assert.ok(t.has('hot.md'));
     assert.ok(t.has('log.md'));
-    assert.ok(t.has('projects/proj/session-state.md'));
-    assert.ok(t.has('projects/proj/hot.md'));
+    assert.ok(t.has(todayEntry), `today's entry is a target: ${JSON.stringify([...t])}`);
+    assert.ok(!t.has(oldEntry), 'an entry of an older date is not');
+    assert.ok(!t.has('projects/proj/session-state.md'), 'session-state.md is a generated view');
+    assert.ok(!t.has('projects/proj/hot.md'), 'the project hot.md is a generated view');
     assert.ok([...t].some((f) => /^projects\/proj\/session-log\/\d{4}-\d{2}-\d{2}\.md$/.test(f)));
   });
 });

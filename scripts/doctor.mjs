@@ -13,7 +13,7 @@
  */
 
 import { existsSync, readFileSync, readdirSync, statSync } from 'fs';
-import { join, relative, extname, dirname } from 'path';
+import { join, relative, extname, dirname, sep } from 'path';
 import { homedir } from 'os';
 import { spawnSync } from 'child_process';
 import { fileURLToPath } from 'url';
@@ -40,7 +40,26 @@ import {
   sessionClosedMarkerPath,
   isUsablePkgRootLocal,
   selfLocationPkgRootFrom,
+  listSessionProjects,
+  listRetrackedViews,
+  listTrackedGeneratedViews,
+  migrationState,
+  upstreamIsMigrated,
+  hasSessionLogHeading,
+  sessionLogReadCandidates,
+  datedEntryPaths,
+  readGeneratedViewsRecord,
+  currentDevice,
+  VIEW_BACKUP_DIR_REL,
 } from '../hooks/hypo-shared.mjs';
+import {
+  baselineIdMismatch,
+  parseSessionEntry,
+  isGeneratedViewPath,
+  isSessionEntryPath,
+  renderViews,
+} from '../hooks/session-entries.mjs';
+import { loadSessionModel, projectEntryScope } from '../hooks/session-views.mjs';
 import { classifyProposals } from './proposal.mjs';
 import { listProposalsChecked, orphanTmpTargetName } from '../hooks/proposal-store.mjs';
 import {
@@ -821,6 +840,9 @@ function checkBrokenLinks(hypoDir, ignorePatterns = []) {
   const broken = [];
 
   for (const file of mdFiles) {
+    // An entry is an immutable source record, and lint leaves its links alone for that reason
+    // (nothing may repair them). It stays in slugSet: the generated views link to it.
+    if (isSessionEntryPath(relative(hypoDir, file).split(sep).join('/'))) continue;
     const raw = readFileSync(file, 'utf-8');
     const content = raw.replace(/<!--[\s\S]*?-->/g, '').replace(/`[^`\n]+`/g, '');
     const links = [...content.matchAll(/\[\[([^\]|#\n]+?)(?:[|#][^\]]*?)?\]\]/g)].map((m) =>
@@ -1099,6 +1121,29 @@ function markerCoversArtifact(marker, artifact) {
 // artifact against a marker doctor itself considers stale.
 function checkSessionCloseArtifacts(hypoDir) {
   const artifacts = [];
+  const ownedViews = readGeneratedViewsRecord(hypoDir).views;
+
+  // The text the generator would write at a project view path now, or null.
+  // Only a migrated vault has generated views; before that the file is the hand-kept original.
+  const migrated = migrationState(hypoDir) === 'migrated';
+  const freshCache = new Map();
+  const freshProjectView = (rel) => {
+    const m = /^projects\/([^/]+)\/(hot|session-state)\.md$/.exec(rel);
+    if (!m || !migrated) return null;
+    const slug = m[1];
+    if (!freshCache.has(slug)) {
+      try {
+        const rendered = renderViews([loadSessionModel(hypoDir, slug)], {
+          device: currentDevice(),
+          only: [slug],
+        }).projects[slug];
+        freshCache.set(slug, { hot: rendered.hot, 'session-state': rendered.sessionState });
+      } catch {
+        freshCache.set(slug, null);
+      }
+    }
+    return freshCache.get(slug)?.[m[2]] ?? null;
+  };
 
   const scanFile = (path, scope) => {
     if (!existsSync(path)) return;
@@ -1108,6 +1153,14 @@ function checkSessionCloseArtifacts(hypoDir) {
     } catch {
       return;
     }
+    // A generated view repeats the close headings of the entries it was built from, so it is no
+    // evidence of a close. Only bytes the generator vouches for are skipped: a hand-written close
+    // in the same file has other bytes and is still scanned.
+    const rel = relative(hypoDir, path).split(sep).join('/');
+    if (isGeneratedViewPath(rel) && ownedViews[rel] === sha256(content)) return;
+    // The ownership record can lack a view that is genuine (a record lost with .cache/): the same
+    // bytes a fresh render of this project would write are still no evidence of a hand-made close.
+    if (freshProjectView(rel) === content) return;
     const result = detectSessionCloseArtifact({ path, content });
     if (result.matched) {
       artifacts.push({ date: result.date, scope, where: relative(hypoDir, path) });
@@ -1319,6 +1372,220 @@ function checkHalfClosedReceipts(hypoDir) {
         .join('; ') +
       (broken.length > 3 ? ` (+${broken.length - 3} more)` : ''),
   );
+}
+
+// A baseline entry names its own content: `baseline-<h16>` is a hash of the bytes it holds. git
+// pairs a baseline with the old `hot.md` or `session-state.md` it was cut from as a rename when it
+// merges the migration commit, so an edit another machine made to the old file lands inside the
+// baseline with no conflict. The bytes then no longer match the name. Nothing is repaired here:
+// the baseline still reads as an entry, and the report tells the user which files to look at.
+function checkBaselineIntegrity(hypoDir) {
+  let slugs = [];
+  try {
+    slugs = readdirSync(join(hypoDir, 'projects'));
+  } catch {
+    return; // no projects/: nothing to judge
+  }
+  let checked = 0;
+  const bad = [];
+  const unparseable = []; // `baselineIdMismatch` answers null for these, which would read as a match
+  for (const slug of slugs.sort()) {
+    const dir = join(hypoDir, 'projects', slug, 'sessions');
+    let names = [];
+    try {
+      names = readdirSync(dir).filter((n) => /-baseline-[0-9a-f]{16}\.md$/.test(n));
+    } catch {
+      continue; // no sessions/ in this project
+    }
+    for (const name of names.sort()) {
+      let text;
+      try {
+        text = readFileSync(join(dir, name), 'utf-8');
+      } catch {
+        continue; // unreadable: not this check's job to diagnose
+      }
+      const parsed = parseSessionEntry(text);
+      if (!parsed.ok) {
+        unparseable.push(`projects/${slug}/sessions/${name} (${parsed.reason})`);
+        continue;
+      }
+      checked++;
+      const mismatch = baselineIdMismatch(name, text);
+      if (mismatch) bad.push({ rel: `projects/${slug}/sessions/${name}`, ...mismatch });
+    }
+  }
+  if (unparseable.length) {
+    warn(
+      'Session baselines',
+      `${unparseable.length} baseline entr${unparseable.length === 1 ? 'y cannot' : 'ies cannot'} be parsed, so its name could not be checked: ` +
+        unparseable.slice(0, 3).join('; ') +
+        (unparseable.length > 3 ? ` (+${unparseable.length - 3} more)` : '') +
+        '. Open the file and repair or remove it; until then its text is missing from the session views.',
+    );
+  }
+  if (checked === 0) return;
+  if (bad.length === 0) {
+    if (unparseable.length) return; // the warning above stands; no pass line next to it
+    pass(
+      'Session baselines',
+      `${checked} baseline entr${checked === 1 ? 'y' : 'ies'} match their names`,
+    );
+    return;
+  }
+  warn(
+    'Session baselines',
+    `${bad.length} baseline entr${bad.length === 1 ? 'y holds' : 'ies hold'} bytes that do not match the name: ` +
+      bad
+        .slice(0, 3)
+        .map((b) => `${b.rel} (content hashes to ${b.expected})`)
+        .join('; ') +
+      (bad.length > 3 ? ` (+${bad.length - 3} more)` : '') +
+      '. An edit to the old hot.md or session-state.md was probably merged into it. The entry still reads, so nothing is lost; review the file and move any text that belongs elsewhere.',
+  );
+}
+
+// ── session entries: migration state and traces of an older version ─────────
+
+// The clock of the old-version window. A test sets HYPO_TEST_NOW (an ISO time), as the SessionStart
+// hook's tests do; otherwise it is the real time.
+function sessionEntriesNow() {
+  const fixed = Date.parse(process.env.HYPO_TEST_NOW ?? '');
+  return Number.isFinite(fixed) ? fixed : Date.now();
+}
+
+const OLD_VERSION_WINDOW_DAYS = 7;
+
+function vaultHasRemote(hypoDir) {
+  const r = spawnSync('git', ['-C', hypoDir, 'remote'], { encoding: 'utf-8' });
+  return r.status === 0 && r.stdout.trim().length > 0;
+}
+
+function countFilesUnder(dir) {
+  let n = 0;
+  let entries;
+  try {
+    entries = readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return 0;
+  }
+  for (const e of entries) n += e.isDirectory() ? countFilesUnder(join(dir, e.name)) : 1;
+  return n;
+}
+
+function checkSessionEntries(hypoDir) {
+  const state = migrationState(hypoDir);
+  const remedy = '/hypo:upgrade --migrate-sessions';
+  // A commit that tracks the generated views again makes migrationState read 'not-migrated', which
+  // would otherwise be reported as "migrates at the next session start". Judged by the same helper
+  // the Stop push guard uses, so both name one state and one remedy, ahead of the state branch.
+  let retracked = [];
+  try {
+    retracked = listRetrackedViews(hypoDir);
+  } catch {
+    // no git to ask (a vault without one tracks nothing)
+  }
+  if (retracked.length > 0) {
+    const list = retracked.map((p) => `'${p}'`).join(' ');
+    warn(
+      'Session views re-tracked',
+      `${retracked.length} generated view(s) are tracked in a commit of this vault again: ${retracked.slice(0, 5).join(', ')}${retracked.length > 5 ? ` (+${retracked.length - 5} more)` : ''}. Stop does not push while they are. Run git -C ${hypoDir} rm --cached -- ${list} and record that removal, so they stay generated`,
+    );
+  }
+  if (state === 'migrated') {
+    pass('Session entries', 'migrated: the session views are generated from projects/*/sessions/');
+  } else if (state === 'opted-out') {
+    warn(
+      'Session entries',
+      `rolled back (opted out): the flat files are the source again. Re-enable with ${remedy}`,
+    );
+  } else if (state === 'incomplete-block') {
+    warn(
+      'Session entries',
+      'the .gitignore or .gitattributes block of Hypomnema is incomplete in HEAD, so the vault is not treated as migrated. Restore the whole block and commit it',
+    );
+  } else if (retracked.length > 0) {
+    // reported above with its own remedy
+  } else if (upstreamIsMigrated(hypoDir)) {
+    warn(
+      'Session entries',
+      `the remote vault is migrated and this copy has not caught up. Start a session here or run ${remedy}`,
+    );
+  } else if (vaultHasRemote(hypoDir)) {
+    pass(
+      'Session entries',
+      `not migrated: this vault has a remote, so it migrates when ${remedy} is run (after every machine has this version)`,
+    );
+  } else {
+    pass('Session entries', 'not migrated: it migrates at the next session start');
+  }
+
+  // A project whose entry scope is exactly `machine:` (no device name) is visible on no machine.
+  const projects = listSessionProjects(hypoDir);
+  const hidden = [];
+  for (const slug of projects) {
+    try {
+      if (projectEntryScope(hypoDir, slug) === 'machine:') hidden.push(slug);
+    } catch {
+      // an unreadable project is not this check's to diagnose
+    }
+  }
+  if (hidden.length > 0) {
+    warn(
+      'Session projects hidden by scope',
+      `${hidden.join(', ')}: visibility scope is an empty "machine:", so no machine shows ${hidden.length === 1 ? 'it' : 'them'}. Set entry_scope in projects/<name>/index.md to shared or machine:<device> (an entry_scope wins over visibility_scope and the old session-state.md scope). Choosing shared shows entries that were limited to one machine`,
+    );
+  }
+
+  if (state !== 'migrated') return;
+
+  try {
+    const tracked = listTrackedGeneratedViews(hypoDir, { source: 'index' });
+    if (tracked.length > 0) {
+      warn(
+        'Session views re-tracked',
+        `${tracked.length} generated view(s) are tracked by git again: ${tracked.slice(0, 5).join(', ')}${tracked.length > 5 ? ` (+${tracked.length - 5} more)` : ''}. Run git rm --cached on them so they stay generated`,
+      );
+    } else {
+      pass('Session views re-tracked', 'no generated view is tracked');
+    }
+  } catch {
+    // no git to ask (a vault without one tracks nothing)
+  }
+
+  const backups = countFilesUnder(join(hypoDir, VIEW_BACKUP_DIR_REL));
+  if (backups > 0) {
+    pass(
+      'Session view backups',
+      `${backups} backup file(s) under ${VIEW_BACKUP_DIR_REL}: bytes the generator replaced. Delete them once reviewed`,
+    );
+  }
+
+  // Another machine on an older version writes the session-log heading of a close but no entry.
+  const now = sessionEntriesNow();
+  const traces = [];
+  for (const slug of projects) {
+    for (let i = 0; i < OLD_VERSION_WINDOW_DAYS; i++) {
+      const date = localAndUtcDates(new Date(now - i * 86_400_000))[0];
+      const logged = sessionLogReadCandidates(slug, date).some((rel) => {
+        try {
+          return hasSessionLogHeading(readFileSync(join(hypoDir, rel), 'utf-8'), date);
+        } catch {
+          return false;
+        }
+      });
+      if (logged && datedEntryPaths(hypoDir, slug, [date]).length === 0) {
+        traces.push(`${slug} (${date})`);
+      }
+    }
+  }
+  if (traces.length > 0) {
+    warn(
+      'Session old-version closes',
+      `${traces.length} close(s) in the last ${OLD_VERSION_WINDOW_DAYS} days have a session-log heading but no entry: ${traces.slice(0, 5).join(', ')}${traces.length > 5 ? ` (+${traces.length - 5} more)` : ''}. An older Hypomnema or a hand-written close. A past trace leaves this report after ${OLD_VERSION_WINDOW_DAYS} days, and upgrading that machine stops new ones`,
+    );
+  } else if (projects.length > 0) {
+    pass('Session old-version closes', `none in the last ${OLD_VERSION_WINDOW_DAYS} days`);
+  }
 }
 
 /**
@@ -2903,6 +3170,8 @@ if (rootOk && args.codex) checkExtensions(args.hypoDir, args.claudeHome, 'codex'
 if (rootOk) checkProjectIndexAnchors(args.hypoDir);
 if (rootOk) checkSessionCloseArtifacts(args.hypoDir);
 if (rootOk) checkHalfClosedReceipts(args.hypoDir);
+if (rootOk) checkBaselineIntegrity(args.hypoDir);
+if (rootOk) checkSessionEntries(args.hypoDir);
 if (rootOk) checkSyncState(args.hypoDir);
 if (rootOk) checkProjectSuggestions(args.hypoDir);
 if (rootOk) checkProposals(args.hypoDir);

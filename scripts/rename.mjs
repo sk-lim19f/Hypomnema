@@ -51,6 +51,7 @@ import {
 import { join, basename, dirname, normalize, isAbsolute } from 'path';
 import { resolveHypoRoot, expandHome } from './lib/hypo-root.mjs';
 import { loadHypoIgnore } from './lib/hypo-ignore.mjs';
+import { isSessionEntryPath, parseSessionEntry } from '../hooks/session-entries.mjs';
 import { collectPagesRename } from './lib/wikilink.mjs';
 import { RENAME_MARKER_REL, renameMarkerPath, readRenameMarker } from './lib/rename-marker.mjs';
 import {
@@ -443,6 +444,55 @@ function runDirectory(args, fromDirRel, ignorePatterns) {
   if (toDirRel === fromDirRel) {
     fail(args, `--from and --to are the same directory (${toDirRel}) — nothing to rename`);
   }
+  // A move that only respells the path in NFC (a decomposed directory name to its precomposed
+  // one). The two spellings are one name on APFS, so this is a single renameSync, not a move to a
+  // new place, and entries written under the NFC name stay correct (see below).
+  const normalizationOnly =
+    toDirRel === toDirRel.normalize('NFC') && toDirRel === fromDirRel.normalize('NFC');
+  // A project directory with entries cannot move: each entry's `project:` field names the
+  // directory it was written in and is immutable, so the move would leave close recovery and the
+  // missing-predecessor check reading the old name. The display name is the index.md title.
+  // The exception is the NFC respelling: project directories were never accepted in NFD, so every
+  // entry already names the NFC project, and the respelled directory is the name it points at.
+  if (/^projects\/[^/]+$/.test(fromDirRel)) {
+    let entryFiles = [];
+    try {
+      entryFiles = readdirSync(join(fromAbs, 'sessions')).filter((f) => f.endsWith('.md'));
+    } catch {
+      // no sessions/ directory: no entries
+    }
+    if (entryFiles.length > 0) {
+      if (!normalizationOnly) {
+        fail(
+          args,
+          `--from '${fromDirRel}' has session entries, and each entry records the project directory ` +
+            `it was written in, so the directory cannot be renamed. The project's display name is ` +
+            `the \`title\` in ${fromDirRel}/index.md: change that instead.`,
+        );
+      }
+      const fromName = fromDirRel.slice('projects/'.length);
+      const nfcName = fromName.normalize('NFC');
+      const stranger = entryFiles.find((f) => {
+        let parsed;
+        try {
+          parsed = parseSessionEntry(readFileSync(join(fromAbs, 'sessions', f), 'utf-8'));
+        } catch {
+          return true;
+        }
+        return (
+          !parsed.ok || (parsed.entry.project !== nfcName && parsed.entry.project !== fromName)
+        );
+      });
+      if (stranger !== undefined) {
+        fail(
+          args,
+          `--from '${fromDirRel}' has session entry '${stranger}' that does not name project ` +
+            `'${nfcName}' (or cannot be read as an entry), so respelling the directory could ` +
+            `leave it pointing at the wrong project. Check that entry first.`,
+        );
+      }
+    }
+  }
   // Same top-level segment only. A move that changes the leading scan-dir segment
   // (e.g. journal/x → pages/x) would change the targetability class and the
   // dir-relative form semantics; that is out of scope for this increment.
@@ -497,11 +547,40 @@ function runDirectory(args, fromDirRel, ignorePatterns) {
   if (movedByRel.size === 0) {
     fail(args, `--from '${fromDirRel}' contains no wiki pages to rename`);
   }
+  // A session entry stays an entry only at projects/<slug>/sessions/<file>.md. The readers key an
+  // entry's project by that directory, so a move that leaves the pattern drops the entry out of the
+  // session history without any error. Moving a whole project directory keeps the pattern.
+  const strandedEntry = [...movedByRel.values()].find(
+    ({ fromPage, toPage }) => isSessionEntryPath(fromPage.rel) && !isSessionEntryPath(toPage.rel),
+  );
+  if (strandedEntry) {
+    fail(
+      args,
+      `--to '${toDirRel}' would move session entry '${strandedEntry.fromPage.rel}' to ` +
+        `'${strandedEntry.toPage.rel}', which is no longer a session entry path. ` +
+        `Rename the whole project directory instead (projects/<old> to projects/<new>).`,
+    );
+  }
 
   // Renumber / merge report: a destination that already exists means this is not a
   // clean 1:1 move. Rather than a terse hard-fail, report exactly which destination
   // paths collide and refuse --apply, leaving the merge/renumber for manual handling.
-  if (existsSync(toAbs)) {
+  // The exception is a normalization-only respelling whose destination is the source itself: on a
+  // file system that folds the two spellings (APFS) both names open the same directory, which is
+  // not a collision. Where they are different names (Linux) the destination only exists if
+  // something else is there, and that still refuses.
+  const destinationIsSource =
+    normalizationOnly &&
+    (() => {
+      try {
+        const a = statSync(fromAbs);
+        const b = statSync(toAbs);
+        return a.ino === b.ino && a.dev === b.dev;
+      } catch {
+        return false;
+      }
+    })();
+  if (existsSync(toAbs) && !destinationIsSource) {
     const collisions = [];
     for (const { toPage } of movedByRel.values()) {
       if (existsSync(toPage.path)) collisions.push(toPage.rel);
@@ -587,6 +666,8 @@ function runDirectory(args, fromDirRel, ignorePatterns) {
     //                         label via [[new|old]] (the page genuinely relocated).
     //  ordinary page        → rewrite normally.
     if (cls === 'sources') continue;
+    //  session entry        → never rewritten (immutable source record), even inside the subtree.
+    if (isSessionEntryPath(p.rel)) continue;
     if (cls === 'timerecord' && !inSubtree) continue;
     const aliasPreserve = cls === 'timerecord' && inSubtree;
     let raw;
@@ -723,6 +804,15 @@ function run(args) {
   if (!fromPage) {
     fail(args, `--from did not resolve to a unique existing page: ${args.from}`);
   }
+  // Session entries are immutable history and the readers find them by directory. Moving one
+  // alone would drop it from the session history, so only a whole project move may carry it.
+  if (isSessionEntryPath(fromPage.rel)) {
+    fail(
+      args,
+      `--from '${fromPage.rel}' is a session entry; renaming a single entry would remove it from ` +
+        `the session history. Rename the whole project directory instead.`,
+    );
+  }
 
   // Compute the destination rel. --to may be a full rel (move across dirs) or a
   // bare new name (rename in place within from-page's directory).
@@ -810,13 +900,31 @@ function run(args) {
     writeRenameMarker(args, thisMarker);
   }
 
+  // Entries are never rewritten, so the ones that link to the old name keep doing so, and every
+  // render of their views writes that old link back. Count them for the report.
+  let entriesWithOldLink = 0;
+  for (const p of pages) {
+    if (!isSessionEntryPath(p.rel)) continue;
+    try {
+      const { rewrites } = rewriteContent(
+        readFileSync(p.path, 'utf-8'),
+        fromPage,
+        toPage,
+        formIndex,
+      );
+      if (rewrites.length > 0) entriesWithOldLink++;
+    } catch {
+      // unreadable entry: not counted
+    }
+  }
+
   // Rewrite inbound references across every NON-preserved page (skip the moved
   // page itself — self-references are rewritten on its own content separately).
   const fileResults = [];
   let totalRewrites = 0;
   const ambiguities = [];
   for (const p of pages) {
-    if (isPreservedSource(p.rel)) continue;
+    if (isPreservedSource(p.rel) || isSessionEntryPath(p.rel)) continue;
     let raw;
     try {
       raw = readFileSync(p.path, 'utf-8');
@@ -888,6 +996,7 @@ function run(args) {
     links_rewritten: totalRewrites,
     rewrites: fileResults,
     ambiguous: ambiguities,
+    session_entries_with_old_link: entriesWithOldLink,
   };
 
   if (args.json) {
@@ -895,6 +1004,12 @@ function run(args) {
   } else {
     const mode = args.apply ? 'Renamed' : 'Dry-run (no changes written)';
     console.log(`${mode}: ${fromPage.rel} → ${toRel}`);
+    if (entriesWithOldLink > 0) {
+      console.log(
+        `  ${entriesWithOldLink} session entr${entriesWithOldLink === 1 ? 'y still links' : 'ies still link'} to the old name. ` +
+          `Entries are never rewritten, so their rendered views keep the old link.`,
+      );
+    }
     console.log(`  ${totalRewrites} inbound link(s) across ${fileResults.length} file(s).`);
     for (const f of fileResults) {
       console.log(`  · ${f.file}: ${f.rewrites.map((r) => `${r.from}→${r.to}`).join(', ')}`);

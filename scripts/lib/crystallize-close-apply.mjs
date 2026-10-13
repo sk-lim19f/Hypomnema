@@ -8,6 +8,8 @@ import {
   closeSync,
   unlinkSync,
   readdirSync,
+  linkSync,
+  writeFileSync,
 } from 'fs';
 import { join, dirname } from 'path';
 import { spawnSync } from 'child_process';
@@ -16,7 +18,7 @@ import { randomBytes, createHash } from 'crypto';
 import { expandHome } from './hypo-root.mjs';
 import { parseStrictDate } from './time.mjs';
 import { maskNonProse } from './code-fence.mjs';
-import { isValidProjectName, substituteTokens, TEMPLATE_DIR } from './project-create.mjs';
+import { substituteTokens, TEMPLATE_DIR } from './project-create.mjs';
 import { appendPendingTags, checkForbidden } from './schema-vocab.mjs';
 import { atomicWrite } from '../../hooks/atomic-write.mjs';
 import {
@@ -25,6 +27,7 @@ import {
   precompactGateStatus,
   writeSessionClosedMarker,
   sessionClosedMarkerPath,
+  sanitizeSessionId,
   partitionLintScope,
   isUnderProjectDirs,
   sessionLogReadCandidates,
@@ -40,12 +43,51 @@ import {
   currentDevice,
   withFileLock,
   resolveGateProjectOverride,
+  readClosePin,
+  writeClosePin,
+  normalizeClosePin,
+  sessionProofCloseId,
+  retireClosePending,
+  entryPathOfClose,
+  listSessionProjects,
+  headPathState,
+  revPathArg,
+  recordTouchedPaths,
+  recordShardAppend,
+  removeShardAppend,
+  loadHypoIgnore,
+  isIgnored,
+  isExcludedFromCommit,
+  isIgnoredByGit,
+  headBlob,
+  nonNfcProjectDir,
+  nonNfcProjectMessage,
+  resolveProjectDirName,
+  vaultOperationInProgress,
 } from '../../hooks/hypo-shared.mjs';
+import {
+  isValidProjectName,
+  TRACK_ID_RE,
+  closeIdFor,
+  entryFileName,
+  formatSessionEntry,
+  parseSessionEntry,
+  resolveSupersedesPrefix,
+  splitLegacyFrontmatter,
+} from '../../hooks/session-entries.mjs';
+import {
+  loadSessionModel,
+  projectEntryScope,
+  readObservedHeads,
+  recordObservedHeads,
+  writeGeneratedViews,
+} from '../../hooks/session-views.mjs';
 import {
   CERT_CHECKPOINT,
   CERT_CLOSE_FILES,
   RECEIPT_SCHEMA_VERSION,
   invalidateCloseArtifacts,
+  invalidateOne,
   receiptPath,
   verifyEntriesInCommit,
   writeReceiptAtomic,
@@ -69,7 +111,12 @@ import {
   closeGateStatus,
   hostTagWarningWithUndo,
 } from '../../hooks/close-gate-store.mjs';
-import { readJournal, recordJournalEntry, clearJournal } from '../../hooks/close-journal.mjs';
+import {
+  readJournal,
+  recordJournalEntry,
+  removeJournalEntry,
+  clearJournal,
+} from '../../hooks/close-journal.mjs';
 import { requireProjectDir } from './crystallize-close-gate.mjs';
 import { summarizeLintForOutput } from './crystallize-helpers.mjs';
 
@@ -131,20 +178,23 @@ function runLint(hypoDir) {
 }
 
 // ── session-close apply ────────────────────────────────────────────
-// Idempotent payload-driven application of the 4 mandatory session-close memory
-// files (+ optional open-questions). Used by the LLM session-close flow as the
-// canonical entrypoint instead of issuing 5+ Write tool calls by hand.
+// Idempotent payload-driven application of a session close. Used by the LLM
+// session-close flow as the canonical entrypoint instead of issuing 5+ Write tool
+// calls by hand.
 //
-// The root pointer table (`hot.md`) used to be a fifth file here, composed by
-// hand into every payload. It is now a projection the SessionStart and Stop
-// hooks regenerate from `projects/*/hot.md`, so a close that wrote it would
-// only be overwritten by its own turn's Stop hook. It left the payload, the
-// overwrite set, and the base snapshot together; a payload that still carries
-// `rootHot` is reported, not applied (see `obsoleteFieldNotices`).
+// A close writes one immutable original entry, `projects/<p>/sessions/<date>-<close_id>.md`
+// (summary plus one section per track update), appends the session-log shard and
+// log.md, and optionally overwrites `pages/open-questions.md`. The project's
+// `hot.md`, `session-state.md` and the root `hot.md` are views generated from the
+// entries: a close never writes them from a payload (a migrated vault gets them
+// regenerated right after the entry lands). An old-format payload that still
+// carries `sessionState`/`projectHot` is converted to an entry, see
+// `absorbLegacyPayload`; `rootHot` is reported, not applied (`obsoleteFieldNotices`).
 //
 // Idempotency:
-//   • full-content fields (sessionState/projectHot/openQuestions): write
-//     only when on-disk bytes differ — re-running with same payload is a no-op.
+//   • the entry: its path carries the close id the close-pin fixes for the whole
+//     close request, so a retry finds its own file (see `classifyExistingEntry`).
+//   • full-content field (openQuestions): write only when on-disk bytes differ.
 //   • append fields (sessionLog/log): skip when the dated heading/entry is
 //     already present (regex shared with sessionCloseFileStatus via hypo-shared).
 //
@@ -173,11 +223,164 @@ function readPayload(source) {
 
 // How long an append waits for its per-target lock before withholding to the
 // proposal-pending gate (see withFileLock). A withheld append blocks the close but
-// is NOT parked as a proposal artifact — the next close re-appends. Default 5s is
-// generous for a real close;
-// the env override exists ONLY so tests can force a fast timeout instead of
-// spinning the full 5s. Not a documented production knob.
-const APPEND_LOCK_TIMEOUT_MS = Number(process.env.HYPO_APPEND_LOCK_TIMEOUT_MS) || 5000;
+// is NOT parked as a proposal artifact, the next close re-appends. The env override
+// exists ONLY so tests can force a fast timeout instead of spinning the full wait.
+// Not a documented production knob.
+//
+// The session-log shard lock and the log.md lock outlive their appends: both are held
+// through the commit (see runHoldingAppendLocks), so a second close waits for the first
+// one's lint and commit, not just its write, hence 20s and not a few seconds. A holder
+// killed mid-close leaves a lock that withFileLock steals after its 30s stale age once the
+// pid is gone; a waiter that gives up first withholds as a conflict and the next close
+// re-applies.
+const HELD_APPEND_LOCK_TIMEOUT_MS = Number(process.env.HYPO_APPEND_LOCK_TIMEOUT_MS) || 20000;
+
+/**
+ * Run `run({shardHeld, logHeld})` while holding the session-log shard lock and then the
+ * log.md lock (that order, always; the vault commit lock comes after both). Each commit
+ * takes its whole path (`--only`), so another close appending to the shard or to log.md
+ * between this close's append and this close's commit would have its text committed under
+ * this close, before its own close finishes. A flag is false when that lock could not be
+ * taken in time: the caller withholds the matching append as a conflict and goes on without
+ * writing that file. The two appends stand or fall together: when either lock times out
+ * both flags are false (a shard timeout never tries the log.md lock; a log.md timeout
+ * withholds the shard append too, still inside the shard lock), because a close that
+ * withholds one append cannot commit, and the other would sit on disk uncommitted for a
+ * second close of the same project to commit under its own name. Both
+ * locks are released on every exit of `run`, including a throw. A timeout that comes out of
+ * `run` itself (a different lock) is not ours and propagates.
+ */
+function runHoldingAppendLocks(shardTarget, logTarget, run) {
+  const hold = (target, inner) => {
+    let held = false;
+    try {
+      return withFileLock(
+        target,
+        () => {
+          held = true;
+          return inner(true);
+        },
+        { timeoutMs: HELD_APPEND_LOCK_TIMEOUT_MS },
+      );
+    } catch (err) {
+      if (held || err?.code !== 'ELOCKTIMEOUT') throw err;
+      return inner(false);
+    }
+  };
+  return hold(shardTarget, (shardHeld) =>
+    shardHeld
+      ? hold(logTarget, (logHeld) => run({ shardHeld: logHeld, logHeld }))
+      : run({ shardHeld: false, logHeld: false }),
+  );
+}
+
+// The caller already holds `target`'s lock (runHoldingAppendLocks), or failed to take it:
+// run `fn` under it, or raise the timeout the append sites turn into a withheld conflict.
+function underHeldLock(held, target, fn) {
+  if (!held) {
+    throw Object.assign(new Error(`lock-timeout: ${target}.lock`), { code: 'ELOCKTIMEOUT' });
+  }
+  return fn();
+}
+
+// One file this close appends to while it holds that file's append lock: `before` and
+// `after` are the exact bytes around the append (null = absent, undefined = unreadable).
+export const appendTarget = (rel, full) => ({ rel, full, before: undefined, after: undefined });
+
+function readBytes(path) {
+  if (!existsSync(path)) return null;
+  try {
+    return readFileSync(path);
+  } catch {
+    return undefined;
+  }
+}
+
+// Run one append under a held lock and record the bytes around it. `after` is read in a
+// finally, so an append that wrote and then threw is still withdrawn.
+function trackAppend(target, held, append) {
+  if (held) target.before = readBytes(target.full);
+  try {
+    append();
+  } finally {
+    if (held) target.after = readBytes(target.full);
+  }
+}
+
+/**
+ * Take back this close's appended bytes that no commit holds. Each commit takes a whole
+ * file (`--only`), so text this close left on disk would be committed by the next close of
+ * that file, under the next close's name. Judged per target, after the commit attempt:
+ * a target is withdrawn only when it was within the commit's scope (a path `.hypoignore`
+ * matches, or an untracked one git's own ignore rules match, is kept out of every commit
+ * and stays as written, it is the user's own log) and HEAD does not hold the bytes this
+ * close left (a commit that landed for it, however the others fared,
+ * stands). Called before the append locks are released. A file is restored only when its
+ * bytes are exactly what this close left (`after`); anything else means someone edited it
+ * under us, and it is left alone and named in a notice. A failed restore is reported the
+ * same way and never throws, so the locks still release.
+ *
+ * After a confirmed restore the append's ownership witnesses go too: this session's
+ * journal record for the path and, for a shard, its append record. Otherwise identical
+ * bytes added later by hand would pass as this close's own.
+ *
+ * @param {{hypoDir: string, sessionId: string|null, closeId: string|null}} ctx
+ * @returns {string[]} the vault-relative paths whose appended bytes were taken back
+ */
+export function withdrawUnlandedAppends(ctx, targets, notices) {
+  const patterns = loadHypoIgnore(ctx.hypoDir);
+  const withdrawn = [];
+  for (const t of targets) {
+    if (t.before === undefined || t.after === undefined) continue;
+    if (t.before === t.after || (t.before && t.after && t.before.equals(t.after))) continue;
+    if (isExcludedFromCommit(ctx.hypoDir, t.rel, patterns)) continue;
+    if (isIgnoredByGit(ctx.hypoDir, t.rel)) continue;
+    if (headBlob(ctx.hypoDir, t.rel)?.equals(t.after)) continue;
+    const now = readBytes(t.full);
+    const unchanged = now && t.after && now.equals(t.after);
+    if (!unchanged) {
+      notices.push(
+        `커밋되지 않은 이번 close의 추가분을 ${t.rel}에서 되돌리지 못했습니다. 파일이 그 사이 다른 곳에서 바뀌었습니다. ` +
+          `내용을 확인하고 직접 정리하세요. 그대로 두면 다음 close가 이 추가분을 함께 커밋할 수 있습니다.`,
+      );
+      continue;
+    }
+    try {
+      if (t.before === null) unlinkSync(t.full);
+      else atomicWrite(t.full, t.before);
+    } catch (err) {
+      notices.push(
+        `커밋되지 않은 이번 close의 추가분을 ${t.rel}에서 되돌리지 못했습니다 (${err?.message || err}). ` +
+          `내용을 직접 정리하세요. 그대로 두면 다음 close가 이 추가분을 함께 커밋할 수 있습니다.`,
+      );
+      continue;
+    }
+    withdrawn.push(t.rel);
+    notices.push(
+      `커밋이 끝나지 않아 이번 close가 ${t.rel}에 추가한 내용을 되돌렸습니다. close를 다시 실행하세요.`,
+    );
+    const afterText = t.after.toString('utf-8');
+    const witnessOk =
+      removeJournalEntry(ctx.hypoDir, ctx.sessionId, t.rel, hashContent(afterText)) &&
+      (t.before === null ||
+        !t.after.subarray(0, t.before.length).equals(t.before) ||
+        removeShardAppend(
+          ctx.hypoDir,
+          ctx.sessionId,
+          t.rel,
+          t.before.toString('utf-8'),
+          t.after.subarray(t.before.length).toString('utf-8'),
+          ctx.closeId,
+        ));
+    if (!witnessOk) {
+      notices.push(
+        `${t.rel}의 추가분은 되돌렸지만, 이번 close가 남긴 기록(.cache/close-journal 또는 session-cache의 shard-appends.json)을 지우지 못했습니다. ` +
+          `같은 내용을 직접 다시 넣으면 이 close가 쓴 것으로 읽힐 수 있으니, 그 기록을 확인하세요.`,
+      );
+    }
+  }
+  return withdrawn;
+}
 
 // atomicWrite is now the shared hooks/atomic-write.mjs implementation
 // (imported above). Six byte-identical copies of this function used to live
@@ -337,9 +540,10 @@ export function overwriteConflictReason(
  * Append `entry` to `path` only if `alreadyPresent(content)` is false.
  * Atomic: rebuilds the full file content and writes via atomicWrite — a crash
  * mid-append cannot leave log.md or session-log/YYYY-MM-DD.md half-written, which
- * matters for these append-only history files.
+ * matters for these append-only history files. `beforeWrite(content, added)`, when
+ * given, runs right before the write with the current text and the text appended.
  */
-function appendIfAbsent(path, entry, alreadyPresent) {
+function appendIfAbsent(path, entry, alreadyPresent, beforeWrite) {
   let content = '';
   if (existsSync(path)) {
     try {
@@ -361,6 +565,7 @@ function appendIfAbsent(path, entry, alreadyPresent) {
   const sep =
     content === '' ? '' : content.endsWith('\n\n') ? '' : content.endsWith('\n') ? '\n' : '\n\n';
   const next = entry.endsWith('\n') ? entry : entry + '\n';
+  beforeWrite?.(content, sep + next);
   atomicWrite(path, content + sep + next);
   return true;
 }
@@ -370,25 +575,78 @@ function todayLocal() {
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
 }
 
-// Spec §5.2.7 / §8.3: 3 mandatory + 2 optional (`log`, `openQuestions`).
-// The payload shape MUST mirror that contract — missing a mandatory field is a
-// payload bug, not a no-op. Caller is the LLM session-close flow, which composes
-// the payload deliberately; partial payloads must fail loudly so caller fixes
-// them rather than silently relying on yesterday's freshness state. (Codex review
-// of the apply path — Worker 1 finding 1.) `log` left the mandatory set in B-1:
-// the root log.md entry is a DERIVABLE artifact (rootLogEntry over this close's
+// The close payload contract (commands/crystallize.md Step 2): `summary` and
+// `sessionLog.entry` are mandatory, `tracks` is an optional array of track
+// updates, `log` and `openQuestions` stay optional. A payload that carries
+// `sessionState` + `projectHot` instead is the old format; `absorbLegacyPayload`
+// turns it into the same shape before anything else reads it. The payload shape
+// MUST be checked here: a missing mandatory field is a payload bug, not a no-op,
+// and partial payloads must fail loudly so the caller fixes them rather than
+// silently relying on yesterday's freshness state. `log` is not mandatory: the
+// root log.md entry is a DERIVABLE artifact (rootLogEntry over this close's
 // sessionLog heading), so apply auto-fills it when the field is absent.
-const REQUIRED_PAYLOAD_FIELDS = [
+const REQUIRED_PAYLOAD_FIELDS = [['sessionLog', 'entry']];
+const LEGACY_PAYLOAD_FIELDS = [
   ['sessionState', 'content'],
   ['projectHot', 'content'],
-  ['sessionLog', 'entry'],
 ];
+
+function validateTracksShape(tracks) {
+  const errs = [];
+  if (!Array.isArray(tracks)) return ['payload.tracks, when present, must be an array'];
+  tracks.forEach((t, i) => {
+    const at = `payload.tracks[${i}]`;
+    if (!t || typeof t !== 'object' || Array.isArray(t)) {
+      errs.push(`${at} must be an object`);
+      return;
+    }
+    if (typeof t.id !== 'string' || !TRACK_ID_RE.test(t.id)) {
+      errs.push(`${at}.id must be a string matching ${TRACK_ID_RE}`);
+    }
+    for (const key of ['title', 'next']) {
+      if (t[key] !== undefined && typeof t[key] !== 'string') {
+        errs.push(`${at}.${key}, when present, must be a string`);
+      }
+    }
+    for (const flag of ['new', 'done']) {
+      if (t[flag] !== undefined && typeof t[flag] !== 'boolean') {
+        errs.push(`${at}.${flag}, when present, must be a boolean`);
+      }
+    }
+    if (
+      t.supersedes !== undefined &&
+      (!Array.isArray(t.supersedes) || t.supersedes.some((x) => typeof x !== 'string'))
+    ) {
+      errs.push(`${at}.supersedes, when present, must be an array of strings`);
+    }
+  });
+  return errs;
+}
 
 function validatePayloadShape(payload) {
   const errs = [];
   if (!payload || typeof payload !== 'object') {
     errs.push('payload must be a JSON object');
     return errs;
+  }
+  const hasLegacy = payload.sessionState !== undefined || payload.projectHot !== undefined;
+  const hasCurrent = payload.summary !== undefined || payload.tracks !== undefined;
+  if (hasLegacy && hasCurrent) {
+    errs.push(
+      'payload carries both the old fields (sessionState/projectHot) and summary/tracks: send one form',
+    );
+  } else if (hasLegacy) {
+    for (const [field, key] of LEGACY_PAYLOAD_FIELDS) {
+      const slot = payload[field];
+      if (!slot || typeof slot !== 'object') {
+        errs.push(`payload.${field} is required (object with .${key})`);
+      } else if (typeof slot[key] !== 'string') {
+        errs.push(`payload.${field}.${key} must be a string`);
+      }
+    }
+  } else {
+    if (typeof payload.summary !== 'string') errs.push('payload.summary is required (string)');
+    if (payload.tracks !== undefined) errs.push(...validateTracksShape(payload.tracks));
   }
   for (const [field, key] of REQUIRED_PAYLOAD_FIELDS) {
     const slot = payload[field];
@@ -433,6 +691,26 @@ function validatePayloadShape(payload) {
   return errs;
 }
 
+// The old payload form carried the two overwrite files whole. It becomes one
+// original entry: `projectHot` is the summary and `sessionState` the body of a
+// `legacy` track, both without their frontmatter. Whether `legacy` is a new
+// track is decided with the other track checks (`planSessionEntry`), which know
+// what is registered. Runs on a payload `validatePayloadShape` already passed.
+function absorbLegacyPayload(payload) {
+  if (payload.sessionState === undefined && payload.projectHot === undefined) {
+    return { payload, legacyFormat: false };
+  }
+  const { sessionState, projectHot, ...rest } = payload;
+  return {
+    payload: {
+      ...rest,
+      summary: splitLegacyFrontmatter(projectHot.content).body,
+      tracks: [{ id: 'legacy', next: splitLegacyFrontmatter(sessionState.content).body }],
+    },
+    legacyFormat: true,
+  };
+}
+
 // Payload fields this apply no longer applies. `rootHot` is the only one so far:
 // the root pointer table became a hook-generated projection of `projects/*/hot.md`,
 // so nothing composed by hand for it can survive the same turn's Stop hook.
@@ -466,7 +744,8 @@ function obsoleteFieldNotices(payload) {
 // hashes the disk bytes for the proof entry. `null` on anything else (dirty,
 // untracked, unreadable, or not a git repo at all): the caller's contract is
 // to treat that as "this target is not provably closed", never as "clean".
-function markCloseWorktreeProofEntry(hypoDir, relPath) {
+// `kind` is 'overwrite' for the appended files and 'create' for a session entry.
+function markCloseWorktreeProofEntry(hypoDir, relPath, kind = 'overwrite') {
   const st = spawnSync('git', ['-C', hypoDir, 'status', '--porcelain', '--', relPath], {
     encoding: 'utf-8',
   });
@@ -477,63 +756,87 @@ function markCloseWorktreeProofEntry(hypoDir, relPath) {
   } catch {
     return null;
   }
-  return { path: relPath, kind: 'overwrite', expected: { bytesSha256: bytesSha256(content) } };
+  return { path: relPath, kind, expected: { bytesSha256: bytesSha256(content) } };
 }
+
+// The proof entry of a `.hypoignore` project's session entry, which no commit
+// holds: its disk bytes. sessionCloseFileStatus has already matched them to the
+// close pin's local proof.
+function markCloseLocalProofEntry(hypoDir, relPath) {
+  let content;
+  try {
+    content = readFileSync(join(hypoDir, relPath));
+  } catch {
+    return null;
+  }
+  return { path: relPath, kind: 'local-create', expected: { bytesSha256: bytesSha256(content) } };
+}
+
+// What `--mark-session-closed` says when a new close signal is open and this
+// request has no entry yet: the earlier close of the session does not prove it.
+const CLOSE_AWAITING_APPLY =
+  '이 세션에 새 close 요청이 열려 있고 아직 이 요청의 원본이 없습니다. close payload로 apply를 먼저 실행하세요';
 
 /**
  * The certification proof for `--mark-session-closed`. `--log-only` needs
- * only `log.md` committed fresh; a project mark needs, for EVERY project in
- * `markerProjects`, session-state.md, hot.md, the exact session-log evidence
- * file `sessionCloseFileStatus` accepted for freshness (never a different
- * hybrid-cutover candidate), and log.md, all committed, not merely present.
- * A project whose status is not ok, or that has no session-log evidence file
- * to name, is incomplete: dropping the session-log target from the proof
- * would certify a close whose session-log was never checked. One incomplete
- * project withholds the WHOLE certification and names which project failed;
- * this never partially certifies.
- * @returns {{ok: boolean, entries: object[], incompleteProjects: string[]}}
+ * only `log.md` committed fresh. A project mark needs, for EVERY project in
+ * `markerProjects`, THIS session's close proven by `sessionCloseFileStatus`
+ * (scope 'session', the close id from sessionProofCloseId for that project): its entry
+ * committed (or, for a `.hypoignore` project, locally proven). The entry is the
+ * whole proof. The session-log heading and the log.md line carry no close id, so
+ * another close of the same day would satisfy them for this one; a gap there
+ * comes back in `notices` and neither gates the proof nor enters the receipt.
+ * This function makes no judgment of its own: a project whose status is not ok is
+ * incomplete. One incomplete project withholds the WHOLE certification and names
+ * which project failed; this never partially certifies.
+ * `proof` carries `closeIdOf(project)`, the close that proves each project (one
+ * session can close several projects in turn, each by its own close), or one
+ * `closeId` for all of them (null when there is no close to prove).
+ * sessionCloseFileStatus throws when neither is given.
+ * @param {string} hypoDir
+ * @param {string[]} markerProjects
+ * @param {boolean} logOnly
+ * @param {{closeId?: string|null, closeIdOf?: (project: string) => string|null}} [proof]
+ * @returns {{ok: boolean, entries: object[], incompleteProjects: string[], notices: object[]}}
  */
-export function buildMarkCloseProof(hypoDir, markerProjects, logOnly) {
+export function buildMarkCloseProof(hypoDir, markerProjects, logOnly, proof = {}) {
   if (logOnly) {
     const e = markCloseWorktreeProofEntry(hypoDir, 'log.md');
     return e
-      ? { ok: true, entries: [e], incompleteProjects: [] }
-      : { ok: false, entries: [], incompleteProjects: ['(log-only)'] };
+      ? { ok: true, entries: [e], incompleteProjects: [], notices: [] }
+      : { ok: false, entries: [], incompleteProjects: ['(log-only)'], notices: [] };
   }
   const byPath = new Map();
   const incompleteProjects = [];
+  const notices = [];
   for (const p of markerProjects) {
-    const status = sessionCloseFileStatus(hypoDir, { projectOverride: p });
-    if (!status.ok || !status.sessionLogEvidence?.path) {
+    const status = sessionCloseFileStatus(hypoDir, {
+      ...(proof.closeIdOf ? { closeId: proof.closeIdOf(p) } : proof),
+      scope: 'session',
+      projectOverride: p,
+    });
+    if (!status.ok) {
       incompleteProjects.push(p);
       continue;
     }
-    const targets = [
-      join('projects', p, 'session-state.md'),
-      join('projects', p, 'hot.md'),
-      status.sessionLogEvidence.path,
-      'log.md',
-    ];
-    const projectEntries = [];
-    let projectOk = true;
-    for (const t of targets) {
-      const e = markCloseWorktreeProofEntry(hypoDir, t);
-      if (!e) {
-        projectOk = false;
-        break;
-      }
-      projectEntries.push(e);
-    }
-    if (!projectOk) {
+    notices.push(...status.notices);
+    const ignorePatterns = loadHypoIgnore(hypoDir);
+    const local =
+      ignorePatterns.length > 0 && isIgnored(join(hypoDir, status.entry), hypoDir, ignorePatterns);
+    const e = local
+      ? markCloseLocalProofEntry(hypoDir, status.entry)
+      : markCloseWorktreeProofEntry(hypoDir, status.entry, 'create');
+    if (!e) {
       incompleteProjects.push(p);
       continue;
     }
-    for (const e of projectEntries) byPath.set(e.path, e);
+    byPath.set(e.path, e);
   }
   return {
     ok: incompleteProjects.length === 0 && markerProjects.length > 0,
     entries: [...byPath.values()],
     incompleteProjects,
+    notices,
   };
 }
 
@@ -558,8 +861,80 @@ export function withdrawOwnReceipt(hypoDir, sessionId, generation) {
   } catch {
     // Unreadable or unparseable: fall through and withdraw.
   }
-  const retracted = invalidateCloseArtifacts(hypoDir, sessionId);
+  // The receipt alone: a marker beside it names a generation of its own, and
+  // withdrawOwnMarker decides whether that one is ours.
+  const retracted = invalidateOne(path);
   return retracted.ok ? { ok: true, withdrawn: true } : { ok: false, reason: retracted.reason };
+}
+
+/**
+ * Take back the compat marker at this session's path, but only if it names the
+ * receipt generation this close filed (or names none readable, which no concurrent
+ * writer of this version produces). A marker of another generation belongs to another
+ * close of the same session and is left alone, like withdrawOwnReceipt does for the
+ * receipt. An absent marker is nothing of ours to take back.
+ * @returns {{ok: true, withdrawn: boolean} | {ok: false, reason: string}}
+ */
+export function withdrawOwnMarker(hypoDir, sessionId, generation) {
+  const path = sessionClosedMarkerPath(hypoDir, sessionId);
+  if (!existsSync(path)) return { ok: true, withdrawn: false };
+  try {
+    const onDisk = JSON.parse(readFileSync(path, 'utf-8'));
+    if (
+      typeof onDisk?.receipt_generation === 'string' &&
+      onDisk.receipt_generation !== generation
+    ) {
+      return { ok: true, withdrawn: false };
+    }
+  } catch {
+    // Unreadable or unparseable: fall through and withdraw.
+  }
+  const retracted = invalidateOne(path);
+  return retracted.ok ? { ok: true, withdrawn: true } : { ok: false, reason: retracted.reason };
+}
+
+// One lock per session id for everything that files or retracts that session's close
+// artifacts (receipt, marker, resolution). Both the apply path and --mark-session-closed
+// reach those writes after the append locks are gone, and the apply path after the vault
+// commit lock too, so two attempts for one session id could otherwise interleave and leave
+// a receipt of one generation beside a marker of another. The target sits under .cache
+// next to the per-session close records, which is gitignored, so its lock files never show
+// as vault changes. Lock order: the vault commit lock (when a path holds it) is taken
+// before this one, and nothing under this lock takes the vault commit lock.
+const SESSION_CLOSE_LOCK_TIMEOUT_MS = 5000;
+
+export function sessionCloseLockTarget(hypoDir, sessionId) {
+  return join(hypoDir, '.cache', 'close-phase', sanitizeSessionId(sessionId));
+}
+
+// Run `fn` under the session's close lock. A lock that is not free in time comes back as
+// `{locked: false}` instead of a throw, so each caller reports it in its own words.
+function withSessionCloseLock(hypoDir, sessionId, fn, timeoutMs = SESSION_CLOSE_LOCK_TIMEOUT_MS) {
+  try {
+    return {
+      locked: true,
+      value: withFileLock(sessionCloseLockTarget(hypoDir, sessionId), fn, { timeoutMs }),
+    };
+  } catch (err) {
+    if (err?.code !== 'ELOCKTIMEOUT') throw err;
+    return { locked: false };
+  }
+}
+
+/**
+ * Invalidate this session's prior receipt and marker when a new close is accepted, under
+ * the session close lock so it cannot cut into the middle of another attempt's
+ * receipt-then-marker landing.
+ * @returns {{ok: boolean, reason?: string}}
+ */
+export function invalidatePriorCloseArtifacts(hypoDir, sessionId, timeoutMs) {
+  const run = withSessionCloseLock(
+    hypoDir,
+    sessionId,
+    () => invalidateCloseArtifacts(hypoDir, sessionId),
+    timeoutMs,
+  );
+  return run.locked ? run.value : { ok: false, reason: 'session-close-lock-timeout' };
 }
 
 /**
@@ -586,13 +961,31 @@ export function withdrawOwnReceipt(hypoDir, sessionId, generation) {
  * transient re-read error would let it stand as valid with no marker. That
  * branch takes the receipt back too, through `withdrawOwnReceipt`.
  *
- * @returns {{ok: true} |
+ * The whole landing runs under the session's close lock (`sessionCloseLockTarget`), and so
+ * does `opts.afterLanded`, which runs once both artifacts have landed (the callers record
+ * the close resolution there). Two attempts for one session id therefore cannot leave a
+ * receipt of one generation beside a marker of the other, and a failed attempt takes back
+ * only the receipt and marker carrying its own generation. `opts.lockTimeoutMs` shortens
+ * the wait for the lock in tests.
+ *
+ * @returns {{ok: true, afterLanded?: any} |
  *   {ok: false, reason: 'receipt-write-failed', writeReason: string, retractFailed?: string} |
- *   {ok: false, reason: 'marker-did-not-land', retractFailed?: string}}
+ *   {ok: false, reason: 'marker-did-not-land', retractFailed?: string} |
+ *   {ok: false, reason: 'session-close-lock-timeout'}}
  *   `retractFailed` is set only when withdrawing the receipt failed too, which
  *   leaves a valid receipt behind a run that reports failure.
  */
-export function landReceiptThenMarker(hypoDir, sessionId, receipt, writeMarker) {
+export function landReceiptThenMarker(hypoDir, sessionId, receipt, writeMarker, opts = {}) {
+  const run = withSessionCloseLock(
+    hypoDir,
+    sessionId,
+    () => landReceiptThenMarkerLocked(hypoDir, sessionId, receipt, writeMarker, opts.afterLanded),
+    opts.lockTimeoutMs,
+  );
+  return run.locked ? run.value : { ok: false, reason: 'session-close-lock-timeout' };
+}
+
+function landReceiptThenMarkerLocked(hypoDir, sessionId, receipt, writeMarker, afterLanded) {
   const written = writeReceiptAtomic(hypoDir, sessionId, receipt);
   if (!written.ok) {
     // Only the re-read reasons mean the rename happened. 'write-failed' and
@@ -613,14 +1006,43 @@ export function landReceiptThenMarker(hypoDir, sessionId, receipt, writeMarker) 
   } catch {
     // A writer that throws did not write. Same outcome as returning false.
   }
-  if (wrote && existsSync(sessionClosedMarkerPath(hypoDir, sessionId))) return { ok: true };
-  const retracted = invalidateCloseArtifacts(hypoDir, sessionId);
+  if (wrote && existsSync(sessionClosedMarkerPath(hypoDir, sessionId))) {
+    return afterLanded ? { ok: true, afterLanded: afterLanded() } : { ok: true };
+  }
+  // Only what this attempt wrote: another close of the session may have landed its own
+  // pair, and taking that back would undo a close that succeeded.
+  const retracted = [
+    withdrawOwnMarker(hypoDir, sessionId, receipt.generation),
+    withdrawOwnReceipt(hypoDir, sessionId, receipt.generation),
+  ].find((r) => !r.ok);
   return {
     ok: false,
     reason: 'marker-did-not-land',
-    ...(retracted.ok ? {} : { retractFailed: retracted.reason }),
+    ...(retracted ? { retractFailed: retracted.reason } : {}),
   };
 }
+
+// closeGateStatus starts its reason with this when a stored resolution exists but
+// this transcript no longer verifies it (hooks/close-gate-store.mjs, prefixMatches
+// false: rewritten, shortened or an implausible count).
+const CLOSE_GATE_UNVERIFIABLE_PREFIX = 'transcript-rewrite-detected';
+
+// What a mark that left such a record alone tells the operator.
+const LEFT_UNVERIFIABLE_NOTE =
+  "This session's recorded close resolution cannot be checked against the transcript as it " +
+  'reads now, so the mark left it untouched. The gate refuses a new close in this session: ' +
+  'close from a new session.';
+
+// One wording for both writers of `close-resolution-failed`.
+const CLOSE_RESOLUTION_FAILED_HELP = (retractFailed) =>
+  'the close could not record its resolution under .cache/close-gate/ (likely a permission ' +
+  'or disk issue), so the receipt and marker it filed were withdrawn and the session is NOT ' +
+  'closed' +
+  (retractFailed
+    ? `; withdrawing them failed (${retractFailed}), so a stale receipt or marker may remain`
+    : '') +
+  '. Fix the directory and re-run the same close: the close signal is still open, so no ' +
+  'fresh close phrase is needed.';
 
 // The commit a session's OLD close receipt certified, when that commit is no
 // longer an ancestor of HEAD (a `git reset --hard` or rebase dropped it).
@@ -655,7 +1077,8 @@ function priorReceiptCommitRewritten(hypoDir, sessionId) {
 // checkpointMode (the git axis narrowed), is green. A failed gate exits 1 with no
 // marker — the next Stop hook re-blocks.
 
-export function runMarkSessionClosed(args) {
+// `testHooks` is test-only, see settleCloseResolution.
+export function runMarkSessionClosed(args, testHooks = null) {
   if (!args.sessionId) {
     const msg = '--session-id=<id> is required with --mark-session-closed';
     console.log(args.json ? JSON.stringify({ ok: false, error: msg }, null, 2) : `✗ ${msg}`);
@@ -759,7 +1182,7 @@ export function runMarkSessionClosed(args) {
     );
     process.exit(1);
   }
-  const invalidated = invalidateCloseArtifacts(args.hypoDir, args.sessionId);
+  const invalidated = invalidatePriorCloseArtifacts(args.hypoDir, args.sessionId);
   if (!invalidated.ok) {
     const msg =
       `--mark-session-closed refused before the gate ran: could not invalidate this session's ` +
@@ -772,6 +1195,20 @@ export function runMarkSessionClosed(args) {
     );
     process.exit(1);
   }
+  // Whether a close signal is open now and where the last one was resolved: the
+  // two facts that pick which close id proves this session (sessionProofCloseId),
+  // for the gate's cwd check below and for the proof this mark certifies. Read
+  // once. With no transcript there is no open signal to find.
+  const closeGate = closeGateStatus({
+    transcriptPath: closeTranscript ?? null,
+    hypoDir: args.hypoDir,
+    sessionId: args.sessionId,
+  });
+  // Test-only seam: runs right after the one gate read, so a test can type into
+  // the transcript where the old second read (the user-close check below) sat.
+  testHooks?.afterCloseGateRead?.();
+  const closeOpen = closeGate.ok;
+  const resolvedAtIndex = closeGate.resolvedAtIndex;
   const gate = precompactGateStatus(args.hypoDir, {
     ...(args.project && !args.logOnly ? { closeScope: [args.project] } : {}),
     ...(closeTranscript ? { transcriptPath: closeTranscript } : {}),
@@ -785,6 +1222,8 @@ export function runMarkSessionClosed(args) {
     // site's identical comment).
     checkpointMode: true,
     sessionId: args.sessionId,
+    closeOpen,
+    resolvedAtIndex,
   });
   const status = gate.close;
   if (!gate.ok) {
@@ -817,18 +1256,11 @@ export function runMarkSessionClosed(args) {
   // branch, which left the success path with no way to see a hostTagWarning at
   // all: a close that survived a pasted host tag wrote its marker, unblocked
   // the Stop chain, and said nothing, on the one entry point a model reaches
-  // after closing by hand. Hoisting changes no gate decision: the decision
-  // below still reads the raw `isCloseGateOpen` boolean per this file's
-  // "runMarkSessionClosed stays on isCloseGateOpen" contract, and this result
-  // is only ever read for its two strings. `null` when there is no transcript
-  // to read either from.
-  const gateStatus = closeTranscript
-    ? closeGateStatus({
-        transcriptPath: closeTranscript,
-        hypoDir: args.hypoDir,
-        sessionId: args.sessionId,
-      })
-    : null;
+  // after closing by hand. The decision below reads this result's raw `open`
+  // (the same walkCloseGate boolean isCloseGateOpen returns, per this file's
+  // "runMarkSessionClosed stays on the raw open" contract), never its
+  // resolution-aware `ok`. `null` when there is no transcript to read either from.
+  const gateStatus = closeTranscript ? closeGate : null;
   // This path writes one thing, the marker, and makes no commit, so the undo
   // it offers is the marker alone. A revert instruction here would point at
   // something this run never created. No 5th argument: kind 'marker-only'
@@ -842,7 +1274,11 @@ export function runMarkSessionClosed(args) {
     args.hypoDir,
     args.sessionId,
   );
-  if (!closeTranscript || !isCloseGateOpen(closeTranscript)) {
+  // Reads `closeGate.open` (walkCloseGate's raw verdict, as isCloseGateOpen
+  // returns) and not a second transcript read: the bound settleCloseResolution
+  // stamps comes from this same read, so a phrase typed after it cannot
+  // authorize this mark and stays a new request.
+  if (!closeTranscript || !closeGate.open) {
     const reason = !closeTranscript
       ? `cannot resolve a transcript for session ${args.sessionId} — the session-closed marker requires a verifiable user close signal`
       : "no user close signal in this session's transcript — marker refused (the user did not signal session close)";
@@ -931,11 +1367,26 @@ export function runMarkSessionClosed(args) {
   // exit 1 as every other refusal here (the apply path maps the same timeout
   // to commit-failed). Any other throw is a real fault and still propagates.
   let receiptResult;
+  // What the proof saw but did not gate on (a close with no log lines under its date).
+  let proofNotices = [];
   try {
     receiptResult = withFileLock(vaultCommitLockTarget(args.hypoDir), () => {
-      const proof = buildMarkCloseProof(args.hypoDir, markerProjects, args.logOnly);
+      const closeIdOf = (project) =>
+        sessionProofCloseId(args.hypoDir, args.sessionId, { closeOpen, resolvedAtIndex, project });
+      const proof = buildMarkCloseProof(args.hypoDir, markerProjects, args.logOnly, { closeIdOf });
+      proofNotices = proof.notices;
       if (!proof.ok)
-        return { ok: false, reason: 'incomplete', incompleteProjects: proof.incompleteProjects };
+        return {
+          ok: false,
+          reason: 'incomplete',
+          incompleteProjects: proof.incompleteProjects,
+          // A new close request with no entry yet: the earlier close cannot vouch for it.
+          ...(!args.logOnly &&
+          closeOpen &&
+          sessionProofCloseId(args.hypoDir, args.sessionId, { closeOpen, resolvedAtIndex }) === null
+            ? { awaitingApply: true }
+            : {}),
+        };
       const head = readHeadShaLocked(args.hypoDir);
       const repo = head ? repoIdentity(args.hypoDir) : null;
       if (!head || !repo) return { ok: false, reason: 'no-commit-identity' };
@@ -956,22 +1407,59 @@ export function runMarkSessionClosed(args) {
         skipped: gate.skipped || { lint: false, feedback: false },
         createdAt: new Date().toISOString(),
       };
-      const landed = landReceiptThenMarker(args.hypoDir, args.sessionId, receipt, () =>
-        writeSessionClosedMarker(args.hypoDir, args.sessionId, {
-          project: markerProject,
-          projects: args.logOnly ? [] : markerProjects,
-          ...(args.logOnly ? { scope: 'log-only' } : {}),
-          verifiedScope,
-          // Same residual the console line below reports, kept in the marker so a
-          // reader auditing this close later sees the same thing the operator saw
-          // at the time. The apply path stamps its own marker the same way.
-          ...(hostTagWarning ? { hostTagWarning } : {}),
-          // Names the receipt this marker projects. See writeSessionClosedMarker's
-          // own doc comment for what a new Stop does with this field.
-          receiptGeneration: generation,
-        }),
+      const landed = landReceiptThenMarker(
+        args.hypoDir,
+        args.sessionId,
+        receipt,
+        () =>
+          writeSessionClosedMarker(args.hypoDir, args.sessionId, {
+            project: markerProject,
+            projects: args.logOnly ? [] : markerProjects,
+            ...(args.logOnly ? { scope: 'log-only' } : {}),
+            verifiedScope,
+            // Same residual the console line below reports, kept in the marker so a
+            // reader auditing this close later sees the same thing the operator saw
+            // at the time. The apply path stamps its own marker the same way.
+            ...(hostTagWarning ? { hostTagWarning } : {}),
+            // Names the receipt this marker projects. See writeSessionClosedMarker's
+            // own doc comment for what a new Stop does with this field.
+            receiptGeneration: generation,
+          }),
+        {
+          // Runs under the same session lock as the receipt and marker above.
+          afterLanded: () => {
+            // A log-only mark proves no project close, so it spends no close signal and
+            // leaves the pin alone: a pending close of this session keeps its id.
+            if (args.logOnly) return { ok: true };
+            // A stored resolution this transcript no longer verifies (rewritten, shortened,
+            // an implausible count) is left exactly as it is: any record settle wrote would
+            // either lower it or stamp a bound the mark never read. The receipt and marker
+            // stay, and the result says so.
+            if (closeGate.reason?.startsWith(CLOSE_GATE_UNVERIFIABLE_PREFIX))
+              return { ok: true, leftUnverifiable: true };
+            // Same rule as the apply marker phase: a close whose signal cannot be
+            // spent is not finished (settleCloseResolution).
+            return settleCloseResolution(
+              args.hypoDir,
+              args.sessionId,
+              closeTranscript,
+              { openedAtIndex: closeGate.openedAtIndex, resolvedAtIndex },
+              testHooks,
+            );
+          },
+        },
       );
-      if (landed.ok) return { ok: true };
+      if (landed.ok) {
+        const settled = landed.afterLanded;
+        if (settled.ok)
+          return settled.leftUnverifiable ? { ok: true, leftUnverifiable: true } : { ok: true };
+        return {
+          ok: false,
+          reason: 'close-resolution-failed',
+          ...(settled.retractFailed ? { retractFailed: settled.retractFailed } : {}),
+        };
+      }
+      if (landed.reason === 'session-close-lock-timeout') return landed;
       return landed.reason === 'receipt-write-failed'
         ? {
             ok: false,
@@ -992,7 +1480,9 @@ export function runMarkSessionClosed(args) {
   if (!receiptResult.ok) {
     const detail =
       receiptResult.reason === 'incomplete'
-        ? `incomplete for project(s): ${receiptResult.incompleteProjects.join(', ')} (session-state.md, hot.md, the session-log evidence file, and log.md must all be committed, not merely present)`
+        ? receiptResult.awaitingApply
+          ? `incomplete for project(s): ${receiptResult.incompleteProjects.join(', ')}. ${CLOSE_AWAITING_APPLY}`
+          : `incomplete for project(s): ${receiptResult.incompleteProjects.join(', ')} (this session's own close entry must be committed, not merely present)`
         : receiptResult.reason === 'mismatch'
           ? `proof mismatch: ${JSON.stringify(receiptResult.mismatches)}`
           : receiptResult.reason === 'write-failed'
@@ -1002,7 +1492,9 @@ export function runMarkSessionClosed(args) {
                 : '')
             : receiptResult.reason === 'vault-commit-lock-timeout'
               ? 'another close or commit held the vault-commit lock past the timeout; re-run shortly'
-              : 'no commit identity (not a git repository, or no commit exists yet)';
+              : receiptResult.reason === 'session-close-lock-timeout'
+                ? 'another close of this session held its close lock past the timeout; re-run shortly'
+                : 'no commit identity (not a git repository, or no commit exists yet)';
     // A marker that did not land after a certified receipt keeps its own
     // wording: it is a disk problem under .cache/, not a proof problem, and the
     // receipt filed for it has already been withdrawn.
@@ -1013,7 +1505,9 @@ export function runMarkSessionClosed(args) {
           (receiptResult.retractFailed
             ? `, but withdrawing it failed (${receiptResult.retractFailed}), so a stale receipt may remain`
             : '')
-        : `session-close checkpoint could not be certified, marker not written (${detail})`;
+        : receiptResult.reason === 'close-resolution-failed'
+          ? CLOSE_RESOLUTION_FAILED_HELP(receiptResult.retractFailed)
+          : `session-close checkpoint could not be certified, marker not written (${detail})`;
     console.log(
       args.json
         ? JSON.stringify(
@@ -1031,7 +1525,7 @@ export function runMarkSessionClosed(args) {
     project: markerProject,
     scope: args.logOnly ? 'log-only' : 'project',
     date: status.dates[0],
-    notices: gate.notices,
+    notices: [...gate.notices, ...proofNotices],
     // The close-time residual, on the success path this entry point owns.
     // Present exactly when closeGateStatus named a neutralized host tag, and
     // carrying the marker-only undo (no commit exists on this path).
@@ -1041,6 +1535,11 @@ export function runMarkSessionClosed(args) {
     // hook self-heals the projection (feedback-sync --write) at /compact. Surface
     // the deferral so the caller knows MEMORY/CLAUDE sync is pending, not lost.
     drift_deferred: gate.driftTargets,
+    // Present only when the stored close resolution could not be verified against
+    // this transcript and the mark left it alone.
+    ...(receiptResult.leftUnverifiable
+      ? { resolution: 'left-unverifiable', resolution_note: LEFT_UNVERIFIABLE_NOTE }
+      : {}),
   };
   if (args.json) {
     console.log(JSON.stringify(result, null, 2));
@@ -1059,6 +1558,8 @@ export function runMarkSessionClosed(args) {
     // prints the same string next to its own commit; both read one value
     // computed once per run, so neither repeats on a later gate read.
     if (hostTagWarning) console.log(`\n⚠ ${hostTagWarning}`);
+    if (receiptResult.leftUnverifiable) console.log(`  · ${LEFT_UNVERIFIABLE_NOTE}`);
+    for (const n of proofNotices) console.log(`  · ${n.reason}`);
   }
   process.exit(0);
 }
@@ -1126,13 +1627,12 @@ export function closeResultContradiction({ ok, markerWritten, markerSkipReason }
 
 // A withheld marker with a legitimate reason is not, by itself, a
 // reason to fail the apply. Most of planMarkerDecision's skip branches
-// (compact-gate-not-ok, no-user-close-signal, transcript-unresolved,
-// commit-failed) name a condition THIS SAME SESSION can clear and retry,
-// see the "a marker withheld by a real vault-commit failure leaves the close
-// signal unspent for a retry" test, whose whole point is that ok stays true
-// there and the close signal is not burned. Forcing ok:false on every one of
-// those would resurrect that exact regression's failure mode from the other
-// direction.
+// (compact-gate-not-ok, no-user-close-signal, transcript-unresolved)
+// name a condition THIS SAME SESSION can clear and retry; ok stays true and
+// the close signal is not burned. Forcing ok:false on every one of those
+// would resurrect that regression's failure mode from the other direction.
+// A commit failure is not on this list: it is ok:false with stage
+// 'commit-failed', and its retry is authorized by the same unspent signal.
 //
 // 'marker-did-not-land' is not one of those. runMarkerPhase only reaches it
 // after `planMarkerDecision` has already returned `write: true`, meaning the
@@ -1154,7 +1654,9 @@ export function markerWriteGenuinelyFailed({ markerWritten, markerSkipReason }) 
     markerWritten !== true &&
     (markerSkipReason === 'marker-did-not-land' ||
       markerSkipReason === 'receipt-proof-mismatch' ||
-      markerSkipReason === 'receipt-write-failed')
+      markerSkipReason === 'receipt-write-failed' ||
+      markerSkipReason === 'session-close-lock-timeout' ||
+      markerSkipReason === 'close-resolution-failed')
   );
 }
 
@@ -1240,8 +1742,121 @@ function verifyCloseAuthority(sessionId, hypoDir) {
   }
   return {
     ok: true,
+    openedAtIndex: gateStatus.openedAtIndex,
+    resolvedAtIndex: gateStatus.resolvedAtIndex,
     ...(gateStatus.hostTagWarning ? { hostTagWarning: gateStatus.hostTagWarning } : {}),
   };
+}
+
+// Pin the close id this request writes under, right after authority passes.
+// A retry of the same request finds `pending` and reuses its id even when the
+// user typed the close phrase again (`openedAtIndex` moved). A `pending` that
+// the recorded resolution already covers is retired first, so a close that
+// crashed between its resolution record and the pin move cannot hand its id to
+// the next request. Throws when the pin cannot be written.
+function pinCloseId(hypoDir, sessionId, { openedAtIndex, resolvedAtIndex }) {
+  const stored = readClosePin(hypoDir, sessionId);
+  let pin = normalizeClosePin(stored, resolvedAtIndex);
+  if (!pin.pending) {
+    pin = {
+      ...pin,
+      pending: {
+        closeId: closeIdFor(sessionId, openedAtIndex),
+        openedAtIndex,
+        entryRelPath: null,
+        entrySha256s: [],
+      },
+    };
+  }
+  if (pin !== stored) writeClosePin(hypoDir, sessionId, pin);
+  return pin.pending.closeId;
+}
+
+// Spend the close signal once the receipt and marker of this session's close
+// have landed: record the close-gate resolution, then retire the pin's
+// `pending`. A resolution that cannot be recorded (an unreadable transcript, a
+// failed write under .cache/close-gate) takes the receipt and marker back, and
+// the close fails with `close-resolution-failed`. The pin keeps `pending`, the
+// signal stays open, so a retry runs under the same id and adopts the entry this
+// close committed. Shared by the apply marker phase and a project
+// `--mark-session-closed` (a `--log-only` mark spends nothing).
+// The resolution covers the records up to the signal THIS close was authorized
+// by, never the whole transcript as it reads now: a close request typed between
+// the gate check and this record would otherwise be marked resolved unseen, and
+// the next apply would refuse it as `no-new-open-since-resolution`.
+// `openedAtIndex` is the 0-based position of that signal, read by the caller's
+// own gate check (both callers hold one: verifyCloseAuthority, or the mark's
+// closeGateStatus read), so the bound is the record COUNT `openedAtIndex + 1`
+// that `resolutionStamp` takes. It is the gate's signal and not the pin's
+// `pending.openedAtIndex` on purpose: a retry reuses `pending` from the first
+// request while the user's retyped phrase (the signal that authorized this retry)
+// sits later, and bounding at the first request would leave that phrase open
+// after the close it asked for. `resolvedAtIndex` (an earlier recorded
+// resolution, or null) keeps a re-mark of an already resolved close from
+// lowering the record. A position that is not a non-negative integer, or a
+// transcript that now holds fewer records than the bound (shrunk or rewritten),
+// records nothing and fails the close like an unwritable record. It never falls
+// back to stamping the whole transcript, which is the race this closes.
+// `resolvedAtIndex` is null whenever the stored record's prefix hash no longer
+// matches the transcript. A mark skips settle for such a record (see
+// CLOSE_GATE_UNVERIFIABLE_PREFIX), so a rewritten transcript never gets a smaller
+// count recorded over it.
+// `testHooks.beforeResolution` and `testHooks.afterResolutionBeforePin` are test-only.
+// @returns {{ok: true} | {ok: false, retractFailed?: string}}
+function settleCloseResolution(
+  hypoDir,
+  sessionId,
+  transcriptPath,
+  { openedAtIndex, resolvedAtIndex = null },
+  testHooks = null,
+) {
+  let landed = false;
+  try {
+    // Outside the bound check so a test can append a record in this very gap.
+    testHooks?.beforeResolution?.();
+    if (Number.isSafeInteger(openedAtIndex) && openedAtIndex >= 0) {
+      const bound = Math.max(openedAtIndex + 1, resolvedAtIndex ?? 0);
+      const stamp = resolutionStamp(readFileSync(transcriptPath), bound);
+      if (stamp?.index === bound) landed = recordGateClosed(hypoDir, sessionId, stamp);
+    }
+  } catch {
+    // an unreadable transcript records nothing, same as a failed write
+  }
+  if (!landed) {
+    const retracted = invalidateCloseArtifacts(hypoDir, sessionId);
+    return retracted.ok ? { ok: false } : { ok: false, retractFailed: retracted.reason };
+  }
+  // Outside the try above so a test seam can throw here.
+  testHooks?.afterResolutionBeforePin?.();
+  resolveClosePin(hypoDir, sessionId);
+  return { ok: true };
+}
+
+// The close resolved (receipt and marker landed, gate resolution recorded):
+// move `pending` to `lastResolved` and to its project's slot in
+// `resolvedByProject` (retireClosePending). Best-effort on purpose. A failure here
+// leaves `pending` standing, and `normalizeClosePin` retires it on the next
+// read because the resolution record already covers it.
+function resolveClosePin(hypoDir, sessionId) {
+  try {
+    const pin = readClosePin(hypoDir, sessionId);
+    if (pin.pending) writeClosePin(hypoDir, sessionId, retireClosePending(pin));
+  } catch {
+    // see above
+  }
+}
+
+// The bytes ensureProjectIndex seeds for `project` on `today`, null when the
+// template is missing.
+function projectIndexSeed(project, today) {
+  const src = join(TEMPLATE_DIR, 'index.md');
+  if (!existsSync(src)) return null;
+  return substituteTokens(readFileSync(src, 'utf-8'), {
+    name: project,
+    started: today,
+    workingDir: '',
+    today,
+  });
 }
 
 // A-1 (project index lifecycle): seed projects/<project>/index.md from the
@@ -1292,14 +1907,8 @@ function verifyCloseAuthority(sessionId, hypoDir) {
 // guard makes the call a no-op.
 export function ensureProjectIndex(hypoDir, project, relPath, today, sessionId) {
   const dest = join(hypoDir, relPath);
-  const src = join(TEMPLATE_DIR, 'index.md');
-  if (!existsSync(src)) return null; // template missing — nothing to scaffold from
-  const content = substituteTokens(readFileSync(src, 'utf-8'), {
-    name: project,
-    started: today,
-    workingDir: '',
-    today,
-  });
+  const content = projectIndexSeed(project, today);
+  if (content === null) return null; // template missing: nothing to scaffold from
   mkdirSync(dirname(dest), { recursive: true });
   let fd;
   try {
@@ -1380,6 +1989,20 @@ function refuseUnlessCloseRequested(args) {
     );
     process.exit(1);
   }
+  let closeId = null;
+  if (args.payload && args.sessionId) {
+    try {
+      closeId = pinCloseId(args.hypoDir, args.sessionId, closeAuth);
+    } catch (err) {
+      const msg =
+        `session-close apply refused before any wiki write or commit: could not pin this ` +
+        `close request's id (${err?.message || err}). Fix the underlying problem (usually a ` +
+        `permission or disk issue under .cache/) and retry; nothing was written.`;
+      const out = { ok: false, stage: 'close-pin', error: msg, applied: [], committed: null };
+      console.log(args.json ? JSON.stringify(out, null, 2) : `✗ ${msg}`);
+      process.exit(1);
+    }
+  }
   // Invalidate this session's prior close receipt and compat marker the
   // moment a NEW close is authorized, before payload validation or preflight,
   // not later at writeCloseIntent. A close authorized now that later fails preflight must not leave a stale
@@ -1388,7 +2011,7 @@ function refuseUnlessCloseRequested(args) {
   // or not this particular attempt goes on to succeed. `--mark-session-closed`
   // invalidates at its own gate call instead (no payload/preflight to race).
   if (args.payload && args.sessionId) {
-    const invalidated = invalidateCloseArtifacts(args.hypoDir, args.sessionId);
+    const invalidated = invalidatePriorCloseArtifacts(args.hypoDir, args.sessionId);
     if (!invalidated.ok) {
       const msg =
         `session-close apply refused before any wiki write or commit: could not invalidate ` +
@@ -1405,11 +2028,25 @@ function refuseUnlessCloseRequested(args) {
       process.exit(1);
     }
   }
-  return closeAuth.hostTagWarning || null;
+  return {
+    hostTagWarning: closeAuth.hostTagWarning || null,
+    closeId,
+    // The authority check's own closeGateStatus read: a signal is open (it
+    // passed), and where the last one was resolved. Nothing records a
+    // resolution before this close's marker lands, so both still hold at the
+    // marker phase's gate.
+    closeOpen: closeAuth.ok === true,
+    resolvedAtIndex: closeAuth.resolvedAtIndex ?? null,
+    // The position of the signal that authorized this apply: the bound its
+    // gate resolution is recorded at (settleCloseResolution). -1 (no position)
+    // fails that record closed.
+    openedAtIndex: closeAuth.openedAtIndex ?? -1,
+  };
 }
 
 // Read the payload, check its shape, and bind it to THIS session. Exits 1 on any
-// of the three failures; returns the parsed payload otherwise.
+// of the three failures; returns `{payload, legacyFormat}` otherwise (an old-format
+// payload already converted, see `absorbLegacyPayload`).
 function loadValidatedPayload(args) {
   let payload;
   try {
@@ -1470,7 +2107,7 @@ function loadValidatedPayload(args) {
     process.exit(1);
   }
 
-  return payload;
+  return absorbLegacyPayload(payload);
 }
 
 // Resolve project: payload.project is REQUIRED (B-3, close-gate-hardening). The
@@ -1484,7 +2121,7 @@ function loadValidatedPayload(args) {
 //                    never reaches a path builder (traversal guard — order is
 //                    the guard). isValidProjectName is SHARED with createProject
 //                    so apply accepts exactly the namespace the repo can
-//                    scaffold (A-Za-z0-9._-, single segment) — no narrower.
+//                    scaffold (Unicode letters/marks/numbers plus ._-, single segment) — no narrower.
 //   - non-existent → projects/<slug>/ absent; abort rather than create.
 // A payload.project that merely DIFFERS from the inferred active project is NOT an
 // error — it is surfaced as a stderr note below and the close proceeds.
@@ -1495,27 +2132,32 @@ function resolveCloseProject(args, payload) {
     process.exit(1);
   }
   if (!isValidProjectName(payload.project)) {
-    const msg = `payload.project ${JSON.stringify(payload.project)} is not a valid project name (single segment, charset A-Za-z0-9._-, ≥1 alnum, not "."/"..")`;
+    const msg = `payload.project ${JSON.stringify(payload.project)} is not a valid project name (single segment of letters, marks, numbers, ".", "_" or "-" with at least one letter or number, not "."/"..")`;
     console.log(args.json ? JSON.stringify({ ok: false, error: msg }, null, 2) : `✗ ${msg}`);
     process.exit(1);
   }
   // existsSync alone is not enough: a regular FILE at projects/<slug> would pass,
   // then apply would build child paths under it and fail with an unstructured
   // filesystem error (codex re-review). Require it to be a directory.
-  const projectDir = join(args.hypoDir, 'projects', payload.project);
-  if (!existsSync(projectDir) || !statSync(projectDir).isDirectory()) {
-    const msg = `payload.project "${payload.project}" does not exist as a directory (no projects/${payload.project}/ directory)`;
+  // Looked up in NFC, so a payload typed in NFD still finds an NFC directory; the name used from
+  // here on is the spelling the directory has on disk.
+  const project = resolveProjectDirName(args.hypoDir, payload.project);
+  if (project === null) {
+    const decomposed = nonNfcProjectDir(args.hypoDir, payload.project);
+    const msg =
+      decomposed !== null
+        ? `payload.project "${payload.project}": ${nonNfcProjectMessage(decomposed)}`
+        : `payload.project "${payload.project}" does not exist as a directory (no projects/${payload.project}/ directory)`;
     console.log(args.json ? JSON.stringify({ ok: false, error: msg }, null, 2) : `✗ ${msg}`);
     process.exit(1);
   }
-  const project = payload.project;
   // probe (the recency-inferred active project) is now consulted ONLY to surface a
   // divergence note — never to resolve the target. Computed AFTER validation so a
   // malformed/missing payload.project fails fast without a pointer-table read.
   // Resolved BEFORE preflight because preflight needs overwrite-target paths
   // (which require the project slug) to filter out errors in files this apply
   // is about to replace — see the filter rationale below.
-  const probe = sessionCloseFileStatus(args.hypoDir);
+  const probe = sessionCloseFileStatus(args.hypoDir, { scope: 'global' });
   // The freshness verification below (and at the post-apply check) already honors
   // payload.project — `project` wins over the inferred active project, and the
   // post-apply sessionCloseFileStatus call passes it as projectOverride. But when the
@@ -1523,10 +2165,10 @@ function resolveCloseProject(args, payload) {
   // (probe.project), that divergence used to be silent, so an operator couldn't tell
   // which project the close actually verified. Surface it on stderr (the stdout JSON
   // contract is untouched) so the verified/closed project is always explicit.
-  if (probe.project && probe.project !== payload.project) {
+  if (probe.project && probe.project !== project) {
     process.stderr.write(
       `note: payload.project="${payload.project}" differs from the inferred active ` +
-        `project "${probe.project}"; verifying and closing "${payload.project}".\n`,
+        `project "${probe.project}"; verifying and closing "${project}".\n`,
     );
   }
   return project;
@@ -1539,12 +2181,19 @@ function resolveCloseProject(args, payload) {
 // here as a format mismatch — not written and then misdiagnosed downstream as
 // "stale" (the "not updated" vs "format mismatch" conflation). All checks
 // exit 1 with stage='pre-apply-verification' and leave the tree untouched.
-function assertPayloadFreshnessContract(args, payload, project, date) {
+// `publishedEntry` is set when `date` is not the payload's own date but the
+// date this close's entry was already published with; the refusal then says so.
+function assertPayloadFreshnessContract(args, payload, project, date, publishedEntry = null) {
+  const why = publishedEntry
+    ? `This close's session entry was already published dated ${date} (${publishedEntry}), ` +
+      `so its logs go under ${date} too, whatever payload.date says. `
+    : '';
   const failPreApply = (msg) => {
+    const error = why + msg;
     console.log(
       args.json
-        ? JSON.stringify({ ok: false, stage: 'pre-apply-verification', error: msg }, null, 2)
-        : `✗ ${msg}`,
+        ? JSON.stringify({ ok: false, stage: 'pre-apply-verification', error }, null, 2)
+        : `✗ ${error}`,
     );
     process.exit(1);
   };
@@ -1579,6 +2228,464 @@ function assertPayloadFreshnessContract(args, payload, project, date) {
   }
 }
 
+// ── original session entry ──────────────────────────────────────────────────
+// A close writes ONE immutable file per close request,
+// `projects/<p>/sessions/<date>-<close_id>.md`. Nothing else of the project's
+// state is overwritten, so two sessions closing the same project never contend
+// for a file. The status views are generated from these entries on read.
+
+// A refusal that fires before this close has written anything the retry would
+// have to undo: same shape as the other early refusals (`committed: null`).
+function failEntry(args, stage, error) {
+  const out = { ok: false, stage, error, applied: [], committed: null };
+  console.log(args.json ? JSON.stringify(out, null, 2) : `✗ ${error}`);
+  process.exit(1);
+}
+
+// The vault-relative path this close's entry lives at. The close id is fixed by
+// the pin, so a file that already carries it (written on another date, the retry
+// crossing midnight) IS this close's entry: reuse its path and date. Else the
+// path the pin recorded, else a fresh one for `date`.
+//
+// One close request writes one entry in one project. A retry whose payload names
+// another project than the one this close already published in (or recorded the
+// intent to) is refused with `entry-project-mismatch` before any write: taking the
+// recorded path would put this project's summary into the first project's file.
+function listProjectsOrFail(args) {
+  try {
+    return listSessionProjects(args.hypoDir);
+  } catch (err) {
+    return failEntry(
+      args,
+      'projects-unreadable',
+      `cannot list ${join(args.hypoDir, 'projects')} (${err?.message || err}); nothing was written.`,
+    );
+  }
+}
+
+function entryPathFor(args, project, closeId, date, pin) {
+  const found = entryPathOfClose(args.hypoDir, project, closeId);
+  const pinned = pin.pending?.closeId === closeId ? pin.pending.entryRelPath : null;
+  if (!found) {
+    const elsewhere =
+      pinned && !pinned.split('\\').join('/').startsWith(`projects/${project}/sessions/`)
+        ? pinned
+        : listProjectsOrFail(args)
+            .filter((p) => p !== project)
+            .map((p) => entryPathOfClose(args.hypoDir, p, closeId))
+            .find(Boolean);
+    if (elsewhere) {
+      const first = elsewhere.split(/[\\/]/)[1];
+      failEntry(
+        args,
+        'entry-project-mismatch',
+        `this close request already has its session entry in project "${first}" ` +
+          `(${elsewhere}), and this payload names project "${project}". One close request ` +
+          `writes one entry in one project. Re-run with "project": "${first}" to finish ` +
+          `that close; nothing was written.`,
+      );
+    }
+  }
+  const rel =
+    found || pinned || join('projects', project, 'sessions', entryFileName(date, closeId));
+  return { relPath: rel, date: rel.match(/(\d{4}-\d{2}-\d{2})-[^/\\]*$/)[1] };
+}
+
+// HEAD's bytes of `relPath`, `null` when HEAD has none (or git cannot say).
+function headBlobText(hypoDir, relPath) {
+  const r = spawnSync('git', ['-C', hypoDir, 'show', revPathArg('HEAD', relPath)], {
+    encoding: 'utf-8',
+    maxBuffer: 64 * 1024 * 1024,
+  });
+  return r.status === 0 ? r.stdout : null;
+}
+
+/**
+ * What to do when the entry path already holds bytes. `text` is what this
+ * attempt would write, `disk` what is there (`undefined`: unreadable), `pin` the
+ * close-pin. The path carries this close's fixed id, so these bytes are this
+ * close's own work or a foreign write; the question is which.
+ *   identical  same bytes: nothing to write
+ *   adopt      committed by this close already (HEAD blob, or for a
+ *              `.hypoignore` project the recorded local proof): keep it, even
+ *              though this attempt's payload would have written other bytes
+ *   replace    uncommitted and recognizably ours: the pin lists the bytes'
+ *              hash for this id and path, or the close journal does
+ *   conflict   anything else: leave the file alone. `reason: 'head-unreadable'`
+ *              when git could not say whether HEAD has the path: committed bytes
+ *              read as uncommitted would be replaced, so no answer is no replace
+ * Whether the path is committed is asked before whether the bytes equal `text`:
+ * a committed entry edited by hand into this attempt's payload is still an edit
+ * of committed bytes, and reading it as `identical` would commit the edit.
+ */
+export function classifyExistingEntry({
+  hypoDir,
+  sessionId,
+  closeId,
+  relPath,
+  text,
+  disk,
+  ignored,
+  pin,
+}) {
+  if (disk === undefined) return { action: 'conflict', reason: 'unreadable' };
+  const same = disk === text;
+  const diskHash = bytesSha256(disk);
+  const journalHit = readJournal(hypoDir, sessionId)[relPath] === diskHash;
+  const pending = pin.pending;
+  const pinHit =
+    !!pending &&
+    pending.closeId === closeId &&
+    pending.entryRelPath === relPath &&
+    pending.entrySha256s.includes(diskHash);
+  if (ignored) {
+    // Never in HEAD. The proof outlives the commit step, the journal does not:
+    // a journal that still names the bytes means the commit step has not run
+    // yet, so the payload can still be corrected.
+    const proof = pin.localProofs[closeId];
+    const proven = !!proof && proof.entryRelPath === relPath;
+    if (proven && proof.entrySha256 === diskHash) {
+      return { action: same ? 'identical' : journalHit ? 'replace' : 'adopt' };
+    }
+    if (pinHit || journalHit) return { action: same ? 'identical' : 'replace' };
+    // A proven entry whose bytes moved with no record of ours is the local
+    // counterpart of a committed entry edited by hand.
+    return same && !proven ? { action: 'identical' } : { action: 'conflict' };
+  }
+  const inHead = headPathState(hypoDir, relPath);
+  if (inHead === 'error') return { action: 'conflict', reason: 'head-unreadable' };
+  if (inHead === 'present') {
+    if (disk !== headBlobText(hypoDir, relPath)) return { action: 'conflict' };
+    return { action: same ? 'identical' : 'adopt' };
+  }
+  if (same) return { action: 'identical' };
+  return pinHit || journalHit ? { action: 'replace' } : { action: 'conflict' };
+}
+
+const ENTRY_CONFLICT_HELP = (relPath, reason) =>
+  reason === 'head-unreadable'
+    ? `git could not say whether ${relPath} is committed (reading HEAD failed), so this close ` +
+      `cannot tell its own uncommitted bytes from committed ones. Nothing was changed. Check ` +
+      `the repository (\`git status\`, \`git log -1\`) and retry once git answers.`
+    : `${relPath} holds bytes this close did not write (or has been edited since it was committed). ` +
+      `Nothing was changed. Look at the file and the vault history, then move or remove the ` +
+      `foreign bytes yourself and retry.`;
+
+/**
+ * Everything about this close's entry that can be decided before a byte is
+ * written: track checks, default and explicit `supersedes`, the entry bytes, and
+ * what is already at `entryPath` (from entryPathFor). Refuses (`track-duplicate`, `track-unknown`,
+ * `track-exists`, `supersedes-unknown`, `payload-reserved-marker`,
+ * `invalid-entry`, `entry-conflict`) with nothing written.
+ */
+function planSessionEntry(args, payload, project, entryPath, closeId, legacyFormat) {
+  const tracks = payload.tracks ?? [];
+  const seen = new Set();
+  for (const t of tracks) {
+    if (seen.has(t.id)) {
+      failEntry(
+        args,
+        'track-duplicate',
+        `payload.tracks names track "${t.id}" more than once. An update is addressed by ` +
+          `(track id, close id), so one close carries one update per track: merge them.`,
+      );
+    }
+    seen.add(t.id);
+  }
+  const model = loadSessionModel(args.hypoDir, project);
+  // This close's own earlier entry (a retry) must not make its tracks look registered.
+  const registered = new Set();
+  const updates = new Map();
+  for (const e of model.entries) {
+    if (e.closeId === closeId) continue;
+    for (const t of e.tracks) {
+      registered.add(t.id);
+      if (!updates.has(t.id)) updates.set(t.id, []);
+      updates.get(t.id).push(e.closeId);
+    }
+  }
+  const observed = readObservedHeads(args.hypoDir, args.sessionId, project);
+  const entryTracks = [];
+  const legacySplitRetired = [];
+  const bodies = {};
+  for (const t of tracks) {
+    const isNew = t.new === true || (legacyFormat && t.id === 'legacy' && !registered.has(t.id));
+    if (!registered.has(t.id) && !isNew) {
+      failEntry(
+        args,
+        'track-unknown',
+        `track "${t.id}" is not registered in ${project}. Registered tracks: ` +
+          `${[...registered].sort().join(', ') || '(none)'}. To start a new track send "new": true.`,
+      );
+    }
+    if (registered.has(t.id) && t.new === true) {
+      failEntry(
+        args,
+        'track-exists',
+        `track "${t.id}" already exists in ${project}: drop "new": true to update it. ` +
+          `Registered tracks: ${[...registered].sort().join(', ')}.`,
+      );
+    }
+    const existing = updates.get(t.id) ?? [];
+    const known = [
+      ...new Set([...(observed.full[t.id] ?? []), ...(observed.pointer[t.id] ?? [])]),
+    ].filter((id) => existing.includes(id));
+    let supersedes = known;
+    if (t.supersedes !== undefined) {
+      const explicit = [];
+      for (const prefix of t.supersedes) {
+        const r = resolveSupersedesPrefix(prefix, existing);
+        if (!r.ok) {
+          failEntry(
+            args,
+            'supersedes-unknown',
+            `supersedes "${prefix}" of track "${t.id}" is ${r.reason}: it must be a close id of ` +
+              `an update of that track, or a prefix of exactly one. Updates: ${existing.join(', ') || '(none)'}.`,
+          );
+        }
+        explicit.push(r.id);
+      }
+      supersedes = [...new Set(t.done === true ? [...explicit, ...known] : explicit)];
+    }
+    entryTracks.push({
+      id: t.id,
+      ...(t.title !== undefined ? { title: t.title } : {}),
+      ...(supersedes.length ? { supersedes } : {}),
+      ...(isNew ? { new: true } : {}),
+      ...(t.done === true ? { done: true } : {}),
+    });
+    if (typeof t.next === 'string') bodies[t.id] = t.next;
+    // The old payload form writes the whole new session-state into `legacy`, so it also retires the
+    // heads a migration split that state into (`legacy-*`). An update replaces only heads of its
+    // own track, so each one the session observed gets a bodyless `done` update that supersedes it.
+    // Left live, the split heads would sit beside a full copy of the same text.
+    if (legacyFormat && t.id === 'legacy') {
+      for (const [id, closeIds] of updates) {
+        if (!id.startsWith('legacy-') || seen.has(id)) continue;
+        const retired = [
+          ...new Set([...(observed.full[id] ?? []), ...(observed.pointer[id] ?? [])]),
+        ].filter((c) => closeIds.includes(c));
+        if (retired.length) legacySplitRetired.push({ id, supersedes: retired, done: true });
+      }
+    }
+  }
+  entryTracks.push(...legacySplitRetired);
+
+  const pin = readClosePin(args.hypoDir, args.sessionId);
+  const { relPath, date: entryDate } = entryPath;
+  // The write time orders this entry among the day's closes. A retry keeps the time its earlier
+  // attempt wrote, like it keeps the date, so the bytes of a retried close stay the same.
+  const earlier = readTarget(join(args.hypoDir, relPath));
+  const earlierEntry = typeof earlier === 'string' ? parseSessionEntry(earlier) : null;
+  const closedAt =
+    earlierEntry?.ok && earlierEntry.entry.closedAt
+      ? earlierEntry.entry.closedAt
+      : new Date().toISOString();
+  let text;
+  try {
+    text = formatSessionEntry({
+      project,
+      closeId,
+      sessionId: args.sessionId,
+      date: entryDate,
+      closedAt,
+      visibilityScope: projectEntryScope(args.hypoDir, project, model),
+      tracks: entryTracks,
+      summary: payload.summary,
+      bodies,
+    });
+  } catch (err) {
+    failEntry(
+      args,
+      err?.code === 'payload-reserved-marker' ? 'payload-reserved-marker' : 'invalid-entry',
+      err?.code === 'payload-reserved-marker'
+        ? `${err.message}. A summary or track body must not hold a line that is exactly an entry marker of this close.`
+        : `the entry could not be formatted: ${err?.message || err}`,
+    );
+  }
+  const ignored = isIgnored(
+    join(args.hypoDir, relPath),
+    args.hypoDir,
+    loadHypoIgnore(args.hypoDir),
+  );
+  const disk = readTarget(join(args.hypoDir, relPath));
+  let finalText = text;
+  if (disk !== null) {
+    const d = classifyExistingEntry({
+      hypoDir: args.hypoDir,
+      sessionId: args.sessionId,
+      closeId,
+      relPath,
+      text,
+      disk,
+      ignored,
+      pin,
+    });
+    if (d.action === 'conflict') {
+      failEntry(args, 'entry-conflict', ENTRY_CONFLICT_HELP(relPath, d.reason));
+    }
+    if (d.action === 'adopt') finalText = disk;
+  }
+  const heads = Object.fromEntries(entryTracks.map((t) => [t.id, [closeId]]));
+  return { relPath, text, finalText, closeId, project, ignored, heads };
+}
+
+// Close-pin write that must land before the entry is published or replaced:
+// `pending.entrySha256s` gains the bytes' hash, so a retry after a crash
+// anywhere past this point can recognize what is on disk as its own.
+function recordPublishIntent(hypoDir, sessionId, closeId, relPath, sha) {
+  const pin = readClosePin(hypoDir, sessionId);
+  const pending = pin.pending;
+  if (!pending || pending.closeId !== closeId) {
+    throw new Error(`the close pin no longer holds close ${closeId}`);
+  }
+  if (pending.entryRelPath === relPath && pending.entrySha256s.includes(sha)) return;
+  writeClosePin(hypoDir, sessionId, {
+    ...pin,
+    pending: {
+      ...pending,
+      entryRelPath: relPath,
+      entrySha256s: pending.entrySha256s.includes(sha)
+        ? pending.entrySha256s
+        : [...pending.entrySha256s, sha],
+    },
+  });
+}
+
+// Publish a new file without ever replacing one: link, then drop the temp name.
+// An existing destination is EEXIST.
+function publishNewEntry(abs, text) {
+  const tmp = `${abs}.${process.pid}.${randomBytes(4).toString('hex')}.tmp`;
+  writeFileSync(tmp, text, { flag: 'wx' });
+  try {
+    linkSync(tmp, abs);
+  } finally {
+    try {
+      unlinkSync(tmp);
+    } catch {
+      // best-effort: a leftover temp name is ignored by `.gitignore` only in a
+      // vault migrated to session entries (its block carries `/projects/*/sessions/*.tmp`)
+    }
+  }
+}
+
+const ENTRY_NOT_REFLECTED_NOTICE = (relPath) =>
+  `이미 기록된 원본이 있어 이번 payload의 요약은 반영되지 않았습니다 (${relPath}). ` +
+  `바꾸고 싶은 내용은 다음 close의 요약에 옮기세요.`;
+
+// Write (publish, replace, or adopt) this close's entry and record everything the
+// retry, the commit and the next close lean on. `testHooks` seams, all test-only:
+// `beforePublish`, `afterPublish` (link done, journal not yet), `afterPinBeforeReplace`.
+function writeSessionEntry(args, plan, acc, testHooks) {
+  const { applied, skipped, appliedPaths, proofEntries, notices } = acc;
+  const { relPath, text, closeId, project, ignored } = plan;
+  const abs = join(args.hypoDir, relPath);
+  const pinFail = (what, err) =>
+    failEntry(
+      args,
+      'close-pin',
+      `could not ${what} in .cache/close-pin (${err?.message || err}). Fix the underlying ` +
+        `problem (usually a permission or disk issue under .cache/) and retry with the same payload.`,
+    );
+  mkdirSync(dirname(abs), { recursive: true });
+  let outcome;
+  for (let attempt = 0; ; attempt++) {
+    const disk = readTarget(abs);
+    if (disk === null) {
+      try {
+        recordPublishIntent(args.hypoDir, args.sessionId, closeId, relPath, bytesSha256(text));
+      } catch (err) {
+        pinFail('record the intent to publish this entry', err);
+      }
+      testHooks?.beforePublish?.({ abs, relPath });
+      try {
+        publishNewEntry(abs, text);
+      } catch (err) {
+        if (err?.code === 'EEXIST' && attempt < 3) continue; // someone got there: judge their bytes
+        throw err;
+      }
+      testHooks?.afterPublish?.({ abs, relPath });
+      outcome = 'created';
+      break;
+    }
+    const d = classifyExistingEntry({
+      hypoDir: args.hypoDir,
+      sessionId: args.sessionId,
+      closeId,
+      relPath,
+      text,
+      disk,
+      ignored,
+      pin: readClosePin(args.hypoDir, args.sessionId),
+    });
+    if (d.action === 'conflict') {
+      failEntry(args, 'entry-conflict', ENTRY_CONFLICT_HELP(relPath, d.reason));
+    }
+    if (d.action === 'replace') {
+      try {
+        recordPublishIntent(args.hypoDir, args.sessionId, closeId, relPath, bytesSha256(text));
+      } catch (err) {
+        pinFail('record the intent to replace this entry', err);
+      }
+      testHooks?.afterPinBeforeReplace?.({ abs, relPath });
+      // The judgment above read `disk`. Bytes that landed since are not the ones
+      // it licensed, so they stay and the close stops.
+      // ponytail: this read and the rename are two steps; a write between them is
+      // still replaced. Closing that needs a lock every entry writer takes.
+      if (readTarget(abs) !== disk) {
+        failEntry(args, 'entry-conflict', ENTRY_CONFLICT_HELP(relPath));
+      }
+      atomicWrite(abs, text);
+      outcome = 'replaced';
+    } else {
+      outcome = d.action === 'adopt' ? 'adopted' : 'identical';
+    }
+    break;
+  }
+
+  const bytes = outcome === 'adopted' ? readTarget(abs) : text;
+  const sha = bytesSha256(bytes);
+  if (outcome !== 'adopted') {
+    recordJournalEntry(args.hypoDir, args.sessionId, relPath, sha);
+    appliedPaths.push(relPath);
+    recordTouchedPaths(args.hypoDir, args.sessionId, [relPath]);
+  }
+  if (ignored && outcome !== 'adopted') {
+    // The journal goes at the commit step and an ignored entry is never in HEAD, so
+    // this is what a retry after that step can still prove the entry with.
+    try {
+      const pin = readClosePin(args.hypoDir, args.sessionId);
+      writeClosePin(args.hypoDir, args.sessionId, {
+        ...pin,
+        localProofs: { ...pin.localProofs, [closeId]: { entryRelPath: relPath, entrySha256: sha } },
+      });
+    } catch (err) {
+      pinFail('record the local proof of this entry', err);
+    }
+  }
+  // Best-effort: a missing record only means this session's next close does not replace
+  // this entry by default, it must not fail a close whose entry is already on disk.
+  try {
+    recordObservedHeads(args.hypoDir, args.sessionId, project, {
+      level: 'full',
+      heads: plan.heads,
+    });
+  } catch (err) {
+    process.stderr.write(
+      `[crystallize] warning: could not record the heads this entry made (${err?.message || err}): the next close of this session will not replace them by default\n`,
+    );
+  }
+  (outcome === 'created' || outcome === 'replaced' ? applied : skipped).push(
+    `sessionEntry (${relPath})`,
+  );
+  if (outcome === 'adopted' && bytes !== text) notices.push(ENTRY_NOT_REFLECTED_NOTICE(relPath));
+  proofEntries.push({
+    path: relPath,
+    kind: ignored ? 'local-create' : 'create',
+    expected: { bytesSha256: sha },
+  });
+}
+
 // Preflight: lint the wiki BEFORE writing any payload bytes. If lint
 // has blockers (errors) in files this apply WON'T overwrite, the wiki is in
 // a degraded state and apply would mask the root cause — abort fail-fast.
@@ -1600,10 +2707,10 @@ function assertPayloadFreshnessContract(args, payload, project, date) {
 // Returns the payload scope and the A-1 index facts alongside the lint result:
 // both are derived here (before any write) and consumed by the write and
 // post-apply phases.
-function runPreflight(args, payload, project, date) {
-  const overwriteTargets = new Set();
-  if (payload.sessionState) overwriteTargets.add(join('projects', project, 'session-state.md'));
-  if (payload.projectHot) overwriteTargets.add(join('projects', project, 'hot.md'));
+function runPreflight(args, payload, project, date, entryRelPath) {
+  // The entry is this close's own file: a retry may replace it, so lint debt in
+  // it is moot here, exactly like an overwrite target's.
+  const overwriteTargets = new Set([entryRelPath]);
   if (payload.openQuestions) overwriteTargets.add(join('pages', 'open-questions.md'));
 
   // Bug B: the documented close path must not be blocked by lint debt OUTSIDE
@@ -1631,9 +2738,7 @@ function runPreflight(args, payload, project, date) {
   const indexRelPath = join('projects', project, 'index.md');
   const indexMissing = !existsSync(join(args.hypoDir, indexRelPath));
   const payloadScope = new Set([
-    join('projects', project, 'session-state.md'),
-    join('projects', project, 'hot.md'),
-    'hot.md',
+    entryRelPath,
     sessionLogWriteTarget,
     sessionLogEvidence, // == write target, except a hybrid-month monthly fallback
     'log.md',
@@ -1921,17 +3026,8 @@ export function closeIntentPath(hypoDir, sessionId) {
   return join(hypoDir, '.cache', 'close-intent', `${sessionId}.json`);
 }
 
-function closeIntentTargetsFor(payload, project) {
-  const targets = [
-    {
-      relPath: join('projects', project, 'session-state.md'),
-      hash: hashContent(payload.sessionState.content),
-    },
-    {
-      relPath: join('projects', project, 'hot.md'),
-      hash: hashContent(payload.projectHot.content),
-    },
-  ];
+function closeIntentTargetsFor(payload, plan) {
+  const targets = [{ relPath: plan.relPath, hash: hashContent(plan.finalText) }];
   if (payload.openQuestions) {
     targets.push({
       relPath: join('pages', 'open-questions.md'),
@@ -2431,9 +3527,25 @@ function applyOverwrites(args, payload, project, date, indexRelPath, indexMissin
     });
   };
 
-  overwrite('sessionState', join('projects', project, 'session-state.md'), payload.sessionState);
-  overwrite('projectHot', join('projects', project, 'hot.md'), payload.projectHot);
   overwrite('openQuestions', join('pages', 'open-questions.md'), payload.openQuestions);
+
+  // Two sessions closing a project that has no index.md yet both try to seed
+  // it, and the one that lost the create finds the other's file, not committed
+  // yet, in the folder its gate refuses to leave dirty. Bytes identical to what
+  // this close would have seeded, in a file HEAD does not have, are committed
+  // by this close too: whoever wrote them, the content is this close's own
+  // seed. Anything else (a hand-edited index.md) stays out of the commit.
+  const adoptSeededIndex = () => {
+    const disk = readTarget(join(args.hypoDir, indexRelPath));
+    if (typeof disk !== 'string' || disk !== projectIndexSeed(project, date)) return;
+    if (headPathState(args.hypoDir, indexRelPath) !== 'absent') return;
+    appliedPaths.push(indexRelPath);
+    proofEntries.push({
+      path: indexRelPath,
+      kind: 'create',
+      expected: { bytesSha256: bytesSha256(disk) },
+    });
+  };
 
   // A-1: fill a missing project index as part of this close's writes (after
   // preflight passed, so an aborted close never leaves a half-applied side
@@ -2471,6 +3583,8 @@ function applyOverwrites(args, payload, project, date, indexRelPath, indexMissin
           bytesSha256: bytesSha,
         });
       }
+    } else {
+      adoptSeededIndex();
     }
   } else {
     // The retry path. A first attempt that seeds index.md and then fails to
@@ -2512,6 +3626,8 @@ function applyOverwrites(args, payload, project, date, indexRelPath, indexMissin
           kind: 'create',
           expected: { bytesSha256: priorIndex.bytesSha256 },
         });
+      } else {
+        adoptSeededIndex();
       }
     }
   }
@@ -2527,7 +3643,7 @@ const entryAlreadyPresent = (entry) => (content) =>
 
 // Append this close's entry to the project's daily session-log shard, pushing the
 // outcome into the shared `acc` bag.
-function appendSessionLogEntry(args, payload, project, date, acc) {
+function appendSessionLogEntry(args, payload, project, date, acc, closeId, shardHeld) {
   const { applied, skipped, appliedPaths, conflicts, proofEntries } = acc;
   const rel = join('projects', project, 'session-log', `${date}.md`);
   const full = join(args.hypoDir, rel);
@@ -2540,7 +3656,8 @@ function appendSessionLogEntry(args, payload, project, date, acc) {
   // monthly file would never verify against the commit.
   let evidencePath = rel;
   // Serialize dedup + create/append on the daily shard so two concurrent
-  // closes never lose an entry: the second closer takes the lock only after
+  // closes never lose an entry: the caller holds the shard lock (runHoldingAppendLocks),
+  // and keeps it through the commit. The second closer takes the lock only after
   // the first committed, re-reads the shard under the lock, and appends onto
   // the committed bytes (temp+rename write-isolation is preserved — a partial
   // write never tears the target). Create and append share ONE lock, so the
@@ -2548,65 +3665,65 @@ function appendSessionLogEntry(args, payload, project, date, acc) {
   // each other — only one closer is ever in the create path (closes the
   // wx-window a bare exclusive-create would leave open).
   try {
-    const outcome = withFileLock(
-      full,
-      () => {
-        // Fallback-aware idempotency (hybrid cutover): during the month the
-        // shard takes over, today's entry may already live in the legacy monthly
-        // file from an earlier (pre-cutover) close. Treat presence in EITHER the
-        // daily shard or the legacy monthly file as "already written" so a same-day
-        // second close does not duplicate an identical entry across both files —
-        // and so an idempotent re-apply stays a true no-op (no shard is created).
-        for (const cand of sessionLogReadCandidates(project, date)) {
-          const cf = join(args.hypoDir, cand);
-          if (!existsSync(cf)) continue;
-          try {
-            if (isPresent(readFileSync(cf, 'utf-8'))) {
-              evidencePath = cand; // the candidate that actually carries the entry
-              return 'skipped';
-            }
-          } catch {
-            /* unreadable candidate — fall through to the write path */
+    const outcome = underHeldLock(shardHeld, full, () => {
+      // Fallback-aware idempotency (hybrid cutover): during the month the
+      // shard takes over, today's entry may already live in the legacy monthly
+      // file from an earlier (pre-cutover) close. Treat presence in EITHER the
+      // daily shard or the legacy monthly file as "already written" so a same-day
+      // second close does not duplicate an identical entry across both files —
+      // and so an idempotent re-apply stays a true no-op (no shard is created).
+      for (const cand of sessionLogReadCandidates(project, date)) {
+        const cf = join(args.hypoDir, cand);
+        if (!existsSync(cf)) continue;
+        try {
+          if (isPresent(readFileSync(cf, 'utf-8'))) {
+            evidencePath = cand; // the candidate that actually carries the entry
+            return 'skipped';
           }
+        } catch {
+          /* unreadable candidate — fall through to the write path */
         }
-        if (!existsSync(full)) {
-          // A daily shard is a new file most days. Seed minimal valid frontmatter
-          // (title + type, the two REQUIRED_FIELDS) so the shard is a first-class
-          // wiki page rather than a W1 "no frontmatter" warning, and write the header
-          // AND the first entry in ONE atomic write — never leave a header-only shard
-          // on disk, which freshness would skip (no dated heading) while derive could
-          // otherwise mistake it for the evidence file. The dated `## [date] ...`
-          // heading lives inside the entry, so freshness / derive / design-history
-          // are unchanged.
-          // Audit fields (device, session_id). The shard frontmatter is git-tracked and synced, so
-          // `device` is an INTENTIONAL synced multi-machine identifier (privacy note:
-          // docs/ARCHITECTURE.md). It is a CREATOR-only stamp — only the session/
-          // machine that first seeds the daily shard is recorded; later same-day
-          // appends do not touch it. The per-session-accurate store is the LOCAL
-          // (.cache/, gitignored) index.jsonl written by hypo-session-record.mjs.
-          // `session_id` is honest naming: the value is the Claude session UUID, and
-          // it is present only on the Stop-chain close path that passes --session-id.
-          const device = currentDevice();
-          const auditFm =
-            (args.sessionId
-              ? `session_id: ${String(args.sessionId).replace(/[\r\n]/g, '')}\n`
-              : '') + `device: ${device}\n`;
-          const header =
-            `---\ntitle: Session Log ${date} (${project})\n` +
-            `type: session-log\nupdated: ${date}\n${auditFm}---\n\n` +
-            `# Session Log ${date} (${project})\n`;
-          const entry = payload.sessionLog.entry;
-          const body = entry.endsWith('\n') ? entry : `${entry}\n`;
-          atomicWrite(full, `${header}\n${body}`);
-          return 'created';
-        }
-        return appendIfAbsent(full, payload.sessionLog.entry, isPresent) ? 'appended' : 'skipped';
-      },
-      { timeoutMs: APPEND_LOCK_TIMEOUT_MS },
-    );
+      }
+      if (!existsSync(full)) {
+        // A daily shard is a new file most days. Seed minimal valid frontmatter
+        // (title + type, the two REQUIRED_FIELDS) so the shard is a first-class
+        // wiki page rather than a W1 "no frontmatter" warning, and write the header
+        // AND the first entry in ONE atomic write — never leave a header-only shard
+        // on disk, which freshness would skip (no dated heading) while derive could
+        // otherwise mistake it for the evidence file. The dated `## [date] ...`
+        // heading lives inside the entry, so freshness / derive / design-history
+        // are unchanged.
+        // No `device` or `session_id` in the header: the shard is git-tracked and two
+        // clones that each create today's first shard must write the same header bytes,
+        // or the union merge keeps both sets of lines. The per-session record of who
+        // wrote what lives in the local (.cache/, gitignored) index.jsonl written by
+        // hypo-session-record.mjs.
+        const header =
+          `---\ntitle: Session Log ${date} (${project})\n` +
+          `type: session-log\nupdated: ${date}\n---\n\n` +
+          `# Session Log ${date} (${project})\n`;
+        const entry = payload.sessionLog.entry;
+        const body = entry.endsWith('\n') ? entry : `${entry}\n`;
+        atomicWrite(full, `${header}\n${body}`);
+        return 'created';
+      }
+      // Another session's marker gate tells this append from a hand edit only by
+      // this record (isForeignAppendOnlyShard). Not recorded, the append still
+      // lands and those gates block on the shard until it is committed.
+      const recordAppend = (before, added) => {
+        if (!recordShardAppend(args.hypoDir, args.sessionId, rel, before, added, closeId))
+          process.stderr.write(
+            `[crystallize] warning: could not record this close's append to ${rel}; another session's close gate blocks on it until it is committed\n`,
+          );
+      };
+      return appendIfAbsent(full, payload.sessionLog.entry, isPresent, recordAppend)
+        ? 'appended'
+        : 'skipped';
+    });
     (outcome === 'skipped' ? skipped : applied).push(`sessionLog (${rel})`);
     if (outcome !== 'skipped') {
       appliedPaths.push(rel);
+      recordTouchedPaths(args.hypoDir, args.sessionId, [rel]);
       // Same journal contract as applyOverwrites: record the FULL file's hash
       // right after this write, not just the entry, since a retry's own
       // "already present" skip below reads the whole file back to compare.
@@ -2628,6 +3745,7 @@ function appendSessionLogEntry(args, payload, project, date, acc) {
         const disk = readTarget(full);
         if (typeof disk === 'string' && journalHash === hashContent(disk)) {
           appliedPaths.push(rel);
+          recordTouchedPaths(args.hypoDir, args.sessionId, [rel]);
         }
       }
     }
@@ -2706,16 +3824,14 @@ function restageOrRecordLogMd(args, logFull, journal, wroteNew, acc) {
   }
 }
 
-function appendRootLogEntry(args, payload, project, date, acc) {
+function appendRootLogEntry(args, payload, project, date, acc, logHeld) {
   const { applied, skipped, conflicts, proofEntries } = acc;
   const logFull = join(args.hypoDir, 'log.md');
   const journal = readJournal(args.hypoDir, args.sessionId);
   if (payload.log) {
     try {
-      const wrote = withFileLock(
-        logFull,
-        () => appendIfAbsent(logFull, payload.log.entry, entryAlreadyPresent(payload.log.entry)),
-        { timeoutMs: APPEND_LOCK_TIMEOUT_MS },
+      const wrote = underHeldLock(logHeld, logFull, () =>
+        appendIfAbsent(logFull, payload.log.entry, entryAlreadyPresent(payload.log.entry)),
       );
       (wrote ? applied : skipped).push('log (log.md)');
       restageOrRecordLogMd(args, logFull, journal, wrote, acc);
@@ -2751,30 +3867,26 @@ function appendRootLogEntry(args, payload, project, date, acc) {
     // the commit with nothing here to catch it.
     const derivedBlocks = [];
     try {
-      const wroteAny = withFileLock(
-        logFull,
-        () => {
-          let w = false;
-          for (const m of (payload.sessionLog.entry || '').matchAll(headingRe)) {
-            const { heading, block } = rootLogEntry(project, date, m[1]);
-            // Earlier versions put an em dash after the slug where this one puts a
-            // colon. That heading is the same entry, and its block is what the
-            // receipt proof has to find in the file.
-            let proofBlock = block;
-            const wrote = appendIfAbsent(logFull, block, (c) => {
-              const lines = (c || '').split(/\r?\n/);
-              if (lines.includes(heading)) return true;
-              if (!lines.map(rootLogHeadingKey).includes(heading)) return false;
-              proofBlock = block.replace(`| ${project}: `, `| ${project} \u2014 `);
-              return true;
-            });
-            derivedBlocks.push(proofBlock);
-            w = w || wrote;
-          }
-          return w;
-        },
-        { timeoutMs: APPEND_LOCK_TIMEOUT_MS },
-      );
+      const wroteAny = underHeldLock(logHeld, logFull, () => {
+        let w = false;
+        for (const m of (payload.sessionLog.entry || '').matchAll(headingRe)) {
+          const { heading, block } = rootLogEntry(project, date, m[1]);
+          // Earlier versions put an em dash after the slug where this one puts a
+          // colon. That heading is the same entry, and its block is what the
+          // receipt proof has to find in the file.
+          let proofBlock = block;
+          const wrote = appendIfAbsent(logFull, block, (c) => {
+            const lines = (c || '').split(/\r?\n/);
+            if (lines.includes(heading)) return true;
+            if (!lines.map(rootLogHeadingKey).includes(heading)) return false;
+            proofBlock = block.replace(`| ${project}: `, `| ${project} \u2014 `);
+            return true;
+          });
+          derivedBlocks.push(proofBlock);
+          w = w || wrote;
+        }
+        return w;
+      });
       (wroteAny ? applied : skipped).push('log (log.md, derived)');
       restageOrRecordLogMd(args, logFull, journal, wroteAny, acc);
       if (derivedBlocks.length > 0) {
@@ -3203,12 +4315,78 @@ function repoIdentity(hypoDir) {
   return { toplevel, prefix };
 }
 
-function runMarkerPhase(args, project, appliedPaths, ok, hostTagWarning, receiptCtx = {}) {
+// The commit step of a close: stage and commit what this apply wrote, under the vault
+// commit lock. Runs inside the session-log shard lock (see runHoldingAppendLocks), so no
+// other close can append to the shard between this close's append and this commit.
+function commitCloseWrites(args, appliedPaths, receiptCtx) {
   const {
     preflightLint = null,
     hasConflicts = false,
     proofEntries = [],
     attemptId = null,
+    testHooks = null,
+  } = receiptCtx;
+  // Scope this commit to the paths THIS apply actually wrote
+  // (appliedPaths), never the broader payloadScope, which also
+  // names lint/evidence candidates apply may not have touched a byte of.
+  // Locked against the SAME target the auto-commit Stop hook holds, so a
+  // concurrent Stop-chain commit on this vault can't interleave with this
+  // apply's stage+commit. A lock-timeout is treated exactly like any other
+  // commit failure below (skip the marker, surface the reason) rather than
+  // crashing the apply.
+  //
+  // registerPendingTagsLocked runs INSIDE this same lock, right before the
+  // commit: a SCHEMA.md registration it makes here
+  // pushes 'SCHEMA.md' onto `appliedPaths` first, so commitWikiChanges below
+  // picks it up in the SAME commit this apply is already making, atomically.
+  // The HEAD read happens in this same critical section too, never a
+  // second, unlocked `git rev-parse HEAD` afterwards, which a concurrent
+  // close landing in the gap could move.
+  let headAfterCommit = null;
+  let commitOutcome;
+  // Test seam: this close's session-log append has landed and its commit has not,
+  // the window in which another close must not be able to append to the shard.
+  testHooks?.beforeCommit?.();
+  try {
+    const locked = withFileLock(vaultCommitLockTarget(args.hypoDir), () => {
+      registerPendingTagsLocked(
+        args,
+        preflightLint,
+        hasConflicts,
+        appliedPaths,
+        proofEntries,
+        attemptId,
+      );
+      const outcome = commitWikiChanges(args.hypoDir, appliedPaths);
+      const head = readHeadShaLocked(args.hypoDir);
+      return { outcome, head };
+    });
+    commitOutcome = locked.outcome;
+    headAfterCommit = locked.head;
+    if (commitOutcome.indexWarning)
+      process.stderr.write(`[crystallize] warning: ${commitOutcome.indexWarning}\n`);
+  } catch (err) {
+    commitOutcome = { committed: false, reason: `vault-commit-lock: ${err?.message || err}` };
+  }
+  // Once these bytes are committed, the journal's only job (telling a
+  // retry's own uncommitted work apart from someone else's) is done —
+  // clear it rather than let a stale record outlive this close and later
+  // match a coincidence it was never meant to license. A commit that
+  // failed leaves the journal in place on purpose: that is exactly the
+  // case the next retry needs it for.
+  if (commitOutcome.committed) clearJournal(args.hypoDir, args.sessionId);
+  return { outcome: commitOutcome, head: headAfterCommit };
+}
+
+function runMarkerPhase(args, project, appliedPaths, ok, hostTagWarning, receiptCtx = {}) {
+  const {
+    proofEntries = [],
+    testHooks = null,
+    commit = null,
+    verify,
+    closeOpen = false,
+    resolvedAtIndex = null,
+    openedAtIndex = -1,
   } = receiptCtx;
   let markerWritten = false;
   let markerSkipReason = null;
@@ -3223,56 +4401,26 @@ function runMarkerPhase(args, project, appliedPaths, ok, hostTagWarning, receipt
   // What the gate refused on, so a compact-gate-not-ok result names its own
   // blockers instead of sending the caller to a different, wider check.
   let gateBlockers = [];
-  if (ok && args.sessionId) {
+  // The post-apply verification (verify(): this close, by its close id). Its
+  // entry must be in HEAD, so it is read after the commit step. It decides
+  // the close only when that commit landed: a commit that failed or never ran
+  // already explains a missing entry, and keeps its own outcome.
+  let verification = null;
+  let verificationCounts = false;
+  if (ok && args.sessionId && commit) {
     // IO stays lazy so this preserves the exact side-effect order (codex design
     // review): commit first (the only mutation), then resolve the
     // transcript, then run the compact gate with that transcript, then scan the
     // user-close signal ONLY once the gate passes. planMarkerDecision owns the
     // branch priority + reason strings; the booleans below are computed in that
     // same short-circuiting order so no read runs earlier than it does today.
-    // Scope this commit to the paths THIS apply actually wrote
-    // (appliedPaths), never the broader payloadScope, which also
-    // names lint/evidence candidates apply may not have touched a byte of.
-    // Locked against the SAME target the auto-commit Stop hook holds, so a
-    // concurrent Stop-chain commit on this vault can't interleave with this
-    // apply's stage+commit. A lock-timeout is treated exactly like any other
-    // commit failure below (skip the marker, surface the reason) rather than
-    // crashing the apply.
-    //
-    // registerPendingTagsLocked runs INSIDE this same lock, right before the
-    // commit: a SCHEMA.md registration it makes here
-    // pushes 'SCHEMA.md' onto `appliedPaths` first, so commitWikiChanges below
-    // picks it up in the SAME commit this apply is already making, atomically.
-    // The HEAD read happens in this same critical section too, never a
-    // second, unlocked `git rev-parse HEAD` afterwards, which a concurrent
-    // close landing in the gap could move.
-    let headAfterCommit = null;
-    try {
-      const locked = withFileLock(vaultCommitLockTarget(args.hypoDir), () => {
-        registerPendingTagsLocked(
-          args,
-          preflightLint,
-          hasConflicts,
-          appliedPaths,
-          proofEntries,
-          attemptId,
-        );
-        const outcome = commitWikiChanges(args.hypoDir, appliedPaths);
-        const head = readHeadShaLocked(args.hypoDir);
-        return { outcome, head };
-      });
-      commitOutcome = locked.outcome;
-      headAfterCommit = locked.head;
-    } catch (err) {
-      commitOutcome = { committed: false, reason: `vault-commit-lock: ${err?.message || err}` };
-    }
-    // Once these bytes are committed, the journal's only job (telling a
-    // retry's own uncommitted work apart from someone else's) is done —
-    // clear it rather than let a stale record outlive this close and later
-    // match a coincidence it was never meant to license. A commit that
-    // failed leaves the journal in place on purpose: that is exactly the
-    // case the next retry needs it for.
-    if (commitOutcome.committed) clearJournal(args.hypoDir, args.sessionId);
+    // The commit itself ran earlier, inside the session-log shard lock (commitCloseWrites),
+    // so the lock is released before this gate looks at the project folder: its lock file
+    // is an untracked file there.
+    commitOutcome = commit.outcome;
+    const headAfterCommit = commit.head;
+    verification = verify();
+    verificationCounts = commitOutcome.committed === true;
     let closeTranscript = null;
     let gateOk = false;
     // verified_scope evidence (session-close-scope-boundary spec §3, revised
@@ -3282,7 +4430,7 @@ function runMarkerPhase(args, project, appliedPaths, ok, hostTagWarning, receipt
     // 'global' scope to "field absent" rather than persist a false claim.
     let gateEvaluatedProjects = [];
     let gateSkipped = { lint: false, feedback: false };
-    if (commitOutcome.committed) {
+    if (commitOutcome.committed && verification.ok) {
       closeTranscript = resolveTranscriptBySessionId(args.sessionId);
       // closeScope: apply KNOWS which project it just closed, and it wrote
       // that project's files from inside this process, they never appear in the
@@ -3313,6 +4461,8 @@ function runMarkerPhase(args, project, appliedPaths, ok, hostTagWarning, receipt
         // (close files, cwd, hot, lint, W8, feedback) is unchanged.
         checkpointMode: true,
         sessionId: args.sessionId,
+        closeOpen,
+        resolvedAtIndex,
       });
       gateOk = gateStatus.ok;
       gateNotices = gateStatus.notices || [];
@@ -3327,7 +4477,7 @@ function runMarkerPhase(args, project, appliedPaths, ok, hostTagWarning, receipt
         .filter(Boolean);
     }
     const decision = planMarkerDecision({
-      ok,
+      ok: ok && (!verificationCounts || verification.ok),
       hasSessionId: true,
       committed: commitOutcome.committed,
       commitReason: commitOutcome.reason,
@@ -3426,22 +4576,38 @@ function runMarkerPhase(args, project, appliedPaths, ok, hostTagWarning, receipt
           // check decides whether the close signal below gets spent, and
           // spending it on a marker this run did not write is the failure
           // this whole phase was reordered to avoid.
-          const landed = landReceiptThenMarker(args.hypoDir, args.sessionId, receipt, () =>
-            writeSessionClosedMarker(args.hypoDir, args.sessionId, {
-              project,
-              projects: [project],
-              verifiedScope: { kind: 'global', projects: gateEvaluatedProjects },
-              // Carried through from refuseUnlessCloseRequested's gate check,
-              // computed once before any write in this apply and unchanged since:
-              // this close survived a HOST_TAG_NAMES-shaped queue item reading as
-              // neutral, so the marker records the same residual the console
-              // output also warns about once.
-              ...(markerHostTagWarning ? { hostTagWarning: markerHostTagWarning } : {}),
-              // Names the receipt this marker is a compat projection
-              // of. A new Stop refuses to trust this marker alone once it sees
-              // this field: it must find the matching, valid receipt too.
-              receiptGeneration,
-            }),
+          const landed = landReceiptThenMarker(
+            args.hypoDir,
+            args.sessionId,
+            receipt,
+            () =>
+              writeSessionClosedMarker(args.hypoDir, args.sessionId, {
+                project,
+                projects: [project],
+                verifiedScope: { kind: 'global', projects: gateEvaluatedProjects },
+                // Carried through from refuseUnlessCloseRequested's gate check,
+                // computed once before any write in this apply and unchanged since:
+                // this close survived a HOST_TAG_NAMES-shaped queue item reading as
+                // neutral, so the marker records the same residual the console
+                // output also warns about once.
+                ...(markerHostTagWarning ? { hostTagWarning: markerHostTagWarning } : {}),
+                // Names the receipt this marker is a compat projection
+                // of. A new Stop refuses to trust this marker alone once it sees
+                // this field: it must find the matching, valid receipt too.
+                receiptGeneration,
+              }),
+            {
+              // Recorded under the session lock the receipt and marker land under
+              // (see the comment below on why only after they landed).
+              afterLanded: () =>
+                settleCloseResolution(
+                  args.hypoDir,
+                  args.sessionId,
+                  closeTranscript,
+                  { openedAtIndex, resolvedAtIndex },
+                  testHooks,
+                ),
+            },
           );
           if (landed.ok) {
             markerWritten = true;
@@ -3465,23 +4631,22 @@ function runMarkerPhase(args, project, appliedPaths, ok, hostTagWarning, receipt
             // true when `transcriptResolved` was true in `planMarkerDecision`'s
             // inputs above, so it is guaranteed non-null at this point.
             //
-            // Best-effort like every other write in this store: resolutionStamp
-            // returns null on anything it cannot read as a Buffer, recordGateClosed
-            // refuses a null stamp, and both fail silently, so a transcript that
-            // vanishes mid-read (or a cache-write failure) can never turn an
-            // otherwise-successful close into a failure.
-            try {
-              recordGateClosed(
-                args.hypoDir,
-                args.sessionId,
-                resolutionStamp(readFileSync(closeTranscript)),
-              );
-            } catch {
-              // Unreadable at the moment of a successful close is not this
-              // apply's problem to surface, the resolution just stays
-              // unrecorded, same as if this session had never resolved at all
-              // (NO_CONSTRAINT).
+            // A resolution that does not land fails the close (see
+            // settleCloseResolution): the pin's `pending` would stay, and the
+            // next close request would borrow this close's id and lose its own
+            // summary to this close's committed entry.
+            const settled = landed.afterLanded;
+            if (!settled.ok) {
+              markerWritten = false;
+              markerSkipReason = 'close-resolution-failed';
+              if (settled.retractFailed) {
+                receiptMismatches = [
+                  { path: '(receipt)', reason: `retract-failed: ${settled.retractFailed}` },
+                ];
+              }
             }
+          } else if (landed.reason === 'session-close-lock-timeout') {
+            markerSkipReason = 'session-close-lock-timeout';
           } else if (landed.reason === 'receipt-write-failed') {
             markerSkipReason = 'receipt-write-failed';
             receiptMismatches = [
@@ -3519,6 +4684,12 @@ function runMarkerPhase(args, project, appliedPaths, ok, hostTagWarning, receipt
     gateNotices,
     gateBlockers,
     receiptMismatches,
+    // A verification that does not decide the close (no commit landed) still
+    // goes out, marked so a reader does not take its `ok` for the close's.
+    verification: verificationCounts
+      ? verification
+      : { ...(verification ?? verify()), counted: false },
+    verificationCounts,
   };
 }
 
@@ -3526,18 +4697,27 @@ function runMarkerPhase(args, project, appliedPaths, ok, hostTagWarning, receipt
 // a tree this apply declined to finish writing, so naming them would point the
 // reader at the wrong repair. A proposal-STORE failure outranks even that: the
 // withheld bytes never reached an artifact, so it is the most urgent repair.
-function resolveCloseStage({ ok, proposalStoreFailed, conflicts, verification, postLintOk }) {
+function resolveCloseStage({
+  ok,
+  proposalStoreFailed,
+  conflicts,
+  commitFailed,
+  verificationOk,
+  postLintOk,
+}) {
   return ok
     ? null
     : proposalStoreFailed
       ? 'proposal-store-failed'
       : conflicts.length > 0
         ? 'proposal-pending'
-        : !verification.ok && !postLintOk
-          ? 'post-apply-verification+lint'
-          : !verification.ok
-            ? 'post-apply-verification'
-            : 'post-apply-lint';
+        : commitFailed
+          ? 'commit-failed'
+          : !verificationOk && !postLintOk
+            ? 'post-apply-verification+lint'
+            : !verificationOk
+              ? 'post-apply-verification'
+              : 'post-apply-lint';
 }
 
 // The stdout JSON contract of a payload-bearing apply. Takes one bag because it
@@ -3549,6 +4729,7 @@ function buildCloseResult({
   project,
   date,
   applied,
+  withdrawnAppends,
   skipped,
   commitOutcome,
   conflicts,
@@ -3574,7 +4755,33 @@ function buildCloseResult({
   restructureWaivers,
   obsoleteNotices,
   hostTagWarning,
+  hypoDir,
+  appliedPaths,
 }) {
+  // The paths this close owns (`appliedPaths`) and still has on disk uncommitted. The list is built
+  // from the paths, not from the display strings: a write with no `applied` line (the SCHEMA.md
+  // pending-tag registration) is as uncommitted as one with a line, and is named by its path. A write
+  // that was already current on a retry sits in `skipped`, not `applied`, so both lists are read for
+  // the display string. The session-log and log.md appends that were taken back are not on disk any
+  // more, and a path whose bytes HEAD already holds is not uncommitted work.
+  const lines = [...applied, ...skipped];
+  const linesOf = (rel) =>
+    lines.filter((line) => line.includes(`(${rel})`) || line.includes(`(${rel},`));
+  const stillOnDisk = [...new Set(appliedPaths)]
+    .filter((rel) => {
+      if (withdrawnAppends.includes(rel)) return false;
+      let disk;
+      try {
+        disk = readFileSync(join(hypoDir, rel), 'utf-8');
+      } catch {
+        return false;
+      }
+      return headBlobText(hypoDir, rel) !== disk;
+    })
+    .flatMap((rel) => {
+      const named = linesOf(rel);
+      return named.length ? named : [rel];
+    });
   return {
     ok,
     stage,
@@ -3640,7 +4847,14 @@ function buildCloseResult({
     // re-runs. Named honestly: `appliedUncommitted` covers every write that landed
     // (overwrite or append), not overwrites alone.
     ...(applied.length > 0 && conflicts.length > 0
-      ? { partialConflict: true, appliedUncommitted: [...applied] }
+      ? { partialConflict: true, appliedUncommitted: stillOnDisk }
+      : {}),
+    // The commit ran and failed (`stage: 'commit-failed'`): what this close wrote and
+    // kept stays on disk uncommitted. The session-log and log.md appends were taken
+    // back; the session entry was not, because the retry finds it again by the close
+    // id and replaces or adopts it. Naming it here is what tells the reader it is there.
+    ...(commitOutcome?.committed === false
+      ? { appliedUncommitted: stillOnDisk, commitFailure: commitOutcome.reason ?? null }
       : {}),
     verification,
     // Surface the marker outcome instead of skipping silently, so the
@@ -3746,6 +4960,7 @@ function printCloseReport({
   markerSkipReason,
   markerGateReason,
   verification,
+  verificationOk,
   postLintOk,
   postBlocking,
   closeScopeNotice,
@@ -3762,6 +4977,8 @@ function printCloseReport({
   // for. Printed before the rest so an old payload's author sees it even when
   // the close otherwise succeeds and they stop reading at the ✓ line.
   for (const n of obsoleteNotices || []) console.log(`  · ${n}`);
+  // What the verification saw but did not gate on (this close has no log lines under its date).
+  for (const n of verification?.notices || []) console.log(`  · ${n.reason}`);
   // Surfaced unconditionally, success or failure. `restructure: true` no
   // longer waives the guard: the target below is still WITHHELD
   // and shows up in the conflicts loop right after this one. This line only
@@ -3845,11 +5062,13 @@ function printCloseReport({
         : 'lint clean';
     if (markerSkipReason) {
       console.log(
-        `\n✓ session-close files verified (all 4 mandatory files fresh, ${lintWord}).` +
+        `\n✓ session-close files verified (this close's entry, session-log and log.md, ${lintWord}).` +
           '\n  session NOT fully closed: the Stop-chain marker was not written (see warning below).',
       );
     } else {
-      console.log(`\n✓ session-close verified (all 4 mandatory files fresh, ${lintWord}).`);
+      console.log(
+        `\n✓ session-close verified (this close's entry, session-log and log.md, ${lintWord}).`,
+      );
     }
   }
   // Warn once per run, not on every gate read, which is exactly the
@@ -3885,15 +5104,19 @@ function printCloseReport({
     // opposite: one is about what is committed, the other about writing under
     // .cache/. Neither is the policy withhold the fallback text below describes,
     // and neither is the gate refusal (compact-gate-not-ok), which stays ok:true.
-    const receiptFailure =
-      markerSkipReason === 'receipt-proof-mismatch'
-        ? `    The 4 mandatory files were applied, but the close checkpoint receipt\n` +
+    const receiptFailure = markerSkipReason?.startsWith('commit-failed:')
+      ? `    The close files were written but the commit failed, so nothing of this\n` +
+        `    close is published. This run reports ok:false and exits 1. The session\n` +
+        `    is NOT closed. To fix: clear the git problem named above, then re-run\n` +
+        `    the same close. No fresh close phrase is needed.\n`
+      : markerSkipReason === 'receipt-proof-mismatch'
+        ? `    The close files were applied, but the close checkpoint receipt\n` +
           `    could not prove them against the commit (see mismatches[] in --json\n` +
           `    output). This run reports ok:false and exits 1. The session is NOT closed.\n` +
           `    To fix: check the listed paths with git status, commit the ones you\n` +
           `    have reviewed, then re-run the same close. No fresh close phrase is needed.\n`
         : markerSkipReason === 'receipt-write-failed'
-          ? `    The 4 mandatory files were applied and committed, but writing the close\n` +
+          ? `    The close files were applied and committed, but writing the close\n` +
             `    checkpoint receipt under .cache/sessions/<session-id>/ failed. This run\n` +
             `    reports ok:false and exits 1. The session is NOT closed.\n` +
             `    To fix: clear whatever blocks that directory (permissions, disk space),\n` +
@@ -3902,7 +5125,7 @@ function printCloseReport({
             // by a compact-gate blocker. It is not a session-id problem and not a receipt
             // problem, so it gets its own words.
             markerSkipReason === 'compact-gate-not-ok'
-            ? `    The 4 mandatory files were applied and verified, but the close gate\n` +
+            ? `    The close files were applied and verified, but the close gate\n` +
               `    refused the per-session Stop-chain marker because a gate blocker\n` +
               `    remains. The session is NOT fully closed: the Stop hook will re-prompt\n` +
               `    until the marker is present. This is not a --session-id problem.\n` +
@@ -3911,7 +5134,15 @@ function printCloseReport({
               `    clear whichever other blocker the gate names), then re-run the same\n` +
               `    close. No fresh close phrase is needed: a close signal is spent only\n` +
               `    once the marker lands.\n`
-            : null;
+            : markerSkipReason === 'session-close-lock-timeout'
+              ? `    The close files were applied and committed, but another close of this\n` +
+                `    session held its close lock past the timeout, so no receipt or marker\n` +
+                `    was filed. This run reports ok:false and exits 1. The session is NOT\n` +
+                `    closed. To fix: re-run the same close shortly. No fresh close phrase\n` +
+                `    is needed.\n`
+              : markerSkipReason === 'close-resolution-failed'
+                ? `    ${CLOSE_RESOLUTION_FAILED_HELP(null)}\n`
+                : null;
     process.stderr.write(
       `\n⚠️  session-close marker NOT written (reason: ${markerSkipReason})\n` +
         // MAJOR FIX (codex cross-review round 5): only present when the reason
@@ -3923,7 +5154,7 @@ function printCloseReport({
         (markerGateReason ? `    Gate detail: ${markerGateReason}\n` : '') +
         (receiptFailure ??
           (diskFailure
-            ? `    The 4 mandatory files were applied and committed, but writing the\n` +
+            ? `    The close files were applied and committed, but writing the\n` +
               `    per-session Stop-chain marker itself failed. This run reports\n` +
               `    ok:false and exits 1. The session is NOT closed: the Stop hook\n` +
               `    will re-prompt until the marker is present.\n` +
@@ -3931,7 +5162,7 @@ function printCloseReport({
               `    (permissions, a directory sitting where the marker file goes,\n` +
               `    disk space), then re-run the same close. No fresh close phrase\n` +
               `    is needed: a close signal is spent only once the marker lands.\n`
-            : `    The 4 mandatory files were applied and verified (ok:true), but the\n` +
+            : `    The close files were applied and verified (ok:true), but the\n` +
               `    per-session Stop-chain marker was withheld. The session is NOT fully\n` +
               `    closed: the Stop hook will re-prompt until the marker is present.\n` +
               `    To fix: re-run with the correct main-conversation --session-id (NOT\n` +
@@ -3941,13 +5172,13 @@ function printCloseReport({
     );
   }
   if (!ok) {
-    if (!verification.ok) {
+    if (!verificationOk) {
       const bad = [
         ...verification.missing.map((f) => `${f} (missing)`),
         ...verification.stale.map((f) => `${f} (stale)`),
       ].join(', ');
       console.log(`\n✗ session-close still incomplete after apply: ${bad}`);
-      console.log('  Fix the payload (likely an `updated:` field) and retry.');
+      console.log("  This close's own entry must be in place and committed. Check it and retry.");
     }
     if (!postLintOk) {
       console.log('\n✗ post-apply lint failed:');
@@ -3983,7 +5214,50 @@ function printCloseReport({
   }
 }
 
-export function applySessionClose(args) {
+// `testHooks` is test-only. `beforeResolution` runs after every gate check and
+// right before the close-gate resolution is recorded, so a test can append a
+// transcript record in that gap. `afterResolutionBeforePin` runs once the gate
+// resolution record has landed and before the close pin's `pending` moves, so a
+// test can crash a close in the one gap between those two writes. `beforePublish`,
+// `afterPublish` and `afterPinBeforeReplace` do the same for the entry write (see
+// `writeSessionEntry`).
+// The no-payload probe with a session id: is there a project this session's own
+// close proves complete right now? Same judgment as the verdict sites
+// (closeGateStatus, then sessionProofCloseId per project, then the session
+// scope of sessionCloseFileStatus), so another session's close of today never
+// reads as this one's, and an open new close request reads as not done.
+function sessionProbeStatus(hypoDir, sessionId) {
+  const gate = closeGateStatus({
+    transcriptPath: resolveTranscriptBySessionId(sessionId) ?? null,
+    hypoDir,
+    sessionId,
+  });
+  let projects;
+  try {
+    projects = listSessionProjects(hypoDir);
+  } catch {
+    // A probe that cannot look reads as "not complete": the full apply path that follows reports
+    // the unreadable directory itself.
+    return { ok: false };
+  }
+  for (const project of projects) {
+    const closeId = sessionProofCloseId(hypoDir, sessionId, {
+      closeOpen: gate.ok,
+      resolvedAtIndex: gate.resolvedAtIndex,
+      project,
+    });
+    if (!closeId) continue;
+    const status = sessionCloseFileStatus(hypoDir, {
+      scope: 'session',
+      closeId,
+      projectOverride: project,
+    });
+    if (status.ok) return status;
+  }
+  return { ok: false };
+}
+
+export function applySessionClose(args, testHooks = null) {
   // Option D: early-exit fires only when NO payload was supplied.
   // Rationale: payload presence is explicit close intent and must always run
   // the full apply path — the per-entry idempotency (overwrite's step-1 skip +
@@ -3994,9 +5268,12 @@ export function applySessionClose(args) {
   // for any actual apply work (readPayload below surfaces "payload is
   // required" the same way it always has).
   if (!args.force && !args.payload) {
-    // No-payload "already complete?" probe uses the
-    // global invariant, not a recency pick.
-    const probe = sessionCloseGlobalStatus(args.hypoDir);
+    // No-payload "already complete?" probe. With a session id it asks about THIS
+    // session's close (the same proof the verdict sites use); without one it can
+    // only say that some close of today exists, which may be another session's.
+    const probe = args.sessionId
+      ? sessionProbeStatus(args.hypoDir, args.sessionId)
+      : sessionCloseGlobalStatus(args.hypoDir);
     // A leftover close-intent record (see closeIntentPath's doc comment)
     // means some earlier apply began this file set and never finished it.
     // `probe.ok` is a freshness read alone, so trusting it here would be
@@ -4012,13 +5289,18 @@ export function applySessionClose(args) {
         alreadyComplete: true,
         project: probe.project,
         date: probe.dates[0],
-        message: '오늘 이미 close 완료로 보임 (probe 모드 — payload 미지정).',
+        scope: args.sessionId ? 'session' : 'global',
+        notices: probe.notices ?? [],
+        message: args.sessionId
+          ? '이 세션의 close가 이미 완료됨 (probe 모드: payload 미지정).'
+          : '이 프로젝트에 오늘 close가 있음. 이 세션의 close인지는 확인하지 않았음 (probe 모드: payload와 --session-id 미지정).',
       };
       if (args.json) {
         console.log(JSON.stringify(result, null, 2));
       } else {
         console.log(`✓ ${result.message}`);
         console.log(`  project: ${result.project} / date: ${result.date}`);
+        for (const n of result.notices) console.log(`  · ${n.reason}`);
       }
       process.exit(0);
     }
@@ -4026,18 +5308,94 @@ export function applySessionClose(args) {
     // "payload is required" with the same error shape as before.
   }
 
-  const hostTagWarning = refuseUnlessCloseRequested(args);
-  const payload = loadValidatedPayload(args);
+  // A commit that names paths fails while a merge, rebase, git am, cherry-pick or revert is open or
+  // paths are unmerged, and the close would have written its entry by then. Refuse before
+  // the first byte. It runs ahead of the authority check, which invalidates this
+  // session's earlier marker and receipt as soon as a new close is authorized.
+  //
+  // A state found open is judged again under the vault commit lock. Another session's Stop sync
+  // holds that lock for the whole of its merge, so an open MERGE_HEAD seen from outside the lock
+  // may be that merge in flight, not a stuck one, and advising `git merge --abort` would abort a
+  // healthy sync. A clean vault never takes the lock here: a close may start while another session
+  // commits, and it waits for the lock at its own commit.
+  let busy = vaultOperationInProgress(args.hypoDir);
+  try {
+    if (busy) {
+      busy = withFileLock(
+        vaultCommitLockTarget(args.hypoDir),
+        () => vaultOperationInProgress(args.hypoDir),
+        { timeoutMs: 3000 },
+      );
+    }
+  } catch (err) {
+    if (err?.code !== 'ELOCKTIMEOUT') throw err;
+    const error =
+      'session-close apply refused: another session is syncing the vault; run the close again in a moment. ' +
+      'Nothing was written.';
+    const out = {
+      ok: false,
+      stage: 'vault-locked',
+      error,
+      applied: [],
+      committed: null,
+    };
+    console.log(args.json ? JSON.stringify(out, null, 2) : `✗ ${error}`);
+    process.exit(1);
+  }
+  if (busy) {
+    const error =
+      `session-close apply refused: the vault repo is mid-operation (${busy.state}): ${busy.detail}. ` +
+      `A close cannot be committed until then. Nothing was written; re-run the close afterwards.`;
+    const out = {
+      ok: false,
+      stage: 'vault-operation-in-progress',
+      error,
+      blocker: busy,
+      applied: [],
+      committed: null,
+    };
+    console.log(args.json ? JSON.stringify(out, null, 2) : `✗ ${error}`);
+    process.exit(1);
+  }
+
+  const { hostTagWarning, closeId, closeOpen, resolvedAtIndex, openedAtIndex } =
+    refuseUnlessCloseRequested(args);
+  const { payload, legacyFormat } = loadValidatedPayload(args);
   // Computed off the payload as read, before any write phase can consume it.
   const obsoleteNotices = obsoleteFieldNotices(payload);
+  if (legacyFormat) {
+    obsoleteNotices.push(
+      '구버전 형식 payload를 받아 원본 항목으로 기록했습니다. 다음 close부터 summary/tracks 형식을 쓰세요',
+    );
+  }
   const project = resolveCloseProject(args, payload);
-  const date = payload.date || todayLocal();
-  assertPayloadFreshnessContract(args, payload, project, date);
+  // A close keeps the date its entry was first published with, and its logs go
+  // under that same date: the post-apply check reads them there. A retry after
+  // midnight (or a payload that moved its date) would otherwise append under the
+  // new day and leave this close's own day without a log for good.
+  const requestedDate = payload.date || todayLocal();
+  const entryPath = entryPathFor(
+    args,
+    project,
+    closeId,
+    requestedDate,
+    readClosePin(args.hypoDir, args.sessionId),
+  );
+  const date = entryPath.date;
+  assertPayloadFreshnessContract(
+    args,
+    payload,
+    project,
+    date,
+    date === requestedDate ? null : entryPath.relPath,
+  );
+  const entryPlan = planSessionEntry(args, payload, project, entryPath, closeId, legacyFormat);
   const { preflightLint, payloadScope, indexRelPath, indexMissing } = runPreflight(
     args,
     payload,
     project,
     date,
+    entryPlan.relPath,
   );
 
   const applied = [];
@@ -4067,7 +5425,17 @@ export function applySessionClose(args) {
   // One bag for the six accumulators, passed to every write phase below. They
   // push into it in call order; nothing is merged back afterwards, so the
   // report lines keep the exact order the inline version produced.
-  const acc = { applied, skipped, appliedPaths, conflicts, restructureWaivers, proofEntries };
+  // `notices` collects what the entry step wants the reader to see (an adopted entry).
+  const notices = [];
+  const acc = {
+    applied,
+    skipped,
+    appliedPaths,
+    conflicts,
+    restructureWaivers,
+    proofEntries,
+    notices,
+  };
 
   // Record this set's targets BEFORE the first byte is written (see
   // closeIntentPath's doc comment above applyOverwrites), and remove the
@@ -4085,7 +5453,7 @@ export function applySessionClose(args) {
   const intentResult = writeCloseIntent(
     args.hypoDir,
     args.sessionId,
-    closeIntentTargetsFor(payload, project),
+    closeIntentTargetsFor(payload, entryPlan),
   );
   if (!intentResult.ok) {
     const msg =
@@ -4102,6 +5470,7 @@ export function applySessionClose(args) {
     console.log(args.json ? JSON.stringify(out, null, 2) : `✗ ${msg}`);
     process.exit(1);
   }
+  writeSessionEntry(args, entryPlan, acc, testHooks);
   applyOverwrites(
     args,
     payload,
@@ -4113,74 +5482,165 @@ export function applySessionClose(args) {
     intentResult.attemptId,
   );
   markCloseIntentApplied(args.hypoDir, args.sessionId, intentResult.attemptId);
-  appendSessionLogEntry(args, payload, project, date, acc);
-  appendRootLogEntry(args, payload, project, date, acc);
+  // The session-log shard lock and the log.md lock are held from the appends below through
+  // the commit (commitCloseWrites), and released before the marker phase. The commit takes
+  // each whole path (`--only`), so another close appending in between would have its text
+  // committed under this close, before its own close finishes. The locks are the same
+  // primitive the appends always used. The order is shard, then log.md, then the vault
+  // commit lock, and no path takes any two of them the other way round.
+  const shardTarget = join(args.hypoDir, 'projects', project, 'session-log', `${date}.md`);
+  const appendTargets = [
+    appendTarget(join('projects', project, 'session-log', `${date}.md`), shardTarget),
+    appendTarget('log.md', join(args.hypoDir, 'log.md')),
+  ];
+  let withdrawnAppends = [];
+  const held = runHoldingAppendLocks(shardTarget, join(args.hypoDir, 'log.md'), (locks) => {
+    // Appended text no commit holds is taken back before the locks release
+    // (withdrawUnlandedAppends), or the next close would commit it as its own.
+    try {
+      trackAppend(appendTargets[0], locks.shardHeld, () =>
+        appendSessionLogEntry(args, payload, project, date, acc, closeId, locks.shardHeld),
+      );
+      trackAppend(appendTargets[1], locks.logHeld, () =>
+        appendRootLogEntry(args, payload, project, date, acc, locks.logHeld),
+      );
 
-  const { proposals, proposalStoreFailures } = parkOverwriteConflicts(args, conflicts);
-  const proposalStoreFailed = proposalStoreFailures.length > 0;
-  // Vault-wide total, not just what THIS close just parked: `proposals` above is
-  // this run's own new artifacts, and a close that never parks anything can still
-  // sit behind dozens accumulated by earlier sessions with no path here that says
-  // so. This used to reuse `doctor`'s `classifyProposals` judgment so the two
-  // surfaces could never disagree about the number, but that judgment reads the
-  // WHOLE audit log and re-hashes every recoverable candidate's target file, on
-  // every close, whether or not anything here needs the pending/recoverable/
-  // evidence-broken breakdown. `listProposalsChecked` counts the SAME artifacts
-  // (classifyProposals emits exactly one entry per valid artifact, so the totals
-  // agree) without either cost: a directory listing plus each artifact's own
-  // JSON, nothing from `applied.log` and no target re-read. The breakdown by
-  // state still lives in `hypomnema doctor`, which is what actually tells a
-  // human whether a parked artifact needs review or just a `proposal reconcile`.
-  // `ok: false` here means the inventory itself could not be enumerated
-  // (permissions, or a file sitting where the directory should be): a real
-  // "unmeasured", not "empty", so `parkedTotal` stays `null` rather than lie
-  // that the backlog is zero.
-  const proposalInventory = listProposalsChecked(args.hypoDir);
-  const parkedTotal = proposalInventory.ok ? proposalInventory.proposals.length : null;
-  // Candidate `.json` files inside a LISTABLE `.cache/proposals` that
-  // listProposalsChecked could not parse into an artifact (corrupt, permission-
-  // denied, or hand-edited into an unrecognizable shape). These are not folded
-  // into parkedTotal above (that count stays "artifacts this close's callers
-  // can actually act on"), but a close must never let one sit invisible: before
-  // this field, an unreadable artifact simply vanished from the count, and a
-  // vault with nothing BUT unreadable ones reported `parkedTotal: 0` with no
-  // line anywhere naming the file. Always an array (empty when nothing is
-  // wrong, or when the whole directory could not even be listed, that failure
-  // already reads as `parkedTotal: null`, not a lying zero here).
-  const parkedUnreadable = proposalInventory.unreadable;
-  // Subset of the line above whose bytes are probably intact: the writer
-  // finished and only the rename never landed. Carried as its own field
-  // rather than carved out of parkedUnreadable, so a `--json` consumer that
-  // already counts unreadable files keeps counting the same set.
-  const parkedOrphanTmp = proposalInventory.orphanTmp || [];
+      // A migrated vault shows the new entry in its generated views right away. A vault
+      // that has not moved to entries has nothing to render (this is a no-op there).
+      // Cost: this runs inside the held section, so the two append locks stay held for as long
+      // as the vault lock wait (about 5s) when another writer holds the vault lock. It stays
+      // here because lint may read the generated views and they should match the appends it
+      // judges; that dependency is not verified, so moving it out is open if the hold time
+      // ever shows up as lock timeouts.
+      try {
+        writeGeneratedViews(args.hypoDir, { projects: [project] });
+      } catch (err) {
+        process.stderr.write(
+          `[crystallize] warning: could not refresh the generated session views (${err?.message || err}); the next session start or stop rewrites them\n`,
+        );
+      }
 
-  // Same-date-tie fix: verify against the SAME project this apply just wrote
-  // (`project` = payload.project || probe.project, resolved at the top). Without
-  // the override, sessionCloseFileStatus re-derives via resolveActiveProject and,
-  // on a same-date root-hot.md tie, can pick a different project — false-failing
-  // a completed close (the 2026-06-09 security-ops-kb incident).
-  const verification = sessionCloseFileStatus(args.hypoDir, { projectOverride: project });
+      const { proposals, proposalStoreFailures } = parkOverwriteConflicts(args, conflicts);
+      const proposalStoreFailed = proposalStoreFailures.length > 0;
+      // Vault-wide total, not just what THIS close just parked: `proposals` above is
+      // this run's own new artifacts, and a close that never parks anything can still
+      // sit behind dozens accumulated by earlier sessions with no path here that says
+      // so. This used to reuse `doctor`'s `classifyProposals` judgment so the two
+      // surfaces could never disagree about the number, but that judgment reads the
+      // WHOLE audit log and re-hashes every recoverable candidate's target file, on
+      // every close, whether or not anything here needs the pending/recoverable/
+      // evidence-broken breakdown. `listProposalsChecked` counts the SAME artifacts
+      // (classifyProposals emits exactly one entry per valid artifact, so the totals
+      // agree) without either cost: a directory listing plus each artifact's own
+      // JSON, nothing from `applied.log` and no target re-read. The breakdown by
+      // state still lives in `hypomnema doctor`, which is what actually tells a
+      // human whether a parked artifact needs review or just a `proposal reconcile`.
+      // `ok: false` here means the inventory itself could not be enumerated
+      // (permissions, or a file sitting where the directory should be): a real
+      // "unmeasured", not "empty", so `parkedTotal` stays `null` rather than lie
+      // that the backlog is zero.
+      const proposalInventory = listProposalsChecked(args.hypoDir);
+      const parkedTotal = proposalInventory.ok ? proposalInventory.proposals.length : null;
+      // Candidate `.json` files inside a LISTABLE `.cache/proposals` that
+      // listProposalsChecked could not parse into an artifact (corrupt, permission-
+      // denied, or hand-edited into an unrecognizable shape). These are not folded
+      // into parkedTotal above (that count stays "artifacts this close's callers
+      // can actually act on"), but a close must never let one sit invisible: before
+      // this field, an unreadable artifact simply vanished from the count, and a
+      // vault with nothing BUT unreadable ones reported `parkedTotal: 0` with no
+      // line anywhere naming the file. Always an array (empty when nothing is
+      // wrong, or when the whole directory could not even be listed, that failure
+      // already reads as `parkedTotal: null`, not a lying zero here).
+      const parkedUnreadable = proposalInventory.unreadable;
+      // Subset of the line above whose bytes are probably intact: the writer
+      // finished and only the rename never landed. Carried as its own field
+      // rather than carved out of parkedUnreadable, so a `--json` consumer that
+      // already counts unreadable files keeps counting the same set.
+      const parkedOrphanTmp = proposalInventory.orphanTmp || [];
 
-  const { postApplyLint, postBlocking, postNotice, postLintOk, w19Notice } = runPostApplyLint(
-    args,
-    payloadScope,
-  );
+      const { postApplyLint, postBlocking, postNotice, postLintOk, w19Notice } = runPostApplyLint(
+        args,
+        payloadScope,
+      );
 
-  // `let` (not const): the close-result invariant self-check below may flip this
-  // to false when the settled close result is internally contradictory.
-  //
-  // A withheld conflict target must fail the close on its own, not merely via the
-  // freshness gate. If the other session already touched that page TODAY, freshness
-  // sees a fresh file and passes — and the close would report ok:true, write the
-  // marker, and drop this session's payload silently. `conflicts` closes that hole.
-  let ok = verification.ok && postLintOk && conflicts.length === 0;
+      // What decides the commit. The post-apply verification joins it once the
+      // commit has landed (runMarkerPhase, below).
+      //
+      // A withheld conflict target must fail the close on its own, not merely via the
+      // freshness gate. If the other session already touched that page TODAY, freshness
+      // sees a fresh file and passes — and the close would report ok:true, write the
+      // marker, and drop this session's payload silently. `conflicts` closes that hole.
+      const preCommitOk = postLintOk && conflicts.length === 0;
 
-  // Scope the non-blocking notice to the close-target project: debt under
-  // projects/<project>/ stays listed; debt elsewhere folds to a count so the
-  // same untouched-file debt does not re-list its filenames on every close.
-  const closeScopeNotice = postNotice.filter((e) => isUnderProjectDirs(e.file, [project]));
-  const otherDebtCount = postNotice.length - closeScopeNotice.length;
+      // Scope the non-blocking notice to the close-target project: debt under
+      // projects/<project>/ stays listed; debt elsewhere folds to a count so the
+      // same untouched-file debt does not re-list its filenames on every close.
+      const closeScopeNotice = postNotice.filter((e) => isUnderProjectDirs(e.file, [project]));
+      const otherDebtCount = postNotice.length - closeScopeNotice.length;
 
+      const commit =
+        preCommitOk && args.sessionId
+          ? commitCloseWrites(args, appliedPaths, {
+              preflightLint,
+              hasConflicts: conflicts.length > 0,
+              proofEntries,
+              attemptId: intentResult.attemptId,
+              testHooks,
+            })
+          : null;
+      return {
+        proposals,
+        proposalStoreFailures,
+        proposalStoreFailed,
+        parkedTotal,
+        parkedUnreadable,
+        parkedOrphanTmp,
+        postApplyLint,
+        postBlocking,
+        postLintOk,
+        w19Notice,
+        preCommitOk,
+        closeScopeNotice,
+        otherDebtCount,
+        commit,
+      };
+    } finally {
+      withdrawnAppends = withdrawUnlandedAppends(
+        { hypoDir: args.hypoDir, sessionId: args.sessionId, closeId },
+        appendTargets,
+        notices,
+      );
+    }
+  });
+  const {
+    proposals,
+    proposalStoreFailures,
+    proposalStoreFailed,
+    parkedTotal,
+    parkedUnreadable,
+    parkedOrphanTmp,
+    postApplyLint,
+    postBlocking,
+    postLintOk,
+    w19Notice,
+    preCommitOk,
+    closeScopeNotice,
+    otherDebtCount,
+    commit,
+  } = held;
+  const markerPhase = runMarkerPhase(args, project, appliedPaths, preCommitOk, hostTagWarning, {
+    commit,
+    proofEntries,
+    testHooks,
+    // This close, by its pinned close id, in the project the payload named (the
+    // same-date-tie fix: never re-derived from root hot.md, which on a tie can
+    // name another project and false-fail a completed close).
+    verify: () =>
+      sessionCloseFileStatus(args.hypoDir, { scope: 'session', closeId, projectOverride: project }),
+    closeOpen,
+    resolvedAtIndex,
+    openedAtIndex,
+  });
   const {
     markerWritten,
     markerSkipReason,
@@ -4189,12 +5649,17 @@ export function applySessionClose(args) {
     gateNotices,
     gateBlockers,
     receiptMismatches,
-  } = runMarkerPhase(args, project, appliedPaths, ok, hostTagWarning, {
-    preflightLint,
-    hasConflicts: conflicts.length > 0,
-    proofEntries,
-    attemptId: intentResult.attemptId,
-  });
+    verification,
+    verificationCounts,
+  } = markerPhase;
+  const verificationOk = !verificationCounts || verification.ok;
+  // `let` (not const): the close-result invariant self-check below may flip this
+  // to false when the settled close result is internally contradictory.
+  // A commit that ran and failed leaves the entry and the appends unpublished, so the
+  // close did not happen. The marker phase has already withheld the marker and receipt
+  // (planMarkerDecision), and the retry is authorized by the same close signal.
+  const commitFailed = commitOutcome?.committed === false;
+  let ok = preCommitOk && verificationOk && !commitFailed;
   // Only a landed commit retires the close-intent record. Everything before
   // this point (the appends, a withheld conflict, a lint or commit failure)
   // leaves it in place: see closeIntentPath's doc comment for why an ok:false
@@ -4219,7 +5684,14 @@ export function applySessionClose(args) {
     commitShaForUndo(commitOutcome),
   );
 
-  let stage = resolveCloseStage({ ok, proposalStoreFailed, conflicts, verification, postLintOk });
+  let stage = resolveCloseStage({
+    ok,
+    proposalStoreFailed,
+    conflicts,
+    commitFailed,
+    verificationOk,
+    postLintOk,
+  });
   // Runtime close-result invariant self-check. When a
   // marker-write path (args.sessionId present) settles into an internally
   // contradictory shape — ok:true with the marker silently withheld and no
@@ -4259,6 +5731,7 @@ export function applySessionClose(args) {
     project,
     date,
     applied,
+    withdrawnAppends,
     skipped,
     commitOutcome,
     conflicts,
@@ -4282,8 +5755,10 @@ export function applySessionClose(args) {
     gateNotices,
     gateBlockers,
     restructureWaivers,
-    obsoleteNotices,
+    obsoleteNotices: [...obsoleteNotices, ...notices],
     hostTagWarning: hostTagNotice,
+    hypoDir: args.hypoDir,
+    appliedPaths,
   });
 
   if (args.json) {
@@ -4304,13 +5779,14 @@ export function applySessionClose(args) {
       markerSkipReason,
       markerGateReason,
       verification,
+      verificationOk,
       postLintOk,
       postBlocking,
       closeScopeNotice,
       otherDebtCount,
       w19Notice,
       restructureWaivers,
-      obsoleteNotices,
+      obsoleteNotices: [...obsoleteNotices, ...notices],
       hostTagWarning: hostTagNotice,
     });
   }

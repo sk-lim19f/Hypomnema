@@ -62,6 +62,32 @@ test('with results: ingest prompt not shown', () => {
   });
 });
 
+test('query: a word only a session entry contains finds nothing, the same word in a page is found', () => {
+  withTmpDir((dir) => {
+    mkdirSync(join(dir, 'pages'), { recursive: true });
+    mkdirSync(join(dir, 'projects', 'p', 'sessions'), { recursive: true });
+    writeFileSync(
+      join(dir, 'projects', 'p', 'sessions', '2026-09-01-c1.md'),
+      '---\ntype: session-entry\ntitle: "session entry: p 2026-09-01"\n---\nZZSESSIONONLY lives here\n',
+    );
+    const args = [`--hypo-dir=${dir}`, '--q=ZZSESSIONONLY', '--json'];
+    let r = run('query.mjs', args);
+    assert.equal(r.status, 0, r.stderr);
+    assert.deepEqual(JSON.parse(r.stdout), [], `entry leaked into query: ${r.stdout}`);
+
+    writeFileSync(
+      join(dir, 'pages', 'y.md'),
+      '---\ntitle: y\ntype: note\n---\nZZSESSIONONLY lives here too\n',
+    );
+    r = run('query.mjs', args);
+    assert.equal(r.status, 0, r.stderr);
+    assert.deepEqual(
+      JSON.parse(r.stdout).map((x) => x.slug),
+      ['pages/y'],
+    );
+  });
+});
+
 // ── resume.mjs smoke tests ───────────────────────────────────────────────────
 
 suite('resume.mjs — fresh-init + commented-example hot.md');
@@ -139,7 +165,8 @@ test('resume picks real project over _template fallback (even when _template is 
     );
     // Touch _template/session-state.md to be 1 second newer than foo's.
     const templateSS = join(hypoDir, 'projects', '_template', 'session-state.md');
-    assert.ok(existsSync(templateSS), 'fixture: _template/session-state.md must exist after init');
+    // init no longer ships this file, so the fixture writes the stray one it is about.
+    writeFileSync(templateSS, '---\ntitle: session-state\ntype: session-state\n---\n');
     const fooSS = join(hypoDir, 'projects', 'foo', 'session-state.md');
     const fooMtime = statSync(fooSS).mtimeMs;
     const newer = new Date(fooMtime + 5000);
@@ -821,6 +848,62 @@ test('resume.mjs: a foreign project surfaces a one-line notice (count + name)', 
   });
 });
 
+// A live close's lock file and a waiter's staging file are untracked, so they used to show up as
+// a second foreign change next to the one real draft.
+test('resume.mjs: a foreign lock artifact is not counted as a foreign change', () => {
+  withTwoProjectResumeWiki((dir) => {
+    const theirs = join(dir, 'projects', 'theirs');
+    writeFileSync(join(theirs, 'draft.md'), 'uncommitted draft\n');
+    // The two files a close locks inside the tracked tree live in a session-log shard.
+    mkdirSync(join(theirs, 'session-log'), { recursive: true });
+    writeFileSync(join(theirs, 'session-log', '2026-01-01.md.lock'), '');
+    writeFileSync(join(theirs, 'session-log', '2026-01-01.md.lock.0123456789abcdef.tmp'), '');
+    const r = runResume(dir);
+    assert.equal(r.status, 0, `expected exit 0; stderr=${r.stderr}`);
+    assert.match(
+      r.stdout,
+      /^\[WIKI: 현재 프로젝트 외 projects\/theirs 변경 1건이 있습니다\./,
+      `only the draft counts, got: ${r.stdout}`,
+    );
+  });
+});
+
+// Only the files a close locks are artifacts: a person's untracked `.lock` file counts.
+test("resume.mjs: a person's untracked .lock file is counted as a foreign change", () => {
+  withTwoProjectResumeWiki((dir) => {
+    const theirs = join(dir, 'projects', 'theirs');
+    writeFileSync(join(theirs, 'draft.md'), 'uncommitted draft\n');
+    writeFileSync(join(theirs, 'draft.md.lock'), 'mine\n');
+    const r = runResume(dir);
+    assert.equal(r.status, 0, `expected exit 0; stderr=${r.stderr}`);
+    assert.match(
+      r.stdout,
+      /^\[WIKI: 현재 프로젝트 외 projects\/theirs 변경 2건이 있습니다\./,
+      `both files count, got: ${r.stdout}`,
+    );
+  });
+});
+
+// The lock-artifact filter covers untracked records only: a tracked file that happens to end in
+// `.lock` and is edited is a person's work.
+test('resume.mjs: a tracked foreign .lock file that was edited is counted as a foreign change', () => {
+  withTwoProjectResumeWiki((dir) => {
+    const rel = join('projects', 'theirs', 'draft.md.lock');
+    writeFileSync(join(dir, rel), 'tracked on purpose\n');
+    const env = { ...process.env, HOME: SESSION_TMP_HOME };
+    spawnSync('git', ['add', '-f', rel], { cwd: dir, env });
+    spawnSync('git', ['commit', '-q', '-m', 'track a lock-named file'], { cwd: dir, env });
+    writeFileSync(join(dir, rel), 'edited by a person\n');
+    const r = runResume(dir);
+    assert.equal(r.status, 0, `expected exit 0; stderr=${r.stderr}`);
+    assert.match(
+      r.stdout,
+      /^\[WIKI: 현재 프로젝트 외 projects\/theirs 변경 1건이 있습니다\./,
+      `the tracked edit counts, got: ${r.stdout}`,
+    );
+  });
+});
+
 test('resume.mjs: own-project changes are excluded from the foreign count', () => {
   withTwoProjectResumeWiki((dir) => {
     writeFileSync(join(dir, 'projects', 'mine', 'draft.md'), 'my own uncommitted work\n');
@@ -1016,5 +1099,181 @@ test('resume.mjs: init --no-git-init vault reports "cannot attribute" on every s
       /^\[WIKI: 미커밋 변경의 귀속을 확인하지 못했습니다\. git 상태를 근거로 작업 범위를 정하지 마십시오\.\]/,
       `expected the cannot-attribute notice on a supported non-git vault, got: ${r.stdout}`,
     );
+  });
+});
+
+// ── resume.mjs — renders from session entries ───────────────────────────────
+
+import { closeIdFor, entryFileName, formatSessionEntry } from '../hooks/session-entries.mjs';
+import { readObservedHeads } from '../hooks/session-views.mjs';
+import { readdirSync } from 'node:fs';
+
+suite('resume.mjs — renders from session entries');
+
+const OLD_STATE_TEXT =
+  '---\ntitle: ss — mine\ntype: session-state\nupdated: 2026-06-28\n---\n\n' +
+  '## Next\n- OLD_STATE_TASK\n\n## Notes\nOLD_NOTES_TAIL\n';
+const OLD_HOT_TEXT =
+  '---\ntitle: hot — mine\ntype: reference\nupdated: 2026-06-28\n---\n\nOLD_HOT_BODY\n';
+
+// A git vault that still tracks the old files (not migrated): the old state and hot are what
+// resume has to show, as virtual baseline entries.
+function withOldFilesVault(fn) {
+  withGrowthWiki((dir) => {
+    const pdir = join(dir, 'projects', 'mine');
+    mkdirSync(pdir, { recursive: true });
+    writeFileSync(join(pdir, 'session-state.md'), OLD_STATE_TEXT);
+    writeFileSync(join(pdir, 'hot.md'), OLD_HOT_TEXT);
+    spawnSync('git', ['add', '-A'], { cwd: dir });
+    spawnSync('git', ['commit', '-q', '-m', 'old files'], { cwd: dir });
+    fn(dir);
+  });
+}
+
+function resumeIn(dir, args, { cwd, env = {} } = {}) {
+  return spawnSync(process.execPath, [join(SCRIPTS, 'resume.mjs'), `--hypo-dir=${dir}`, ...args], {
+    encoding: 'utf-8',
+    cwd,
+    env: {
+      ...process.env,
+      HYPO_DIR: dir,
+      HOME: SESSION_TMP_HOME,
+      CLAUDE_CODE_SESSION_ID: '',
+      CLAUDE_SESSION_ID: '',
+      ...env,
+    },
+  });
+}
+
+test('이행 전 resume에 옛 본문', () => {
+  withOldFilesVault((dir) => {
+    const r = resumeIn(dir, ['--project=mine']);
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    assert.match(r.stdout, /OLD_STATE_TASK/, `the old session-state body is missing: ${r.stdout}`);
+    assert.match(r.stdout, /OLD_HOT_BODY/, `the old hot body is missing: ${r.stdout}`);
+    assert.match(r.stdout, /^Next up \(1\):\n- /m, `the summary list is missing: ${r.stdout}`);
+  });
+});
+
+test('`## Notes`가 든 머리의 요약이 그 절에서 끊기지 않음', () => {
+  withOldFilesVault((dir) => {
+    const r = resumeIn(dir, ['--project=mine', '--json']);
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.nextUp.length, 1, r.stdout);
+    assert.match(out.nextUp[0].body, /OLD_STATE_TASK/);
+    assert.match(out.nextUp[0].body, /## Notes/);
+    assert.match(
+      out.nextUp[0].body,
+      /OLD_NOTES_TAIL/,
+      `the summary was cut at the first inner heading: ${JSON.stringify(out.nextUp[0].body)}`,
+    );
+  });
+});
+
+test('resume 뒤 observed heads에 머리 기록', () => {
+  withOldFilesVault((dir) => {
+    const r = resumeIn(dir, ['--project=mine', '--json', '--session-id=s-resume-obs']);
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    const { nextUp } = JSON.parse(r.stdout);
+    assert.equal(nextUp.length, 1, r.stdout);
+    const heads = readObservedHeads(dir, 's-resume-obs', 'mine');
+    assert.deepEqual(heads.full, { [nextUp[0].trackId]: [nextUp[0].closeId] });
+    assert.deepEqual(heads.pointer, {});
+  });
+});
+
+test('세션 id 가 없으면 observed heads 를 기록하지 않는다', () => {
+  withOldFilesVault((dir) => {
+    const r = resumeIn(dir, ['--project=mine']);
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    assert.deepEqual(readObservedHeads(dir, 's-resume-obs', 'mine'), { full: {}, pointer: {} });
+    const sessionsDir = join(dir, '.cache', 'sessions');
+    const recorded = existsSync(sessionsDir)
+      ? readdirSync(sessionsDir).filter((id) =>
+          existsSync(join(sessionsDir, id, 'observed-heads.json')),
+        )
+      : [];
+    assert.deepEqual(recorded, [], 'no observed-heads file may be written without a session id');
+  });
+});
+
+test('세션 id 는 환경 변수 CLAUDE_CODE_SESSION_ID 에서도 읽는다', () => {
+  withOldFilesVault((dir) => {
+    const r = resumeIn(dir, ['--project=mine'], {
+      env: { CLAUDE_CODE_SESSION_ID: 's-resume-env' },
+    });
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    assert.equal(Object.keys(readObservedHeads(dir, 's-resume-env', 'mine').full).length, 1);
+  });
+});
+
+// A vault with no `.git` counts as migrated, so only the session entries are on the page.
+function writeEntry(dir, project, sessionId, date, { title, body, summary }) {
+  const closeId = closeIdFor(sessionId, 0);
+  mkdirSync(join(dir, 'projects', project, 'sessions'), { recursive: true });
+  writeFileSync(
+    join(dir, 'projects', project, 'sessions', entryFileName(date, closeId)),
+    formatSessionEntry({
+      project,
+      closeId,
+      date,
+      tracks: [{ id: 'main', title, new: true }],
+      summary,
+      bodies: { main: body },
+    }),
+  );
+  return closeId;
+}
+
+function withEntryVault(fn) {
+  withTmpDir((dir) => {
+    const hypoDir = join(dir, 'wiki');
+    const initR = run('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-hooks', '--no-git-init']);
+    assert.equal(initR.status, 0, `init failed: ${initR.stderr}`);
+    fn(hypoDir);
+  });
+}
+
+test('원본 항목의 다음 할 일과 배경이 렌더되고 observed heads 에 그 close id 가 든다', () => {
+  withEntryVault((dir) => {
+    const closeId = writeEntry(dir, 'p1', 's-entry-1', '2026-09-01', {
+      title: 'Main track',
+      body: 'ENTRY_NEXT_TASK',
+      summary: 'ENTRY_SUMMARY',
+    });
+    const r = resumeIn(dir, ['--project=p1', '--session-id=s-resume-entry']);
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    assert.match(r.stdout, /ENTRY_NEXT_TASK/);
+    assert.match(r.stdout, /ENTRY_SUMMARY/);
+    assert.match(r.stdout, /^- Main track \(2026-09-01\)$/m);
+    assert.deepEqual(readObservedHeads(dir, 's-resume-entry', 'p1').full, { main: [closeId] });
+  });
+});
+
+test('활성 프로젝트 대체는 파일 mtime 이 아니라 최신 원본 date', () => {
+  withEntryVault((dir) => {
+    writeEntry(dir, 'older', 's-old', '2026-01-01', {
+      title: 'Old',
+      body: 'OLDER_BODY',
+      summary: 's',
+    });
+    writeEntry(dir, 'newer', 's-new', '2026-03-01', {
+      title: 'New',
+      body: 'NEWER_BODY',
+      summary: 's',
+    });
+    // The older project's files are the freshest on disk: mtime would pick it.
+    const future = new Date('2030-01-01T00:00:00Z');
+    for (const f of [
+      'sessions',
+      `sessions/${entryFileName('2026-01-01', closeIdFor('s-old', 0))}`,
+    ]) {
+      utimesSync(join(dir, 'projects', 'older', f), future, future);
+    }
+    const r = resumeIn(dir, [], { cwd: dir });
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    assert.match(r.stdout, /^Project: newer$/m, r.stdout);
+    assert.match(r.stdout, /NEWER_BODY/);
   });
 });

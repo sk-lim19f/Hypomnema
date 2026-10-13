@@ -9,6 +9,7 @@ import {
   mkdtempSync,
   mkdirSync,
   rmSync,
+  readdirSync,
   writeFileSync,
   appendFileSync,
   readFileSync,
@@ -17,7 +18,6 @@ import {
   unlinkSync,
   cpSync,
   chmodSync,
-  statSync,
 } from 'node:fs';
 import { join, dirname, basename } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -37,21 +37,28 @@ import {
   freshDates,
   isForeignProjectFile,
   classifyForeignOnlyDirty,
-  renderRootHotProjection,
-  formatRootHotProjection,
-  writeRootHotProjection,
-  scanRootHotProjectionSources,
-  sortRootHotRows,
+  backUpGeneratedPath,
+  collectProjectWorkingDirs,
   writeRootHotHealthNotice,
   consumeRootHotHealthNotice,
+  readAutoStagedRecord,
   ROOT_HOT_BACKUP_SUFFIX,
   resolveActiveProject,
-  claimProjectionWrite,
-  claimAndWriteRootHotProjection,
-  rootHotProjectionIsCurrent,
   sessionCloseFileStatus,
   readTouchedPathsStrict,
+  writeClosePin,
+  migrationState,
 } from '../hooks/hypo-shared.mjs';
+import {
+  GITIGNORE_BLOCK,
+  closeIdFor,
+  entryFileName,
+  formatSessionEntry,
+  isGeneratedViewPath,
+  renderViews,
+  sortRootRows,
+} from '../hooks/session-entries.mjs';
+import { writeGeneratedViews } from '../hooks/session-views.mjs';
 import {
   snapshotBase,
   readBaseEntry,
@@ -94,6 +101,7 @@ import {
   withTmpDir,
   withWiki,
   writeMarker,
+  makeMultiProjectWiki,
 } from './helpers.mjs';
 
 // mkdtempSync leaves its directory behind, and five transcript fixtures in this
@@ -172,88 +180,23 @@ test('hot-rebuild emits no growth line when wiki is clean', () => {
   });
 });
 
-suite('hypo-hot-rebuild.mjs: directory-scan row format (ISSUE-115 wave 1)');
-
-// ISSUE-115 wave 1 retired parsePointerRows: the row set no longer comes from
-// parsing the PREVIOUS root file at all, so these two tests (formerly named
-// for the retired parser) now pin the replacement contract: a row survives
-// rebuild exactly when a real `projects/<slug>/hot.md` backs it, regardless of
-// what shape (or garbage) the old root file's row was in.
-test('a row backed by a real project hot.md survives rebuild', () => {
-  withTmpDir((dir) => {
-    mkdirSync(join(dir, 'projects', 'my-project'), { recursive: true });
-    writeFileSync(
-      join(dir, 'projects', 'my-project', 'hot.md'),
-      '---\ntitle: my-project\nupdated: 2026-01-01\n---\n# Hot\n',
-    );
-    writeFileSync(
-      join(dir, 'hot.md'),
-      '---\ntitle: Hot Cache: Pointer\ntype: reference\nupdated: 2026-01-01\ntags: [wiki, operations]\n---\n\n' +
-        '# Hot Cache\n\n> Read at session start\n\n## Active Projects\n\n' +
-        '| Project | Last Session | Hot Cache |\n|---|---|---|\n',
-    );
-    writeFileSync(join(dir, 'hypo-config.md'), '# config');
-    const r = runStop('hypo-hot-rebuild.mjs', dir);
-    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
-    const result = readFileSync(join(dir, 'hot.md'), 'utf-8');
-    assert.ok(
-      result.includes('[[projects/my-project/hot]]'),
-      `a project with a real hot.md must get a row: ${result}`,
-    );
-  });
-});
-
-test('a row in the OLD root file with no backing project directory does not survive rebuild', () => {
-  withTmpDir((dir) => {
-    // valid-project has a real projects/valid-project/hot.md; bad-project only
-    // ever existed as a row in the old root file (any shape, whether wikilink
-    // or markdown link, no longer matters, since the old file's rows are never
-    // read). Directory-scan is the only source of truth for wave 1.
-    mkdirSync(join(dir, 'projects', 'valid-project'), { recursive: true });
-    writeFileSync(
-      join(dir, 'projects', 'valid-project', 'hot.md'),
-      '---\ntitle: valid-project\nupdated: 2026-01-01\n---\n# Hot\n',
-    );
-    writeFileSync(
-      join(dir, 'hot.md'),
-      '---\ntitle: Hot Cache: Pointer\ntype: reference\nupdated: 2026-01-01\ntags: [wiki, operations]\n---\n\n' +
-        '# Hot Cache\n\n> Read at session start\n\n## Active Projects\n\n' +
-        '| Project | Last Session | Hot Cache |\n|---|---|---|\n' +
-        '| valid-project | 2026-01-01 | [[projects/valid-project/hot]] |\n' +
-        '| bad-project | 2026-01-01 | [projects/bad-project/hot](projects/bad-project/hot.md) |\n',
-    );
-    writeFileSync(join(dir, 'hypo-config.md'), '# config');
-    const r = runStop('hypo-hot-rebuild.mjs', dir);
-    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
-    const result = readFileSync(join(dir, 'hot.md'), 'utf-8');
-    assert.ok(
-      result.includes('[[projects/valid-project/hot]]'),
-      `a real project's row must survive: ${result}`,
-    );
-    assert.ok(
-      !result.includes('bad-project'),
-      `a row with no backing project directory must not survive: ${result}`,
-    );
-  });
-});
-
 suite('hypo-hot-rebuild.mjs: the rebuild touches no base (root hot.md drift fix)');
 
-// hot-rebuild rewrites hot.md through writeRootHotProjection (atomicWrite),
+// hot-rebuild writes the generated views through atomicWrite, which
 // hypo-auto-stage's PostToolUse-based advanceBaseForWrite never sees (it only
 // fires for a Write/Edit/MultiEdit TOOL call). That write used to leave the
 // session's observed base for hot.md pointing at the pre-rebuild bytes, so a
 // close carrying the (correct, post-rebuild) content parked a false
-// 'base-mismatch' conflict against its own session's edit. The first fix was to
-// advance the base from inside the hook; the fix that removed the contention is
-// this one: the root hot.md is not an overwrite target at all any more, so no
-// session snapshots it, no close writes it, and the hook has no base to keep.
+// 'base-mismatch' conflict against its own session's edit. The root hot.md is
+// not an overwrite target at all any more, so no session snapshots it, no close
+// writes it, and the hook has no base to keep. The write case is pinned in the
+// generated-views suite below (the base sentinel survives a real rewrite); the
+// two tests here cover a vault the hook does not write.
 //
-// The stale row seeded below has nothing to do with a date rollover (it is a
-// deliberately wrong literal date), so this pins the general case: ANY
-// same-day rewrite hot-rebuild makes must leave the base alone, not only one
-// triggered by the calendar turning over at midnight.
-test('hot-rebuild rewrites hot.md, mints no base entry for it, and a close after it does not park', () => {
+// The vault below is moved to session entries first (the block is in HEAD, no view is tracked), so
+// the rebuild really rewrites the root table. In an unmigrated vault the generator writes nothing
+// and the checks about the base would pass without the hook ever reaching its write.
+test('hot-rebuild mints no base entry for hot.md when it rewrites the root table, and a close after it does not park', () => {
   withWiki(
     (dir, today) => {
       const rootHotPath = join(dir, 'hot.md');
@@ -266,6 +209,17 @@ test('hot-rebuild rewrites hot.md, mints no base entry for it, and a close after
       );
     },
     (dir, today) => {
+      const g = (...a) => spawnSync('git', ['-C', dir, ...a], { encoding: 'utf-8' });
+      const tracked = g('ls-files', '-z')
+        .stdout.split('\0')
+        .filter((rel) => isGeneratedViewPath(rel));
+      assert.ok(tracked.includes('hot.md'), 'fixture: the root view starts out tracked');
+      g('rm', '-q', '--cached', '--', ...tracked);
+      writeFileSync(join(dir, '.gitignore'), `.cache/\n${GITIGNORE_BLOCK}`);
+      g('add', '-A');
+      assert.equal(g('commit', '-q', '-m', 'move to session entries').status, 0);
+      assert.equal(migrationState(dir), 'migrated', 'fixture: the generator will write');
+
       const sid = 'sess-hotrebuild-advance';
       snapshotBase(dir, sid, overwriteTargets('test-project'));
       assert.equal(
@@ -279,11 +233,12 @@ test('hot-rebuild rewrites hot.md, mints no base entry for it, and a close after
 
       const disk = readFileSync(join(dir, 'hot.md'), 'utf-8');
       assert.ok(
-        disk.includes(`| test-project | ${today} |`),
-        'hot-rebuild must have corrected the stale row',
+        !disk.includes('| test-project | 2000-01-01 |'),
+        'the hook did write: the stale seeded row is gone',
       );
+      assert.equal(disk, renderViews([]).root, 'the root table is the generator output');
 
-      // Assertion 1: the rewrite left no base behind. `advanceBase` mints a key
+      // Assertion 1: the run left no base behind. `advanceBase` mints a key
       // whether or not the target was tracked, so a re-added call here shows up
       // as a 'hash' state on a file `snapshotBase` never recorded.
       assert.equal(
@@ -291,43 +246,33 @@ test('hot-rebuild rewrites hot.md, mints no base entry for it, and a close after
         'unknown',
         'the rebuild must not mint a base entry for a file no session snapshots',
       );
-      // Assertion 2: the close that follows the rewrite still succeeds. This is
-      // the failure the whole change exists to remove: the hook rewrites the
-      // table mid-session, and the close must neither park it nor write it. An
-      // installed copy on the previous command file still sends `rootHot`, so
-      // that is the payload used here.
+      // Assertion 2: the close that follows the run still succeeds, neither
+      // parking the table nor writing it. An installed copy on the previous
+      // command file still sends `rootHot`, so that is the payload used here.
       const payload = payloadForCleanWiki(dir, today);
       payload.rootHot = { content: `${disk.trimEnd()}\n` };
       const r2 = runApply(dir, payload, { sessionId: sid });
       const out = JSON.parse(r2.stdout);
       assert.equal(out.ok, true, `apply must not park: ${r2.stdout}`);
       assert.deepEqual(out.conflicts ?? [], [], `no conflict expected: ${r2.stdout}`);
+      // The close re-renders the views itself (a migrated vault shows a new entry at once), so
+      // the table's bytes may move; what must not move is the base, which no session snapshots.
       assert.equal(
-        readFileSync(join(dir, 'hot.md'), 'utf-8'),
-        disk,
-        "the close must leave the hook's bytes exactly as they were",
+        readBaseEntry(dir, sid, 'hot.md').state,
+        'unknown',
+        'the close must not mint a base entry for the root table either',
       );
     },
   );
 });
 
-test('hot-rebuild leaves the base untouched when the file is already canonical (no write, no advance)', () => {
+test('hot-rebuild leaves the base untouched when it writes nothing (no write, no advance)', () => {
   withTmpDir((dir) => {
-    // Built from the SAME generator hot-rebuild.mjs itself calls
-    // (renderRootHotProjection), not a hand-duplicated copy of its template --
-    // a second copy would silently drift from the real output shape and stop
-    // proving anything the moment one of them changed. A real backing project
-    // is required: the generator's row set comes only from a directory scan
-    // (ISSUE-115 wave 1), so a hand-written row with no
-    // `projects/my-project/hot.md` behind it would never round-trip as a
-    // no-op.
-    mkdirSync(join(dir, 'projects', 'my-project'), { recursive: true });
-    const rebuildToday = new Date().toISOString().slice(0, 10);
-    writeFileSync(
-      join(dir, 'projects', 'my-project', 'hot.md'),
-      `---\ntitle: my-project\nupdated: ${rebuildToday}\n---\n# Hot\n`,
-    );
-    writeFileSync(join(dir, 'hot.md'), renderRootHotProjection(dir));
+    // Built from the SAME generator the hook uses (renderViews), not a
+    // hand-duplicated copy of its template: a second copy would silently drift
+    // from the real output shape. A vault with no projects renders exactly this,
+    // so the hook has nothing to write.
+    writeFileSync(join(dir, 'hot.md'), renderViews([]).root);
     writeFileSync(join(dir, 'hypo-config.md'), '# config');
 
     const sid = 'sess-hotrebuild-noop';
@@ -352,7 +297,7 @@ test('hot-rebuild leaves the base untouched when the file is already canonical (
     assert.equal(
       baseAfter.hash,
       SENTINEL_HASH,
-      'a no-op rebuild must not touch the observed base (advanceBase must not fire outside the write branch)',
+      'a run that writes nothing must not touch the observed base (advanceBase must not fire outside the write branch)',
     );
   });
 });
@@ -536,119 +481,41 @@ test('hypo-auto-commit.mjs: an unrelated staged file from another session is lef
   });
 });
 
-test('hypo-hot-rebuild.mjs feeds its own hot.md write into the scoped commit', () => {
-  withGrowthWiki((dir) => {
-    // withGrowthWiki's hot.md has an empty pointer table, so rebuild() is a
-    // no-op there (parsePointerRows returns []); build a minimal fixture with
-    // one row so rebuild() actually rewrites hot.md deterministically.
-    mkdirSync(join(dir, 'projects', 'p1'), { recursive: true });
-    writeFileSync(
-      join(dir, 'projects', 'p1', 'hot.md'),
-      '---\ntitle: hot\nupdated: 2020-01-01\n---\n',
-    );
-    writeFileSync(
-      join(dir, 'hot.md'),
-      '---\ntitle: Hot\nupdated: stale\n---\n\n## Active Projects\n\n' +
-        '| Project | Last Session | Hot Cache |\n|---|---|---|\n' +
-        '| p1 | old-date | [[projects/p1/hot]] |\n',
-    );
-    spawnSync('git', ['-C', dir, 'add', '-A']);
-    spawnSync('git', ['-C', dir, 'commit', '-q', '-m', 'seed hot.md row'], { cwd: dir });
-    // hot-rebuild alone: proves it accumulates hot.md into the session's set.
-    const r = runStop('hypo-hot-rebuild.mjs', dir, { session_id: 'sess-hotrebuild' });
+test('hypo-hot-rebuild.mjs feeds its own log.md write into the scoped commit, and never claims a generated view', () => {
+  withSyncedWiki((dir) => {
+    // alpha closed today except for its root log.md entry, so the rebuild stage
+    // derives that entry (a hook-generated write that never goes through
+    // Write/Edit) and has to claim it.
+    const today = todayLocal();
+    makeMultiProjectWiki(dir, today, [{ slug: 'alpha', date: today, logEntry: false }]);
+    const sid = 'sess-hotrebuild';
+    const r = runStop('hypo-hot-rebuild.mjs', dir, { session_id: sid });
     assert.equal(r.status, 0, `stderr: ${r.stderr}`);
-    const touched = JSON.parse(readFileSync(touchedPathsPath(dir, 'sess-hotrebuild'), 'utf-8'));
-    assert.ok(
-      touched.includes('hot.md'),
-      `hot.md must be recorded as touched: ${JSON.stringify(touched)}`,
-    );
+    const touched = JSON.parse(readFileSync(touchedPathsPath(dir, sid), 'utf-8'));
+    assert.deepEqual(touched, ['log.md'], 'log.md and nothing else is recorded as touched');
     // end-to-end: hot-rebuild's accumulation is what lets auto-commit include
-    // the hook-generated hot.md, which never goes through Write/Edit at all.
-    const commitRes = runStop('hypo-auto-commit.mjs', dir, { session_id: 'sess-hotrebuild' });
+    // the hook-generated log.md.
+    const commitRes = runStop('hypo-auto-commit.mjs', dir, { session_id: sid });
     assert.equal(commitRes.status, 0, `stderr: ${commitRes.stderr}`);
     const committed = spawnSync(
       'git',
       ['-C', dir, 'show', '--name-only', '--pretty=format:', 'HEAD'],
       { encoding: 'utf-8' },
     ).stdout;
-    assert.ok(/^hot\.md$/m.test(committed), `hot.md must be in the scoped commit: ${committed}`);
+    assert.ok(/^log\.md$/m.test(committed), `log.md must be in the scoped commit: ${committed}`);
   });
 });
-
-// Sibling of the hot-rebuild test above, for the OTHER call site. Without
-// this, SessionStart's own projection write never lands in any session's
-// touched-paths set: writeRootHotProjection at Stop sees disk already equals
-// the projection SessionStart just wrote (a no-op, so hot-rebuild records
-// nothing touched either), and hypo-auto-commit only ever commits its
-// touched-paths set, so the write this hook makes would sit forever as an
-// uncommitted, unattributable dirty file, blocking the close gate and
-// PreCompact. This is the BLOCKER this test exists to pin: it failed red
-// before recordTouchedPaths was added to hypo-session-start.mjs's projection
-// call.
-test('hypo-session-start.mjs feeds its own hot.md write into the scoped commit', () => {
-  withGrowthWiki((dir) => {
-    // A real project so the projection actually differs from withGrowthWiki's
-    // empty-row hot.md (a no-op write records nothing touched, same reasoning
-    // as the hot-rebuild sibling test above).
-    mkdirSync(join(dir, 'projects', 'p1'), { recursive: true });
-    writeFileSync(
-      join(dir, 'projects', 'p1', 'hot.md'),
-      '---\ntitle: hot\nupdated: 2020-01-01\n---\n',
-    );
-    spawnSync('git', ['-C', dir, 'add', '-A']);
-    spawnSync('git', ['-C', dir, 'commit', '-q', '-m', 'seed p1'], { cwd: dir });
-    const sessionId = 'sess-sessionstart-hotproj';
-    const r = spawnSync(process.execPath, [join(HOOKS, 'hypo-session-start.mjs')], {
-      input: JSON.stringify({ cwd: dir, session_id: sessionId }),
-      encoding: 'utf-8',
-      env: { ...process.env, HOME: SESSION_TMP_HOME, HYPO_DIR: dir },
-    });
-    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
-    const touched = JSON.parse(readFileSync(touchedPathsPath(dir, sessionId), 'utf-8'));
-    assert.ok(
-      touched.includes('hot.md'),
-      `SessionStart's own hot.md write must be recorded as touched: ${JSON.stringify(touched)}`,
-    );
-    // end-to-end: without that record, auto-commit would never see this write
-    // at all, since hot-rebuild's own Stop-time write is a no-op (disk already
-    // matches the projection SessionStart just wrote).
-    const commitRes = runStop('hypo-auto-commit.mjs', dir, { session_id: sessionId });
-    assert.equal(commitRes.status, 0, `stderr: ${commitRes.stderr}`);
-    const committed = spawnSync(
-      'git',
-      ['-C', dir, 'show', '--name-only', '--pretty=format:', 'HEAD'],
-      { encoding: 'utf-8' },
-    ).stdout;
-    assert.ok(
-      /^hot\.md$/m.test(committed),
-      `SessionStart's hot.md write must reach the scoped commit: ${committed}`,
-    );
-  });
-});
-
-// ── BLOCKER fix (r5-w1.md, review round 5): a stale 'hot.md' claim over
-// content this session never actually wrote must not be swept into its
-// commit ──
-//
-// hypo-session-start.mjs's pre-write claim (claimProjectionWrite, taken
-// BEFORE writeRootHotProjection ever runs) used to survive a scanError or a
-// thrown read failure with nothing on that path alone to revoke it: 'hot.md'
-// stayed in the touched-paths set even though this session's own write never
-// landed. The fix re-verifies ownership at the LAST possible moment, inside
-// hypo-auto-commit.mjs's scoped-commit wrapper (rootHotProjectionIsCurrent),
-// instead of trying to remember to revoke the claim on every upstream branch
-// that can go wrong.
+// A stale 'hot.md' claim (the path sits in the session's touched-paths set, but the bytes on
+// disk are not this session's) must not be swept into its commit. The claim no longer needs
+// re-verifying at commit time: commitWikiChanges never commits a generated view path, whoever
+// wrote it, so a person's edit of a view survives on disk and stays out of every commit.
 test('hypo-auto-commit.mjs: a stale hot.md claim over content this session never wrote is excluded from the commit', () => {
   withGrowthWiki((dir) => {
     // withGrowthWiki's own seed commit already carries a hand-authored hot.md
-    // with no ownership hash ever recorded for it: the same shape a
-    // scanError-preserved stale claim protects a human's bytes against.
+    // (tracked, as a vault from before the move has it).
     const seeded = readFileSync(join(dir, 'hot.md'), 'utf-8');
     const humanEdit = '# private notes written while the claim sat stale\n';
     writeFileSync(join(dir, 'hot.md'), humanEdit);
-    // Stand in for the stale claim itself: a scanError-skipped SessionStart
-    // write leaves exactly this: 'hot.md' claimed, nothing this session
-    // actually produced backing it up.
     recordTouchedPaths(dir, 'sess-stale-claim', ['hot.md']);
     const r = runStop('hypo-auto-commit.mjs', dir, { session_id: 'sess-stale-claim' });
     assert.equal(r.status, 0, `stderr: ${r.stderr}`);
@@ -672,98 +539,8 @@ test('hypo-auto-commit.mjs: a stale hot.md claim over content this session never
       humanEdit,
       'the human edit itself must survive on disk: excluded from THIS commit, not destroyed',
     );
-    assert.equal(
-      consumeRootHotHealthNotice(dir),
-      '루트 hot.md이 이번 세션이 실제로 쓴 내용과 달라 이번 커밋에서 제외했습니다. 다음 세션 시작/종료 시 다시 확인됩니다.',
-      'the exclusion must leave a durable notice for the next SessionStart',
-    );
   });
 });
-
-// n1 (codex, 3rd-round): the sibling of the test above, but the content that
-// replaces a session's own bytes comes from ANOTHER SESSION's legitimate
-// write, not a human hand-edit. The old global-only ownership check could
-// not tell the two apart: a sibling session's write also updates the
-// global hash, so it read as "current" and staged the sibling's bytes into
-// this session's commit. Two sessions racing the one shared root hot.md is
-// not rare: measured across 349 real sessions, 2081 pairs overlap in time.
-test("n1: session A's stale claim is excluded once session B's own write replaces the bytes on disk", () => {
-  withGrowthWiki((dir) => {
-    mkdirSync(join(dir, 'projects', 'p1'), { recursive: true });
-    writeFileSync(
-      join(dir, 'projects', 'p1', 'hot.md'),
-      '---\ntitle: hot\nupdated: 2026-01-01\n---\n',
-    );
-    spawnSync('git', ['-C', dir, 'add', '-A']);
-    spawnSync('git', ['-C', dir, 'commit', '-q', '-m', 'seed p1'], { cwd: dir });
-
-    const sessA = 'sess-n1-a';
-    const sessB = 'sess-n1-b';
-    const rA = spawnSync(process.execPath, [join(HOOKS, 'hypo-session-start.mjs')], {
-      input: JSON.stringify({ cwd: dir, session_id: sessA }),
-      encoding: 'utf-8',
-      env: { ...process.env, HOME: SESSION_TMP_HOME, HYPO_DIR: dir },
-    });
-    assert.equal(rA.status, 0, `stderr: ${rA.stderr}`);
-    const bytesAfterA = readFileSync(join(dir, 'hot.md'), 'utf-8');
-
-    // A second project appears and session B's own SessionStart regenerates
-    // the projection with different bytes, racing ahead of A's own Stop and
-    // becoming the new global "last write" A's stale claim would otherwise
-    // ride along with.
-    mkdirSync(join(dir, 'projects', 'p2'), { recursive: true });
-    writeFileSync(
-      join(dir, 'projects', 'p2', 'hot.md'),
-      '---\ntitle: hot\nupdated: 2026-02-02\n---\n',
-    );
-    const rB = spawnSync(process.execPath, [join(HOOKS, 'hypo-session-start.mjs')], {
-      input: JSON.stringify({ cwd: dir, session_id: sessB }),
-      encoding: 'utf-8',
-      env: { ...process.env, HOME: SESSION_TMP_HOME, HYPO_DIR: dir },
-    });
-    assert.equal(rB.status, 0, `stderr: ${rB.stderr}`);
-    const bytesAfterB = readFileSync(join(dir, 'hot.md'), 'utf-8');
-    assert.notEqual(bytesAfterB, bytesAfterA, 'fixture: B must actually change the bytes on disk');
-
-    // Session A now Stops. Its OWN claim ('hot.md', made before B ever ran)
-    // is still sitting in A's touched-paths set.
-    const headBefore = spawnSync('git', ['-C', dir, 'rev-parse', 'HEAD'], {
-      encoding: 'utf-8',
-    }).stdout.trim();
-    const commitRes = runStop('hypo-auto-commit.mjs', dir, { session_id: sessA });
-    assert.equal(commitRes.status, 0, `stderr: ${commitRes.stderr}`);
-
-    // Read what the commit CONTAINS, not what is left staged. `git diff
-    // --cached` is empty both when hot.md was correctly excluded and when it
-    // was swept in and committed, so asserting on it cannot tell the two
-    // apart: this assertion passed even with the exclusion gate forced fully
-    // open. The commit's own file list is the only thing that distinguishes
-    // them.
-    const headAfter = spawnSync('git', ['-C', dir, 'rev-parse', 'HEAD'], {
-      encoding: 'utf-8',
-    }).stdout.trim();
-    assert.notEqual(
-      headAfter,
-      headBefore,
-      'fixture: A must actually produce a commit, or the file-list assertion below measures nothing',
-    );
-    const committed = spawnSync(
-      'git',
-      ['-C', dir, 'show', '--pretty=format:', '--name-only', 'HEAD'],
-      { encoding: 'utf-8' },
-    ).stdout;
-    assert.ok(
-      !/(^|\n)hot\.md(\n|$)/.test(committed),
-      `A's stale claim must not put B's bytes in A's commit: ${committed}`,
-    );
-    assert.equal(
-      readFileSync(join(dir, 'hot.md'), 'utf-8'),
-      bytesAfterB,
-      "B's bytes must survive untouched: A's Stop must not overwrite them either",
-    );
-  });
-});
-
 // Codex pre-commit review (BLOCKER, 2 rounds) on the first cut of this suite:
 //
 //   1a. drain-before-lock: the Stop hook used to drain (delete) the session's
@@ -900,25 +677,22 @@ const revParse = (dir, rev) =>
 
 // blocker (codex): Stop used to carry four separate registrations, and Claude
 // Code runs every hook matched by an event in parallel. hypo-hot-rebuild.mjs was
-// written against an order it did not have: it writes root hot.md and only then
+// written against an order it did not have: it writes log.md and only then
 // claims it into the session's touched-paths set, so hypo-auto-commit could take
 // the vault lock in between and commit without it. Nothing failed, so nothing
 // said so, and the fresh bytes just stayed uncommitted.
 //
 // hypo-stop.mjs is the single registration now and its STAGES list is the order.
 // Nothing checks that order at runtime, so this is what holds it: run the real
-// orchestrator and ask whether the projection hot-rebuild wrote reached the
-// commit auto-commit made. Reorder STAGES and this goes red; it is the only
-// place outside that array where the order is written down.
-test('hypo-stop.mjs: the projection hot-rebuild writes reaches the commit auto-commit makes (the Stop chain is ordered)', () => {
+// orchestrator and ask whether what hot-rebuild wrote reached the commit
+// auto-commit made. Reorder STAGES and this goes red; it is the only place
+// outside that array where the order is written down.
+test('hypo-stop.mjs: what hot-rebuild writes reaches the commit auto-commit makes (the Stop chain is ordered)', () => {
   withSyncedWiki((dir) => {
-    // A project hot.md makes the root projection differ from the fixture's
-    // empty table, so the rebuild stage actually writes and claims `hot.md`.
-    mkdirSync(join(dir, 'projects', 'alpha'), { recursive: true });
-    writeFileSync(
-      join(dir, 'projects', 'alpha', 'hot.md'),
-      `---\ntitle: alpha\nupdated: ${todayLocal()}\n---\n\n# alpha\n`,
-    );
+    // alpha is closed today except for its root log.md entry, so the rebuild
+    // stage derives that entry and claims `log.md`.
+    const today = todayLocal();
+    makeMultiProjectWiki(dir, today, [{ slug: 'alpha', date: today, logEntry: false }]);
     const before = revParse(dir, 'HEAD');
 
     const r = runStop('hypo-stop.mjs', dir, { session_id: 'sess-stop-order' });
@@ -938,14 +712,13 @@ test('hypo-stop.mjs: the projection hot-rebuild writes reaches the commit auto-c
             .map((l) => l.trim())
             .filter(Boolean);
     assert.ok(
-      committed.includes('hot.md'),
+      committed.includes('log.md'),
       after === before
-        ? 'the Stop chain made no commit at all: auto-commit ran before hot-rebuild claimed hot.md, so its scope was empty'
-        : `the Stop commit left hot.md out, so the rebuild landed after it: ${committed.join(', ')}`,
+        ? 'the Stop chain made no commit at all: auto-commit ran before hot-rebuild claimed log.md, so its scope was empty'
+        : `the Stop commit left log.md out, so the rebuild landed after it: ${committed.join(', ')}`,
     );
   });
 });
-
 // Final cross-review finding: a stage that exited non-zero or was killed was
 // written to stderr only, and the reply stayed `continue: true, suppressOutput:
 // true`, a clean Stop to anyone reading it. hot-rebuild dying after its rename
@@ -1372,13 +1145,12 @@ test('hypo-auto-commit.mjs: a .hypoignore-dropped touched path is NOT swept off 
 // ── Stop retires everything it did not keep out of the commit ─────────────
 //
 // commitTouchedPaths used to retire only the paths that landed in the commit.
-// A claim that was already clean at Stop (SessionStart's root hot.md claim
-// over a file a person then committed by hand) or one the auto-commit wrapper
-// deliberately left out (rootHotProjectionIsCurrent said no) then stayed for
-// the whole session. A sibling session that later left that path dirty would
-// block this session's close as a "known session write", and this session's
-// next Stop would sweep the sibling's edit into its own commit. Only a path
-// `.hypoignore` keeps out of the commit is still unresolved work.
+// A claim that was already clean at Stop (a path a person then committed by
+// hand) then stayed for the whole session. A sibling session that later left
+// that path dirty would block this session's close as a "known session write",
+// and this session's next Stop would sweep the sibling's edit into its own
+// commit. Only a path `.hypoignore` keeps out of the commit is still
+// unresolved work.
 
 function touchedOnDisk(dir, sessionId) {
   const p = touchedPathsPath(dir, sessionId);
@@ -1388,87 +1160,6 @@ function touchedOnDisk(dir, sessionId) {
 function gitOut(dir, ...args) {
   return spawnSync('git', ['-C', dir, ...args], { encoding: 'utf-8' }).stdout;
 }
-
-// One project whose hot.md row makes the root projection differ from the
-// fixture's empty table, so SessionStart's projection write is a real change.
-function seedProjectForRootProjection(dir, slug) {
-  mkdirSync(join(dir, 'projects', slug), { recursive: true });
-  writeFileSync(
-    join(dir, 'projects', slug, 'hot.md'),
-    '---\ntitle: hot\nupdated: 2026-01-01\n---\n',
-  );
-  spawnSync('git', ['-C', dir, 'add', '-A']);
-  spawnSync('git', ['-C', dir, 'commit', '-q', '-m', `seed ${slug}`]);
-}
-
-function startRootHotSession(dir, sessionId) {
-  const r = spawnSync(process.execPath, [join(HOOKS, 'hypo-session-start.mjs')], {
-    input: JSON.stringify({ cwd: dir, session_id: sessionId }),
-    encoding: 'utf-8',
-    env: { ...process.env, HOME: SESSION_TMP_HOME, HYPO_DIR: dir },
-  });
-  assert.equal(r.status, 0, `session-start stderr: ${r.stderr}`);
-}
-
-test("Stop: SessionStart's hot.md claim is retired at the first Stop even though hot.md was already committed by hand", () => {
-  withGrowthWiki((dir) => {
-    seedProjectForRootProjection(dir, 'p1');
-    const sid = 'sess-retire-clean-claim';
-    startRootHotSession(dir, sid);
-    assert.ok(
-      touchedOnDisk(dir, sid).includes('hot.md'),
-      'fixture: the real SessionStart claim path must have claimed hot.md',
-    );
-    // The person commits the projection by hand in the same turn, so hot.md is
-    // clean by the time Stop runs and never lands in the auto-commit itself.
-    spawnSync('git', ['-C', dir, 'add', 'hot.md']);
-    spawnSync('git', ['-C', dir, 'commit', '-q', '-m', 'hand commit']);
-    assert.equal(gitOut(dir, 'status', '--porcelain', '--', 'hot.md'), '', 'fixture: hot.md clean');
-
-    const r = runStop('hypo-auto-commit.mjs', dir, { session_id: sid });
-    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
-    assert.deepEqual(
-      touchedOnDisk(dir, sid),
-      [],
-      'a claim over an already-clean file is not unresolved work and must not outlive the first Stop',
-    );
-  });
-});
-
-test("Stop: a hot.md claim the wrapper left out (another session's bytes on disk) is retired, so this session's close is not blocked on it", () => {
-  withGrowthWiki((dir) => {
-    seedProjectForRootProjection(dir, 'p1');
-    const sessA = 'sess-retire-left-out-a';
-    const sessB = 'sess-retire-left-out-b';
-    startRootHotSession(dir, sessA);
-    // Session B changes the projection bytes after A claimed hot.md, so A's
-    // ownership check at Stop says no and hot.md is dropped from A's commit.
-    seedProjectForRootProjection(dir, 'p2');
-    startRootHotSession(dir, sessB);
-    const bBytes = readFileSync(join(dir, 'hot.md'), 'utf-8');
-
-    const r = runStop('hypo-auto-commit.mjs', dir, { session_id: sessA });
-    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
-    assert.equal(readFileSync(join(dir, 'hot.md'), 'utf-8'), bBytes, "B's bytes stay on disk");
-    assert.notEqual(
-      gitOut(dir, 'status', '--porcelain', '--', 'hot.md'),
-      '',
-      "fixture: hot.md is still dirty because of B's write",
-    );
-    assert.deepEqual(touchedOnDisk(dir, sessA), [], 'the left-out claim must be retired too');
-
-    // The consequence a checkpoint gate sees: B's dirty hot.md is not A's.
-    const gate = precompactGateStatus(dir, {
-      claudeHome: join(dir, '.claude-none'),
-      checkpointMode: true,
-      sessionId: sessA,
-    });
-    assert.ok(
-      !(gate.blockers || []).some((b) => b.type === 'known-session-write'),
-      `A must not be blocked on a file B left dirty: ${JSON.stringify(gate.blockers)}`,
-    );
-  });
-});
 
 test('Stop: a page committed by hand is not swept back in when another session later leaves it dirty', () => {
   withGrowthWiki((dir) => {
@@ -1518,57 +1209,6 @@ test('Stop: a .hypoignore-dropped touched path stays tracked while its clean and
       touchedOnDisk(dir, sid),
       ['secret.md'],
       'only the .hypoignore-dropped dirty path is still unresolved',
-    );
-  });
-});
-
-// ── SessionStart claims and writes root hot.md under one vault lock hold ──
-//
-// The claim used to be taken before the vault lock. A Stop for the same
-// session_id that won the lock in between found hot.md claimed but clean,
-// committed nothing, and retired the claim; the write that followed left
-// hot.md dirty with no claim, which the checkpoint gate reads as ownerless.
-// afterClaim runs that Stop at exactly that point.
-test('claimAndWriteRootHotProjection: a same-session Stop that runs right after the claim cannot retire it before the write lands', () => {
-  withGrowthWiki((dir) => {
-    seedProjectForRootProjection(dir, 'p1');
-    const sid = 'sess-claim-write-one-lock';
-    let stop = null;
-    const out = claimAndWriteRootHotProjection(dir, sid, {
-      afterClaim: () => {
-        stop = spawnSync(process.execPath, [join(HOOKS, 'hypo-auto-commit.mjs')], {
-          input: JSON.stringify({ session_id: sid }),
-          encoding: 'utf-8',
-          env: {
-            ...process.env,
-            HOME: SESSION_TMP_HOME,
-            HYPO_DIR: dir,
-            HYPO_VAULT_LOCK_TIMEOUT_MS: '300',
-          },
-        });
-      },
-    });
-    assert.ok(stop, 'fixture: the injected Stop must have run between the claim and the write');
-    assert.equal(stop.status, 0, `stop stderr: ${stop.stderr}`);
-    assert.equal(out.claimFailed, false);
-    assert.equal(out.result.written, true, 'fixture: the projection write must be a real change');
-    assert.notEqual(
-      gitOut(dir, 'status', '--porcelain', '--', 'hot.md'),
-      '',
-      'fixture: the write leaves hot.md dirty',
-    );
-    assert.ok(
-      touchedOnDisk(dir, sid).includes('hot.md'),
-      `the claim must survive the Stop that ran in between: ${JSON.stringify(touchedOnDisk(dir, sid))}`,
-    );
-    const gate = precompactGateStatus(dir, {
-      claudeHome: join(dir, '.claude-none'),
-      checkpointMode: true,
-      sessionId: sid,
-    });
-    assert.ok(
-      (gate.blockers || []).some((b) => b.type === 'known-session-write' && b.file === 'hot.md'),
-      `hot.md must block as this session's own write, not pass as ownerless: ${JSON.stringify(gate)}`,
     );
   });
 });
@@ -1762,7 +1402,7 @@ test('commitWikiChanges is called with the crystallize apply payload paths, not 
   // lint/evidence candidates the apply may not have touched at all).
   withSyncedWiki((dir) => {
     mkdirSync(join(dir, 'projects', 'proj'), { recursive: true });
-    writeFileSync(join(dir, 'projects', 'proj', 'session-state.md'), '# old state\n');
+    writeFileSync(join(dir, 'projects', 'proj', 'notes.md'), '# old notes\n');
     // A file this close's payload never names — simulates lint/evidence debt
     // elsewhere in payloadScope that must NOT ride along in the commit.
     writeFileSync(join(dir, 'unrelated-debt.md'), '# pre-existing debt\n');
@@ -1770,8 +1410,8 @@ test('commitWikiChanges is called with the crystallize apply payload paths, not 
     spawnSync('git', ['-C', dir, 'commit', '-q', '-m', 'seed'], { cwd: dir });
     writeFileSync(join(dir, 'unrelated-debt.md'), '# still dirty, untouched by apply\n');
 
-    const scopeActuallyWritten = ['projects/proj/session-state.md'];
-    writeFileSync(join(dir, 'projects', 'proj', 'session-state.md'), '# new state\n');
+    const scopeActuallyWritten = ['projects/proj/notes.md'];
+    writeFileSync(join(dir, 'projects', 'proj', 'notes.md'), '# new notes\n');
     const res = commitWikiChanges(dir, scopeActuallyWritten);
     assert.equal(res.committed, true, `stderr: ${JSON.stringify(res)}`);
     const committed = spawnSync(
@@ -1780,8 +1420,8 @@ test('commitWikiChanges is called with the crystallize apply payload paths, not 
       { encoding: 'utf-8' },
     ).stdout;
     assert.ok(
-      /session-state\.md/.test(committed),
-      `session-state.md must be committed: ${committed}`,
+      /projects\/proj\/notes\.md/.test(committed),
+      `notes.md must be committed: ${committed}`,
     );
     assert.ok(
       !/unrelated-debt\.md/.test(committed),
@@ -2056,14 +1696,15 @@ test('derived project hot without verify_by_date gets no STALE marker', () => {
 test('root/global hot injection path carries no STALE marker logic', () => {
   // Global hot is a derived pointer table (hypo-hot-rebuild) with no per-page
   // frontmatter, so A3 deliberately leaves its injection path untouched. Pin
-  // that scope: staleMarkerForPath is only wired to the project hot/state block.
+  // that scope: staleMarkerForText is only wired to the project hot/state block.
   const src = readFileSync(join(HOOKS, 'hypo-session-start.mjs'), 'utf-8');
-  const markerCount = (src.match(/staleMarkerForPath\(/g) || []).length;
-  // one definition + two call sites (hotPath, statePath); nothing on global hot.
+  const markerCount = (src.match(/staleMarkerForText\(/g) || []).length;
+  // one definition + two call sites (the old hot and the old state, both read from the baseline
+  // entry); nothing on global hot.
   assert.equal(
     markerCount,
     3,
-    `staleMarkerForPath must be scoped to project hot/state, found ${markerCount} refs`,
+    `staleMarkerForText must be scoped to project hot/state, found ${markerCount} refs`,
   );
 });
 
@@ -2590,9 +2231,10 @@ test('substituteTokens replaces all four tokens', () => {
 });
 
 test('createProject scaffolds files, hot row, and log entry with substitution', () => {
-  withGrowthWiki((dir) => {
-    // withGrowthWiki ships templates-less; copy the _template into the package
-    // is unnecessary — createProject reads from the real package templates dir.
+  // A vault with no git entry counts as moved to session entries, so the view
+  // generator writes the root row. createProject reads the real package
+  // templates dir.
+  withTmpDir((dir) => {
     writeFileSync(join(dir, 'log.md'), '# Log\n');
     const res = createProject({
       hypoDir: dir,
@@ -2619,7 +2261,7 @@ test('createProject scaffolds files, hot row, and log entry with substitution', 
 });
 
 test('createProject is idempotent on re-run', () => {
-  withGrowthWiki((dir) => {
+  withTmpDir((dir) => {
     writeFileSync(join(dir, 'log.md'), '# Log\n');
     const opts = {
       hypoDir: dir,
@@ -2648,6 +2290,57 @@ test('createProject rejects an invalid project name', () => {
       () => createProject({ hypoDir: dir, name: '../evil', workingDir: '/x' }),
       /invalid project name/,
     );
+  });
+});
+
+test('createProject takes a Korean name, and an NFD spelling reuses the NFC directory', () => {
+  const ko = '인수인계-runbook';
+  withTmpDir((dir) => {
+    writeFileSync(join(dir, 'log.md'), '# Log\n');
+    const opts = {
+      hypoDir: dir,
+      name: ko,
+      workingDir: '/x',
+      started: '2026-05-21',
+      today: '2026-05-21',
+    };
+    const first = createProject(opts);
+    assert.ok(first.created.includes(`projects/${ko}/index.md`), JSON.stringify(first));
+    assert.ok(existsSync(join(dir, 'projects', ko, 'index.md')));
+    const again = createProject({ ...opts, name: ko.normalize('NFD') });
+    assert.ok(again.skipped.includes(`projects/${ko}/index.md`), JSON.stringify(again));
+    assert.deepEqual(
+      readdirSync(join(dir, 'projects')),
+      [ko],
+      'no second directory beside the first',
+    );
+  });
+});
+
+test('createProject refuses a directory stored in NFD with the rename message and scaffolds nothing', () => {
+  const ko = '인수인계-runbook';
+  withTmpDir((dir) => {
+    writeFileSync(join(dir, 'log.md'), '# Log\n');
+    mkdirSync(join(dir, 'projects', ko.normalize('NFD')), { recursive: true });
+    for (const name of [ko, ko.normalize('NFD')]) {
+      assert.throws(
+        () => createProject({ hypoDir: dir, name, workingDir: '/x' }),
+        /Rename projects\/.+ to its NFC spelling.*\/hypo:rename --from="projects\/[^"]+" --to="projects\//,
+      );
+    }
+    assert.deepEqual(readdirSync(join(dir, 'projects', ko.normalize('NFD'))), []);
+  });
+});
+
+test('createProject still rejects whitespace, separator and control-character names', () => {
+  withGrowthWiki((dir) => {
+    for (const bad of ['a b', 'a/b', 'a\\b', '', 'a\u0001b', 'a\u0000b', '인수 인계']) {
+      assert.throws(
+        () => createProject({ hypoDir: dir, name: bad, workingDir: '/x' }),
+        /invalid project name/,
+        `name ${JSON.stringify(bad)} must be rejected`,
+      );
+    }
   });
 });
 
@@ -3265,6 +2958,79 @@ test('syncRemote aborts a conflicting merge and leaves the tree clean (no marker
       entries.some((e) => e.op === 'conflict'),
       `a conflict entry must be recorded: ${JSON.stringify(entries)}`,
     );
+  });
+});
+
+// Two machines close on the same day: each appends its own line at the end of the root log.md. A
+// plain text merge calls that a conflict, the Stop sync aborts it, and no session entry reaches
+// the other machine. The `.gitattributes` that `init` writes carries the union driver for it.
+test('two clones of an init vault that both append to log.md and sync on the same day merge without a conflict', () => {
+  withTmpDir((base) => {
+    const remote = join(base, 'remote.git');
+    const a = join(base, 'a');
+    const b = join(base, 'b');
+    // Every git call, including the ones syncRemote makes in this process, runs with the seeded test
+    // HOME (the vault's pre-commit hook resolves the install root from it) and a git config of its
+    // own, so nothing depends on the developer's HOME or ~/.gitconfig.
+    const gitConfig = join(base, 'gitconfig');
+    writeFileSync(gitConfig, '[init]\n\tdefaultBranch = main\n[commit]\n\tgpgsign = false\n');
+    const gitEnv = {
+      ...process.env,
+      HOME: SESSION_TMP_HOME,
+      GIT_CONFIG_GLOBAL: gitConfig,
+      GIT_CONFIG_NOSYSTEM: '1',
+    };
+    const gitq = (dir, ...args) =>
+      spawnSync('git', ['-C', dir, ...args], { encoding: 'utf-8', env: gitEnv });
+    const gitOk = (dir, ...args) => {
+      const r = gitq(dir, ...args);
+      assert.equal(r.status, 0, `git ${args.join(' ')}: ${r.stderr}`);
+      return r.stdout;
+    };
+    spawnSync('git', ['init', '--bare', '-q', remote], { env: gitEnv });
+    spawnSync('git', ['init', '-q', a], { env: gitEnv });
+    gitq(a, 'config', 'user.email', 'a@test.com');
+    gitq(a, 'config', 'user.name', 'A');
+    const init = run('init.mjs', [`--hypo-dir=${a}`, '--no-hooks', '--no-git-init']);
+    assert.equal(init.status, 0, init.stderr);
+    assert.match(readFileSync(join(a, '.gitattributes'), 'utf-8'), /^log\.md merge=union$/m);
+    gitOk(a, 'add', '-A');
+    gitOk(a, 'commit', '-q', '-m', 'init');
+    gitOk(a, 'remote', 'add', 'origin', remote);
+    gitOk(a, 'push', '-q', '-u', 'origin', 'HEAD');
+    spawnSync('git', ['clone', '-q', remote, b], { env: gitEnv });
+    gitq(b, 'config', 'user.email', 'b@test.com');
+    gitq(b, 'config', 'user.name', 'B');
+
+    const append = (dir, line) => {
+      const log = join(dir, 'log.md');
+      writeFileSync(log, `${readFileSync(log, 'utf-8').replace(/\n*$/, '\n')}${line}\n`);
+      gitOk(dir, 'add', '-A');
+      gitOk(dir, 'commit', '-q', '-m', `close ${line}`);
+    };
+    append(a, '- 2026-10-12 close from A');
+    gitOk(a, 'push', '-q');
+    append(b, '- 2026-10-12 close from B');
+
+    const saved = Object.fromEntries(Object.keys(gitEnv).map((k) => [k, process.env[k]]));
+    Object.assign(process.env, gitEnv);
+    let res;
+    try {
+      res = syncRemote(b);
+    } finally {
+      for (const [k, v] of Object.entries(saved)) {
+        if (v === undefined) delete process.env[k];
+        else process.env[k] = v;
+      }
+    }
+    assert.equal(res.conflict, false, JSON.stringify(res));
+    assert.equal(res.pulled, true, JSON.stringify(res));
+    assert.equal(res.pushed, true, JSON.stringify(res));
+    assert.equal(gitq(b, 'ls-files', '-u').stdout.trim(), '');
+    const log = readFileSync(join(b, 'log.md'), 'utf-8');
+    assert.ok(log.includes('close from A') && log.includes('close from B'), log);
+    assert.ok(!log.includes('<<<<<<<'), log);
+    assert.equal(gitOk(remote, 'rev-parse', 'HEAD'), gitOk(b, 'rev-parse', 'HEAD'));
   });
 });
 
@@ -4232,6 +3998,34 @@ test('checkpointMode omitted (Stop/PreCompact/check): the existing unscoped git 
   });
 });
 
+// A close of `sessionId` that committed its entry and stopped before its receipt:
+// the pin still holds it as pending, which is what `--mark-session-closed` proves
+// the session by. Only the entry is committed (`commit -- <path>`), so another
+// session's staged file stays staged. Duplicated from close-global.test.mjs and
+// crystallize-apply.test.mjs on purpose: it is a local fixture in each area.
+function pinCommittedClose(dir, sessionId, { project = 'test-project', date = todayLocal() } = {}) {
+  const closeId = closeIdFor(sessionId, 0);
+  const rel = `projects/${project}/sessions/${date}-${closeId}.md`;
+  mkdirSync(join(dir, 'projects', project, 'sessions'), { recursive: true });
+  writeFileSync(
+    join(dir, rel),
+    formatSessionEntry({ project, closeId, date, tracks: [], summary: 'fixture', bodies: {} }),
+  );
+  const git = (...a) =>
+    spawnSync('git', ['-C', dir, ...a], {
+      encoding: 'utf-8',
+      env: { ...process.env, HOME: SESSION_TMP_HOME },
+    });
+  git('add', '--', rel);
+  git('commit', '-q', '-m', `entry ${closeId}`, '--', rel);
+  writeClosePin(dir, sessionId, {
+    pending: { closeId, openedAtIndex: 0, entryRelPath: rel, entrySha256s: [] },
+    lastResolved: null,
+    localProofs: {},
+  });
+  return rel;
+}
+
 // Both marker-writing entry points (`--apply-session-close` and
 // `--mark-session-closed`) run the shared gate in checkpointMode, so a dirty
 // root file that belongs to ANOTHER session must not stop either one from
@@ -4270,6 +4064,8 @@ test("crystallize --apply-session-close and --mark-session-closed both issue a r
           );
           flags.push('--apply-session-close', `--payload=${payloadPath}`);
         } else {
+          // --mark proves this session by its own committed entry and pending pin
+          pinCommittedClose(dir, sid);
           flags.push('--mark-session-closed', '--project=test-project');
         }
         const r = run('crystallize.mjs', flags);
@@ -4363,6 +4159,8 @@ test("crystallize --apply-session-close and --mark-session-closed leave another 
           );
           flags.push('--apply-session-close', `--payload=${payloadPath}`);
         } else {
+          // --mark proves this session by its own committed entry and pending pin
+          pinCommittedClose(dir, sid);
           flags.push('--mark-session-closed', '--project=test-project');
         }
         const r = run('crystallize.mjs', flags);
@@ -4555,17 +4353,13 @@ test('commitWikiChanges: the commit message reports scoped N paths across M proj
   withSyncedWiki((dir) => {
     mkdirSync(join(dir, 'projects', 'alpha'), { recursive: true });
     mkdirSync(join(dir, 'projects', 'beta'), { recursive: true });
-    writeFileSync(join(dir, 'projects', 'alpha', 'hot.md'), '# alpha\n');
-    writeFileSync(join(dir, 'projects', 'alpha', 'session-state.md'), '# alpha state\n');
-    writeFileSync(join(dir, 'projects', 'beta', 'hot.md'), '# beta\n');
+    writeFileSync(join(dir, 'projects', 'alpha', 'notes.md'), '# alpha\n');
+    writeFileSync(join(dir, 'projects', 'alpha', 'index.md'), '# alpha index\n');
+    writeFileSync(join(dir, 'projects', 'beta', 'notes.md'), '# beta\n');
     // project = `projects/<slug>/...` → <slug>. A top-level path (no
     // `projects/` prefix) has no project of its own — this fixture stays
     // entirely under `projects/` so N and M are unambiguous.
-    const scope = [
-      'projects/alpha/hot.md',
-      'projects/alpha/session-state.md',
-      'projects/beta/hot.md',
-    ];
+    const scope = ['projects/alpha/notes.md', 'projects/alpha/index.md', 'projects/beta/notes.md'];
     const res = commitWikiChanges(dir, scope);
     assert.equal(res.committed, true, `stderr: ${JSON.stringify(res)}`);
     assert.equal(res.scoped, 3, `expected 3 scoped paths: ${JSON.stringify(res)}`);
@@ -4697,6 +4491,1156 @@ test('commitWikiChanges: a vault nested inside a larger repository commits its v
       g('status', '--porcelain', '--', 'vault').stdout,
       '',
       'no rename residue left staged',
+    );
+  });
+});
+
+// A pre-commit hook installed through a repository-local hooksPath, so a global
+// core.hooksPath on the developer's machine can neither replace nor add to it.
+function withPreCommitHook(dir, script, fn) {
+  const hooks = join(dir, '.git', 'x-test-hooks');
+  mkdirSync(hooks, { recursive: true });
+  writeFileSync(join(hooks, 'pre-commit'), `#!/bin/sh\n${script}\n`);
+  chmodSync(join(hooks, 'pre-commit'), 0o755);
+  spawnSync('git', ['-C', dir, 'config', 'core.hooksPath', hooks]);
+  try {
+    fn();
+  } finally {
+    spawnSync('git', ['-C', dir, 'config', '--unset', 'core.hooksPath']);
+  }
+}
+const cachedNames = (dir) =>
+  spawnSync('git', ['-C', dir, 'diff', '--cached', '--name-only'], { encoding: 'utf-8' }).stdout;
+const headText = (dir, rel) =>
+  spawnSync('git', ['-C', dir, 'show', `HEAD:${rel}`], { encoding: 'utf-8' }).stdout;
+
+// X1 (wave B, third review): `--only` reads the path into the real index and again into
+// the commit. Another close appending between the two reads (here the pre-commit hook,
+// which git runs after both) leaves HEAD with the append and the real index without
+// it, and the next plain commit takes the append back out of HEAD. Disabling the check
+// (X1): in commitWikiChanges replace `git('reset', '-q', 'HEAD', '--', ...commitScope)`
+// with `{ status: 0 }`. The index assertion and the plain-commit assertion go red.
+test('commitWikiChanges: an append landing inside its pathspec commit leaves the index at HEAD, so a plain commit keeps it', () => {
+  withSyncedWiki((dir) => {
+    const rel = 'shard.md';
+    writeFileSync(join(dir, rel), 'committed\n');
+    assert.equal(commitWikiChanges(dir, [rel]).committed, true);
+    appendFileSync(join(dir, rel), 'this close\n');
+    withPreCommitHook(dir, `printf 'other close\\n' >> ${rel}\ngit add -- ${rel}`, () => {
+      const res = commitWikiChanges(dir, [rel]);
+      assert.equal(res.committed, true, JSON.stringify(res));
+      assert.equal(res.indexWarning, undefined, JSON.stringify(res));
+    });
+    assert.equal(
+      headText(dir, rel),
+      'committed\nthis close\nother close\n',
+      'precondition: the other append landed in the commit',
+    );
+    assert.equal(cachedNames(dir), '', 'the index of the committed path is HEAD');
+    spawnSync('git', ['-C', dir, 'commit', '-q', '--allow-empty', '-m', 'plain']);
+    assert.equal(headText(dir, rel), 'committed\nthis close\nother close\n');
+  });
+});
+
+// X2 (wave B, third review): a commit the pre-commit hook refuses used to leave every
+// path the call staged in the index (a new session entry included), for the next plain
+// commit anyone runs to take along. Disabling the check (X2): in commitWikiChanges make
+// `failed` return `{ committed: false, reason }` before it touches the index. The
+// staged-names and the plain-commit assertions go red.
+test('commitWikiChanges: a refused commit puts the index of its paths back, so a plain commit takes none of them', () => {
+  withSyncedWiki((dir) => {
+    const entry = 'projects/p/sessions/2026-10-06-s-x2-0.md';
+    mkdirSync(join(dir, 'projects', 'p', 'sessions'), { recursive: true });
+    writeFileSync(join(dir, 'staged.md'), 'v1\n');
+    assert.equal(commitWikiChanges(dir, ['staged.md']).committed, true);
+    // A path that already had something staged gets exactly that back.
+    writeFileSync(join(dir, 'staged.md'), 'v2 staged\n');
+    spawnSync('git', ['-C', dir, 'add', '--', 'staged.md']);
+    writeFileSync(join(dir, 'staged.md'), 'v3 on disk\n');
+    writeFileSync(join(dir, entry), 'new entry\n');
+    const lsBefore = spawnSync('git', ['-C', dir, 'ls-files', '-s'], { encoding: 'utf-8' }).stdout;
+    withPreCommitHook(dir, 'exit 1', () => {
+      const res = commitWikiChanges(dir, [entry, 'staged.md']);
+      assert.equal(res.committed, false, JSON.stringify(res));
+      assert.match(res.reason, /^git commit failed/);
+      assert.doesNotMatch(res.reason, /not restored/);
+    });
+    assert.equal(
+      spawnSync('git', ['-C', dir, 'ls-files', '-s'], { encoding: 'utf-8' }).stdout,
+      lsBefore,
+      'the index is what it was before the call',
+    );
+    assert.equal(cachedNames(dir), 'staged.md\n');
+    assert.equal(readFileSync(join(dir, entry), 'utf-8'), 'new entry\n', 'the work tree is kept');
+    writeFileSync(join(dir, 'other.md'), 'other\n');
+    spawnSync('git', ['-C', dir, 'add', '--', 'other.md']);
+    spawnSync('git', ['-C', dir, 'commit', '-q', '-m', 'plain']);
+    const names = spawnSync('git', ['-C', dir, 'show', '--name-only', '--pretty=format:', 'HEAD'], {
+      encoding: 'utf-8',
+    }).stdout;
+    assert.ok(!names.includes(entry), names);
+    assert.ok(names.includes('other.md'), names);
+  });
+});
+
+// ISSUE-198: the commit runs in the real index (`--only`), so after it every committed path has
+// index == HEAD. A path whose index entry is neither HEAD's nor the bytes about to be committed
+// (a version a person staged by hand, or one hypo-auto-stage staged before a later write) is saved
+// under `.cache/backups/staged/` first and named in a health notice.
+const indexBlob = (dir, rel) => gitOut(dir, 'show', `:${rel}`);
+const stagedBackupDir = (dir) => join(dir, '.cache', 'backups', 'staged');
+const stagedBackupFiles = (dir) =>
+  existsSync(stagedBackupDir(dir)) ? readdirSync(stagedBackupDir(dir), { recursive: true }) : [];
+
+// Disabling the backup: in `backUpStagedVersions` make the `continue` condition always true
+// (`if (true || blob === head.get(path) ...)`). The backup, the stagedBackups and the notice
+// assertions go red; the HEAD and index assertions stay green.
+test('ISSUE-198: a version the person staged is saved before the close commits the same path', () => {
+  withSyncedWiki((dir) => {
+    const rel = 'staged-version.md';
+    writeFileSync(join(dir, rel), 'v0\n');
+    assert.equal(commitWikiChanges(dir, [rel]).committed, true);
+    writeFileSync(join(dir, rel), 'v1 staged by hand\n');
+    spawnSync('git', ['-C', dir, 'add', '--', rel]);
+    writeFileSync(join(dir, rel), 'v2 on disk\n');
+    const res = commitWikiChanges(dir, [rel]);
+    assert.equal(res.committed, true, JSON.stringify(res));
+    assert.deepEqual(res.committedPaths, [rel]);
+    assert.equal(res.indexWarning, undefined, JSON.stringify(res));
+    assert.equal(headText(dir, rel), 'v2 on disk\n', 'HEAD has the work tree version');
+    assert.equal(indexBlob(dir, rel), 'v2 on disk\n', 'the index is HEAD for a committed path');
+    assert.equal(cachedNames(dir), '', 'index == HEAD');
+    assert.equal(readFileSync(join(dir, rel), 'utf-8'), 'v2 on disk\n');
+    // The staged version survives, in the backup, and a notice names it.
+    assert.equal(res.stagedBackups?.length, 1, JSON.stringify(res));
+    assert.equal(res.stagedBackups[0].path, rel);
+    assert.equal(readFileSync(res.stagedBackups[0].backupPath, 'utf-8'), 'v1 staged by hand\n');
+    assert.deepEqual(
+      stagedBackupFiles(dir),
+      [`${rel}${ROOT_HOT_BACKUP_SUFFIX}`],
+      'it sits under .cache/backups/staged/',
+    );
+    const notice = consumeRootHotHealthNotice(dir) ?? '';
+    assert.ok(
+      notice.includes(`.cache/backups/staged/${rel}${ROOT_HOT_BACKUP_SUFFIX}`) &&
+        notice.includes(rel),
+      `the notice names the path and its backup: ${notice}`,
+    );
+    assert.ok(
+      !gitOut(dir, 'ls-files').includes('.cache'),
+      'the backup directory is not tracked by this commit',
+    );
+  });
+});
+
+// The real hypo-auto-stage hook as a subprocess, the way Claude Code runs it after an Edit: it
+// stages the file and records the blob it staged in `.cache/auto-staged.json`.
+function runAutoStage(dir, rel) {
+  const r = spawnSync(process.execPath, [join(HOOKS, 'hypo-auto-stage.mjs')], {
+    input: JSON.stringify({ tool_name: 'Edit', tool_input: { file_path: join(dir, rel) } }),
+    encoding: 'utf-8',
+    env: { ...process.env, HOME: SESSION_TMP_HOME, HYPO_DIR: dir },
+  });
+  assert.equal(r.status, 0, `auto-stage must not fail: ${r.stderr}`);
+}
+
+// Disabling the record: in `backUpStagedVersions` (hooks/hypo-shared.mjs) change
+// `const autoStaged = readAutoStagedRecord(hypoDir);` to `const autoStaged = {};`. The
+// no-backup and no-notice assertions go red. Deleting the `recordAutoStagedBlob` call in
+// hooks/hypo-auto-stage.mjs reddens the record assertion and the same two. Deleting the
+// `dropAutoStagedBlobs` call in `commitWikiChanges` reddens only the last assertion.
+test('ISSUE-198: a blob hypo-auto-stage staged is not backed up when a later write goes into the commit', () => {
+  withSyncedWiki((dir) => {
+    const rel = 'auto-staged.md';
+    writeFileSync(join(dir, rel), 'v0\n');
+    assert.equal(commitWikiChanges(dir, [rel]).committed, true);
+    writeFileSync(join(dir, rel), 'v0\nv1 by the Edit tool\n');
+    runAutoStage(dir, rel);
+    assert.equal(indexBlob(dir, rel), 'v0\nv1 by the Edit tool\n', 'the hook staged the edit');
+    const recorded = readAutoStagedRecord(dir)[rel];
+    assert.equal(
+      recorded?.blob,
+      gitOut(dir, 'rev-parse', `:${rel}`).trim(),
+      'the hook recorded the blob it staged',
+    );
+    assert.equal(
+      recorded.headBlob,
+      gitOut(dir, 'rev-parse', `HEAD:${rel}`).trim(),
+      'and the HEAD blob it sat on',
+    );
+    writeFileSync(join(dir, rel), 'v0\nv1 by the Edit tool\nv2 appended later\n');
+    const res = commitWikiChanges(dir, [rel]);
+    assert.equal(res.committed, true, JSON.stringify(res));
+    assert.deepEqual(res.committedPaths, [rel]);
+    assert.equal(headText(dir, rel), 'v0\nv1 by the Edit tool\nv2 appended later\n');
+    assert.equal(res.stagedBackups, undefined, JSON.stringify(res));
+    assert.deepEqual(stagedBackupFiles(dir), [], 'no copy of the file is kept');
+    assert.equal(consumeRootHotHealthNotice(dir), null, 'no notice for Claude’s own staging');
+    assert.equal(readAutoStagedRecord(dir)[rel], undefined, 'a committed path leaves the record');
+  });
+});
+
+// Disabling: in `backUpStagedVersions` change `blob === autoStaged[path]` to `path in autoStaged`;
+// the backup assertions go red (the skip then swallows a person's blob too).
+test('ISSUE-198: a person staging other bytes after hypo-auto-stage still gets the backup', () => {
+  withSyncedWiki((dir) => {
+    const rel = 'auto-then-person.md';
+    writeFileSync(join(dir, rel), 'v0\n');
+    assert.equal(commitWikiChanges(dir, [rel]).committed, true);
+    writeFileSync(join(dir, rel), 'v1 by the Edit tool\n');
+    runAutoStage(dir, rel);
+    writeFileSync(join(dir, rel), 'v1b staged by hand\n');
+    spawnSync('git', ['-C', dir, 'add', '--', rel]);
+    writeFileSync(join(dir, rel), 'v2 on disk\n');
+    const res = commitWikiChanges(dir, [rel]);
+    assert.equal(res.committed, true, JSON.stringify(res));
+    assert.equal(headText(dir, rel), 'v2 on disk\n');
+    assert.equal(res.stagedBackups?.length, 1, JSON.stringify(res));
+    assert.equal(res.stagedBackups[0].path, rel);
+    assert.equal(readFileSync(res.stagedBackups[0].backupPath, 'utf-8'), 'v1b staged by hand\n');
+    assert.deepEqual(stagedBackupFiles(dir), [`${rel}${ROOT_HOT_BACKUP_SUFFIX}`]);
+    const notice = consumeRootHotHealthNotice(dir) ?? '';
+    assert.ok(notice.includes(`.cache/backups/staged/${rel}${ROOT_HOT_BACKUP_SUFFIX}`), notice);
+  });
+});
+
+// Pins the fail-safe: a record that cannot be parsed skips nothing. It has no one-line disable,
+// since the unreadable branch already returns `{}`; it guards a later change that trusts a
+// partial parse.
+test('ISSUE-198: an unreadable auto-stage record skips nothing, so the staged blob is saved', () => {
+  withSyncedWiki((dir) => {
+    const rel = 'auto-record-broken.md';
+    writeFileSync(join(dir, rel), 'v0\n');
+    assert.equal(commitWikiChanges(dir, [rel]).committed, true);
+    writeFileSync(join(dir, rel), 'v1 by the Edit tool\n');
+    runAutoStage(dir, rel);
+    writeFileSync(join(dir, '.cache', 'auto-staged.json'), '{not json');
+    writeFileSync(join(dir, rel), 'v2 on disk\n');
+    const res = commitWikiChanges(dir, [rel]);
+    assert.equal(res.committed, true, JSON.stringify(res));
+    assert.equal(res.stagedBackups?.length, 1, JSON.stringify(res));
+    assert.equal(readFileSync(res.stagedBackups[0].backupPath, 'utf-8'), 'v1 by the Edit tool\n');
+  });
+});
+
+test('ISSUE-198: nothing staged by hand means no backup and no notice, and index == HEAD afterwards', () => {
+  withSyncedWiki((dir) => {
+    writeFileSync(join(dir, 'kept.md'), 'v1\n');
+    writeFileSync(join(dir, 'gone.md'), 'v1\n');
+    assert.equal(commitWikiChanges(dir, ['kept.md', 'gone.md']).committed, true);
+    writeFileSync(join(dir, 'kept.md'), 'v2\n'); // modified
+    rmSync(join(dir, 'gone.md')); // deleted
+    writeFileSync(join(dir, 'fresh.md'), 'new\n'); // untracked
+    // Someone else's staged file is outside this call's scope and stays exactly as staged.
+    writeFileSync(join(dir, 'other.md'), 'other\n');
+    spawnSync('git', ['-C', dir, 'add', '--', 'other.md']);
+    const res = commitWikiChanges(dir, ['kept.md', 'gone.md', 'fresh.md']);
+    assert.equal(res.committed, true, JSON.stringify(res));
+    assert.equal(res.scoped, 3, JSON.stringify(res));
+    assert.equal(res.indexWarning, undefined, JSON.stringify(res));
+    assert.equal(res.stagedBackups, undefined, JSON.stringify(res));
+    assert.equal(headText(dir, 'kept.md'), 'v2\n');
+    assert.equal(headText(dir, 'fresh.md'), 'new\n');
+    assert.equal(cachedNames(dir), 'other.md\n', 'only the other staged file differs from HEAD');
+    const status = gitOut(dir, 'status', '--porcelain');
+    assert.equal(status, 'A  other.md\n', `no staged-deleted or modified residue: ${status}`);
+    const inHead = gitOut(dir, 'show', '--name-only', '--pretty=format:', 'HEAD');
+    assert.ok(!inHead.includes('other.md'), 'the other staged file did not ride along');
+    assert.deepEqual(stagedBackupFiles(dir), [], 'nothing was backed up');
+    assert.equal(consumeRootHotHealthNotice(dir), null, 'and no notice was left');
+  });
+});
+
+// The pair of the backup test: a staged version that equals what gets committed, or HEAD, loses
+// nothing, so it is not saved. A rename's destination is compared against the source's HEAD blob.
+test('ISSUE-198: a staged version equal to the commit, to HEAD, or to a rename source is not saved', () => {
+  withSyncedWiki((dir) => {
+    writeFileSync(join(dir, 'same.md'), 'v0\n');
+    writeFileSync(join(dir, 'old-name.md'), 'moved\n');
+    assert.equal(commitWikiChanges(dir, ['same.md', 'old-name.md']).committed, true);
+    // Staged exactly what is on disk: differs from HEAD, equals the committed bytes.
+    writeFileSync(join(dir, 'same.md'), 'v1\n');
+    spawnSync('git', ['-C', dir, 'add', '--', 'same.md']);
+    // A plain rename: the destination blob is the source's HEAD blob.
+    spawnSync('git', ['-C', dir, 'mv', 'old-name.md', 'new-name.md']);
+    const res = commitWikiChanges(dir, ['same.md', 'new-name.md']);
+    assert.equal(res.committed, true, JSON.stringify(res));
+    assert.equal(res.scoped, 2, JSON.stringify(res));
+    assert.equal(res.stagedBackups, undefined, JSON.stringify(res));
+    assert.deepEqual(stagedBackupFiles(dir), []);
+    assert.equal(consumeRootHotHealthNotice(dir), null);
+    assert.equal(cachedNames(dir), '');
+    assert.equal(headText(dir, 'new-name.md'), 'moved\n');
+  });
+});
+
+test('ISSUE-198: a rename destination restaged with other bytes has that version saved', () => {
+  withSyncedWiki((dir) => {
+    const body = Array.from({ length: 12 }, (_, i) => `line ${i}\n`).join('');
+    writeFileSync(join(dir, 'old-name.md'), body);
+    assert.equal(commitWikiChanges(dir, ['old-name.md']).committed, true);
+    spawnSync('git', ['-C', dir, 'mv', 'old-name.md', 'new-name.md']);
+    writeFileSync(join(dir, 'new-name.md'), `${body}staged edit\n`);
+    spawnSync('git', ['-C', dir, 'add', '--', 'new-name.md']);
+    writeFileSync(join(dir, 'new-name.md'), `${body}later edit\n`);
+    const res = commitWikiChanges(dir, ['new-name.md']);
+    assert.equal(res.committed, true, JSON.stringify(res));
+    assert.equal(headText(dir, 'new-name.md'), `${body}later edit\n`);
+    assert.equal(res.stagedBackups?.length, 1, JSON.stringify(res));
+    assert.equal(readFileSync(res.stagedBackups[0].backupPath, 'utf-8'), `${body}staged edit\n`);
+    assert.equal(cachedNames(dir), '', 'the rename left no residue');
+  });
+});
+
+// The scenario that left a path 'MM' and made every later non-ff merge refuse: hypo-auto-stage's
+// `git add` after a write, then an unstaged write (a close appending log.md) before the commit.
+// What pins the post-commit state here is index == HEAD for the committed path (status empty).
+test('ISSUE-198: an auto-staged path appended to afterwards commits clean, and a later merge is not refused', () => {
+  withSyncedWiki((dir) => {
+    const env = { ...process.env, HOME: SESSION_TMP_HOME };
+    const g = (cwd, ...a) => spawnSync('git', ['-C', cwd, ...a], { encoding: 'utf-8', env });
+    const base = '# log\nl1\nl2\nl3\nl4\nl5\nl6\nl7\n';
+    writeFileSync(join(dir, 'log.md'), base);
+    assert.equal(commitWikiChanges(dir, ['log.md']).committed, true);
+    assert.equal(g(dir, 'push', '-q').status, 0);
+    // Another machine edits the top of the same file and pushes.
+    const other = `${dir}-other`;
+    try {
+      const url = g(dir, 'remote', 'get-url', 'origin').stdout.trim();
+      assert.equal(g(dir, 'clone', '-q', url, other).status, 0);
+      g(other, 'config', 'user.email', 'o@test.com');
+      g(other, 'config', 'user.name', 'O');
+      writeFileSync(join(other, 'log.md'), base.replace('# log', '# log, edited elsewhere'));
+      g(other, 'commit', '-q', '-am', 'edit elsewhere');
+      assert.equal(g(other, 'push', '-q').status, 0);
+
+      // The write is auto-staged by the real hook, then a close appends to the same file without
+      // staging.
+      writeFileSync(join(dir, 'log.md'), `${base}tool write\n`);
+      runAutoStage(dir, 'log.md');
+      assert.equal(indexBlob(dir, 'log.md'), `${base}tool write\n`, 'precondition: hook staged it');
+      appendFileSync(join(dir, 'log.md'), 'close append\n');
+      const res = commitWikiChanges(dir, ['log.md']);
+      assert.equal(res.committed, true, JSON.stringify(res));
+      assert.equal(headText(dir, 'log.md'), `${base}tool write\nclose append\n`);
+      assert.equal(g(dir, 'status', '--porcelain', 'log.md').stdout, '', 'neither MM nor M');
+
+      const pull = g(dir, 'pull', '--no-rebase', '--no-edit', '-q');
+      assert.equal(pull.status, 0, `merge refused: ${pull.stderr}`);
+      const merged = readFileSync(join(dir, 'log.md'), 'utf-8');
+      assert.ok(merged.startsWith('# log, edited elsewhere\n'), 'their edit arrived');
+      assert.ok(merged.endsWith('tool write\nclose append\n'), 'ours stayed');
+    } finally {
+      rmSync(other, { recursive: true, force: true });
+    }
+  });
+});
+
+// A staged version that cannot be saved stops the commit before anything is staged.
+test('ISSUE-198: when the staged version cannot be saved nothing is committed and nothing moves', () => {
+  withSyncedWiki((dir) => {
+    const rel = 'unsaved.md';
+    writeFileSync(join(dir, rel), 'v0\n');
+    assert.equal(commitWikiChanges(dir, [rel]).committed, true);
+    writeFileSync(join(dir, rel), 'v1 staged by hand\n');
+    spawnSync('git', ['-C', dir, 'add', '--', rel]);
+    writeFileSync(join(dir, rel), 'v2 on disk\n');
+    // `.cache/backups` is a file, so no backup can be written under it.
+    mkdirSync(join(dir, '.cache'), { recursive: true });
+    writeFileSync(join(dir, '.cache', 'backups'), 'in the way\n');
+    const headBefore = gitOut(dir, 'rev-parse', 'HEAD');
+    const lsBefore = gitOut(dir, 'ls-files', '-s');
+    const res = commitWikiChanges(dir, [rel]);
+    assert.equal(res.committed, false, JSON.stringify(res));
+    assert.match(res.reason, /could not save a version staged in the index/);
+    assert.equal(gitOut(dir, 'rev-parse', 'HEAD'), headBefore, 'HEAD did not move');
+    assert.equal(gitOut(dir, 'ls-files', '-s'), lsBefore, 'the index is what it was');
+    assert.equal(indexBlob(dir, rel), 'v1 staged by hand\n', 'the staged version is still staged');
+    assert.equal(readFileSync(join(dir, rel), 'utf-8'), 'v2 on disk\n');
+  });
+});
+
+test('ISSUE-198: a refused commit leaves HEAD, the index and the work tree as they were, and the backup notice says the stage stays', () => {
+  withSyncedWiki((dir) => {
+    const rel = 'refused.md';
+    writeFileSync(join(dir, rel), 'v1\n');
+    assert.equal(commitWikiChanges(dir, [rel]).committed, true);
+    writeFileSync(join(dir, rel), 'v2 staged by hand\n');
+    spawnSync('git', ['-C', dir, 'add', '--', rel]);
+    writeFileSync(join(dir, rel), 'v3 on disk\n');
+    const headBefore = gitOut(dir, 'rev-parse', 'HEAD');
+    const lsBefore = gitOut(dir, 'ls-files', '-s');
+    withPreCommitHook(dir, 'exit 1', () => {
+      const res = commitWikiChanges(dir, [rel]);
+      assert.equal(res.committed, false, JSON.stringify(res));
+      assert.match(res.reason, /^git commit failed/);
+      assert.doesNotMatch(res.reason, /not restored/);
+    });
+    assert.equal(gitOut(dir, 'rev-parse', 'HEAD'), headBefore, 'HEAD did not move');
+    assert.equal(gitOut(dir, 'ls-files', '-s'), lsBefore, 'the index is what it was');
+    assert.equal(indexBlob(dir, rel), 'v2 staged by hand\n');
+    assert.equal(readFileSync(join(dir, rel), 'utf-8'), 'v3 on disk\n');
+    // The backup is announced before anything is staged, so the refused commit leaves the notice,
+    // and it says the person's version stays in the index when the commit fails.
+    const notice = consumeRootHotHealthNotice(dir) ?? '';
+    assert.ok(notice.includes(rel) && notice.includes('index 에 그대로 남습니다'), notice);
+  });
+});
+
+// A version a person staged is in the index before the tool's edit lands on disk. The hook must not
+// add the path over it: the backup step of the later commit reads the index, and after the add only
+// the tool's bytes are left there. Disabling: in hooks/hypo-auto-stage.mjs change
+// `before.index !== before.head &&` to `false &&`. The index assertion goes red, and with it the
+// backup and notice assertions.
+test('ISSUE-198: hypo-auto-stage leaves a version a person staged in the index, and the commit saves it', () => {
+  withSyncedWiki((dir) => {
+    const rel = 'person-then-tool.md';
+    writeFileSync(join(dir, rel), 'v0\n');
+    assert.equal(commitWikiChanges(dir, [rel]).committed, true);
+    writeFileSync(join(dir, rel), 'PERSON staged by hand\n');
+    spawnSync('git', ['-C', dir, 'add', '--', rel]);
+    writeFileSync(join(dir, rel), 'TOOL bytes on disk\n');
+    runAutoStage(dir, rel);
+    assert.equal(indexBlob(dir, rel), 'PERSON staged by hand\n', 'the hook kept their stage');
+    assert.equal(readAutoStagedRecord(dir)[rel], undefined, 'and recorded nothing as its own');
+    const res = commitWikiChanges(dir, [rel]);
+    assert.equal(res.committed, true, JSON.stringify(res));
+    assert.equal(headText(dir, rel), 'TOOL bytes on disk\n', 'HEAD has the tool bytes');
+    assert.equal(res.stagedBackups?.length, 1, JSON.stringify(res));
+    assert.equal(readFileSync(res.stagedBackups[0].backupPath, 'utf-8'), 'PERSON staged by hand\n');
+    const notice = consumeRootHotHealthNotice(dir) ?? '';
+    assert.ok(notice.includes(rel) && notice.includes('.cache/backups/staged/'), notice);
+  });
+});
+
+// Disabling: in `isAutoStagedBlob` (hooks/hypo-shared.mjs) drop the `entry.headBlob === (headBlob
+// ?? null)` clause. The stale-record test goes red (the old bytes are trusted again).
+test('ISSUE-198: an auto-stage record is not trusted once HEAD has moved past the blob it sat on', () => {
+  withSyncedWiki((dir) => {
+    const rel = 'stale-record.md';
+    writeFileSync(join(dir, rel), 'v0\n');
+    assert.equal(commitWikiChanges(dir, [rel]).committed, true);
+    writeFileSync(join(dir, rel), 'T bytes by the Edit tool\n');
+    runAutoStage(dir, rel);
+    assert.ok(readAutoStagedRecord(dir)[rel], 'precondition: the hook left a record');
+    // HEAD moves by a plain commit, which does not touch the record.
+    writeFileSync(join(dir, rel), 'X committed by someone\n');
+    spawnSync('git', ['-C', dir, 'add', '--', rel]);
+    spawnSync('git', ['-C', dir, 'commit', '-q', '-m', 'plain', '--', rel]);
+    // A person stages exactly the bytes the record names.
+    writeFileSync(join(dir, rel), 'T bytes by the Edit tool\n');
+    spawnSync('git', ['-C', dir, 'add', '--', rel]);
+    writeFileSync(join(dir, rel), 'Y on disk\n');
+    const res = commitWikiChanges(dir, [rel]);
+    assert.equal(res.committed, true, JSON.stringify(res));
+    assert.equal(res.stagedBackups?.length, 1, JSON.stringify(res));
+    assert.equal(
+      readFileSync(res.stagedBackups[0].backupPath, 'utf-8'),
+      'T bytes by the Edit tool\n',
+    );
+  });
+});
+
+// Disabling: in `isAutoStagedBlob` change `entry.blob === blob &&` to `(entry.blob ?? entry) ===
+// blob &&` and delete the `entry.headBlob === (headBlob ?? null)` clause. The old-format
+// assertion goes red.
+test('ISSUE-198: an auto-stage record in the old string format is not trusted', () => {
+  withSyncedWiki((dir) => {
+    const rel = 'old-format.md';
+    writeFileSync(join(dir, rel), 'v0\n');
+    assert.equal(commitWikiChanges(dir, [rel]).committed, true);
+    writeFileSync(join(dir, rel), 'v1 by the Edit tool\n');
+    runAutoStage(dir, rel);
+    const blob = readAutoStagedRecord(dir)[rel].blob;
+    writeFileSync(join(dir, '.cache', 'auto-staged.json'), JSON.stringify({ [rel]: blob }));
+    writeFileSync(join(dir, rel), 'v2 on disk\n');
+    const res = commitWikiChanges(dir, [rel]);
+    assert.equal(res.committed, true, JSON.stringify(res));
+    assert.equal(res.stagedBackups?.length, 1, JSON.stringify(res));
+    assert.equal(readFileSync(res.stagedBackups[0].backupPath, 'utf-8'), 'v1 by the Edit tool\n');
+  });
+});
+
+// Disabling: in the `stagedFiles.length === 0` branch of `commitWikiChanges` change
+// `const restored = restoreIndex();` to `const restored = { status: 0 };`. The index assertion
+// goes red.
+test('ISSUE-198: a call with nothing to commit leaves a version a person staged in the index', () => {
+  withSyncedWiki((dir) => {
+    const rel = 'stage-only.md';
+    writeFileSync(join(dir, rel), 'v0\n');
+    assert.equal(commitWikiChanges(dir, [rel]).committed, true);
+    writeFileSync(join(dir, rel), 'PERSON staged by hand\n');
+    spawnSync('git', ['-C', dir, 'add', '--', rel]);
+    writeFileSync(join(dir, rel), 'v0\n'); // the work tree is HEAD again
+    const headBefore = gitOut(dir, 'rev-parse', 'HEAD');
+    const res = commitWikiChanges(dir, [rel]);
+    assert.equal(res.committed, true, JSON.stringify(res));
+    assert.equal(res.scoped, 0, JSON.stringify(res));
+    assert.equal(gitOut(dir, 'rev-parse', 'HEAD'), headBefore, 'no commit was made');
+    assert.equal(indexBlob(dir, rel), 'PERSON staged by hand\n', 'their stage is still staged');
+    assert.equal(readFileSync(join(dir, rel), 'utf-8'), 'v0\n');
+  });
+});
+
+// A git that fails only for `diff --cached`, put first on PATH. The call reads the staged paths
+// with that command; an error there used to read as "nothing staged".
+// Disabling: in `commitWikiChanges` delete the `if (staged.status !== 0) return failed(...)` line.
+// The committed:false and index assertions go red.
+test('ISSUE-198: a failing staged-diff command is a failed commit with the index put back', () => {
+  withSyncedWiki((dir) => {
+    withTmpDir((bin) => {
+      const real = spawnSync('which', ['git'], { encoding: 'utf-8' }).stdout.trim();
+      const wrapper = join(bin, 'git');
+      writeFileSync(
+        wrapper,
+        `#!/bin/sh\ncase " $* " in *" --cached "*) echo 'simulated diff failure' >&2; exit 1;; esac\nexec '${real}' "$@"\n`,
+      );
+      chmodSync(wrapper, 0o755);
+      const rel = 'diff-fails.md';
+      writeFileSync(join(dir, rel), 'v0\n');
+      assert.equal(commitWikiChanges(dir, [rel]).committed, true);
+      writeFileSync(join(dir, rel), 'v1 on disk\n');
+      const headBefore = gitOut(dir, 'rev-parse', 'HEAD');
+      const savedPath = process.env.PATH;
+      let res;
+      try {
+        process.env.PATH = `${bin}:${savedPath}`;
+        res = commitWikiChanges(dir, [rel]);
+      } finally {
+        process.env.PATH = savedPath;
+      }
+      assert.equal(res.committed, false, JSON.stringify(res));
+      assert.match(res.reason, /^git diff --cached failed: simulated diff failure/);
+      assert.doesNotMatch(res.reason, /not restored/);
+      assert.equal(gitOut(dir, 'rev-parse', 'HEAD'), headBefore, 'nothing was committed');
+      assert.equal(indexBlob(dir, rel), 'v0\n', 'the index is what it was');
+      assert.equal(readFileSync(join(dir, rel), 'utf-8'), 'v1 on disk\n');
+    });
+  });
+});
+
+// The post-commit reset journal; an empty one is no file.
+const reconcileJournal = (dir) => {
+  try {
+    return JSON.parse(readFileSync(join(dir, '.cache', 'index-reconcile.json'), 'utf-8'));
+  } catch {
+    return {};
+  }
+};
+
+// Disabling: in `commitWikiChanges` delete the `reconcileStaleIndex(hypoDir);` call. The
+// reconciled-index assertion goes red. Deleting the `journalIndexBlobs` call reddens the same one.
+test('ISSUE-198: a reset that failed after a landed commit is finished by the next commit call', () => {
+  withSyncedWiki((dir) => {
+    const rel = 'reconcile.md';
+    writeFileSync(join(dir, rel), 'committed\n');
+    assert.equal(commitWikiChanges(dir, [rel]).committed, true);
+    appendFileSync(join(dir, rel), 'this close\n');
+    withPreCommitHook(dir, `printf 'other close\\n' >> ${rel}\ngit add -- ${rel}`, () => {
+      withPostCommitLock(dir, () => {
+        const res = commitWikiChanges(dir, [rel]);
+        assert.equal(res.committed, true, JSON.stringify(res));
+        assert.match(res.indexWarning ?? '', /git reset -q HEAD/, JSON.stringify(res));
+      });
+    });
+    assert.equal(headText(dir, rel), 'committed\nthis close\nother close\n', 'HEAD has the append');
+    assert.equal(cachedNames(dir), `${rel}\n`, 'precondition: the index still differs from HEAD');
+    assert.ok(reconcileJournal(dir)[rel], 'the journal names the path');
+
+    writeFileSync(join(dir, 'next.md'), 'next\n');
+    const next = commitWikiChanges(dir, ['next.md']);
+    assert.equal(next.committed, true, JSON.stringify(next));
+    assert.equal(cachedNames(dir), '', 'the index of the earlier path is HEAD again');
+    assert.equal(reconcileJournal(dir)[rel], undefined, 'entry dropped');
+    spawnSync('git', ['-C', dir, 'commit', '-q', '--allow-empty', '-m', 'plain']);
+    assert.equal(
+      headText(dir, rel),
+      'committed\nthis close\nother close\n',
+      'a plain commit keeps it',
+    );
+  });
+});
+
+// The pair: a person staged other bytes for the journaled path since the failed reset. That is not
+// residue; it is left staged, and the entry is dropped. Disabling: in `reconcileStaleIndex` change
+// `index.get(p) === journal[p] &&` to `true &&`. The staged-bytes assertion goes red.
+test('ISSUE-198: the reconcile leaves a version a person staged since the failed reset', () => {
+  withSyncedWiki((dir) => {
+    const rel = 'reconcile-person.md';
+    writeFileSync(join(dir, rel), 'committed\n');
+    assert.equal(commitWikiChanges(dir, [rel]).committed, true);
+    appendFileSync(join(dir, rel), 'this close\n');
+    withPreCommitHook(dir, `printf 'other close\\n' >> ${rel}\ngit add -- ${rel}`, () => {
+      withPostCommitLock(dir, () => {
+        assert.equal(commitWikiChanges(dir, [rel]).committed, true);
+      });
+    });
+    writeFileSync(join(dir, rel), 'PERSON staged since\n');
+    spawnSync('git', ['-C', dir, 'add', '--', rel]);
+    writeFileSync(join(dir, rel), 'committed\nthis close\nother close\n');
+    writeFileSync(join(dir, 'next.md'), 'next\n');
+    const next = commitWikiChanges(dir, ['next.md']);
+    assert.equal(next.committed, true, JSON.stringify(next));
+    assert.equal(indexBlob(dir, rel), 'PERSON staged since\n', 'their stage was not reset');
+    assert.equal(reconcileJournal(dir)[rel], undefined, 'the entry is dropped either way');
+  });
+});
+
+// A refused commit never moves HEAD, so its journal has nothing to finish. The person's version
+// is back in the index, and the next unrelated call must not reset it to HEAD.
+// Disabling: in `commitWikiChanges` delete the `dropIndexJournal(hypoDir, journaled);` line in
+// `failed`. The journal-dropped assertion goes red.
+test('ISSUE-198: a refused commit leaves no journal, and the next unrelated commit keeps the stage it restored', () => {
+  withSyncedWiki((dir) => {
+    const rel = 'refused-journal.md';
+    writeFileSync(join(dir, rel), 'v1\n');
+    assert.equal(commitWikiChanges(dir, [rel]).committed, true);
+    writeFileSync(join(dir, rel), 'PERSON staged by hand\n');
+    spawnSync('git', ['-C', dir, 'add', '--', rel]);
+    writeFileSync(join(dir, rel), 'v3 on disk\n');
+    withPreCommitHook(dir, 'exit 1', () => {
+      const res = commitWikiChanges(dir, [rel]);
+      assert.equal(res.committed, false, JSON.stringify(res));
+      assert.match(res.reason, /^git commit failed/);
+    });
+    assert.equal(reconcileJournal(dir)[rel], undefined, 'a refused commit leaves no journal entry');
+    writeFileSync(join(dir, rel), 'v4 on disk\n');
+    writeFileSync(join(dir, 'unrelated.md'), 'next\n');
+    const next = commitWikiChanges(dir, ['unrelated.md']);
+    assert.equal(next.committed, true, JSON.stringify(next));
+    assert.deepEqual(next.committedPaths, ['unrelated.md']);
+    assert.equal(next.indexWarning, undefined, JSON.stringify(next));
+    assert.equal(indexBlob(dir, rel), 'PERSON staged by hand\n', 'their stage was not reset');
+  });
+});
+
+// The same, for an entry that outlived its refused commit (a process killed before `failed` ran).
+// HEAD's blob for the path is still the one journaled, so the commit never landed.
+// Disabling: in `reconcileStaleIndex` change `now !== (entry.head ?? null) &&` to `true &&`. The
+// staged-bytes assertion goes red.
+test('ISSUE-198: a journal entry whose commit never landed does not reset the stage', () => {
+  withSyncedWiki((dir) => {
+    const rel = 'unlanded.md';
+    writeFileSync(join(dir, rel), 'v1\n');
+    assert.equal(commitWikiChanges(dir, [rel]).committed, true);
+    const headBlob = gitOut(dir, 'rev-parse', `HEAD:${rel}`).trim();
+    writeFileSync(join(dir, rel), 'PERSON staged by hand\n');
+    spawnSync('git', ['-C', dir, 'add', '--', rel]);
+    const personBlob = gitOut(dir, 'rev-parse', `:${rel}`).trim();
+    writeFileSync(join(dir, rel), 'v3 on disk\n');
+    mkdirSync(join(dir, '.cache'), { recursive: true });
+    writeFileSync(
+      join(dir, '.cache', 'index-reconcile.json'),
+      JSON.stringify({ [rel]: { index: personBlob, head: headBlob } }),
+    );
+    writeFileSync(join(dir, 'unrelated2.md'), 'next\n');
+    const next = commitWikiChanges(dir, ['unrelated2.md']);
+    assert.equal(next.committed, true, JSON.stringify(next));
+    assert.equal(indexBlob(dir, rel), 'PERSON staged by hand\n', 'their stage was not reset');
+    assert.equal(reconcileJournal(dir)[rel], undefined, 'the entry is dropped');
+  });
+});
+
+// A reset that fails again on the retry is reported by the commit that retried it, and the entry
+// stays. A git that fails only the reset naming the earlier path, put first on PATH.
+// Disabling: in `commitWikiChanges` change `[reconcileWarning, ownWarning]` to `[ownWarning]`. The
+// warning assertions go red.
+test('ISSUE-198: a retried reset that fails again comes back as an indexWarning and keeps the entry', () => {
+  withSyncedWiki((dir) => {
+    withTmpDir((bin) => {
+      const rel = 'retry-fails.md';
+      writeFileSync(join(dir, rel), 'committed\n');
+      assert.equal(commitWikiChanges(dir, [rel]).committed, true);
+      appendFileSync(join(dir, rel), 'this close\n');
+      withPreCommitHook(dir, `printf 'other close\\n' >> ${rel}\ngit add -- ${rel}`, () => {
+        withPostCommitLock(dir, () => {
+          assert.equal(commitWikiChanges(dir, [rel]).committed, true);
+        });
+      });
+      assert.equal(cachedNames(dir), `${rel}\n`, 'precondition: the index still differs from HEAD');
+      const real = spawnSync('which', ['git'], { encoding: 'utf-8' }).stdout.trim();
+      const wrapper = join(bin, 'git');
+      writeFileSync(
+        wrapper,
+        `#!/bin/sh\ncase " $* " in *" reset "*"${rel}"*) echo 'simulated reset failure' >&2; exit 1;; esac\nexec '${real}' "$@"\n`,
+      );
+      chmodSync(wrapper, 0o755);
+      writeFileSync(join(dir, 'next-retry.md'), 'next\n');
+      const savedPath = process.env.PATH;
+      let next;
+      try {
+        process.env.PATH = `${bin}:${savedPath}`;
+        next = commitWikiChanges(dir, ['next-retry.md']);
+      } finally {
+        process.env.PATH = savedPath;
+      }
+      assert.equal(next.committed, true, JSON.stringify(next));
+      assert.deepEqual(next.committedPaths, ['next-retry.md']);
+      assert.match(next.indexWarning ?? '', /simulated reset failure/, JSON.stringify(next));
+      assert.match(next.indexWarning ?? '', /git reset -q HEAD -- retry-fails\.md/);
+      assert.ok(reconcileJournal(dir)[rel], 'the entry is kept for the next call');
+      assert.equal(cachedNames(dir), `${rel}\n`, 'the index is still stale');
+      // The next call without the failure finishes the reset and warns of nothing.
+      writeFileSync(join(dir, 'next-retry2.md'), 'next\n');
+      const again = commitWikiChanges(dir, ['next-retry2.md']);
+      assert.equal(again.committed, true, JSON.stringify(again));
+      assert.equal(again.indexWarning, undefined, JSON.stringify(again));
+      assert.equal(cachedNames(dir), '', 'the index of the earlier path is HEAD again');
+      assert.equal(reconcileJournal(dir)[rel], undefined, 'entry dropped');
+    });
+  });
+});
+
+// An earlier failed reset leaves its entry; a later call on the same path that fails its own reset
+// and is then refused must not take that entry with it. Before, the new call overwrote the entry and
+// its refusal deleted it, so the stale index lost both its retry and its warning.
+// Disabling: in `journalIndexBlobs` change `if (record[path] && typeof record[path] === 'object')
+// continue;` to `if (false) continue;`. The kept-entry assertions go red.
+test('ISSUE-198: a refused call on a path with an older failed-reset entry keeps that entry', () => {
+  withSyncedWiki((dir) => {
+    withTmpDir((bin) => {
+      const rel = 'same-path.md';
+      writeFileSync(join(dir, rel), 'committed\n');
+      assert.equal(commitWikiChanges(dir, [rel]).committed, true);
+      appendFileSync(join(dir, rel), 'this close\n');
+      withPreCommitHook(dir, `printf 'other close\\n' >> ${rel}\ngit add -- ${rel}`, () => {
+        withPostCommitLock(dir, () => {
+          assert.equal(commitWikiChanges(dir, [rel]).committed, true);
+        });
+      });
+      const older = reconcileJournal(dir)[rel];
+      assert.ok(older, 'precondition: the failed reset left an entry');
+      assert.equal(cachedNames(dir), `${rel}\n`, 'precondition: the index still differs from HEAD');
+
+      const real = spawnSync('which', ['git'], { encoding: 'utf-8' }).stdout.trim();
+      const wrapper = join(bin, 'git');
+      writeFileSync(
+        wrapper,
+        `#!/bin/sh\ncase " $* " in *" reset "*"${rel}"*) echo 'simulated reset failure' >&2; exit 1;; esac\nexec '${real}' "$@"\n`,
+      );
+      chmodSync(wrapper, 0o755);
+      appendFileSync(join(dir, rel), 'retry close\n');
+      const savedPath = process.env.PATH;
+      try {
+        process.env.PATH = `${bin}:${savedPath}`;
+        withPreCommitHook(dir, 'exit 1', () => {
+          const refused = commitWikiChanges(dir, [rel]);
+          assert.equal(refused.committed, false, JSON.stringify(refused));
+          assert.match(refused.reason, /^git commit failed/);
+        });
+      } finally {
+        process.env.PATH = savedPath;
+      }
+      assert.deepEqual(reconcileJournal(dir)[rel], older, 'the older entry survived the refusal');
+      assert.equal(cachedNames(dir), `${rel}\n`, 'the stale index is still stale, not forgotten');
+
+      // A later landed commit with the lock gone finishes the older reset.
+      writeFileSync(join(dir, rel), 'committed\nthis close\nother close\n');
+      writeFileSync(join(dir, 'later.md'), 'later\n');
+      const later = commitWikiChanges(dir, ['later.md']);
+      assert.equal(later.committed, true, JSON.stringify(later));
+      assert.equal(later.indexWarning, undefined, JSON.stringify(later));
+      assert.equal(cachedNames(dir), '', 'the index of the earlier path is HEAD again');
+      assert.equal(reconcileJournal(dir)[rel], undefined, 'entry dropped');
+    });
+  });
+});
+
+// A post-commit hook of a person's own that stages other bytes for the path just committed. The
+// reset after the commit used to put HEAD over them without a trace. Disabling: in
+// `commitWikiChanges` change `(indexNow.get(p) ?? null) === (added.get(p) ?? null)` to `true`. The
+// index and notice assertions go red.
+function withPostCommitHook(dir, script, fn) {
+  const hooks = join(dir, '.git', 'x-test-hooks');
+  mkdirSync(hooks, { recursive: true });
+  writeFileSync(join(hooks, 'post-commit'), `#!/bin/sh\n${script}\n`);
+  chmodSync(join(hooks, 'post-commit'), 0o755);
+  spawnSync('git', ['-C', dir, 'config', 'core.hooksPath', hooks]);
+  try {
+    fn();
+  } finally {
+    spawnSync('git', ['-C', dir, 'config', '--unset', 'core.hooksPath']);
+  }
+}
+
+test('ISSUE-198: a blob a post-commit hook staged is left in the index and named in a notice, not reset', () => {
+  withSyncedWiki((dir) => {
+    const rel = 'hook-staged.md';
+    writeFileSync(join(dir, rel), 'committed\n');
+    assert.equal(commitWikiChanges(dir, [rel]).committed, true);
+    appendFileSync(join(dir, rel), 'this close\n');
+    withPostCommitHook(
+      dir,
+      `blob=$(printf 'bytes only in the index\\n' | git hash-object -w --stdin)\ngit update-index --cacheinfo "100644,$blob,${rel}"`,
+      () => {
+        const res = commitWikiChanges(dir, [rel]);
+        assert.equal(res.committed, true, JSON.stringify(res));
+        assert.deepEqual(res.committedPaths, [rel]);
+        assert.equal(res.indexWarning, undefined, JSON.stringify(res));
+      },
+    );
+    assert.equal(headText(dir, rel), 'committed\nthis close\n', 'the commit landed');
+    assert.equal(indexBlob(dir, rel), 'bytes only in the index\n', 'the hook staged bytes survive');
+    assert.equal(readFileSync(join(dir, rel), 'utf-8'), 'committed\nthis close\n');
+    const notice = consumeRootHotHealthNotice(dir) ?? '';
+    assert.ok(notice.includes(rel) && notice.includes('git reset -q HEAD'), notice);
+  });
+});
+
+// The same post-commit hook, but the read of the index after the commit fails once (a git on PATH
+// that fails only the first `ls-files -s -z --` after the hook has run). Which blob each path holds
+// is then unknown, so nothing is reset: the hook's stage survives, the journal entry stays, and the
+// warning names the failed read. The next call, with the read working, sees that the index blob is
+// not the journaled one, leaves it, and drops the entry.
+// Disabling: in `commitWikiChanges` change the `: [];` after the `resetScope` filter to
+// `: commitScope;`. The staged-bytes assertion goes red.
+test('ISSUE-198: a failed index read after the commit resets nothing, keeps the journal, and the next call leaves a hook-staged blob alone', () => {
+  withSyncedWiki((dir) => {
+    withTmpDir((bin) => {
+      const rel = 'read-fails.md';
+      writeFileSync(join(dir, rel), 'committed\n');
+      assert.equal(commitWikiChanges(dir, [rel]).committed, true);
+      appendFileSync(join(dir, rel), 'this close\n');
+      const real = spawnSync('which', ['git'], { encoding: 'utf-8' }).stdout.trim();
+      const flag = join(bin, 'hook-ran');
+      const wrapper = join(bin, 'git');
+      writeFileSync(
+        wrapper,
+        `#!/bin/sh\nif [ -f '${flag}' ]; then\n  case " $* " in\n    *" ls-files -s -z -- "*) rm -f '${flag}'; echo 'simulated ls-files failure' >&2; exit 1;; esac\nfi\nexec '${real}' "$@"\n`,
+      );
+      chmodSync(wrapper, 0o755);
+      const savedPath = process.env.PATH;
+      let res;
+      try {
+        process.env.PATH = `${bin}:${savedPath}`;
+        withPostCommitHook(
+          dir,
+          `blob=$(printf 'bytes only in the index\\n' | git hash-object -w --stdin)\ngit update-index --cacheinfo "100644,$blob,${rel}"\n: > '${flag}'`,
+          () => {
+            res = commitWikiChanges(dir, [rel]);
+          },
+        );
+      } finally {
+        process.env.PATH = savedPath;
+      }
+      assert.equal(res.committed, true, JSON.stringify(res));
+      assert.deepEqual(res.committedPaths, [rel]);
+      assert.match(
+        res.indexWarning ?? '',
+        /could not be read after the commit/,
+        JSON.stringify(res),
+      );
+      assert.match(res.indexWarning ?? '', /simulated ls-files failure/, JSON.stringify(res));
+      assert.equal(headText(dir, rel), 'committed\nthis close\n', 'the commit landed');
+      assert.equal(
+        indexBlob(dir, rel),
+        'bytes only in the index\n',
+        'the hook staged bytes survive',
+      );
+      assert.ok(reconcileJournal(dir)[rel], 'the journal entry is kept for the next call');
+
+      // The next call, read working: the hook's blob is not the journaled one, so it stays.
+      writeFileSync(join(dir, 'after-read-fails.md'), 'next\n');
+      const next = commitWikiChanges(dir, ['after-read-fails.md']);
+      assert.equal(next.committed, true, JSON.stringify(next));
+      assert.deepEqual(next.committedPaths, ['after-read-fails.md']);
+      assert.equal(next.indexWarning, undefined, JSON.stringify(next));
+      assert.equal(
+        indexBlob(dir, rel),
+        'bytes only in the index\n',
+        'the later call left it alone',
+      );
+      assert.equal(reconcileJournal(dir)[rel], undefined, 'the entry is settled and dropped');
+      assert.equal(headText(dir, rel), 'committed\nthis close\n', 'HEAD is untouched');
+      assert.equal(readFileSync(join(dir, rel), 'utf-8'), 'committed\nthis close\n');
+    });
+  });
+});
+
+// The pair: with nothing staged after the commit the same call still brings the path to HEAD and
+// leaves no notice, so the check above is not "never reset".
+test('ISSUE-198: without a stage made after the commit the path is reset to HEAD and no notice is left', () => {
+  withSyncedWiki((dir) => {
+    const rel = 'plain-reset.md';
+    writeFileSync(join(dir, rel), 'committed\n');
+    assert.equal(commitWikiChanges(dir, [rel]).committed, true);
+    appendFileSync(join(dir, rel), 'this close\n');
+    const res = commitWikiChanges(dir, [rel]);
+    assert.equal(res.committed, true, JSON.stringify(res));
+    assert.deepEqual(res.committedPaths, [rel]);
+    assert.equal(cachedNames(dir), '', 'index == HEAD');
+    assert.equal(consumeRootHotHealthNotice(dir), null);
+  });
+});
+
+// A landed commit whose reset failed, then a Stop with nothing new to commit (an empty scope).
+// Disabling: in `commitWikiChanges` move `const reconcileWarning = reconcileStaleIndex(hypoDir);`
+// below the `if (supplied.size === 0)` return. The index assertion goes red.
+test('ISSUE-198: an idle call with an empty scope finishes a reset that failed after a landed commit', () => {
+  withSyncedWiki((dir) => {
+    const rel = 'idle-retry.md';
+    writeFileSync(join(dir, rel), 'committed\n');
+    assert.equal(commitWikiChanges(dir, [rel]).committed, true);
+    appendFileSync(join(dir, rel), 'this close\n');
+    withPreCommitHook(dir, `printf 'other close\\n' >> ${rel}\ngit add -- ${rel}`, () => {
+      withPostCommitLock(dir, () => {
+        const res = commitWikiChanges(dir, [rel]);
+        assert.equal(res.committed, true, JSON.stringify(res));
+        assert.match(res.indexWarning ?? '', /git reset -q HEAD/, JSON.stringify(res));
+      });
+    });
+    assert.equal(cachedNames(dir), `${rel}\n`, 'precondition: the index still differs from HEAD');
+    assert.ok(reconcileJournal(dir)[rel], 'precondition: the journal names the path');
+
+    const idle = commitWikiChanges(dir, []);
+    assert.equal(idle.committed, true, JSON.stringify(idle));
+    assert.equal(idle.scoped, 0, JSON.stringify(idle));
+    assert.equal(idle.indexWarning, undefined, JSON.stringify(idle));
+    assert.equal(cachedNames(dir), '', 'the index of the earlier path is HEAD again');
+    assert.equal(reconcileJournal(dir)[rel], undefined, 'entry dropped');
+    assert.equal(
+      headText(dir, rel),
+      'committed\nthis close\nother close\n',
+      'HEAD keeps the append',
+    );
+  });
+});
+
+// The backups hold a person's staged bytes, so none is written under a `.cache/` that a `git add -A`
+// would stage. Disabling: in `backUpStagedVersions` change `if (unignored.length > 0) {` to
+// `if (false) {`. The committed, backup and notice assertions go red.
+test('ISSUE-198: a staged version is not backed up while .cache/ is not ignored, and the commit is refused with the stage intact', () => {
+  withSyncedWiki((dir) => {
+    writeFileSync(join(dir, '.gitignore'), 'unrelated/\n');
+    const rel = 'cache-not-ignored.md';
+    writeFileSync(join(dir, rel), 'v0\n');
+    assert.equal(commitWikiChanges(dir, [rel]).committed, true);
+    writeFileSync(join(dir, rel), 'v1 staged by hand\n');
+    spawnSync('git', ['-C', dir, 'add', '--', rel]);
+    writeFileSync(join(dir, rel), 'v2 on disk\n');
+    const headBefore = gitOut(dir, 'rev-parse', 'HEAD');
+    const lsBefore = gitOut(dir, 'ls-files', '-s');
+    const res = commitWikiChanges(dir, [rel]);
+    assert.equal(res.committed, false, JSON.stringify(res));
+    assert.match(res.reason, /could not save a version staged in the index/);
+    assert.match(res.reason, /\.cache\/ is not ignored/);
+    assert.equal(gitOut(dir, 'rev-parse', 'HEAD'), headBefore, 'HEAD did not move');
+    assert.equal(gitOut(dir, 'ls-files', '-s'), lsBefore, 'the index is what it was');
+    assert.equal(indexBlob(dir, rel), 'v1 staged by hand\n', 'their stage is still staged');
+    assert.equal(readFileSync(join(dir, rel), 'utf-8'), 'v2 on disk\n');
+    assert.deepEqual(stagedBackupFiles(dir), [], 'no backup was written');
+    const notice = consumeRootHotHealthNotice(dir) ?? '';
+    assert.ok(notice.includes('.gitignore') && notice.includes('/.cache/'), notice);
+    // The pair: once the ignore line is there the same call saves the version and commits.
+    writeFileSync(join(dir, '.gitignore'), 'unrelated/\n/.cache/\n');
+    const again = commitWikiChanges(dir, [rel]);
+    assert.equal(again.committed, true, JSON.stringify(again));
+    assert.equal(again.stagedBackups?.length, 1, JSON.stringify(again));
+    assert.equal(readFileSync(again.stagedBackups[0].backupPath, 'utf-8'), 'v1 staged by hand\n');
+  });
+});
+
+// A dangling symlink put where a staged deletion was gets staged by `git add -A`, and the file
+// check that announces the replaced deletion followed the link and saw nothing.
+// Disabling: in `backUpStagedVersions` change `!isFileOrLink(join(hypoDir, path))` back to
+// `!statIs(join(hypoDir, path), 'file')`. The notice assertion goes red.
+test('ISSUE-198: a dangling symlink replacing a staged deletion is announced', () => {
+  withSyncedWiki((dir) => {
+    const rel = 'dangling.md';
+    writeFileSync(join(dir, rel), 'v0\n');
+    assert.equal(commitWikiChanges(dir, [rel]).committed, true);
+    assert.equal(spawnSync('git', ['-C', dir, 'rm', '-q', '--', rel]).status, 0);
+    symlinkSync(join(dir, 'no-such-target'), join(dir, rel));
+    const res = commitWikiChanges(dir, [rel]);
+    assert.equal(res.committed, true, JSON.stringify(res));
+    assert.deepEqual(res.committedPaths, [rel]);
+    const notice = consumeRootHotHealthNotice(dir) ?? '';
+    assert.ok(notice.includes(rel) && notice.includes('삭제'), notice);
+  });
+});
+
+// `git rm` stages a deletion; a tool write brings the file back. The hook must not turn the
+// deletion into a modification (`git add` would), and the commit that replaces it says so.
+// Disabling the hook half: in hooks/hypo-auto-stage.mjs delete the
+// `isStagedDeletion(before.head, before.indexed) ||` line. The index-still-deleted assertion goes
+// red. Disabling the notice: in `backUpStagedVersions` change `!isStagedDeletion(head.get(path) ??
+// null, indexed.has(path)) ||` to `true ||`. The notice assertions go red.
+test('ISSUE-198: hypo-auto-stage keeps a staged deletion, and the commit replaces it with a notice', () => {
+  withSyncedWiki((dir) => {
+    const rel = "it's deleted.md";
+    writeFileSync(join(dir, rel), 'v0\n');
+    assert.equal(commitWikiChanges(dir, [rel]).committed, true);
+    assert.equal(spawnSync('git', ['-C', dir, 'rm', '-q', '--', rel]).status, 0);
+    writeFileSync(join(dir, rel), 'TOOL bytes after the rm\n');
+    runAutoStage(dir, rel);
+    assert.equal(gitOut(dir, 'ls-files', '-s', '--', rel), '', 'the index still has no entry');
+    assert.equal(gitOut(dir, 'diff', '--cached', '--name-status'), `D\t${rel}\n`);
+    assert.equal(readAutoStagedRecord(dir)[rel], undefined, 'and recorded nothing as its own');
+
+    const res = commitWikiChanges(dir, [rel]);
+    assert.equal(res.committed, true, JSON.stringify(res));
+    assert.deepEqual(res.committedPaths, [rel]);
+    assert.equal(headText(dir, rel), 'TOOL bytes after the rm\n', 'HEAD has the new content');
+    const notice = consumeRootHotHealthNotice(dir) ?? '';
+    assert.ok(notice.includes(rel) && notice.includes('삭제'), notice);
+    assert.ok(notice.includes(`git rm -- 'it'\\''s deleted.md'`), `the redo is quoted: ${notice}`);
+  });
+});
+
+// A rename's source is a deletion too, but the rename is that deletion: no notice.
+test('ISSUE-198: a rename does not announce its source as a replaced deletion', () => {
+  withSyncedWiki((dir) => {
+    writeFileSync(join(dir, 'src-moved.md'), 'content\n');
+    assert.equal(commitWikiChanges(dir, ['src-moved.md']).committed, true);
+    spawnSync('git', ['-C', dir, 'mv', 'src-moved.md', 'dst-moved.md']);
+    const res = commitWikiChanges(dir, ['dst-moved.md']);
+    assert.equal(res.committed, true, JSON.stringify(res));
+    assert.equal(consumeRootHotHealthNotice(dir), null, 'no notice for a plain rename');
+  });
+});
+
+// The notice write must be durable: the caller replaces the only copy of someone's bytes after it.
+// atomicWrite exposes no seam to observe `durable`, so this reads the source: the call inside
+// `writeRootHotHealthNotice` passes `{ durable: true }`. Disabling: delete `durable: true,` there.
+test('writeRootHotHealthNotice passes durable to atomicWrite', () => {
+  const src = readFileSync(join(HOOKS, 'hypo-shared.mjs'), 'utf-8');
+  const start = src.indexOf('export function writeRootHotHealthNotice');
+  const body = src.slice(start, src.indexOf('\n}\n', start));
+  assert.match(body, /atomicWrite\([^;]*\{\s*durable: true,?\s*\}\s*\)/s);
+});
+
+// Disabling: in `commitWikiChanges` replace `commitScope.map(shellQuote)` with `commitScope`. The
+// quoted-name assertions go red.
+test('commitWikiChanges: the reset advice quotes each path for a POSIX shell', () => {
+  withSyncedWiki((dir) => {
+    writeFileSync(join(dir, 'with space.md'), 'v1\n');
+    writeFileSync(join(dir, "it's.md"), 'v1\n');
+    writeFileSync(join(dir, 'plain.md'), 'v1\n');
+    withPostCommitLock(dir, () => {
+      const res = commitWikiChanges(dir, ['with space.md', "it's.md", 'plain.md']);
+      assert.equal(res.committed, true, JSON.stringify(res));
+      const advice = res.indexWarning ?? '';
+      assert.ok(advice.includes("'with space.md'"), advice);
+      assert.ok(advice.includes(`'it'\\''s.md'`), advice);
+      assert.ok(/ plain\.md[ `]/.test(advice), `a safe name stays bare: ${advice}`);
+    });
+  });
+});
+
+// A staged version that is saved but cannot be announced stops the commit before it stages
+// anything. The notice path is a directory, so the notice write fails and the backup succeeds.
+// Disabling: in `backUpStagedVersions` delete the `if (!noticed) throw ...` line. The committed
+// assertion goes red.
+test('ISSUE-198: a backup whose notice cannot be written stops the commit before anything is staged', () => {
+  withSyncedWiki((dir) => {
+    const rel = 'unannounced.md';
+    writeFileSync(join(dir, rel), 'v0\n');
+    assert.equal(commitWikiChanges(dir, [rel]).committed, true);
+    writeFileSync(join(dir, rel), 'v1 staged by hand\n');
+    spawnSync('git', ['-C', dir, 'add', '--', rel]);
+    writeFileSync(join(dir, rel), 'v2 on disk\n');
+    mkdirSync(join(dir, '.cache', 'root-hot-projection-notice.json'), { recursive: true });
+    const headBefore = gitOut(dir, 'rev-parse', 'HEAD');
+    const res = commitWikiChanges(dir, [rel]);
+    assert.equal(res.committed, false, JSON.stringify(res));
+    assert.match(res.reason, /could not save a version staged in the index/);
+    assert.equal(gitOut(dir, 'rev-parse', 'HEAD'), headBefore, 'HEAD did not move');
+    assert.equal(indexBlob(dir, rel), 'v1 staged by hand\n', 'the staged version is still staged');
+  });
+});
+
+// A generated view's rename half. `git mv projects/p/hot.md pages/x.md` stages the view's
+// deletion; committing the pair would commit that deletion, which this function never does for a
+// view. The whole pair stays out and is reported, not retired.
+test('commitWikiChanges: a rename out of a generated view path is left out whole and reported unresolved', () => {
+  withSyncedWiki((dir) => {
+    mkdirSync(join(dir, 'projects', 'p'), { recursive: true });
+    mkdirSync(join(dir, 'pages'), { recursive: true });
+    writeFileSync(join(dir, 'projects', 'p', 'hot.md'), 'legacy tracked view\n');
+    spawnSync('git', ['-C', dir, 'add', '-A']);
+    spawnSync('git', ['-C', dir, 'commit', '-q', '-m', 'legacy view']);
+    spawnSync('git', ['-C', dir, 'mv', 'projects/p/hot.md', 'pages/x.md']);
+    const headBefore = gitOut(dir, 'rev-parse', 'HEAD');
+    const res = commitWikiChanges(dir, ['pages/x.md']);
+    assert.equal(res.committed, true, JSON.stringify(res));
+    assert.equal(res.scoped, 0, JSON.stringify(res));
+    assert.deepEqual(res.committedPaths, []);
+    assert.deepEqual(res.ignoredPaths, ['pages/x.md'], 'kept unresolved for the caller');
+    assert.equal(gitOut(dir, 'rev-parse', 'HEAD'), headBefore, 'nothing was committed');
+    assert.match(
+      gitOut(dir, 'status', '--porcelain', '--', 'projects/p/hot.md', 'pages/x.md'),
+      /^R {2}projects\/p\/hot\.md -> pages\/x\.md$/m,
+      'the rename is still staged as it was',
+    );
+  });
+});
+
+// A rename between two ordinary paths still commits as a pair (contrast for the one above).
+test('commitWikiChanges: a rename between ordinary paths still commits both halves', () => {
+  withSyncedWiki((dir) => {
+    writeFileSync(join(dir, 'a.md'), 'content\n');
+    assert.equal(commitWikiChanges(dir, ['a.md']).committed, true);
+    spawnSync('git', ['-C', dir, 'mv', 'a.md', 'b.md']);
+    const res = commitWikiChanges(dir, ['b.md']);
+    assert.equal(res.committed, true, JSON.stringify(res));
+    assert.deepEqual(res.committedPaths, ['b.md']);
+    assert.equal(gitOut(dir, 'status', '--porcelain', '--', 'a.md', 'b.md'), '');
+  });
+});
+
+// A post-commit hook that leaves `index.lock` behind makes the reset to HEAD after the commit fail,
+// which is how a transient lock after the commit looks to this function. The commit has landed,
+// so the call still reports it, and says what to run.
+function withPostCommitLock(dir, fn) {
+  const hooks = join(dir, '.git', 'x-test-hooks');
+  mkdirSync(hooks, { recursive: true });
+  writeFileSync(
+    join(hooks, 'post-commit'),
+    '#!/bin/sh\n: > "$(git rev-parse --git-path index.lock)"\n',
+  );
+  chmodSync(join(hooks, 'post-commit'), 0o755);
+  spawnSync('git', ['-C', dir, 'config', 'core.hooksPath', hooks]);
+  try {
+    fn();
+  } finally {
+    spawnSync('git', ['-C', dir, 'config', '--unset', 'core.hooksPath']);
+    rmSync(join(dir, '.git', 'index.lock'), { force: true });
+  }
+}
+
+test('commitWikiChanges: a reset that fails after the commit landed reports committed with an indexWarning', () => {
+  withSyncedWiki((dir) => {
+    writeFileSync(join(dir, 'lockwarn.md'), 'v1\n');
+    withPostCommitLock(dir, () => {
+      const res = commitWikiChanges(dir, ['lockwarn.md']);
+      assert.equal(res.committed, true, JSON.stringify(res));
+      assert.match(
+        res.indexWarning ?? '',
+        /git reset -q HEAD -- lockwarn\.md/,
+        JSON.stringify(res),
+      );
+    });
+    assert.equal(headText(dir, 'lockwarn.md'), 'v1\n', 'the commit landed');
+  });
+});
+
+// Disabling the pass-through: in hooks/hypo-auto-commit.mjs delete the `writeRootHotHealthNotice`
+// call under `typeof result.indexWarning === 'string'`. The notice assertion goes red.
+test('hypo-auto-commit: an indexWarning from the commit reaches the next SessionStart as a health notice', () => {
+  withGrowthWiki((dir) => {
+    const sid = 'sess-index-warning';
+    writeFileSync(join(dir, 'warned.md'), '# warned\n');
+    recordTouchedPaths(dir, sid, 'warned.md');
+    withPostCommitLock(dir, () => {
+      const r = runStop('hypo-auto-commit.mjs', dir, { session_id: sid });
+      assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    });
+    assert.equal(headText(dir, 'warned.md'), '# warned\n', 'precondition: the commit landed');
+    const notice = consumeRootHotHealthNotice(dir) ?? '';
+    assert.match(
+      notice,
+      /git reset -q HEAD -- warned\.md/,
+      `the notice carries the fix: ${notice}`,
     );
   });
 });
@@ -5737,7 +6681,9 @@ test('own-project changes are excluded from the foreign count', () => {
 // it).
 test('root-level uncommitted changes (shared vault infra) count as unattributed, not silently dropped', () => {
   withTwoProjectWiki((dir, work) => {
-    writeFileSync(join(dir, 'hot.md'), '---\ntitle: Hot\nupdated: today\n---\n## edited\n');
+    // Root hot.md is a generated view of the session entries now, and the hook sets a hand-edited
+    // one aside; another root-level file stands for shared vault infra.
+    writeFileSync(join(dir, 'hypo-config.md'), '# config\nedited\n');
     const r = runSessionStartFor(dir, work, 'issue99-root');
     assert.equal(r.status, 0, `stderr: ${r.stderr}`);
     assert.ok(
@@ -5943,6 +6889,62 @@ test('a project directory name with a real newline stays a single-line notice (s
   });
 });
 
+// A live close's lock file and a waiter's staging file are untracked, so they used to show up as
+// a second foreign change next to the one real draft.
+test('a foreign lock artifact is not counted as a foreign change', () => {
+  withTwoProjectWiki((dir, work) => {
+    const theirs = join(dir, 'projects', 'theirs');
+    writeFileSync(join(theirs, 'draft.md'), 'uncommitted draft\n');
+    // The two files a close locks inside the tracked tree live in a session-log shard.
+    mkdirSync(join(theirs, 'session-log'), { recursive: true });
+    writeFileSync(join(theirs, 'session-log', '2026-01-01.md.lock'), '');
+    writeFileSync(join(theirs, 'session-log', '2026-01-01.md.lock.0123456789abcdef.tmp'), '');
+    const r = runSessionStartFor(dir, work, 'issue99-lock-artifact');
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    assert.match(
+      r.stdout,
+      /\[WIKI: 현재 프로젝트 외 projects\/theirs 변경 1건이 있습니다\./,
+      `only the draft counts, got: ${r.stdout}`,
+    );
+  });
+});
+
+// Only the files a close locks are artifacts: a person's untracked `.lock` file counts.
+test("a person's untracked .lock file is counted as a foreign change", () => {
+  withTwoProjectWiki((dir, work) => {
+    const theirs = join(dir, 'projects', 'theirs');
+    writeFileSync(join(theirs, 'draft.md'), 'uncommitted draft\n');
+    writeFileSync(join(theirs, 'draft.md.lock'), 'mine\n');
+    const r = runSessionStartFor(dir, work, 'person-lock-file');
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    assert.match(
+      r.stdout,
+      /\[WIKI: 현재 프로젝트 외 projects\/theirs 변경 2건이 있습니다\./,
+      `both files count, got: ${r.stdout}`,
+    );
+  });
+});
+
+// The lock-artifact filter covers untracked records only: a tracked file that happens to end in
+// `.lock` and is edited is a person's work.
+test('a tracked foreign .lock file that was edited is counted as a foreign change', () => {
+  withTwoProjectWiki((dir, work) => {
+    const rel = join('projects', 'theirs', 'draft.md.lock');
+    writeFileSync(join(dir, rel), 'tracked on purpose\n');
+    const env = { ...process.env, HOME: SESSION_TMP_HOME };
+    spawnSync('git', ['add', '-f', rel], { cwd: dir, env });
+    spawnSync('git', ['commit', '-q', '-m', 'track a lock-named file'], { cwd: dir, env });
+    writeFileSync(join(dir, rel), 'edited by a person\n');
+    const r = runSessionStartFor(dir, work, 'issue99-tracked-lock');
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    assert.match(
+      r.stdout,
+      /\[WIKI: 현재 프로젝트 외 projects\/theirs 변경 1건이 있습니다\./,
+      `the tracked edit counts, got: ${r.stdout}`,
+    );
+  });
+});
+
 test('clean vault: no foreign notice at all (quiet at zero)', () => {
   withTwoProjectWiki((dir, work) => {
     const r = runSessionStartFor(dir, work, 'issue99-clean');
@@ -5954,19 +6956,16 @@ test('clean vault: no foreign notice at all (quiet at zero)', () => {
   });
 });
 
-// ── ISSUE-115 wave 1: root hot.md projection ────────────────────────────────
+// ── generated views at Stop: hot-rebuild, auto-commit and the commit guard ──
 //
-// Root hot.md stops being a file Claude hand-edits and becomes a deterministic
-// projection of projects/<slug>/hot.md. renderRootHotProjection (pure) and
-// writeRootHotProjection (the only writer) live in hooks/hypo-shared.mjs; both
-// hypo-session-start.mjs (SessionStart) and hypo-hot-rebuild.mjs (Stop) call
-// writeRootHotProjection instead of the retired row-parsing rebuild(). This
-// suite owns both call sites since neither has its own area file and both are
-// already covered by hypo-session-start.mjs fixtures a few suites up.
+// The three session views (`projects/<p>/hot.md`, `projects/<p>/session-state.md` and the root
+// `hot.md`) are rendered from the session entries by `writeGeneratedViews`
+// (hooks/session-views.mjs). Stop stage 1 (hypo-hot-rebuild.mjs) writes all of them, stage 3
+// (hypo-auto-commit.mjs) writes them again when its pull moved HEAD, and commitWikiChanges never
+// commits one. The generator's own behaviour (ownership, backups, lock, byte-identical rewrites)
+// is pinned in tests/session-entries.test.mjs; this suite pins the three call sites.
 
-suite(
-  'hypo-shared.mjs / hypo-session-start.mjs / hypo-hot-rebuild.mjs: root hot.md projection (ISSUE-115 wave 1)',
-);
+suite('hypo-hot-rebuild.mjs / hypo-auto-commit.mjs: generated views at Stop');
 
 function projectionWikiDir() {
   const dir = mkdtempSync(join(tmpdir(), 'hypo-hotproj-'));
@@ -5984,196 +6983,372 @@ function writeProjectHotFixture(dir, slug, { title, updated } = {}) {
   writeFileSync(join(projDir, 'hot.md'), `${fm.join('\n')}\n# Hot\n`);
 }
 
-test('AC1: a manually deleted root hot.md row comes back after SessionStart', () => {
-  const dir = projectionWikiDir();
+const svGit = (dir, ...args) => spawnSync('git', ['-C', dir, ...args], { encoding: 'utf-8' });
+
+function svPut(dir, rel, text) {
+  mkdirSync(dirname(join(dir, rel)), { recursive: true });
+  writeFileSync(join(dir, rel), text);
+}
+
+function svCommitAll(dir, message = 'x') {
+  assert.equal(svGit(dir, 'add', '-A').status, 0);
+  const r = svGit(
+    dir,
+    '-c',
+    'user.email=t@example.com',
+    '-c',
+    'user.name=t',
+    'commit',
+    '-q',
+    '-m',
+    message,
+  );
+  assert.equal(r.status, 0, r.stderr);
+}
+
+// One session entry with a single track `masking`; the close id is the only thing that varies.
+function svEntry(dir, project, closeId, date = '2026-10-01') {
+  const rel = `projects/${project}/sessions/${entryFileName(date, closeId)}`;
+  svPut(
+    dir,
+    rel,
+    formatSessionEntry({
+      project,
+      closeId,
+      sessionId: null,
+      date,
+      visibilityScope: null,
+      tracks: [{ id: 'masking', title: 'Masking' }],
+      bodies: { masking: `next for ${closeId}\n` },
+      summary: `summary ${closeId}\n`,
+    }),
+  );
+  return rel;
+}
+
+// Two clones of one remote, both on a vault that has moved to session entries: the block is in
+// HEAD, no view is tracked, projects p and q each hold one entry.
+function withMigratedPair(fn) {
+  const base = mkdtempSync(join(tmpdir(), 'hypo-views-'));
+  const remote = join(base, 'remote.git');
+  const a = join(base, 'a');
+  const b = join(base, 'b');
   try {
-    writeProjectHotFixture(dir, 'alpha', { title: 'Alpha', updated: '2026-09-10' });
-    // Root already carries the alpha row (as a prior projection/rebuild would
-    // have left it), then a user deletes the row by hand.
-    writeRootHotProjection(dir);
-    assert.ok(readFileSync(join(dir, 'hot.md'), 'utf-8').includes('[[projects/alpha/hot]]'));
-    writeFileSync(
-      join(dir, 'hot.md'),
-      '---\ntitle: Hot Cache\nupdated: 2026-09-10\n---\n\n# Hot Cache\n\n## Active Projects\n\n| Project | Last Session | Hot Cache |\n|---|---|---|\n',
-    );
-    assert.ok(!readFileSync(join(dir, 'hot.md'), 'utf-8').includes('alpha'));
-    const r = runStart(dir);
+    spawnSync('git', ['init', '--bare', '-q', remote]);
+    spawnSync('git', ['init', '-q', a]);
+    svPut(a, '.gitignore', GITIGNORE_BLOCK);
+    for (const slug of ['p', 'q']) {
+      svPut(a, `projects/${slug}/index.md`, `---\ntitle: ${slug}\n---\n`);
+      svEntry(a, slug, `${slug}-1`);
+    }
+    svCommitAll(a, 'init');
+    svGit(a, 'remote', 'add', 'origin', remote);
+    assert.equal(svGit(a, 'push', '-q', '-u', 'origin', 'HEAD').status, 0);
+    assert.equal(spawnSync('git', ['clone', '-q', remote, b]).status, 0);
+    fn(a, b);
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+}
+
+const GENERATED_PATHS = /(^|\/)(hot|session-state)\.md$/m;
+
+test('hot-rebuild writes every project view and the root from the entries on disk, including a project SessionStart left to Stop', () => {
+  withMigratedPair((a) => {
+    // SessionStart on p wrote the root and p's views and handed the rest to Stop.
+    const first = writeGeneratedViews(a, { projects: ['p'] });
+    assert.deepEqual(first.written.sort(), [
+      'hot.md',
+      'projects/p/hot.md',
+      'projects/p/session-state.md',
+    ]);
+    assert.equal(existsSync(join(a, 'projects/q/hot.md')), false, 'fixture: q has no views yet');
+    // Another session closes into q before this one ends.
+    svEntry(a, 'q', 'q-2', '2026-10-02');
+
+    // A recorded base for the root hot.md that is deliberately wrong: the write
+    // branch of the hook must not advance it (the root file is no overwrite target).
+    const sid = 'hotrebuild-all-views';
+    const SENTINEL_HASH = 'sentinel-does-not-match-disk';
+    snapshotBase(a, sid, ['hot.md']);
+    advanceBase(a, sid, 'hot.md', SENTINEL_HASH);
+    const r = runStop('hypo-hot-rebuild.mjs', a, { session_id: sid });
     assert.equal(r.status, 0, `stderr: ${r.stderr}`);
-    const after = readFileSync(join(dir, 'hot.md'), 'utf-8');
-    assert.ok(
-      after.includes('[[projects/alpha/hot]]'),
-      `deleted row must be regenerated by SessionStart, got: ${after}`,
-    );
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
-});
+    assert.equal(readBaseEntry(a, sid, 'hot.md').hash, SENTINEL_HASH, 'the rebuild mints no base');
 
-test('AC2: a new project directory gets a row without the root file being touched by hand', () => {
-  const dir = projectionWikiDir();
-  try {
-    writeRootHotProjection(dir); // establish an empty-but-present root file
-    writeProjectHotFixture(dir, 'brandnew', { title: 'Brand New', updated: '2026-09-15' });
-    const r = runStart(dir);
-    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
-    const after = readFileSync(join(dir, 'hot.md'), 'utf-8');
-    assert.ok(
-      after.includes('[[projects/brandnew/hot]]'),
-      `new project row must appear after SessionStart, got: ${after}`,
-    );
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
-});
-
-test('AC3: _template never becomes a row', () => {
-  const dir = projectionWikiDir();
-  try {
-    writeProjectHotFixture(dir, '_template', { title: 'Template', updated: '2026-09-16' });
-    writeProjectHotFixture(dir, 'real', { title: 'Real', updated: '2026-09-01' });
-    const content = renderRootHotProjection(dir);
-    assert.ok(!content.includes('_template'), `_template leaked into the projection: ${content}`);
-    assert.ok(content.includes('[[projects/real/hot]]'));
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
-});
-
-// Nothing pinned the sort rule itself before this: flipping the comparator
-// (descending -> ascending, swapping which end blank dates land on, or
-// dropping the slug tie-break) left the whole suite green, since AC5 only
-// checks that two renders of ONE tree agree with each other and the
-// `updated:` assertion is a max, which is order-independent. Spec 3.3
-// mandates: date descending, blank dates last, ties broken by slug ascending.
-test('row order: date descending, blank dates last, ties broken by slug ascending', () => {
-  const dir = projectionWikiDir();
-  try {
-    // Same day twice (zed/alpha, so a slug-ascending tie-break is the only
-    // thing that could put alpha before zed), a distinct earlier day, and one
-    // dateless project that must sort last regardless of its slug.
-    writeProjectHotFixture(dir, 'zed', { updated: '2026-09-10' });
-    writeProjectHotFixture(dir, 'alpha', { updated: '2026-09-10' });
-    writeProjectHotFixture(dir, 'older', { updated: '2026-01-01' });
-    writeProjectHotFixture(dir, 'nodate', {});
-    const content = renderRootHotProjection(dir);
-    const slugOrder = content
-      .split('\n')
-      .filter((l) => l.includes('[[projects/'))
-      .map((l) => l.match(/\[\[projects\/([^/]+)\/hot\]\]/)[1]);
+    for (const view of ['projects/q/hot.md', 'projects/q/session-state.md']) {
+      assert.match(
+        readFileSync(join(a, view), 'utf-8'),
+        /q-2/,
+        `${view} must hold the newest entry`,
+      );
+    }
+    assert.match(readFileSync(join(a, 'hot.md'), 'utf-8'), /\| q \| 2026-10-02 \|/);
     assert.deepEqual(
-      slugOrder,
-      ['alpha', 'zed', 'older', 'nodate'],
-      `expected date-descending order with a slug tie-break and blank-last, got: ${JSON.stringify(slugOrder)}`,
+      peekTouchedPaths(a, sid),
+      [],
+      'a generated view is never claimed for the commit',
     );
+    assert.doesNotMatch(
+      svGit(a, 'status', '--porcelain').stdout,
+      GENERATED_PATHS,
+      'the views are ignored, so git status never lists one',
+    );
+  });
+});
+
+test('a row with no project behind it does not survive the rebuild, and every project with entries has one', () => {
+  withMigratedPair((a) => {
+    writeFileSync(
+      join(a, 'hot.md'),
+      '---\ntitle: Hot Cache: Pointer\n---\n\n## Active Projects\n\n| Project | Last Session | Hot Cache |\n|---|---|---|\n' +
+        '| ghost | 2026-01-01 | [[projects/ghost/hot]] |\n' +
+        '| bad | 2026-01-01 | [bad](projects/bad/hot.md) |\n',
+    );
+    const r = runStop('hypo-hot-rebuild.mjs', a, { session_id: 'hotrebuild-ghost-row' });
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    const root = readFileSync(join(a, 'hot.md'), 'utf-8');
+    assert.match(root, /\| p \| 2026-10-01 \| \[\[projects\/p\/hot\]\] \|/);
+    assert.match(root, /\| q \| 2026-10-01 \| \[\[projects\/q\/hot\]\] \|/);
+    assert.doesNotMatch(root, /ghost|bad/);
+  });
+});
+
+test("auto-commit's pull brings in another clone's entry, and the views at the end of Stop hold it", () => {
+  withMigratedPair((a, b) => {
+    writeGeneratedViews(a);
+    assert.doesNotMatch(readFileSync(join(a, 'projects/p/session-state.md'), 'utf-8'), /p-2/);
+    // The other clone closes into p and pushes.
+    const rel = svEntry(b, 'p', 'p-2', '2026-10-02');
+    svCommitAll(b, 'entry from b');
+    assert.equal(svGit(b, 'push', '-q', 'origin', 'HEAD').status, 0);
+
+    const r = runStop('hypo-auto-commit.mjs', a, { session_id: 'autocommit-pull-regen' });
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+
+    assert.equal(existsSync(join(a, rel)), true, 'fixture: the pull must have landed the entry');
+    assert.match(readFileSync(join(a, 'projects/p/session-state.md'), 'utf-8'), /p-2/);
+    assert.match(readFileSync(join(a, 'projects/p/hot.md'), 'utf-8'), /p-2/);
+    assert.match(readFileSync(join(a, 'hot.md'), 'utf-8'), /\| p \| 2026-10-02 \|/);
+    assert.doesNotMatch(svGit(a, 'status', '--porcelain').stdout, GENERATED_PATHS);
+  });
+});
+
+test('commitWikiChanges drops generated view paths from its input and commits the rest', () => {
+  withTmpDir((dir) => {
+    spawnSync('git', ['init', '-q', dir]);
+    // A vault from before the move: the views are tracked and edited like any page.
+    for (const rel of [
+      'hot.md',
+      'projects/p/hot.md',
+      'projects/p/session-state.md',
+      'pages/x.md',
+    ]) {
+      svPut(dir, rel, 'old\n');
+    }
+    svCommitAll(dir, 'seed');
+    for (const rel of [
+      'hot.md',
+      'projects/p/hot.md',
+      'projects/p/session-state.md',
+      'pages/x.md',
+    ]) {
+      svPut(dir, rel, 'new\n');
+    }
+    svGit(dir, 'config', 'user.email', 't@example.com');
+    svGit(dir, 'config', 'user.name', 't');
+
+    const r = commitWikiChanges(dir, [
+      'projects/p/hot.md',
+      'hot.md',
+      'projects/p/session-state.md',
+      'pages/x.md',
+    ]);
+    assert.equal(r.committed, true, JSON.stringify(r));
+    assert.deepEqual(r.committedPaths, ['pages/x.md']);
+    assert.deepEqual(
+      svGit(dir, 'show', '--name-only', '--pretty=format:', 'HEAD')
+        .stdout.split('\n')
+        .filter(Boolean),
+      ['pages/x.md'],
+    );
+    const status = svGit(dir, 'status', '--porcelain').stdout;
+    for (const rel of ['hot.md', 'projects/p/hot.md', 'projects/p/session-state.md']) {
+      assert.ok(status.includes(` M ${rel}`), `${rel} must still be a modified file: ${status}`);
+    }
+
+    // Only view paths: a clean success, and no commit.
+    const head = gitHead(dir);
+    const onlyViews = commitWikiChanges(dir, ['hot.md', 'projects/p/hot.md']);
+    assert.equal(onlyViews.committed, true, JSON.stringify(onlyViews));
+    assert.equal(onlyViews.scoped, 0);
+    assert.equal(gitHead(dir), head, 'a view-only input creates no commit');
+  });
+});
+
+test('hot-rebuild leaves the views alone and says why while the vault lock is held elsewhere', () => {
+  withMigratedPair((a) => {
+    writeGeneratedViews(a);
+    const before = readFileSync(join(a, 'hot.md'), 'utf-8');
+    svEntry(a, 'q', 'q-2', '2026-10-02');
+    const prevTimeout = process.env.HYPO_VAULT_LOCK_TIMEOUT_MS;
+    process.env.HYPO_VAULT_LOCK_TIMEOUT_MS = '200';
+    const lockPath = `${vaultCommitLockTarget(a)}.lock`;
+    try {
+      mkdirSync(dirname(lockPath), { recursive: true });
+      writeFileSync(lockPath, String(process.pid));
+      const r = runStop('hypo-hot-rebuild.mjs', a, { session_id: 'hotrebuild-locked' });
+      assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    } finally {
+      rmSync(lockPath, { force: true });
+      if (prevTimeout === undefined) delete process.env.HYPO_VAULT_LOCK_TIMEOUT_MS;
+      else process.env.HYPO_VAULT_LOCK_TIMEOUT_MS = prevTimeout;
+    }
+    assert.equal(readFileSync(join(a, 'hot.md'), 'utf-8'), before, 'nothing was written');
+    const notice = consumeRootHotHealthNotice(a);
+    assert.ok(notice?.includes('잠금'), `the next SessionStart must be told: ${notice}`);
+  });
+});
+
+test('hot-rebuild backs up bytes it did not write under .cache/backups and leaves a notice that names the backup', () => {
+  withMigratedPair((a) => {
+    writeFileSync(join(a, 'hot.md'), 'my own notes\n');
+    const r = runStop('hypo-hot-rebuild.mjs', a, { session_id: 'hotrebuild-backup' });
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    const backup = join(a, '.cache/backups', `hot.md${ROOT_HOT_BACKUP_SUFFIX}`);
+    assert.equal(readFileSync(backup, 'utf-8'), 'my own notes\n');
+    assert.match(readFileSync(join(a, 'hot.md'), 'utf-8'), /\[\[projects\/p\/hot\]\]/);
+    const notice = consumeRootHotHealthNotice(a);
+    assert.ok(
+      notice?.includes(`.cache/backups/hot.md${ROOT_HOT_BACKUP_SUFFIX}`),
+      `the notice must name the backup: ${notice}`,
+    );
+  });
+});
+
+// Disabling the defense: in `listSessionProjects` (hooks/hypo-shared.mjs) return `[]` for every
+// read error. The rebuild then renders an empty root table over the real one, and the unchanged
+// bytes assertion goes red.
+test('hot-rebuild keeps the root hot.md and leaves a notice when projects/ cannot be listed', () => {
+  if (process.getuid?.() === 0) return; // root reads a mode 000 directory
+  withMigratedPair((a) => {
+    writeGeneratedViews(a, { projects: ['p'] });
+    const before = readFileSync(join(a, 'hot.md'), 'utf-8');
+    assert.match(before, /\[\[projects\/p\/hot\]\]/, 'fixture: the table has the p row');
+    consumeRootHotHealthNotice(a);
+    chmodSync(join(a, 'projects'), 0o000);
+    try {
+      const r = runStop('hypo-hot-rebuild.mjs', a, { session_id: 'hotrebuild-unlistable' });
+      assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    } finally {
+      chmodSync(join(a, 'projects'), 0o755);
+    }
+    assert.equal(readFileSync(join(a, 'hot.md'), 'utf-8'), before, 'the old root table is kept');
+    const notice = consumeRootHotHealthNotice(a) ?? '';
+    assert.match(notice, /EACCES/, `a notice says why the views were not refreshed: ${notice}`);
+  });
+});
+
+test('hot-rebuild leaves a vault that has not moved to session entries as it was', () => {
+  withTmpDir((dir) => {
+    spawnSync('git', ['init', '-q', dir]);
+    svPut(dir, 'projects/p/index.md', '---\ntitle: p\n---\n');
+    svPut(dir, 'projects/p/hot.md', 'old project hot\n');
+    svPut(dir, 'hot.md', 'old root hot\n');
+    svCommitAll(dir, 'seed');
+    const r = runStop('hypo-hot-rebuild.mjs', dir, { session_id: 'hotrebuild-unmigrated' });
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    assert.equal(JSON.parse(r.stdout).continue, true);
+    assert.equal(readFileSync(join(dir, 'hot.md'), 'utf-8'), 'old root hot\n');
+    assert.equal(readFileSync(join(dir, 'projects/p/hot.md'), 'utf-8'), 'old project hot\n');
+    assert.equal(
+      svGit(dir, 'status', '--porcelain').stdout.replace('?? .cache/\n', ''),
+      '',
+      'nothing but the cache directory changed',
+    );
+  });
+});
+
+test('an unreadable projects/ does not throw out of collectProjectWorkingDirs', () => {
+  const dir = projectionWikiDir();
+  try {
+    rmSync(join(dir, 'projects'), { recursive: true, force: true });
+    writeFileSync(join(dir, 'projects'), 'not a directory\n'); // readdirSync throws ENOTDIR
+    assert.deepEqual(collectProjectWorkingDirs(dir), []);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
 });
 
-// Same rule, but through the axis a user actually experiences: which project
-// resolveActiveProject picks when two projects tie on today's date. Spec §8
-// names this explicitly as a risk (insertion order -> slug-ascending changes
-// which project wins a same-day tie), so it gets its own assertion distinct
-// from the row-order array above.
+// The root table rows are in sortRootRows order, and resolveActiveProject reads the table as it
+// is written: on a same-day tie it takes the first row, so the slug-ascending order decides.
 test('row order tie-break is user-visible: resolveActiveProject picks the slug-ascending winner on a same-day tie', () => {
   const dir = projectionWikiDir();
   try {
-    writeProjectHotFixture(dir, 'zed', { updated: '2026-09-10' });
-    writeProjectHotFixture(dir, 'alpha', { updated: '2026-09-10' });
-    writeRootHotProjection(dir);
+    const rows = sortRootRows([
+      { slug: 'zed', date: '2026-09-10' },
+      { slug: 'alpha', date: '2026-09-10' },
+    ]);
+    const table = rows.map((r) => `| ${r.slug} | ${r.date} | [[projects/${r.slug}/hot]] |`);
+    writeFileSync(
+      join(dir, 'hot.md'),
+      `---\ntitle: "Hot Cache: Pointer"\n---\n\n## Active Projects\n\n| Project | Last Session | Hot Cache |\n|---|---|---|\n${table.join('\n')}\n`,
+    );
     assert.equal(
       resolveActiveProject(dir),
       'alpha',
-      "on a same-day tie, resolveActiveProject must pick the slug-ascending winner (the projection's sort order), not insertion order",
+      'on a same-day tie, resolveActiveProject must pick the slug-ascending winner, not insertion order',
     );
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
 });
 
-test('AC4: a project hot.md with no `updated` gets a blank date, never today', () => {
-  const dir = projectionWikiDir();
-  const today = todayLocal();
-  try {
-    writeProjectHotFixture(dir, 'dateless', { title: 'Dateless' }); // no `updated:`
-    const content = renderRootHotProjection(dir);
-    const row = content.split('\n').find((l) => l.includes('[[projects/dateless/hot]]'));
-    assert.ok(row, `expected a row for dateless, got: ${content}`);
-    assert.match(row, /^\|\s*dateless\s*\|\s*\|\s*\[\[projects\/dateless\/hot\]\]\s*\|$/, row);
-    assert.ok(!row.includes(today), `date column must stay blank, not today: ${row}`);
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
-});
-
-// A malformed `updated:` value (not a well-formed YYYY-MM-DD string) must not
-// leak anywhere: not into the row's date column, and not into root
-// frontmatter's `updated:` via the row-date-max reduce. Before the ISO
-// validation was added, `parseFrontmatterField(...) || ''` only caught
-// absent/empty values, so a token like `stale` flowed straight into a raw
-// string compare (`'stale' > '2026-01-02'` is true in JS) and could win the
-// max, writing `updated: stale` into root hot.md's own frontmatter. Root
-// hot.md is regenerated every SessionStart and Stop, so a person editing the
-// bad value away by hand gets overwritten again on the next session; the bad
-// token would sit there until the offending project's own `updated:` is
-// fixed. sessionCloseFileStatus still checks this field against today's
-// date exactly like a project-owned file (see the 'n1' test below), so a
-// malformed sibling row does not just sit unnoticed, it can also stale-flag
-// an otherwise current close.
-test('a malformed `updated:` value does not pollute root frontmatter or the row date, and does not hide the project', () => {
+test('the blank-date regex claim in the spec holds: resolveActiveProject still matches a dateless row', () => {
   const dir = projectionWikiDir();
   try {
-    writeProjectHotFixture(dir, 'bad', { updated: 'stale' });
-    writeProjectHotFixture(dir, 'good', { updated: '2026-01-02' });
-    const content = renderRootHotProjection(dir);
-    assert.match(
-      content,
-      /^updated:\s*2026-01-02$/m,
-      `root frontmatter updated: must be the real max (2026-01-02), never the malformed token: ${content}`,
+    writeFileSync(
+      join(dir, 'hot.md'),
+      '---\ntitle: "Hot Cache: Pointer"\n---\n\n## Active Projects\n\n| Project | Last Session | Hot Cache |\n|---|---|---|\n| onlyblank |  | [[projects/onlyblank/hot]] |\n',
     );
-    const badRow = content.split('\n').find((l) => l.includes('[[projects/bad/hot]]'));
-    assert.ok(badRow, `expected a row for bad even with a malformed date, got: ${content}`);
-    assert.match(
-      badRow,
-      /^\|\s*bad\s*\|\s*\|\s*\[\[projects\/bad\/hot\]\]\s*\|$/,
-      `malformed date must render as blank, not leak through: ${badRow}`,
-    );
-    writeRootHotProjection(dir);
     assert.equal(
       resolveActiveProject(dir),
-      'good',
-      'a malformed sibling row must not stop resolveActiveProject from picking the well-dated project',
+      'onlyblank',
+      "a blank-date row must still be matched by resolveActiveProject (spec §3.3's optional date group)",
     );
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
 });
 
-// n1: root hot.md must not go stale from a SIBLING project's date. Root
-// hot.md's `updated:` is the max across every project row (see
-// formatRootHotProjection), so a vault with two or more projects can carry a
-// row that is not today even on a session where the active project's own
-// close is fully current. `sessionCloseFileStatus` still runs `checkUpdated`
-// against root hot.md exactly like every project-owned file (see
-// hooks/hypo-shared.mjs:2188), so that non-today max wrongly marks root
-// hot.md stale and blocks an otherwise-complete close.
-//
-// This assertion is RED right now on purpose: `checkUpdated('hot.md')` for
-// the root file has not been removed from sessionCloseFileStatus yet (that
-// removal lives in a sibling change to hooks/hypo-shared.mjs's
-// sessionCloseFileStatus, tracked separately from this projection wave).
-// Once that removal lands, root hot.md stops being gated against today's
-// date and this test goes green with no edit needed here.
+test("sortRootRows pins slug-ascending against a fixed adversarial input order, not this runtime's readdirSync order", () => {
+  // Deliberately built in reverse of what a real readdirSync on this runtime would ever hand a
+  // scan: a mutation that deletes the tie-break or reverses it stays green when this only runs
+  // through a live directory listing, since that listing already arrives slug-ascending.
+  const sorted = sortRootRows([
+    { slug: 'zed', date: '2026-09-10' },
+    { slug: 'alpha', date: '2026-09-10' },
+  ]);
+  assert.deepEqual(
+    sorted.map((r) => r.slug),
+    ['alpha', 'zed'],
+    "same-date rows must sort slug-ascending regardless of the input array's own order",
+  );
+});
+
+// n1: root hot.md must not go stale from a SIBLING project's date. Root hot.md's `updated:` is the
+// max across every project row, so a vault with two or more projects can carry a row that is not
+// today even on a session where the active project's own close is fully current.
 test('n1: root hot.md must not be reported stale by a sibling project whose row date is the max', () => {
   const dir = projectionWikiDir();
   const today = todayLocal();
   try {
-    // 'active' is the project actually being closed this session: every one
-    // of its own files is current. 'other' only exists to push the root
-    // projection's row-date max past today.
     writeProjectHotFixture(dir, 'active', { title: 'Active', updated: today });
     writeProjectHotFixture(dir, 'other', { title: 'Other', updated: '2099-01-01' });
-    writeRootHotProjection(dir);
+    writeFileSync(
+      join(dir, 'hot.md'),
+      `---\ntitle: "Hot Cache: Pointer"\ntype: reference\nupdated: 2099-01-01\ntags: [wiki, operations]\n---\n\n## Active Projects\n\n| Project | Last Session | Hot Cache |\n|---|---|---|\n| other | 2099-01-01 | [[projects/other/hot]] |\n| active | ${today} | [[projects/active/hot]] |\n`,
+    );
     assert.match(
       readFileSync(join(dir, 'hot.md'), 'utf-8'),
       /^updated: 2099-01-01$/m,
@@ -6192,624 +7367,15 @@ test('n1: root hot.md must not be reported stale by a sibling project whose row 
     );
     writeFileSync(join(dir, 'log.md'), `## [${today}] session | active\n`);
 
-    const status = sessionCloseFileStatus(dir, { projectOverride: 'active' });
+    // 'global' is the any-close-of-today judgment this fixture models: today's session-log
+    // heading and log.md line, no entry file. The close as a whole must pass (ok), not just
+    // leave hot.md out of `stale`: a root hot.md at 2099 is no gap in any part of it.
+    const status = sessionCloseFileStatus(dir, { scope: 'global', projectOverride: 'active' });
     assert.ok(
-      !status.stale.includes('hot.md'),
+      !status.stale.includes('hot.md') && !status.missing.includes('hot.md'),
       `root hot.md must not go stale from a sibling project's row date: ${JSON.stringify(status)}`,
     );
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
-});
-
-test('AC5: generating twice off the same tree produces byte-identical output', () => {
-  const dir = projectionWikiDir();
-  try {
-    writeProjectHotFixture(dir, 'alpha', { title: 'Alpha', updated: '2026-09-10' });
-    writeProjectHotFixture(dir, 'beta', { title: 'Beta' }); // dateless
-    const first = renderRootHotProjection(dir);
-    const second = renderRootHotProjection(dir);
-    assert.equal(first, second, 'two renders of the same tree must be byte-identical');
-    assert.match(
-      first,
-      /^updated: 2026-09-10$/m,
-      `frontmatter updated: must be the row-date max (2026-09-10), not today: ${first}`,
-    );
-    // Re-run through the actual write path too: a no-op second write must not
-    // touch the file (no today-drift smuggled in via a write-time stamp).
-    writeRootHotProjection(dir);
-    const before = readFileSync(join(dir, 'hot.md'), 'utf-8');
-    const wroteAgain = writeRootHotProjection(dir);
-    const after = readFileSync(join(dir, 'hot.md'), 'utf-8');
-    assert.equal(wroteAgain.written, false, 'a second write on an unchanged tree must be a no-op');
-    assert.equal(before, after, 'file bytes must not move on a no-op regenerate');
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
-});
-
-test('AC6: SessionStart creates root hot.md when it does not exist at all', () => {
-  const dir = projectionWikiDir();
-  try {
-    writeProjectHotFixture(dir, 'alpha', { title: 'Alpha', updated: '2026-09-10' });
-    assert.ok(!existsSync(join(dir, 'hot.md')));
-    const r = runStart(dir);
-    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
-    assert.ok(existsSync(join(dir, 'hot.md')), 'SessionStart must create a missing root hot.md');
-    assert.ok(readFileSync(join(dir, 'hot.md'), 'utf-8').includes('[[projects/alpha/hot]]'));
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
-});
-
-// This used to pin an ordering: the projection had to land before
-// snapshotBase so the session would observe its own fresh bytes as the base
-// for root hot.md. That ordering stopped mattering when root hot.md left
-// base-store's `overwriteTargets`. There is no base to observe, so what this
-// test pins now is the other half of the same contract: the SessionStart write
-// mints nothing. Its sibling on the Stop path is 'hot-rebuild rewrites hot.md,
-// mints no base entry for it, and a close after it does not park'. Both are
-// needed: a re-added advanceBase in either hook would be invisible to the other
-// one's test.
-test('AC7: the SessionStart projection write mints no base entry for root hot.md', () => {
-  const dir = projectionWikiDir();
-  const sessionId = 'hotproj-order-check';
-  try {
-    writeProjectHotFixture(dir, 'alpha', { title: 'Alpha', updated: '2026-09-10' });
-    const r = spawnSync(process.execPath, [join(HOOKS, 'hypo-session-start.mjs')], {
-      input: JSON.stringify({ cwd: dir, session_id: sessionId }),
-      encoding: 'utf-8',
-      env: { ...process.env, HOME: SESSION_TMP_HOME, HYPO_DIR: dir },
-    });
-    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
-    // The write itself still has to happen. Asserting only on the base would
-    // also pass in a build where SessionStart stopped writing the file at all.
-    assert.ok(
-      readFileSync(join(dir, 'hot.md'), 'utf-8').includes('[[projects/alpha/hot]]'),
-      'SessionStart must still write the projection',
-    );
-    const base = readBaseEntry(dir, sessionId, 'hot.md');
-    assert.equal(
-      base.state,
-      'unknown',
-      `the projection write must not mint a base entry for a file no session snapshots, got: ${JSON.stringify(base)}`,
-    );
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
-});
-
-test('the Stop-hook rebuild path (hypo-hot-rebuild.mjs) also uses the projection generator', () => {
-  const dir = projectionWikiDir();
-  try {
-    writeProjectHotFixture(dir, 'alpha', { title: 'Alpha', updated: '2026-09-10' });
-    writeFileSync(
-      join(dir, 'hot.md'),
-      '---\ntitle: stale\nupdated: 2000-01-01\n---\n\n# Hot\n\n## Active Projects\n\n| Project | Last Session | Hot Cache |\n|---|---|---|\n',
-    );
-    const r = runStop('hypo-hot-rebuild.mjs', dir);
-    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
-    const after = readFileSync(join(dir, 'hot.md'), 'utf-8');
-    assert.ok(
-      after.includes('[[projects/alpha/hot]]'),
-      `Stop-hook rebuild must regenerate via the directory scan, got: ${after}`,
-    );
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
-});
-
-// n2 fix (codex, 3rd-round review): createProject used to hand-insert its row
-// (insertHotRow), which left the ownership hash pointing at whatever a
-// SESSION's own projection write last produced, never at the hand-inserted
-// bytes. Every normal project-create therefore made the very NEXT
-// SessionStart/Stop read root hot.md as externally edited, back it up, and
-// fire a "손으로 편집한 내용이 있었습니다" false alarm at the user. Now
-// createProject calls the canonical writeRootHotProjection itself, so the
-// ownership hash is correct the moment the row lands and there is nothing
-// left for the next write to mistake for a hand edit.
-test('project-create.mjs regenerates the row via the canonical projection, leaving ownership correct for the next write', () => {
-  const dir = projectionWikiDir();
-  try {
-    writeRootHotProjection(dir); // empty-but-present root file, as init would leave it
-    createProject({
-      name: 'freshly-created',
-      workingDir: '/tmp/nonexistent-work-dir',
-      hypoDir: dir,
-    });
-    const content = readFileSync(join(dir, 'hot.md'), 'utf-8');
-    const rowMatches = [...content.matchAll(/\[\[projects\/freshly-created\/hot\]\]/g)];
-    assert.equal(
-      rowMatches.length,
-      1,
-      `expected exactly one row for freshly-created, got ${rowMatches.length}: ${content}`,
-    );
-    // The regression this test exists to pin: the NEXT write (a real
-    // SessionStart/Stop, standing in here) must be a clean no-op, not a
-    // false "external edit" backup over content createProject itself wrote.
-    const next = writeRootHotProjection(dir);
-    assert.equal(
-      next.written,
-      false,
-      'the next write must see its own bytes already on disk, not rewrite them',
-    );
-    assert.equal(
-      next.backedUp,
-      false,
-      "createProject's own row must never be mistaken for a hand edit and backed up",
-    );
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
-});
-
-test('the blank-date regex claim in the spec holds: resolveActiveProject still matches a dateless row', () => {
-  const dir = projectionWikiDir();
-  try {
-    writeProjectHotFixture(dir, 'onlyblank', { title: 'Only Blank' }); // no updated:
-    writeRootHotProjection(dir);
-    const content = readFileSync(join(dir, 'hot.md'), 'utf-8');
-    assert.match(content, /\|\s*onlyblank\s*\|\s*\|\s*\[\[projects\/onlyblank\/hot\]\]\s*\|/);
-    const resolved = resolveActiveProject(dir);
-    assert.equal(
-      resolved,
-      'onlyblank',
-      "a blank-date row must still be matched by resolveActiveProject (spec §3.3's optional date group)",
-    );
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
-});
-
-// Spec correction (post-implementation): the design originally read a
-// project's frontmatter `title` for the Project column, on the observation
-// that the real vault's ROOT table already matched its slugs 1:1. That
-// observation was about the root table, not about `title`: measured against
-// the real vault, `title` is that page's own heading text (`hot: hypomnema`,
-// `security-backoffice: Hot Cache`), not a name meant for this column, and
-// reading it rewrote 15 of 38 rows for no information gain. The slug is now
-// the only source for the Project column; `title` is never read for it.
-test("display name is always the slug, never that project hot.md's frontmatter title", () => {
-  const dir = projectionWikiDir();
-  try {
-    writeProjectHotFixture(dir, 'hypomnema', { title: 'hot: hypomnema', updated: '2026-09-17' });
-    const content = renderRootHotProjection(dir);
-    const row = content.split('\n').find((l) => l.includes('[[projects/hypomnema/hot]]'));
-    assert.ok(row, `expected a row for hypomnema, got: ${content}`);
-    assert.match(
-      row,
-      /^\|\s*hypomnema\s*\|\s*2026-09-17\s*\|\s*\[\[projects\/hypomnema\/hot\]\]\s*\|$/,
-      `Project column must be the slug, not the frontmatter title: ${row}`,
-    );
-    assert.ok(!row.includes('hot: hypomnema'), `frontmatter title leaked into the row: ${row}`);
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
-});
-
-// Sibling of AC1, but at the file level instead of the row level: AC1 proves a
-// single DELETED row comes back; this proves an external process overwriting
-// the WHOLE file with arbitrary content (not just a missing row, content
-// that isn't even a valid pointer table) is replaced wholesale by the next
-// SessionStart's projection, exactly as any other projection consumer expects
-// a derived file to behave. Nothing else pins this today: it was previously
-// (incidentally) exercised by tests/proposal-base.test.mjs's session_id/base
-// fixture, which this task moved off of hot.md once hot.md became a
-// projection target (see the proposal_base_fix note in this task's report).
-test('SessionStart overwrites an arbitrary external write to root hot.md with the projection', () => {
-  const dir = projectionWikiDir();
-  try {
-    writeProjectHotFixture(dir, 'alpha', { title: 'Alpha', updated: '2026-09-10' });
-    writeFileSync(join(dir, 'hot.md'), '# some other process wrote this, not a pointer table\n');
-    const r = runStart(dir);
-    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
-    const after = readFileSync(join(dir, 'hot.md'), 'utf-8');
-    assert.ok(
-      !after.includes('some other process wrote this'),
-      `an arbitrary external write to hot.md must not survive SessionStart: ${after}`,
-    );
-    assert.ok(
-      after.includes('[[projects/alpha/hot]]'),
-      `SessionStart must have replaced it with the real projection: ${after}`,
-    );
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
-});
-
-// The 'hot-rebuild leaves the base untouched...' no-op test above builds its
-// fixture FROM renderRootHotProjection itself, which proves idempotency but
-// pins nothing about the generator's actual body text: that fixture would
-// track a silently changed body with zero red anywhere. This is the string
-// that gets injected into the model's context on every MISS-branch
-// SessionStart (hypo-session-start.mjs's GLOBAL_HOT read), so a silent change
-// to it is a silent change to what every session is told about this file.
-// Pins only the parts a human is meant to act on (the two headings and the
-// table header), not the whole body, so an unrelated wording tweak elsewhere
-// does not have to touch this test.
-test('generated body text is pinned: headings and table header', () => {
-  const dir = projectionWikiDir();
-  try {
-    const content = renderRootHotProjection(dir);
-    assert.match(content, /^# Hot Cache$/m, `H1 heading must be present: ${content}`);
-    // The frontmatter title must match what init writes (formatRootHotProjection([])) byte for byte. When the two
-    // drift, a fresh vault gets the template title from init and then the generator
-    // rewrites it on the first SessionStart, which the ownership check reads as a
-    // foreign write and backs up. That leaves an empty backup file in every new vault.
-    assert.match(
-      content,
-      /^title: "Hot Cache: Pointer"$/m,
-      `generator title must match what init writes exactly: ${content}`,
-    );
-    assert.match(content, /^## Active Projects$/m, `Active Projects heading missing: ${content}`);
-    assert.match(
-      content,
-      /^## Session Start Checklist$/m,
-      `Session Start Checklist heading missing: ${content}`,
-    );
-    assert.match(
-      content,
-      /^\| Project \| Last Session \| Hot Cache \|$/m,
-      `table header must be present: ${content}`,
-    );
-    assert.match(
-      content,
-      /generated projection of `projects\/\*\/hot\.md`/,
-      `the hand-off-to-the-generator notice must be present: ${content}`,
-    );
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
-});
-
-// ── BLOCKER fix: back up (not destroy) hand-authored content on migration ──
-//
-// Before this fix, writeRootHotProjection read the existing hot.md only to
-// compare it against the fresh projection, then replaced it outright the
-// first time SessionStart or the Stop rebuild ran against a real vault. A
-// person's own notes in root hot.md, committed or not, had no recovery path.
-
-test('BLOCKER: a hand-authored hot.md is backed up, byte for byte, on the first projection write', () => {
-  const dir = projectionWikiDir();
-  try {
-    writeProjectHotFixture(dir, 'alpha', { title: 'Alpha', updated: '2026-09-10' });
-    const manual = '# My hand-written notes\n\nDo not touch this file, Claude.\n';
-    writeFileSync(join(dir, 'hot.md'), manual);
-    const result = writeRootHotProjection(dir);
-    assert.equal(result.written, true);
-    assert.equal(
-      result.backedUp,
-      true,
-      'the first overwrite of a non-projection file must back it up',
-    );
-    const backupPath = join(dir, `hot.md${ROOT_HOT_BACKUP_SUFFIX}`);
-    assert.equal(result.backupPath, backupPath);
-    assert.ok(existsSync(backupPath), `expected a backup file at ${backupPath}`);
-    assert.equal(
-      readFileSync(backupPath, 'utf-8'),
-      manual,
-      'the backup must hold the exact pre-migration bytes',
-    );
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
-});
-
-test('BLOCKER: the FIRST migration backup is never replaced, and a SECOND external overwrite gets its own backup instead of being silently destroyed', () => {
-  // Before the fix this pins, a fixed backup filename meant the SECOND
-  // external overwrite found the name already taken, skipped the backup
-  // step entirely, and was overwritten with nothing to recover it from: the
-  // exact data loss this test used to accept as "expected" (result.backedUp
-  // === false on the second call). It must now land in a NEW, numbered
-  // backup file instead.
-  const dir = projectionWikiDir();
-  try {
-    writeProjectHotFixture(dir, 'alpha', { updated: '2026-09-10' });
-    writeFileSync(join(dir, 'hot.md'), '# first manual content\n');
-    writeRootHotProjection(dir); // migrates: backs up "# first manual content\n"
-    const backupPath = join(dir, `hot.md${ROOT_HOT_BACKUP_SUFFIX}`);
-    const firstBackupBytes = readFileSync(backupPath, 'utf-8');
-    assert.equal(firstBackupBytes, '# first manual content\n');
-
-    // A second external stomp with content that still has no marker (same
-    // shape as 'SessionStart overwrites an arbitrary external write' above,
-    // just probing the backup instead of the row content).
-    writeFileSync(join(dir, 'hot.md'), '# second manual overwrite, no marker\n');
-    const result = writeRootHotProjection(dir);
-    assert.equal(
-      result.backedUp,
-      true,
-      'a second non-owned overwrite must ALSO be backed up, not silently destroyed',
-    );
-    assert.notEqual(
-      result.backupPath,
-      backupPath,
-      'the second backup must land at a DIFFERENT path than the first',
-    );
-    assert.equal(
-      readFileSync(backupPath, 'utf-8'),
-      firstBackupBytes,
-      'the ORIGINAL pre-migration content must survive untouched',
-    );
-    assert.equal(
-      readFileSync(result.backupPath, 'utf-8'),
-      '# second manual overwrite, no marker\n',
-      'the SECOND overwrite must also be recoverable, not lost',
-    );
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
-});
-
-test('BLOCKER: once a hot.md carries the projection marker, further writes never back it up again', () => {
-  const dir = projectionWikiDir();
-  try {
-    writeProjectHotFixture(dir, 'alpha', { updated: '2026-09-10' });
-    writeRootHotProjection(dir); // already projection-owned from the start, no prior manual content
-    assert.ok(!existsSync(join(dir, `hot.md${ROOT_HOT_BACKUP_SUFFIX}`)));
-    writeProjectHotFixture(dir, 'beta', { updated: '2026-09-11' }); // force a real second write
-    const result = writeRootHotProjection(dir);
-    assert.equal(result.written, true);
-    assert.equal(
-      result.backedUp,
-      false,
-      'a file that already carries the marker is never backed up',
-    );
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
-});
-
-// Final cross-review finding: this used to make the whole directory 0500, so
-// the backup and the projection write failed together in the same parent.
-// Deleting the backUpOnce call outright still threw, still kept the original,
-// and still left no backup, so the test passed without the defense. The
-// failure is now injected into the backup write alone; the projection write
-// after it would succeed, which the retry at the end proves.
-// Disabling the check: delete `backupPath = backUpOnce(hotPath, current,
-// testHooks)` in writeRootHotProjectionUnlocked. The projection then replaces
-// the hand-authored file and the first assertion fails.
-test('BLOCKER: a failed backup write aborts the transition, the pre-migration file survives untouched', () => {
-  const dir = projectionWikiDir();
-  try {
-    writeProjectHotFixture(dir, 'alpha', { updated: '2026-09-10' });
-    const manual = '# hand-authored, must survive a failed migration\n';
-    writeFileSync(join(dir, 'hot.md'), manual);
-    const injected = new Error('injected backup write failure');
-    let backupAttempts = 0;
-    let thrown = null;
-    try {
-      writeRootHotProjection(dir, {
-        beforeBackupWrite: () => {
-          backupAttempts++;
-          throw injected;
-        },
-      });
-    } catch (err) {
-      thrown = err;
-    }
-    assert.equal(
-      readFileSync(join(dir, 'hot.md'), 'utf-8'),
-      manual,
-      'a failed backup must stop the projection from replacing the hand-authored file',
-    );
-    assert.equal(thrown, injected, 'the backup failure must propagate, not be swallowed');
-    assert.equal(backupAttempts, 1);
-    assert.ok(
-      !existsSync(join(dir, `hot.md${ROOT_HOT_BACKUP_SUFFIX}`)),
-      'a failed migration must not leave a half-written backup file behind either',
-    );
-    // Control: the same directory takes the projection once the backup can be
-    // written, so the refusal above came from the backup alone.
-    const retry = writeRootHotProjection(dir);
-    assert.equal(retry.written, true);
-    assert.equal(readFileSync(retry.backupPath, 'utf-8'), manual);
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
-});
-
-test('major-2: a hand-authored hot.md that coincidentally quotes the projection marker sentence is still backed up, not silently adopted as ours', () => {
-  // Before this fix, ownership was decided by a plain substring check on the
-  // marker sentence. A person's own file that happened to quote that exact
-  // sentence (copied out of documentation, say) read as "already ours" and
-  // skipped the backup outright: the marker collision this test pins
-  // against. Ownership is now a hash of the exact bytes this function itself
-  // last wrote, so a substring match alone can never pass it.
-  const dir = projectionWikiDir();
-  try {
-    writeProjectHotFixture(dir, 'alpha', { updated: '2026-09-10' });
-    const manual =
-      '# Notes\n\nSomeone pasted "generated projection of `projects/*/hot.md`" into their own draft here.\n';
-    writeFileSync(join(dir, 'hot.md'), manual);
-    const result = writeRootHotProjection(dir);
-    assert.equal(
-      result.backedUp,
-      true,
-      'a marker-sentence substring match must not be treated as ownership',
-    );
-    assert.equal(readFileSync(result.backupPath, 'utf-8'), manual);
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
-});
-
-test('major-2: the migration backup is added to the vault .gitignore so a scoped commit can never pick it up', () => {
-  const dir = projectionWikiDir();
-  try {
-    writeProjectHotFixture(dir, 'alpha', { updated: '2026-09-10' });
-    writeFileSync(join(dir, 'hot.md'), '# hand-authored, must never be auto-committed\n');
-    const result = writeRootHotProjection(dir);
-    assert.equal(result.backedUp, true);
-    assert.equal(result.gitignoreUpdated, true);
-    const gitignore = readFileSync(join(dir, '.gitignore'), 'utf-8');
-    assert.ok(
-      gitignore.includes('/hot.md.pre-projection-backup*.md'),
-      `expected the backup pattern in .gitignore, got: ${gitignore}`,
-    );
-    // A second migration-triggering write must not touch .gitignore again --
-    // the pattern is already there.
-    writeFileSync(join(dir, 'hot.md'), '# a second stomp\n');
-    const second = writeRootHotProjection(dir);
-    assert.equal(second.gitignoreUpdated, false, 'the pattern is already present, nothing to add');
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
-});
-
-// ── major 1: scan errors are distinct from "genuinely no sources" ──────────
-
-test('major-1: no projects/ directory at all is not a scan error', () => {
-  const dir = mkdtempSync(join(tmpdir(), 'hypo-hotproj-noprojectsdir-'));
-  try {
-    const scan = scanRootHotProjectionSources(dir);
-    assert.equal(scan.scanError, false, 'a fresh vault with no projects/ yet is not a scan error');
-    assert.deepEqual(scan.rows, []);
-    const result = writeRootHotProjection(dir);
-    assert.equal(result.scanError, false);
-    assert.equal(result.written, true, 'an empty table is still written the first time');
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
-});
-
-test('major-1: a project directory that exists but has no hot.md produces no row (distinct from a deleted-row-only-in-root case)', () => {
-  const dir = projectionWikiDir();
-  try {
-    mkdirSync(join(dir, 'projects', 'ghost'), { recursive: true }); // no hot.md inside
-    writeProjectHotFixture(dir, 'real', { updated: '2026-09-10' });
-    const { rows, scanError } = scanRootHotProjectionSources(dir);
-    assert.equal(scanError, false);
-    assert.deepEqual(
-      rows.map((r) => r.slug),
-      ['real'],
-      'a project directory with no hot.md must not produce a row, even though the directory itself exists',
-    );
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
-});
-
-test('major-1: readdirSync failure on projects/ is a scan error, and the write leaves the existing root file untouched', () => {
-  const dir = projectionWikiDir();
-  try {
-    writeProjectHotFixture(dir, 'alpha', { updated: '2026-09-10' });
-    writeRootHotProjection(dir); // establish a real prior root file
-    const before = readFileSync(join(dir, 'hot.md'), 'utf-8');
-    chmodSync(join(dir, 'projects'), 0o000);
-    try {
-      const scan = scanRootHotProjectionSources(dir);
-      assert.equal(scan.scanError, true);
-      assert.ok(scan.warnings.length > 0, 'a scan error must produce at least one warning');
-      const result = writeRootHotProjection(dir);
-      assert.equal(result.written, false, 'a scan error must never write');
-      assert.equal(result.scanError, true);
-      const after = readFileSync(join(dir, 'hot.md'), 'utf-8');
-      assert.equal(
-        after,
-        before,
-        'a scan error must leave the existing root file byte-for-byte untouched, not replace it with an empty table',
-      );
-    } finally {
-      chmodSync(join(dir, 'projects'), 0o755);
-    }
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
-});
-
-test('major-1: a per-project hot.md read failure keeps the row with a blank date and reports a warning instead of staying silent', () => {
-  const dir = projectionWikiDir();
-  try {
-    writeProjectHotFixture(dir, 'unreadable', { updated: '2026-09-10' });
-    const hotPath = join(dir, 'projects', 'unreadable', 'hot.md');
-    chmodSync(hotPath, 0o000);
-    try {
-      const scan = scanRootHotProjectionSources(dir);
-      assert.deepEqual(scan.rows, [{ slug: 'unreadable', date: '' }]);
-      assert.ok(
-        scan.warnings.some((w) => w.includes('unreadable')),
-        `expected a warning naming the unreadable project, got: ${JSON.stringify(scan.warnings)}`,
-      );
-    } finally {
-      chmodSync(hotPath, 0o644);
-    }
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
-});
-
-test('major-1: a project directory that cannot be traversed (EACCES) keeps the row with a warning instead of silently disappearing', () => {
-  // Before this fix, the per-row gate was `existsSync(hotPath)`, which folds
-  // EVERY stat failure into `false`: indistinguishable from "no hot.md
-  // here". A permission error on the PROJECT DIRECTORY itself (not the file)
-  // hits exactly that path: existsSync can't even traverse into the
-  // directory, so the row vanished from the table with no warning at all.
-  const dir = projectionWikiDir();
-  try {
-    writeProjectHotFixture(dir, 'locked', { updated: '2026-09-10' });
-    const projectDir = join(dir, 'projects', 'locked');
-    chmodSync(projectDir, 0o000);
-    try {
-      const scan = scanRootHotProjectionSources(dir);
-      assert.deepEqual(
-        scan.rows,
-        [{ slug: 'locked', date: '' }],
-        'an inaccessible project directory must not silently drop its row',
-      );
-      assert.ok(
-        scan.warnings.some((w) => w.includes('locked')),
-        `expected a warning naming the inaccessible project, got: ${JSON.stringify(scan.warnings)}`,
-      );
-    } finally {
-      chmodSync(projectDir, 0o755);
-    }
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
-});
-
-// ── major 4: mutation-resistant assertions on top of the ACs above ─────────
-
-test("major-4 tie-break: sortRootHotRows pins slug-ascending against a fixed adversarial input order, not this runtime's readdirSync order", () => {
-  // Deliberately built in reverse of what a real readdirSync on this runtime
-  // would ever hand the scan (see sortRootHotRows's own docstring): a mutation
-  // that deletes the tie-break or reverses it stays green when this only runs
-  // through a live directory scan, since that scan already arrives
-  // slug-ascending. Calling the sort directly against 'zed' before 'alpha' is
-  // what actually exercises the branch.
-  const sorted = sortRootHotRows([
-    { slug: 'zed', date: '2026-09-10' },
-    { slug: 'alpha', date: '2026-09-10' },
-  ]);
-  assert.deepEqual(
-    sorted.map((r) => r.slug),
-    ['alpha', 'zed'],
-    "same-date rows must sort slug-ascending regardless of the input array's own order",
-  );
-});
-
-test('major-4 no-op write suppression: a no-op write never touches the file on disk, not just its return value', () => {
-  const dir = projectionWikiDir();
-  try {
-    writeProjectHotFixture(dir, 'alpha', { title: 'Alpha', updated: '2026-09-10' });
-    writeRootHotProjection(dir);
-    const before = statSync(join(dir, 'hot.md'));
-    const result = writeRootHotProjection(dir);
-    const after = statSync(join(dir, 'hot.md'));
-    assert.equal(result.written, false);
-    // A mutation that always calls atomicWrite and only fakes the boolean
-    // result would still pass an assertion on the return value alone: an
-    // atomicWrite is a temp-file-then-rename, and a rename onto an existing
-    // path swaps the directory entry to a NEW inode even when the bytes end
-    // up byte-identical. Pinning the inode (and mtime, belt-and-suspenders)
-    // is what a same-bytes-only check cannot catch.
-    assert.equal(
-      after.ino,
-      before.ino,
-      'a no-op write must not replace the inode: atomicWrite must not have run at all',
-    );
-    assert.equal(after.mtimeMs, before.mtimeMs, 'a no-op write must not bump mtime either');
+    assert.equal(status.ok, true, `the otherwise-complete close passes: ${JSON.stringify(status)}`);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -6833,731 +7399,2641 @@ test('writeRootHotHealthNotice / consumeRootHotHealthNotice: one-shot, unlinked 
   }
 });
 
-test('claimProjectionWrite: a missing session_id is fail-closed (ok:false), unlike the generic best-effort recordTouchedPaths', () => {
+// Disabling: in `writeRootHotHealthNotice` (hooks/hypo-shared.mjs) change
+// `String(message).split('\n')` to `[String(message)]`; this test goes red.
+test('writeRootHotHealthNotice: a multi-line message written again is kept once, line by line', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'hypo-notice-lines-'));
+  try {
+    for (let i = 0; i < 3; i++) writeRootHotHealthNotice(dir, 'a\nb');
+    assert.equal(consumeRootHotHealthNotice(dir), 'a\nb');
+    writeRootHotHealthNotice(dir, 'a\nb');
+    writeRootHotHealthNotice(dir, 'b\nc');
+    assert.equal(consumeRootHotHealthNotice(dir), 'a\nb\nc', 'a new line is added after the old');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ── view backups ───────────────────────────────────────────────────────────
+
+test('backUpGeneratedPath backs up any generated view path, reuses a backup that holds the same bytes and numbers a different one', () => {
   const dir = projectionWikiDir();
   try {
-    assert.deepEqual(
-      claimProjectionWrite(dir, null, ['hot.md']),
-      { ok: false, added: false },
-      'no session_id must never read as "claimed" for a write nothing can account for',
+    for (const rel of ['projects/alpha/hot.md', 'hot.md']) {
+      const abs = join(dir, rel);
+      const base = join(dir, '.cache/backups', rel);
+      const first = backUpGeneratedPath(dir, abs, 'one\n');
+      assert.equal(
+        first,
+        `${base}${ROOT_HOT_BACKUP_SUFFIX}`,
+        'under .cache/backups, not beside the view',
+      );
+      assert.equal(
+        existsSync(`${abs}${ROOT_HOT_BACKUP_SUFFIX}`),
+        false,
+        'nothing next to the view',
+      );
+      assert.equal(readFileSync(first, 'utf-8'), 'one\n');
+      assert.equal(
+        backUpGeneratedPath(dir, abs, 'one\n'),
+        first,
+        'same bytes: the backup that exists',
+      );
+      assert.equal(existsSync(`${base}.pre-projection-backup-2.md`), false);
+      const second = backUpGeneratedPath(dir, abs, 'two\n');
+      assert.equal(second, `${base}.pre-projection-backup-2.md`);
+      assert.equal(backUpGeneratedPath(dir, abs, 'two\n'), second);
+      assert.equal(backUpGeneratedPath(dir, abs, 'one\n'), first, 'an older backup is still found');
+    }
+    assert.throws(
+      () => backUpGeneratedPath(dir, join(dir, '..', 'outside.md'), 'x\n'),
+      /outside the vault/,
     );
+    const injected = new Error('injected');
+    assert.throws(
+      () =>
+        backUpGeneratedPath(dir, join(dir, 'projects/alpha/hot.md'), 'three\n', {
+          beforeBackupWrite: () => {
+            throw injected;
+          },
+        }),
+      injected,
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ── SessionStart and session entries: moving, catching up, injecting ─────────
+//
+// The names below are added next to the suites above rather than into their import lists, so a
+// second lane appending to this file does not touch the same lines.
+import { realpathSync } from 'node:fs';
+import {
+  GITIGNORE_BLOCK as SS_GITIGNORE_BLOCK,
+  entryFileName as ssEntryFileName,
+  parseSessionEntry as ssParse,
+  renderViews as ssRenderViews,
+} from '../hooks/session-entries.mjs';
+import { createHash as ssCreateHash } from 'node:crypto';
+import {
+  clearGeneratedPathsBlockingPull as ssClearGeneratedPaths,
+  migrationState as ssMigrationState,
+  SESSION_ENTRIES_OFF_MARKER as SS_OFF_MARKER,
+} from '../hooks/hypo-shared.mjs';
+import {
+  loadSessionModel as ssLoadModel,
+  migrateVaultToSessionEntries as ssMigrate,
+  writeGeneratedViews as ssWriteViews,
+} from '../hooks/session-views.mjs';
+
+const SS_OLD_HOT =
+  '---\ntitle: "hot: p"\ntype: reference\nupdated: 2026-09-20\n---\nold hot body\n';
+const SS_OLD_STATE =
+  '---\ntype: session-state\nupdated: 2026-09-25\n---\n## Next Up\nold state body\n';
+const SS_MIGRATION_SUBJECT = 'hypomnema: move session state into projects/*/sessions entries';
+
+// Every git child of these fixtures gets HOME in the session temp dir and no system config; the
+// identity comes from each clone's own config.
+const ssGit = (dir, args) =>
+  spawnSync('git', args, {
+    cwd: dir,
+    encoding: 'utf-8',
+    env: { ...process.env, HOME: SESSION_TMP_HOME, GIT_CONFIG_NOSYSTEM: '1' },
+  });
+function ssGitOk(dir, args) {
+  const r = ssGit(dir, args);
+  assert.equal(r.status, 0, `git ${args.join(' ')}: ${r.stderr}`);
+  return r.stdout;
+}
+const ssPut = (dir, rel, text) => {
+  mkdirSync(dirname(join(dir, rel)), { recursive: true });
+  writeFileSync(join(dir, rel), text);
+};
+const ssRead = (dir, rel) => readFileSync(join(dir, rel), 'utf-8');
+const ssHead = (dir) => ssGitOk(dir, ['rev-parse', 'HEAD']).trim();
+const ssCount = (dir) => Number(ssGitOk(dir, ['rev-list', '--count', 'HEAD']).trim());
+const ssMigrationCommits = (dir) =>
+  ssGitOk(dir, ['log', '--format=%s'])
+    .split('\n')
+    .filter((s) => s === SS_MIGRATION_SUBJECT).length;
+const ssIdentify = (dir) => {
+  ssGitOk(dir, ['config', 'user.email', 't@example.com']);
+  ssGitOk(dir, ['config', 'user.name', 't']);
+  ssGitOk(dir, ['config', 'commit.gpgsign', 'false']);
+};
+const ssCommitAll = (dir, message = 'x') => {
+  ssGitOk(dir, ['add', '-A']);
+  ssGitOk(dir, ['commit', '-q', '-m', message]);
+};
+
+/**
+ * A vault that has not moved to session entries: project `p` (working dir `work`) and project `q`
+ * with the old two files tracked. `opts.remote` adds a bare origin the vault is pushed to;
+ * `other()` clones it into a second machine. Calls `fn({root, dir, work, origin, other})`.
+ */
+function withStartVault(opts, fn) {
+  withTmpDir((root) => {
+    const dir = join(root, 'a');
+    const work = join(root, 'work');
+    mkdirSync(work, { recursive: true });
+    mkdirSync(dir, { recursive: true });
+    ssGitOk(dir, ['init', '-q', '-b', 'main']);
+    ssIdentify(dir);
+    const files = {
+      '.gitignore': '.cache/\n',
+      'hypo-config.md': '# config\n',
+      'hot.md': '---\ntitle: Hot\nupdated: 2026-09-01\n---\n# Hot\n',
+      'projects/p/index.md': `---\ntitle: p\ntype: project-index\nupdated: 2026-09-01\nworking_dir: "${realpathSync(work)}"\n---\n# p\n`,
+      'projects/p/hot.md': SS_OLD_HOT,
+      'projects/p/session-state.md': SS_OLD_STATE,
+      'projects/q/index.md': '---\ntitle: q\ntype: project-index\nupdated: 2026-09-01\n---\n# q\n',
+      'projects/q/hot.md': SS_OLD_HOT.replace('"hot: p"', '"hot: q"'),
+      'projects/q/session-state.md': SS_OLD_STATE,
+      ...opts.files,
+    };
+    for (const [rel, text] of Object.entries(files)) ssPut(dir, rel, text);
+    ssCommitAll(dir, 'seed');
+    const origin = join(root, 'origin.git');
+    if (opts.remote) {
+      ssGitOk(root, ['init', '-q', '--bare', '-b', 'main', origin]);
+      ssGitOk(dir, ['remote', 'add', 'origin', origin]);
+      ssGitOk(dir, ['push', '-q', '-u', 'origin', 'main']);
+    }
+    const other = () => {
+      const b = join(root, 'b');
+      ssGitOk(root, ['clone', '-q', origin, b]);
+      ssIdentify(b);
+      return b;
+    };
+    fn({ root, dir, work, origin, other });
+  });
+}
+
+// Run the real SessionStart hook; `env` may carry HYPO_TEST_NOW and the like.
+function ssStart(dir, cwd, { sessionId = 'sess-t12', env = {} } = {}) {
+  const r = spawnSync(process.execPath, [join(HOOKS, 'hypo-session-start.mjs')], {
+    input: JSON.stringify({ cwd, session_id: sessionId }),
+    encoding: 'utf-8',
+    env: {
+      ...process.env,
+      HOME: SESSION_TMP_HOME,
+      HYPO_DIR: dir,
+      HYPO_DEVICE: 'dev-t12',
+      GIT_CONFIG_NOSYSTEM: '1',
+      ...env,
+    },
+  });
+  assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+  const out = JSON.parse(r.stdout);
+  return {
+    r,
+    out,
+    sys: out.systemMessage ?? '',
+    ctx: out.hookSpecificOutput?.additionalContext ?? '',
+  };
+}
+
+// Another machine's work: an entry file for `project` with one track, written and committed.
+function ssPutEntry(dir, project, { date, sessionId, openedAt = 1, track, title, body }) {
+  const closeId = closeIdFor(sessionId, openedAt);
+  ssPut(
+    dir,
+    `projects/${project}/sessions/${ssEntryFileName(date, closeId)}`,
+    formatSessionEntry({
+      project,
+      closeId,
+      sessionId,
+      date,
+      tracks: [{ id: track, title, new: true }],
+      summary: `summary of ${closeId}`,
+      bodies: { [track]: body },
+    }),
+  );
+  return { closeId, fileName: ssEntryFileName(date, closeId) };
+}
+
+const SS_DAY_ONE = { HYPO_TEST_NOW: '2026-10-07T03:00:00Z' };
+const SS_DAY_TWO = { HYPO_TEST_NOW: '2026-10-08T03:00:00Z' };
+
+suite('hypo-session-start.mjs: a vault without a remote moves itself to session entries');
+
+test('(1)(11) the first SessionStart makes one migration commit and leaves the views on disk and out of git', () => {
+  withStartVault({}, ({ dir, work }) => {
+    const before = ssCount(dir);
+    const { sys } = ssStart(dir, work);
+    assert.equal(ssCount(dir), before + 1);
+    assert.equal(ssMigrationCommits(dir), 1);
+    assert.equal(ssMigrationState(dir), 'migrated');
+    assert.match(sys, /옮겼습니다/, `the move is told to the user: ${sys}`);
+    assert.doesNotMatch(
+      ssGitOk(dir, ['status', '--porcelain']),
+      /hot\.md|session-state\.md/,
+      'no generated path shows in git status',
+    );
+    // (11) the current project's view is on disk and is what the generator renders for the
+    // post-move model: written after the move, not before it.
+    const models = ['p', 'q'].map((slug) => ssLoadModel(dir, slug, { state: 'migrated' }));
+    const expected = ssRenderViews(models, { device: 'dev-t12', only: ['p'] }).projects.p
+      .sessionState;
+    assert.equal(ssRead(dir, 'projects/p/session-state.md'), expected);
+    assert.match(expected, /baseline-[0-9a-f]{16}/, 'it carries the baseline close id');
+  });
+});
+
+test('(3) a move that cannot take the lock still injects the old session-state body and leaves tracked files alone', () => {
+  withStartVault({}, ({ dir, work }) => {
+    const head = ssHead(dir);
+    const lock = `${vaultCommitLockTarget(dir)}.lock`;
+    mkdirSync(dirname(lock), { recursive: true });
+    writeFileSync(lock, String(process.pid));
+    const { sys, ctx } = ssStart(dir, work, { env: { HYPO_VAULT_LOCK_TIMEOUT_MS: '300' } });
+    rmSync(lock, { force: true });
+    assert.equal(ssHead(dir), head, 'no migration commit');
+    assert.equal(ssRead(dir, 'projects/p/session-state.md'), SS_OLD_STATE);
+    assert.equal(ssRead(dir, 'projects/p/hot.md'), SS_OLD_HOT);
+    assert.equal(ssGitOk(dir, ['status', '--porcelain']).trim(), '');
+    assert.match(
+      ctx,
+      /old state body/,
+      'the injection reads the baseline built from the old files',
+    );
+    assert.match(sys, /미뤘습니다/);
+  });
+});
+
+test('(7) an opted-out vault is not moved, and the rollback notice reaches the injection', () => {
+  withStartVault({}, ({ dir, work }) => {
+    ssPut(dir, SS_OFF_MARKER, 'rolled back\n');
+    ssCommitAll(dir, 'opt out');
+    const head = ssHead(dir);
+    const { ctx, sys } = ssStart(dir, work);
+    assert.equal(ssHead(dir), head);
+    assert.equal(ssMigrationCommits(dir), 0);
+    assert.match(ctx, /롤백 지점 이후 구버전 기계의 쓰기까지 포함/);
+    assert.match(sys, /롤백 지점 이후 구버전 기계의 쓰기까지 포함/);
+  });
+});
+
+test('(8) a SessionStart past the start deadline defers the move; inside it the move happens', () => {
+  withStartVault({}, ({ dir, work }) => {
+    const head = ssHead(dir);
+    const late = ssStart(dir, work, { env: { ...SS_DAY_ONE, HYPO_TEST_NOW_STEP_MS: '25000' } });
+    assert.equal(ssHead(dir), head, 'no migration commit past the deadline');
+    assert.match(late.sys, /다음 세션으로 미뤘습니다/);
+    assert.match(late.ctx, /old state body/);
+    const inTime = ssStart(dir, work, { env: { ...SS_DAY_ONE, HYPO_TEST_NOW_STEP_MS: '1000' } });
+    assert.equal(ssMigrationCommits(dir), 1, 'the same vault moves when time is left');
+    assert.match(inTime.sys, /옮겼습니다/);
+  });
+});
+
+test('(8b) the start deadline is 15 seconds: a start 16s in is deferred, one 14s in moves', () => {
+  withStartVault({}, ({ dir, work }) => {
+    const head = ssHead(dir);
+    const late = ssStart(dir, work, { env: { ...SS_DAY_ONE, HYPO_TEST_NOW_STEP_MS: '16000' } });
+    assert.equal(ssHead(dir), head, 'no migration commit 16s in');
+    assert.match(late.sys, /시간이 부족해/);
+    const inTime = ssStart(dir, work, { env: { ...SS_DAY_TWO, HYPO_TEST_NOW_STEP_MS: '14000' } });
+    assert.equal(ssMigrationCommits(dir), 1, 'the same vault moves 14s in');
+    assert.match(inTime.sys, /옮겼습니다/);
+  });
+});
+
+test('(8c) the first move of a vault whose files are as HEAD has them sets nothing aside: no backup, no notice', () => {
+  withStartVault({}, ({ dir, work }) => {
+    const { r, sys } = ssStart(dir, work, { env: SS_DAY_ONE });
+    assert.equal(ssMigrationCommits(dir), 1, 'precondition: the vault moved');
     assert.equal(
-      recordTouchedPaths(dir, null, ['hot.md']),
-      true,
-      'the generic accumulate function is unaffected: still true, nothing to accumulate',
+      existsSync(join(dir, '.cache', 'backups', 'hot.md.pre-projection-backup.md')),
+      false,
     );
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
+    assert.doesNotMatch(sys, /생성기가 쓰지 않은 내용/);
+    assert.doesNotMatch(r.stderr, /생성기가 쓰지 않은 내용/);
+  });
 });
 
-// design.md v5 boost: the caller (hypo-session-start.mjs) must be able to
-// tell "I just claimed this" from "this was already claimed by an earlier
-// SessionStart on the same (resumed) session_id", only the FIRST call may
-// be undone by that caller's own failure handling.
-test('claimProjectionWrite: `added` distinguishes a fresh claim from one already held by this session', () => {
-  const dir = projectionWikiDir();
-  try {
-    const first = claimProjectionWrite(dir, 'sess-added', ['hot.md']);
-    assert.deepEqual(first, { ok: true, added: true }, 'first claim on this path is newly added');
-    const second = claimProjectionWrite(dir, 'sess-added', ['hot.md']);
-    assert.deepEqual(
-      second,
-      { ok: true, added: false },
-      'a repeat claim of an already-held path reports ok but NOT added',
-    );
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
+test('(8d) a backup notice that both the move and the pending health notice carry shows once in the message and once on stderr', () => {
+  withStartVault({}, ({ dir, work }) => {
+    ssPut(dir, 'hot.md', 'an old machine wrote this\n'); // not what HEAD tracks
+    const { r, sys } = ssStart(dir, work, { env: SS_DAY_ONE });
+    assert.equal(ssMigrationCommits(dir), 1, 'precondition: the vault moved');
+    const count = (text) => text.split('생성기가 쓰지 않은 내용').length - 1;
+    assert.equal(count(sys), 1, sys);
+    assert.equal(count(r.stderr), 1, r.stderr);
+    assert.match(sys, /`\.cache\/backups\/hot\.md\.pre-projection-backup\.md`/);
+  });
 });
 
-test('major-3 E2E: a held touched-paths lock makes SessionStart skip the write cleanly, root bytes untouched, all three channels report it', () => {
-  // Real end-to-end run of the hook (not a direct function call), holding the
-  // SAME per-session lock claimProjectionWrite itself takes: the shape a
-  // lock-timeout actually has in production, not a lock-timeout test that
-  // only ever exercised the auto-commit vault lock (a DIFFERENT lock target).
-  const dir = projectionWikiDir();
-  try {
-    writeProjectHotFixture(dir, 'alpha', { updated: '2026-09-10' });
-    writeRootHotProjection(dir); // establish a real prior root file + ownership state
-    const before = readFileSync(join(dir, 'hot.md'), 'utf-8');
-    // A second project so the projection WOULD differ if the write went
-    // through: a no-op write can't be told apart from "skipped" otherwise.
-    writeProjectHotFixture(dir, 'beta', { updated: '2026-09-11' });
-
-    const lockPath = `${touchedPathsPath(dir, 'test-growth')}.lock`; // runStart's fixed session_id
-    mkdirSync(dirname(lockPath), { recursive: true });
-    writeFileSync(lockPath, 'held by another writer\n');
+test('(F2) a move that throws is deferred with a notice, and the start goes on to inject', () => {
+  if (process.getuid?.() === 0) return; // chmod 000 does not stop root
+  withStartVault({}, ({ dir, work }) => {
+    const sessions = join(dir, 'projects', 'p', 'sessions');
+    mkdirSync(sessions, { recursive: true });
+    chmodSync(sessions, 0o000);
     try {
-      const r = runStart(dir);
-      assert.equal(r.status, 0, `stderr: ${r.stderr}`);
-      const out = JSON.parse(r.stdout);
-      assert.equal(
-        readFileSync(join(dir, 'hot.md'), 'utf-8'),
-        before,
-        'root bytes must be byte-for-byte unchanged when the pre-claim fails',
+      const head = ssHead(dir);
+      const { r, sys, ctx } = ssStart(dir, work, { env: SS_DAY_ONE });
+      assert.doesNotMatch(r.stderr, /\[hypo-session-start\] error:/, 'not the top-level catch');
+      assert.equal(ssHead(dir), head, 'no migration commit');
+      assert.match(
+        sys,
+        /이행을 다음 세션으로 미뤘습니다: .*EACCES/s,
+        'the deferral names the cause',
       );
-      assert.ok(
-        out.systemMessage && out.systemMessage.includes('건너뛰었습니다'),
-        `expected the skip notice in systemMessage: ${JSON.stringify(out)}`,
-      );
-      assert.ok(
-        r.stderr.includes('건너뛰었습니다'),
-        `expected the skip notice on stderr too: ${r.stderr}`,
-      );
-      const ctx = injectedContext(out) || '';
-      assert.ok(
-        ctx.includes('건너뛰었습니다'),
-        `expected the skip notice folded into additionalContext too: ${ctx}`,
+      assert.match(ctx, /WIKI HOT CACHE: project=p/, 'the injection still has its header');
+    } finally {
+      chmodSync(sessions, 0o755);
+    }
+  });
+});
+
+const DEFERRED_BY_LOCK = /이행을 다음 세션으로 미뤘습니다: 다른 세션이 저장소 잠금/;
+test('(F8) a deferral that passes (the deadline) does not hide a different one (a busy lock) the same day, and a repeat of the same one stays quiet', () => {
+  withStartVault({}, ({ dir, work }) => {
+    const late = ssStart(dir, work, { env: { ...SS_DAY_ONE, HYPO_TEST_NOW_STEP_MS: '25000' } });
+    assert.match(late.sys, /시간이 부족해/, 'the deadline notice');
+    const lock = `${vaultCommitLockTarget(dir)}.lock`;
+    mkdirSync(dirname(lock), { recursive: true });
+    writeFileSync(lock, String(process.pid));
+    try {
+      const env = { ...SS_DAY_ONE, HYPO_VAULT_LOCK_TIMEOUT_MS: '300' };
+      const busy = ssStart(dir, work, { env });
+      assert.match(busy.sys, DEFERRED_BY_LOCK, 'the lock notice shows the same day');
+      const again = ssStart(dir, work, { env });
+      assert.doesNotMatch(
+        again.sys,
+        DEFERRED_BY_LOCK,
+        'the same reason on the same day is said once',
       );
     } finally {
-      rmSync(lockPath, { force: true });
+      rmSync(lock, { force: true });
     }
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
+  });
 });
 
-test('major-2/3: a Stop-hook rebuild that hits a scan error leaves a health notice the next SessionStart surfaces as a systemMessage', () => {
-  const dir = projectionWikiDir();
-  try {
-    writeProjectHotFixture(dir, 'alpha', { updated: '2026-09-10' });
-    writeRootHotProjection(dir); // establish a real prior root file
-    chmodSync(join(dir, 'projects'), 0o000);
-    try {
-      const stop = runStop('hypo-hot-rebuild.mjs', dir);
-      assert.equal(stop.status, 0, `stderr: ${stop.stderr}`);
-    } finally {
-      chmodSync(join(dir, 'projects'), 0o755);
-    }
-    const r = runStart(dir);
-    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
-    const out = JSON.parse(r.stdout);
-    assert.ok(
-      out.systemMessage && out.systemMessage.length > 0,
-      `expected the prior Stop's scan-error notice to surface as a systemMessage, got: ${JSON.stringify(out)}`,
-    );
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
+test('(10) the terminal summary shows a baseline head whole, `## Notes` and the sentence after it included', () => {
+  const state =
+    '---\ntype: session-state\nupdated: 2026-09-25\n---\n## Next Up\nold state body\n## Notes\nNOTES_SENTENCE_T12\n';
+  withStartVault({ files: { 'projects/p/session-state.md': state } }, ({ dir, work }) => {
+    const { r } = ssStart(dir, work);
+    assert.match(r.stderr, /이행 전 기록/, `the head title: ${r.stderr}`);
+    assert.match(r.stderr, /NOTES_SENTENCE_T12/, `the sentence after ## Notes: ${r.stderr}`);
+  });
 });
 
-// ── major-3 gap: SessionStart's and Stop's OWN result-consuming branches ───
-// The tests above exercise scanRootHotProjectionSources / writeRootHotProjection
-// directly, or Stop's health-notice relay one hop removed from where it is
-// produced. None of them run the branch that reads `result.warnings` /
-// `result.gitignoreUpdated` / `result.lockTimeout` off THIS call's own
-// return value inside hypo-session-start.mjs or hypo-hot-rebuild.mjs:
-// deleting those checks leaves every test above green. chmodSync 0o000 is
-// root- and Windows-unsafe (the same reason the parkedTotal fix below moves
-// off it), so these force the same error codes portably: ENOTDIR (a file
-// where a directory is expected) and EISDIR (a directory where a file is
-// expected).
-//
-// SessionStart's own `else if (result.scanError)` branch (~line 1091) was
-// dead code until the guard that now precedes it.
-// `collectProjectWorkingDirs` (called earlier, for hit/miss project
-// resolution) used to do an unguarded `readdirSync(projects/)`, and
-// `scanError` is set by `scanRootHotProjectionSources` for exactly the same
-// condition (projects/ itself unreadable). So the crash always happened
-// first, caught only by the hook's own outer try/catch, which logs to stderr
-// and prints the untouched default `outExtra`: the branch that names the
-// unreadable directory could never fire for the one input it exists to
-// report. That readdirSync is wrapped now (hooks/hypo-shared.mjs, inside
-// collectProjectWorkingDirs, degrading to "no projects"), and the test
-// directly below is what pins the guard: it asserts the scanError notice
-// actually reaches the person, which is false again the moment the guard
-// comes off.
+suite('hypo-session-start.mjs: a vault with a remote is never moved from a hook');
 
-test('an unreadable projects/ reaches the scanError notice instead of taking the whole hook to its top-level catch', () => {
-  const dir = projectionWikiDir();
-  try {
-    rmSync(join(dir, 'projects'), { recursive: true, force: true });
-    writeFileSync(join(dir, 'projects'), 'not a directory\n'); // readdirSync throws ENOTDIR
-    const r = runStart(dir);
-    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
-    const out = JSON.parse(r.stdout);
-    assert.equal(out.continue, true);
-    // Two worlds this tells apart. Without the guard in
-    // collectProjectWorkingDirs, cwd-to-project resolution throws first and
-    // the hook lands in its top-level catch: still exit 0, but the person is
-    // told nothing about WHICH directory to fix. With it, the projection's
-    // own scanError branch runs and names the path and the check command.
-    // Surviving is not the property under test here; being diagnosable is.
-    assert.ok(
-      !r.stderr.includes('[hypo-session-start] error:'),
-      `expected no top-level crash, got: ${r.stderr}`,
+test('(2)(2b) an old-format vault with a remote gets a daily notice in systemMessage and nothing else changes', () => {
+  withStartVault({ remote: true }, ({ dir, work }) => {
+    const head = ssHead(dir);
+    const first = ssStart(dir, work, { env: SS_DAY_ONE });
+    assert.equal(ssHead(dir), head, 'no new commit');
+    assert.match(
+      first.sys,
+      /아직 옛 세션 현황 형식/,
+      'in systemMessage, not only additionalContext',
     );
-    assert.ok(
-      out.systemMessage && out.systemMessage.includes('projects/ 디렉터리를 읽을 수 없어'),
-      `expected the scanError notice to reach the person, got: ${JSON.stringify(out)}`,
+    assert.match(first.ctx, /old state body/, 'the old session-state body is injected');
+    assert.equal(ssRead(dir, 'projects/p/hot.md'), SS_OLD_HOT);
+    assert.equal(ssRead(dir, 'projects/p/session-state.md'), SS_OLD_STATE);
+    assert.equal(
+      ssGitOk(dir, ['status', '--porcelain']).trim(),
+      '',
+      'tracked files byte-unchanged',
     );
-    assert.ok(
-      out.systemMessage.includes(join(dir, 'projects')),
-      `expected the notice to name the directory to check, got: ${out.systemMessage}`,
-    );
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
+    // (2b) the same state on the same day is not said again; another day says it again
+    const again = ssStart(dir, work, { env: SS_DAY_ONE });
+    assert.doesNotMatch(again.sys, /아직 옛 세션 현황 형식/);
+    const nextDay = ssStart(dir, work, { env: SS_DAY_TWO });
+    assert.match(nextDay.sys, /아직 옛 세션 현황 형식/);
+    // a changed state is said at once, even on the same day
+    ssPut(dir, SS_OFF_MARKER, 'rolled back\n');
+    ssCommitAll(dir, 'opt out');
+    const optedOut = ssStart(dir, work, { env: SS_DAY_TWO });
+    assert.match(optedOut.sys, /롤백 지점 이후 구버전 기계의 쓰기까지 포함/);
+    assert.doesNotMatch(optedOut.sys, /아직 옛 세션 현황 형식/);
+  });
 });
 
-test("major-3: SessionStart's own warnings branch (EISDIR on a project hot.md) reaches systemMessage through the real hook", () => {
-  const dir = projectionWikiDir();
-  try {
-    writeProjectHotFixture(dir, 'alpha', { updated: '2026-09-10' });
-    const hotPath = join(dir, 'projects', 'alpha', 'hot.md');
-    rmSync(hotPath, { force: true });
-    mkdirSync(hotPath); // readFileSync throws EISDIR, distinct from ENOENT/ENOTDIR ("absent")
-    const r = runStart(dir);
-    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
-    const out = JSON.parse(r.stdout);
-    assert.ok(
-      out.systemMessage && out.systemMessage.includes('alpha'),
-      `expected SessionStart's own warnings notice naming the project, got: ${JSON.stringify(out)}`,
-    );
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
-});
-
-test("major-3: SessionStart's own gitignoreUpdated branch records .gitignore in this session's own touched-paths", () => {
-  const dir = projectionWikiDir();
-  try {
-    writeProjectHotFixture(dir, 'alpha', { updated: '2026-09-10' });
-    writeFileSync(
-      join(dir, 'hot.md'),
-      '# hand-authored, must trigger a first-time migration backup\n',
-    );
-    const r = runStart(dir);
-    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
-    const touched = JSON.parse(readFileSync(touchedPathsPath(dir, 'test-growth'), 'utf-8'));
-    assert.ok(
-      touched.includes('.gitignore'),
-      `expected the migration's .gitignore write in this session's own touched-paths, got: ${JSON.stringify(touched)}`,
-    );
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
-});
-
-test("major-3: SessionStart's own lockTimeout branch reaches systemMessage through the real hook and drops its own pre-write claim", () => {
-  const dir = projectionWikiDir();
-  const prevTimeout = process.env.HYPO_VAULT_LOCK_TIMEOUT_MS;
-  process.env.HYPO_VAULT_LOCK_TIMEOUT_MS = '200'; // fail fast instead of the 5s default
-  try {
-    writeProjectHotFixture(dir, 'alpha', { updated: '2026-09-10' });
-    writeRootHotProjection(dir); // establish a real prior root file
-    const before = readFileSync(join(dir, 'hot.md'), 'utf-8');
-    writeProjectHotFixture(dir, 'beta', { updated: '2026-09-11' }); // so a write WOULD differ
-    const lockPath = `${vaultCommitLockTarget(dir)}.lock`;
-    mkdirSync(dirname(lockPath), { recursive: true });
-    writeFileSync(lockPath, String(process.pid));
-    try {
-      const r = runStart(dir);
-      assert.equal(r.status, 0, `stderr: ${r.stderr}`);
-      const out = JSON.parse(r.stdout);
-      assert.equal(
-        readFileSync(join(dir, 'hot.md'), 'utf-8'),
-        before,
-        'the real hook must not have replaced root hot.md while the lock was held elsewhere',
-      );
-      assert.ok(
-        out.systemMessage && out.systemMessage.includes('잠금을 얻지 못했습니다'),
-        `expected the real hook's own lockTimeout notice, got: ${JSON.stringify(out)}`,
-      );
-      const touched = existsSync(touchedPathsPath(dir, 'test-growth'))
-        ? JSON.parse(readFileSync(touchedPathsPath(dir, 'test-growth'), 'utf-8'))
-        : [];
-      assert.ok(
-        !touched.includes('hot.md'),
-        'a lock refusal must drop its own pre-write claim, not leave hot.md falsely claimed',
-      );
-    } finally {
-      rmSync(lockPath, { force: true });
-    }
-  } finally {
-    if (prevTimeout === undefined) delete process.env.HYPO_VAULT_LOCK_TIMEOUT_MS;
-    else process.env.HYPO_VAULT_LOCK_TIMEOUT_MS = prevTimeout;
-    rmSync(dir, { recursive: true, force: true });
-  }
-});
-
-// design.md v5 boost, test 37: the SAME distinction as the test above, but
-// for the SECOND SessionStart on a resumed session_id, a fresh claim's own
-// failure drops it (test above), while a REPEAT claim's failure must not
-// drop a claim an EARLIER, already-successful call on the same session_id
-// still holds. `runStart` always uses session_id 'test-growth', so calling
-// it twice models a resume.
-test("v5 boost / test 37: a second SessionStart's failed write, on an ALREADY-claimed path, leaves the earlier claim in place (only a NEWLY-added claim is ever reverted)", () => {
-  const dir = projectionWikiDir();
-  const prevTimeout = process.env.HYPO_VAULT_LOCK_TIMEOUT_MS;
-  process.env.HYPO_VAULT_LOCK_TIMEOUT_MS = '200'; // fail fast instead of the 5s default
-  try {
-    writeProjectHotFixture(dir, 'alpha', { updated: '2026-09-10' });
-    // First SessionStart: no lock held, the write succeeds. 'hot.md' is now
-    // claimed in 'test-growth's touched-paths set, uncommitted (no Stop ran).
-    const r1 = runStart(dir);
-    assert.equal(r1.status, 0, `stderr: ${r1.stderr}`);
-    const touchedAfterFirst = JSON.parse(
-      readFileSync(touchedPathsPath(dir, 'test-growth'), 'utf-8'),
-    );
-    assert.ok(
-      touchedAfterFirst.includes('hot.md'),
-      `fixture: the first run must claim hot.md: ${JSON.stringify(touchedAfterFirst)}`,
-    );
-
-    // Second SessionStart, SAME session_id: force this run's own write to
-    // fail (vault lock held elsewhere). Its own claimProjectionWrite call
-    // sees 'hot.md' already present, so `added` is false this time.
-    writeProjectHotFixture(dir, 'beta', { updated: '2026-09-11' }); // so a write WOULD differ
-    const lockPath = `${vaultCommitLockTarget(dir)}.lock`;
-    mkdirSync(dirname(lockPath), { recursive: true });
-    writeFileSync(lockPath, String(process.pid));
-    try {
-      const r2 = runStart(dir);
-      assert.equal(r2.status, 0, `stderr: ${r2.stderr}`);
-      const out2 = JSON.parse(r2.stdout);
-      assert.ok(
-        out2.systemMessage && out2.systemMessage.includes('잠금을 얻지 못했습니다'),
-        `expected the second run's own lockTimeout notice: ${JSON.stringify(out2)}`,
-      );
-    } finally {
-      rmSync(lockPath, { force: true });
-    }
-
-    const touchedAfterSecond = JSON.parse(
-      readFileSync(touchedPathsPath(dir, 'test-growth'), 'utf-8'),
-    );
-    assert.ok(
-      touchedAfterSecond.includes('hot.md'),
-      "the FIRST run's still-unresolved claim must survive the SECOND run's own failure: " +
-        JSON.stringify(touchedAfterSecond),
-    );
-  } finally {
-    if (prevTimeout === undefined) delete process.env.HYPO_VAULT_LOCK_TIMEOUT_MS;
-    else process.env.HYPO_VAULT_LOCK_TIMEOUT_MS = prevTimeout;
-    rmSync(dir, { recursive: true, force: true });
-  }
-});
-
-test("major-3: Stop's own lockTimeout branch leaves a health notice the next SessionStart surfaces", () => {
-  const dir = projectionWikiDir();
-  const prevTimeout = process.env.HYPO_VAULT_LOCK_TIMEOUT_MS;
-  process.env.HYPO_VAULT_LOCK_TIMEOUT_MS = '200';
-  try {
-    writeProjectHotFixture(dir, 'alpha', { updated: '2026-09-10' });
-    writeRootHotProjection(dir);
-    const before = readFileSync(join(dir, 'hot.md'), 'utf-8');
-    writeProjectHotFixture(dir, 'beta', { updated: '2026-09-11' });
-    const lockPath = `${vaultCommitLockTarget(dir)}.lock`;
-    mkdirSync(dirname(lockPath), { recursive: true });
-    writeFileSync(lockPath, String(process.pid));
-    try {
-      const stop = runStop('hypo-hot-rebuild.mjs', dir);
-      assert.equal(stop.status, 0, `stderr: ${stop.stderr}`);
-      assert.equal(
-        readFileSync(join(dir, 'hot.md'), 'utf-8'),
-        before,
-        "Stop's own rebuild must not have replaced root hot.md while the lock was held elsewhere",
-      );
-    } finally {
-      rmSync(lockPath, { force: true });
-    }
-    const r = runStart(dir);
-    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
-    const out = JSON.parse(r.stdout);
-    assert.ok(
-      out.systemMessage && out.systemMessage.includes('잠금을 얻지 못했습니다'),
-      `expected the prior Stop's own lockTimeout notice to surface, got: ${JSON.stringify(out)}`,
-    );
-  } finally {
-    if (prevTimeout === undefined) delete process.env.HYPO_VAULT_LOCK_TIMEOUT_MS;
-    else process.env.HYPO_VAULT_LOCK_TIMEOUT_MS = prevTimeout;
-    rmSync(dir, { recursive: true, force: true });
-  }
-});
-
-// ── MAJOR fix: a migration backup must reach the person, not just the disk ─
-//
-// Before this fix, `backedUp`/`backupPath` came back from writeRootHotProjection
-// but neither call site (SessionStart's own write, or the Stop-hook rebuild)
-// ever read them. The backup file itself was never lost, but its EXISTENCE
-// was: it is gitignored, so `git status` never shows it either, and a person
-// who had just hand-edited root hot.md would see their edit silently replaced
-// with no trace of where it went.
-
-test('MAJOR: a hand-authored root hot.md backed up during SessionStart itself is named in systemMessage', () => {
-  const dir = projectionWikiDir();
-  try {
-    writeProjectHotFixture(dir, 'alpha', { updated: '2026-09-10' });
-    const manual = '# My hand-written notes\n\nDo not touch this file, Claude.\n';
-    writeFileSync(join(dir, 'hot.md'), manual);
-    const r = runStart(dir);
-    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
-    const out = JSON.parse(r.stdout);
-    const backupPath = join(dir, `hot.md${ROOT_HOT_BACKUP_SUFFIX}`);
-    assert.ok(existsSync(backupPath), `expected a backup file at ${backupPath}`);
-    assert.ok(
-      out.systemMessage && out.systemMessage.includes(basename(backupPath)),
-      `expected the backup filename in systemMessage, got: ${JSON.stringify(out)}`,
-    );
-    // Naming the file is not yet a recovery path: copying the backup back
-    // onto root hot.md is the one thing that does NOT work, so the notice
-    // has to say where the content actually goes. Two worlds this tells
-    // apart: "the notice names the file" and "the notice also says what to
-    // do with it".
-    assert.ok(
-      out.systemMessage.includes('projects/<slug>/hot.md'),
-      `expected the notice to name where the content should go, got: ${out.systemMessage}`,
-    );
-    assert.ok(
-      out.systemMessage.includes('루트로 되돌리지 마세요'),
-      `expected the notice to warn against copying it back, got: ${out.systemMessage}`,
-    );
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
-});
-
-test('MAJOR: a hand-authored root hot.md backed up by the Stop-hook rebuild is named in the next SessionStart systemMessage', () => {
-  const dir = projectionWikiDir();
-  try {
-    writeProjectHotFixture(dir, 'alpha', { updated: '2026-09-10' });
-    const manual = '# My hand-written notes\n\nDo not touch this file, Claude.\n';
-    writeFileSync(join(dir, 'hot.md'), manual);
-    const stop = runStop('hypo-hot-rebuild.mjs', dir);
-    assert.equal(stop.status, 0, `stderr: ${stop.stderr}`);
-    const backupPath = join(dir, `hot.md${ROOT_HOT_BACKUP_SUFFIX}`);
-    assert.ok(existsSync(backupPath), `expected a backup file at ${backupPath}`);
-    // Stop's own rebuild already regenerated hot.md into the canonical
-    // projection, so this SessionStart's own write is a no-op: the
-    // systemMessage seen here can only be the health notice Stop left behind
-    // (consumeRootHotHealthNotice), proving that delivery path names the file
-    // too, not just SessionStart's own direct-write path above.
-    const r = runStart(dir);
-    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
-    const out = JSON.parse(r.stdout);
-    assert.ok(
-      out.systemMessage && out.systemMessage.includes(basename(backupPath)),
-      `expected the prior Stop's backup notice to name the file in systemMessage, got: ${JSON.stringify(out)}`,
-    );
-    // codex 3rd-tier finding 6: naming the file is not yet a recovery path.
-    // Before that fix, Stop's own health notice named ONLY the backup
-    // filename, with no guidance at all. This is the ONE assertion pair that
-    // catches a regression here: `out.systemMessage.includes(basename(...))`
-    // alone (the assertion above) still passes even if the guidance sentence
-    // never reaches this surface, since the filename is present either way.
-    assert.ok(
-      out.systemMessage.includes('projects/<slug>/hot.md'),
-      `expected the Stop-hook notice to also say where the content should go, got: ${out.systemMessage}`,
-    );
-    assert.ok(
-      out.systemMessage.includes('루트로 되돌리지 마세요'),
-      `expected the Stop-hook notice to also warn against copying it back, got: ${out.systemMessage}`,
-    );
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
-});
-
-// codex 3rd-tier finding 6, third writer: project-create's own
-// writeRootHotProjection call can trigger the exact same migration backup a
-// hand-authored root hot.md would (whoever ran `hypomnema project new` or
-// answered a project-creation offer right after hand-editing root hot.md),
-// but before this fix `backedUp`/`backupPath` were read by neither
-// createProject's own `warnings` array nor its CLI's console output. The
-// backup landed on disk and the person's edit vanished from the pointer
-// table with no route back to it anywhere this call site's own output
-// reaches.
-test('MAJOR: a hand-authored root hot.md backed up by createProject reaches the SAME recovery guidance in `warnings`', () => {
-  const dir = projectionWikiDir();
-  try {
-    writeProjectHotFixture(dir, 'alpha', { updated: '2026-09-10' });
-    const manual = '# My hand-written notes\n\nDo not touch this file, Claude.\n';
-    writeFileSync(join(dir, 'hot.md'), manual);
-
-    const result = createProject({ hypoDir: dir, name: 'beta', workingDir: '/tmp/beta' });
-
-    const backupPath = join(dir, `hot.md${ROOT_HOT_BACKUP_SUFFIX}`);
-    assert.ok(existsSync(backupPath), `expected a backup file at ${backupPath}`);
-    // Naming the file alone is not a recovery path (see the two Stop/
-    // SessionStart tests above for why); both assertions below must hold,
-    // not just the filename one, or a regression that drops the guidance
-    // sentence while keeping the filename passes silently.
-    const notice = result.warnings.find((w) => w.includes(basename(backupPath)));
-    assert.ok(
-      notice,
-      `expected createProject's warnings to name the backup file, got: ${JSON.stringify(result.warnings)}`,
-    );
-    assert.ok(
-      notice.includes('projects/<slug>/hot.md'),
-      `expected the notice to say where the content should go, got: ${notice}`,
-    );
-    assert.ok(
-      notice.includes('루트로 되돌리지 마세요'),
-      `expected the notice to warn against copying it back, got: ${notice}`,
-    );
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
-});
-
-// ── MAJOR fix (r5-w1.md): narrow the ownership-check-to-final-write TOCTOU ─
-//
-// The ownership check reads hotPath once, then this function still runs
-// ensureVaultGitignorePattern and (when a backup is needed) the backup write
-// itself before ever reaching the rename that replaces hotPath: real I/O
-// against OTHER files that a human's own save can land inside. A second read
-// immediately before that rename catches anything that appeared in that
-// window instead of silently discarding it. `beforeFinalWrite` is a
-// test-only hook (see writeRootHotProjection's own doc comment) that lets a
-// test write new bytes at exactly the point a real concurrent writer would
-// need to land in: genuine two-process timing inside one synchronous call
-// cannot be reproduced deterministically any other way.
-
-test('MAJOR: bytes that land between the ownership check and the final write are backed up too, not silently discarded', () => {
-  const dir = projectionWikiDir();
-  try {
-    writeProjectHotFixture(dir, 'p1', { updated: '2026-01-01' });
-    writeRootHotProjection(dir); // establishes ownership over the current projection
-    writeProjectHotFixture(dir, 'p2', { updated: '2026-01-02' }); // forces the NEXT write to differ
-    const hotPath = join(dir, 'hot.md');
-    const raceContent = '# a human save landing mid-write, must not be lost\n';
-    const result = writeRootHotProjection(dir, {
-      beforeFinalWrite: () => writeFileSync(hotPath, raceContent),
+test('(2c) before the move, a new entry head points at its own file and only the baseline head points at session-state.md', () => {
+  withStartVault({ remote: true }, ({ dir, work }) => {
+    const one = ssPutEntry(dir, 'p', {
+      date: '2999-01-02',
+      sessionId: 's-one',
+      track: 'trk-one',
+      title: 'Track One',
+      body: 'X'.repeat(5000),
     });
-    assert.equal(result.written, true);
-    assert.equal(
-      result.backedUp,
-      true,
-      'content that appears between the ownership check and the final write must still be backed up',
-    );
-    assert.equal(
-      readFileSync(result.backupPath, 'utf-8'),
-      raceContent,
-      'the backup must hold the RACE content, not the earlier (already-owned) current content',
-    );
-    assert.equal(
-      readFileSync(hotPath, 'utf-8'),
-      result.content,
-      'the final file must still land on the correct fresh projection, race notwithstanding',
-    );
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
+    const two = ssPutEntry(dir, 'p', {
+      date: '2999-01-01',
+      sessionId: 's-two',
+      track: 'trk-two',
+      title: 'Track Two',
+      body: 'Y'.repeat(5000),
+    });
+    const { ctx } = ssStart(dir, work, { env: SS_DAY_ONE });
+    for (const e of [one, two]) {
+      const path = `projects/p/sessions/${e.fileName}`;
+      assert.ok(ctx.includes(path), `the injection names ${path}: ${ctx.slice(0, 1500)}`);
+      assert.ok(existsSync(join(dir, path)), `${path} is on disk`);
+    }
+    const stateLines = ctx.split('\n').filter((l) => l.includes('projects/p/session-state.md'));
+    assert.ok(stateLines.length > 0, 'the baseline head points at the old file');
+    for (const l of stateLines) assert.match(l, /baseline-/, `only a baseline head: ${l}`);
+  });
 });
 
-test('writeRootHotProjection: no interloping write between the two reads never backs up on a false positive', () => {
-  const dir = projectionWikiDir();
+test('(F1) before the move, a hand edit of an old file reaches the injection from the working tree and the file stays as it is', () => {
+  withStartVault({ remote: true }, ({ dir, work }) => {
+    const edited = SS_OLD_STATE.replace('old state body', 'WORKTREE_EDIT_T12');
+    ssPut(dir, 'projects/p/session-state.md', edited);
+    const head = ssHead(dir);
+    const { ctx } = ssStart(dir, work, { env: SS_DAY_ONE });
+    assert.match(ctx, /WORKTREE_EDIT_T12/, 'the working-tree text is what the session is told');
+    assert.doesNotMatch(ctx, /old state body/, 'not the committed text');
+    assert.equal(ssRead(dir, 'projects/p/session-state.md'), edited, 'the edit is untouched');
+    assert.equal(ssHead(dir), head, 'no commit');
+  });
+});
+
+test('(F1b) before the move, an old file the vault .gitignore keeps out of git is injected, not reported as no snapshot yet', () => {
+  withStartVault({ remote: true }, ({ root, dir }) => {
+    ssPut(dir, '.gitignore', '.cache/\nprojects/z/\n');
+    ssCommitAll(dir, 'ignore z');
+    const workZ = join(root, 'work-z');
+    mkdirSync(workZ, { recursive: true });
+    ssPut(
+      dir,
+      'projects/z/index.md',
+      `---\ntitle: z\ntype: project-index\nupdated: 2026-09-01\nworking_dir: "${realpathSync(workZ)}"\n---\n# z\n`,
+    );
+    ssPut(
+      dir,
+      'projects/z/session-state.md',
+      SS_OLD_STATE.replace('old state body', 'Z_STATE_T12'),
+    );
+    assert.equal(ssGitOk(dir, ['ls-files', 'projects/z']).trim(), '', 'precondition: untracked');
+    const { ctx } = ssStart(dir, workZ, { env: SS_DAY_ONE, sessionId: 'sess-t12-z' });
+    assert.match(ctx, /Z_STATE_T12/, 'the file on disk is injected');
+    assert.doesNotMatch(ctx, /no snapshot yet/);
+  });
+});
+
+test('(F2) a session state that cannot be read keeps the rest of the start and says so, instead of dropping the whole injection', () => {
+  if (process.getuid?.() === 0) return; // chmod 000 does not stop root, so the fixture cannot fail
+  withStartVault({ remote: true }, ({ dir, work }) => {
+    const sessions = join(dir, 'projects', 'p', 'sessions');
+    mkdirSync(sessions, { recursive: true });
+    chmodSync(sessions, 0o000);
+    try {
+      const { r, sys, ctx } = ssStart(dir, work, { env: SS_DAY_ONE });
+      assert.doesNotMatch(r.stderr, /\[hypo-session-start\] error:/, 'not the top-level catch');
+      assert.match(sys, /세션 현황을 읽지 못해/, 'the user is told');
+      assert.match(ctx, /EACCES/, 'with the cause');
+      assert.match(ctx, /아직 옛 세션 현황 형식/, 'the notices before the injection are kept');
+      assert.match(ctx, /WIKI HOT CACHE: project=p, session state could not be read/);
+      assert.doesNotMatch(ctx, /no snapshot yet/, 'an unreadable state is not an absent one');
+      const marker = JSON.parse(readFileSync(sharedMod.sessionMarkerPath('sess-t12'), 'utf-8'));
+      assert.equal(marker.unavailable, true, 'first-prompt is told it was not a first session');
+      assert.equal(marker.hasSnapshot, false);
+    } finally {
+      chmodSync(sessions, 0o755);
+    }
+  });
+});
+
+test('(N1) a notes.md scoped to one machine is injected there and not on another machine', () => {
+  withStartVault({}, ({ dir, work }) => {
+    ssPut(
+      dir,
+      'projects/p/notes.md',
+      '---\nvisibility_scope: machine:dev-t12\n---\nNOTE_FOR_DEV_T12\n',
+    );
+    const owner = ssStart(dir, work, { env: { ...SS_DAY_ONE, HYPO_DEVICE: 'dev-t12' } });
+    assert.match(owner.ctx, /Project notes/);
+    assert.match(owner.ctx, /NOTE_FOR_DEV_T12/, 'the owning machine is told the note');
+    const other = ssStart(dir, work, { env: { ...SS_DAY_ONE, HYPO_DEVICE: 'dev-other' } });
+    assert.match(other.ctx, /WIKI HOT CACHE: project=p/, 'the rest of the injection is there');
+    assert.doesNotMatch(other.ctx, /NOTE_FOR_DEV_T12/, 'another machine is not');
+  });
+});
+
+test('(N2) a notes.md that .hypoignore matches is not injected, and the same note is when the rule is gone', () => {
+  withStartVault({}, ({ dir, work }) => {
+    ssPut(dir, 'projects/p/notes.md', 'NOTE_PLAIN_T12\n');
+    assert.match(ssStart(dir, work, { env: SS_DAY_ONE }).ctx, /NOTE_PLAIN_T12/);
+    ssPut(dir, '.hypoignore', 'projects/p/notes.md\n');
+    const hidden = ssStart(dir, work, { env: SS_DAY_ONE });
+    assert.match(hidden.ctx, /WIKI HOT CACHE: project=p/, 'the project itself is not hidden');
+    assert.doesNotMatch(hidden.ctx, /NOTE_PLAIN_T12/);
+  });
+});
+
+test('(U1) an entry that cannot be read is told as a count next to the entries that can, and the project is not a first session', () => {
+  withStartVault({}, ({ dir, work }) => {
+    ssPutEntry(dir, 'p', {
+      date: '2999-01-02',
+      sessionId: 's-good',
+      track: 'trk-good',
+      title: 'Good',
+      body: 'GOOD_ENTRY_BODY\n',
+    });
+    ssPut(
+      dir,
+      `projects/p/sessions/${ssEntryFileName('2999-01-03', 'bad-close')}`,
+      'not an entry\n',
+    );
+    const { ctx } = ssStart(dir, work, { env: SS_DAY_ONE });
+    assert.match(ctx, /GOOD_ENTRY_BODY/, 'the readable entry is injected');
+    assert.match(ctx, /세션 원본 1개를 읽지 못해/, 'the count is told');
+    assert.doesNotMatch(ctx, /bad-close/, 'not the file name');
+    assert.doesNotMatch(ctx, /no snapshot yet/);
+  });
+});
+
+test('(U2) when the only entry file cannot be read the project is unavailable, not "no snapshot yet"', () => {
+  withStartVault({}, ({ dir, work }) => {
+    ssGitOk(dir, ['rm', '-q', 'projects/p/hot.md', 'projects/p/session-state.md']);
+    ssCommitAll(dir, 'no old files');
+    ssPut(
+      dir,
+      `projects/p/sessions/${ssEntryFileName('2999-01-03', 'bad-close')}`,
+      'not an entry\n',
+    );
+    const { ctx } = ssStart(dir, work, { env: SS_DAY_ONE, sessionId: 'sess-t12-u2' });
+    assert.match(ctx, /WIKI HOT CACHE: project=p, session state could not be read/);
+    assert.doesNotMatch(ctx, /no snapshot yet/);
+    const marker = JSON.parse(readFileSync(sharedMod.sessionMarkerPath('sess-t12-u2'), 'utf-8'));
+    assert.equal(marker.unavailable, true, 'first-prompt is told it was not a first session');
+  });
+});
+
+test('(H1) a vault with no git: a project hidden by .hypoignore on the first start is moved on the start that sees it, and its old text is injected without a backup', () => {
+  withTmpDir((root) => {
+    const dir = join(root, 'vault');
+    const work = join(root, 'work');
+    mkdirSync(work, { recursive: true });
+    ssPut(dir, 'hypo-config.md', '# config\n');
+    ssPut(
+      dir,
+      'projects/p/index.md',
+      `---\ntitle: p\ntype: project-index\nupdated: 2026-09-01\nworking_dir: "${realpathSync(work)}"\n---\n# p\n`,
+    );
+    ssPut(dir, 'projects/p/hot.md', SS_OLD_HOT);
+    ssPut(dir, 'projects/p/session-state.md', SS_OLD_STATE);
+    ssPut(dir, '.hypoignore', 'projects/p/\n');
+    ssStart(dir, work, { env: SS_DAY_ONE });
+    assert.equal(ssRead(dir, 'projects/p/hot.md'), SS_OLD_HOT, 'hidden: not touched');
+    rmSync(join(dir, '.hypoignore'));
+    const { ctx } = ssStart(dir, work, { env: SS_DAY_TWO });
+    assert.match(ctx, /old state body/, 'the old state is in the injection');
+    assert.match(ctx, /old hot body/);
+    assert.equal(existsSync(join(dir, '.cache', 'backups')), false, 'no backup of those bytes');
+    const baselines = readdirSync(join(dir, 'projects', 'p', 'sessions')).filter((n) =>
+      n.includes('-baseline-'),
+    );
+    assert.equal(baselines.length, 2);
+  });
+});
+
+// An old file git does not track is not published and not claimed by the move, but the session that
+// starts right after it is still told its text (the file is on disk until the writer backs it up).
+function withUntrackedProject(index, fn) {
+  withStartVault({}, ({ root, dir }) => {
+    const workZ = join(root, 'work-z');
+    mkdirSync(workZ, { recursive: true });
+    ssPut(
+      dir,
+      'projects/z/index.md',
+      `---\ntitle: z\ntype: project-index\nupdated: 2026-09-01\nworking_dir: "${realpathSync(workZ)}"\n${index}---\n# z\n`,
+    );
+    ssPut(
+      dir,
+      'projects/z/session-state.md',
+      SS_OLD_STATE.replace('old state body', 'Z_UNTRACKED_STATE'),
+    );
+    assert.equal(ssGitOk(dir, ['ls-files', 'projects/z']).trim(), '', 'precondition: untracked');
+    fn({ dir, workZ });
+  });
+}
+
+function assertUntrackedNeverPublished(dir) {
+  assert.equal(ssMigrationState(dir), 'migrated', 'the start moved the vault');
+  assert.equal(ssGit(dir, ['grep', '-q', 'Z_UNTRACKED_STATE', 'HEAD']).status, 1, 'in no commit');
+  for (const view of ['hot.md', 'projects/z/hot.md', 'projects/z/session-state.md']) {
+    assert.doesNotMatch(ssRead(dir, view), /Z_UNTRACKED_STATE/, `${view} is no shared view of it`);
+  }
+  assert.match(
+    ssRead(dir, '.cache/backups/projects/z/session-state.md.pre-projection-backup.md'),
+    /Z_UNTRACKED_STATE/,
+    'a backup holds the bytes',
+  );
+}
+
+test('(L1) the start that moves the vault still injects an untracked old file, publishes it nowhere, backs it up and says where', () => {
+  withUntrackedProject('', ({ dir, workZ }) => {
+    const { ctx, sys } = ssStart(dir, workZ, { env: SS_DAY_ONE, sessionId: 'sess-t12-l1' });
+    assert.match(ctx, /Z_UNTRACKED_STATE/, 'this session is told the text');
+    assertUntrackedNeverPublished(dir);
+    assert.match(
+      sys,
+      /\.cache\/backups\/projects\/z\/session-state\.md/,
+      'the notice names the backup',
+    );
+    assert.match(sys, /notes\.md/, 'and how to bring the text back');
+  });
+});
+
+test('(L2) an untracked old file whose untracked index.md scopes it to another machine is not injected here, and is in no commit or view', () => {
+  withUntrackedProject('visibility_scope: machine:dev-other\n', ({ dir, workZ }) => {
+    const { ctx } = ssStart(dir, workZ, { env: SS_DAY_ONE, sessionId: 'sess-t12-l2' });
+    assert.doesNotMatch(
+      ctx,
+      /Z_UNTRACKED_STATE/,
+      "the other machine's memory is not this session's",
+    );
+    assertUntrackedNeverPublished(dir);
+  });
+});
+
+test('(L3) an untracked old file scoped to another machine is injected only on the machine it names without entry_scope, and entry_scope: shared in index.md reopens it here', () => {
+  const startOn = (device, indexLine, assertCtx) =>
+    withUntrackedProject(indexLine, ({ dir, workZ }) => {
+      ssPut(
+        dir,
+        'projects/z/session-state.md',
+        SS_OLD_STATE.replace(
+          'type: session-state',
+          'type: session-state\nvisibility_scope: machine:other-device',
+        ).replace('old state body', 'Z_UNTRACKED_STATE'),
+      );
+      const { ctx } = ssStart(dir, workZ, {
+        env: { ...SS_DAY_ONE, HYPO_DEVICE: device },
+        sessionId: `sess-t12-l3-${device}-${indexLine ? 'es' : 'plain'}`,
+      });
+      assert.match(ctx, /WIKI HOT CACHE: project=z/, 'the rest of the injection is there');
+      assertCtx(ctx);
+    });
+  startOn('this-device', '', (ctx) =>
+    assert.doesNotMatch(ctx, /Z_UNTRACKED_STATE/, 'its own machine scope decides'),
+  );
+  startOn('other-device', '', (ctx) =>
+    assert.match(ctx, /Z_UNTRACKED_STATE/, 'the machine it names is told the text'),
+  );
+  startOn('this-device', 'entry_scope: shared\n', (ctx) =>
+    assert.match(ctx, /Z_UNTRACKED_STATE/, 'entry_scope: shared replaces the machine scope'),
+  );
+});
+
+test('(9b) a clone that takes a migration commit with a fast-forward has the root hot.md and a MISS injection of it', () => {
+  withStartVault({ remote: true }, ({ dir, work, other }) => {
+    const b = other();
+    assert.equal(ssMigrate(b).migrated, true);
+    ssGitOk(b, ['push', '-q', 'origin', 'main']);
+    const unrelated = join(dirname(work), 'unrelated');
+    mkdirSync(unrelated, { recursive: true });
+    const { ctx } = ssStart(dir, unrelated);
+    assert.equal(ssMigrationState(dir), 'migrated', 'the fast-forward brought the move');
+    assert.ok(existsSync(join(dir, 'hot.md')), 'the root hot.md is on disk when the hook ends');
+    assert.match(ssRead(dir, 'hot.md'), /\[\[projects\/p\/hot\]\]/);
+    assert.match(ctx, /WIKI HOT CACHE: global/);
+    assert.match(ctx, /\| p \|/, 'the MISS injection carries the root table');
+  });
+});
+
+suite('hypo-session-start.mjs: injection from session entries and observed heads');
+
+test('(5) a head that fits goes in whole and a head that does not goes in as a pointer, and each is recorded as such', () => {
+  withStartVault({}, ({ dir, work }) => {
+    const one = ssPutEntry(dir, 'p', {
+      date: '2999-01-02',
+      sessionId: 's-one',
+      track: 'trk-one',
+      title: 'Track One',
+      body: 'BODY_ONE_MARK\n'.repeat(100),
+    });
+    const two = ssPutEntry(dir, 'p', {
+      date: '2999-01-01',
+      sessionId: 's-two',
+      track: 'trk-two',
+      title: 'Track Two',
+      body: 'BODY_TWO_MARK\n'.repeat(500),
+    });
+    const { ctx } = ssStart(dir, work, { sessionId: 'sess-t12-heads' });
+    assert.match(ctx, /BODY_ONE_MARK/, 'the first head is whole');
+    assert.doesNotMatch(ctx, /BODY_TWO_MARK/, 'the second is a pointer line, not a body');
+    assert.match(
+      ctx,
+      new RegExp(
+        `Track Two \\(trk-two\\) · 2999-01-01 · ${two.closeId}: 이 트랙을 이어 작업하면 먼저 projects/p/session-state.md`,
+      ),
+      'once the vault has moved, the generated view is where a head is read',
+    );
+    const observed = JSON.parse(ssRead(dir, '.cache/sessions/sess-t12-heads/observed-heads.json'))
+      .projects.p;
+    assert.deepEqual(observed.full['trk-one'], [one.closeId], 'the whole head is recorded full');
+    assert.deepEqual(
+      observed.pointer['trk-two'],
+      [two.closeId],
+      'the pointer head is recorded pointer',
+    );
+    assert.equal(observed.full['trk-two'], undefined, 'and not as full');
+    assert.equal(observed.pointer['trk-one'], undefined, 'nor the first as a pointer');
+  });
+});
+
+test('(6) the marker says there is no snapshot for a project that has views but no entries, and that there is one with an entry', () => {
+  withTmpDir((root) => {
+    const dir = join(root, 'vault');
+    const work = join(root, 'work');
+    mkdirSync(work, { recursive: true });
+    ssPut(
+      dir,
+      'projects/p/index.md',
+      `---\ntitle: p\ntype: project-index\nupdated: 2026-09-01\nworking_dir: "${realpathSync(work)}"\n---\n# p\n`,
+    );
+    // Real generator output carries `generated: sessions`; a flat file without it is an old file,
+    // which a vault with no git moves into a baseline entry (see the suite at the end).
+    const generatedView = '---\ngenerated: sessions\n---\n# generated view only\n';
+    ssPut(dir, 'projects/p/hot.md', generatedView);
+    ssPut(dir, 'projects/p/session-state.md', generatedView);
+    const bare = ssStart(dir, work, { sessionId: 'sess-t12-nosnap' });
+    assert.ok(bare.out, 'the hook ran on a vault with no git');
+    const marker = JSON.parse(readFileSync(markerPath('sess-t12-nosnap'), 'utf-8'));
+    assert.equal(marker.hasSnapshot, false);
+    rmSync(markerPath('sess-t12-nosnap'), { force: true });
+    ssPutEntry(dir, 'p', {
+      date: '2026-10-01',
+      sessionId: 's-one',
+      track: 'trk-one',
+      title: 'Track One',
+      body: 'a body\n',
+    });
+    ssStart(dir, work, { sessionId: 'sess-t12-snap' });
+    const withEntry = JSON.parse(readFileSync(markerPath('sess-t12-snap'), 'utf-8'));
+    assert.equal(withEntry.hasSnapshot, true);
+    rmSync(markerPath('sess-t12-snap'), { force: true });
+  });
+});
+
+test('(9) a SessionStart in p writes p and the root from the pulled entries and leaves the views of q alone', () => {
+  withStartVault({ remote: true }, ({ dir, work, other }) => {
+    assert.equal(ssMigrate(dir).migrated, true);
+    ssGitOk(dir, ['push', '-q', 'origin', 'main']);
+    ssWriteViews(dir, { device: 'dev-t12' });
+    const qBefore = ssRead(dir, 'projects/q/session-state.md');
+    const b = other();
+    ssPutEntry(b, 'p', {
+      date: '2026-10-05',
+      sessionId: 's-p',
+      track: 'trk-p',
+      title: 'Track P',
+      body: 'BODY_P_T12\n',
+    });
+    ssPutEntry(b, 'q', {
+      date: '2026-10-06',
+      sessionId: 's-q',
+      track: 'trk-q',
+      title: 'Track Q',
+      body: 'BODY_Q_T12\n',
+    });
+    ssCommitAll(b, 'entries from another machine');
+    ssGitOk(b, ['push', '-q', 'origin', 'main']);
+    const { ctx } = ssStart(dir, work);
+    assert.match(ssRead(dir, 'projects/p/session-state.md'), /BODY_P_T12/);
+    assert.match(ctx, /BODY_P_T12/);
+    const root = ssRead(dir, 'hot.md');
+    assert.match(root, /\| p \| 2026-10-05 \|/);
+    assert.match(root, /\| q \| 2026-10-06 \|/);
+    assert.equal(
+      ssRead(dir, 'projects/q/session-state.md'),
+      qBefore,
+      "q's view waits for the Stop hook",
+    );
+  });
+});
+
+test('the injection comes from the entries even when a flat view on disk says something else', () => {
+  withTmpDir((root) => {
+    const dir = join(root, 'vault');
+    const work = join(root, 'work');
+    mkdirSync(work, { recursive: true });
+    ssPut(
+      dir,
+      'projects/p/index.md',
+      `---\ntitle: p\ntype: project-index\nupdated: 2026-09-01\nworking_dir: "${realpathSync(work)}"\n---\n# p\n`,
+    );
+    // A stale generated view (it carries the generator's marker), not an old file: a vault with no
+    // git moves an old file into a baseline entry, and that is injected.
+    ssPut(
+      dir,
+      'projects/p/session-state.md',
+      '---\ngenerated: sessions\n---\n# a stale flat view\nSTALE_FLAT_T12\n',
+    );
+    ssPutEntry(dir, 'p', {
+      date: '2026-10-01',
+      sessionId: 's-one',
+      track: 'trk-one',
+      title: 'Track One',
+      body: 'ENTRY_BODY_T12\n',
+    });
+    const { ctx } = ssStart(dir, work);
+    assert.match(ctx, /ENTRY_BODY_T12/);
+    assert.doesNotMatch(ctx, /STALE_FLAT_T12/);
+  });
+});
+
+suite('hypo-session-start.mjs: catching up to a migration commit another machine pushed');
+
+// `dir` is behind: another clone migrated and pushed, and `dir` has not fetched yet.
+function withBehindVault(fn) {
+  withStartVault({ remote: true }, ({ dir, work, origin, other }) => {
+    const b = other();
+    assert.equal(ssMigrate(b).migrated, true);
+    ssGitOk(b, ['push', '-q', 'origin', 'main']);
+    fn({ dir, work, origin, b, migrationSha: ssHead(b) });
+  });
+}
+const ssBackups = (dir, rel) => {
+  const base = join(dir, '.cache', 'backups', dirname(rel));
+  const stem = rel.split('/').at(-1);
   try {
-    writeProjectHotFixture(dir, 'p1', { updated: '2026-01-01' });
-    writeRootHotProjection(dir);
-    writeProjectHotFixture(dir, 'p2', { updated: '2026-01-02' });
-    let hookCalls = 0;
-    const result = writeRootHotProjection(dir, {
-      beforeFinalWrite: () => {
-        hookCalls++;
+    return readdirSync(base)
+      .filter((n) => n.startsWith(`${stem}.pre-`))
+      .map((n) => readFileSync(join(base, n), 'utf-8'));
+  } catch {
+    return [];
+  }
+};
+const ssContains = (dir, sha) =>
+  ssGit(dir, ['merge-base', '--is-ancestor', sha, 'HEAD']).status === 0;
+
+test('(4) an uncommitted edit of a view is backed up and the fast-forward still lands, with no migration commit of its own', () => {
+  withBehindVault(({ dir, work, migrationSha }) => {
+    ssPut(dir, 'projects/p/hot.md', 'LOCAL_EDIT_T12\n');
+    const { sys } = ssStart(dir, work);
+    assert.ok(ssContains(dir, migrationSha), 'HEAD holds the remote migration commit');
+    assert.equal(ssMigrationState(dir), 'migrated');
+    assert.equal(ssMigrationCommits(dir), 1, 'only the remote machine moved the vault');
+    assert.ok(
+      ssBackups(dir, 'projects/p/hot.md').includes('LOCAL_EDIT_T12\n'),
+      'the edit is backed up',
+    );
+    assert.doesNotMatch(sys, /받지 못했습니다/);
+  });
+});
+
+test('(4b) an uncommitted pure-addition line of .gitignore survives the fast-forward next to the block, once each', () => {
+  withBehindVault(({ dir, work, migrationSha }) => {
+    ssPut(dir, '.gitignore', '.cache/\nlocal-only/\n');
+    ssStart(dir, work);
+    assert.ok(ssContains(dir, migrationSha));
+    const lines = ssRead(dir, '.gitignore').split('\n');
+    assert.equal(
+      lines.filter((l) => l === SS_GITIGNORE_BLOCK.split('\n')[0]).length,
+      1,
+      'the block',
+    );
+    assert.equal(lines.filter((l) => l === 'local-only/').length, 1, 'the local line');
+    assert.match(ssGitOk(dir, ['diff', '--name-only']), /\.gitignore/, 'still uncommitted');
+    assert.equal(ssGitOk(dir, ['ls-files', '-u']).trim(), '');
+  });
+});
+
+test('(4c) a local .gitignore negation stops the fast-forward and says so, with HEAD and the file untouched', () => {
+  withBehindVault(({ dir, work, migrationSha }) => {
+    ssPut(dir, '.gitignore', '.cache/\n!keep.md\n');
+    const head = ssHead(dir);
+    const { sys } = ssStart(dir, work);
+    assert.equal(ssHead(dir), head);
+    assert.equal(ssContains(dir, migrationSha), false);
+    assert.equal(ssRead(dir, '.gitignore'), '.cache/\n!keep.md\n');
+    assert.match(sys, /이행 커밋을 받지 못했습니다/);
+  });
+});
+
+test('(4d) a view another session staged is backed up byte for byte, unstaged, and the fast-forward lands', () => {
+  withBehindVault(({ dir, work, migrationSha }) => {
+    ssPut(dir, 'projects/p/hot.md', 'STAGED_BYTES_T12\n');
+    ssGitOk(dir, ['add', 'projects/p/hot.md']);
+    ssPut(dir, 'projects/p/hot.md', 'WORKTREE_BYTES_T12\n');
+    ssStart(dir, work);
+    assert.ok(ssContains(dir, migrationSha));
+    const saved = ssBackups(dir, 'projects/p/hot.md');
+    assert.ok(saved.includes('STAGED_BYTES_T12\n'), 'the stage bytes are kept');
+    assert.ok(saved.includes('WORKTREE_BYTES_T12\n'), 'and the working tree bytes');
+    assert.equal(ssGitOk(dir, ['diff', '--cached', '--name-only']).trim(), '');
+    assert.equal(ssMigrationCommits(dir), 1);
+  });
+});
+
+test('(4e) an edit that differs from the remote baseline becomes an additional baseline commit and reaches the remote', () => {
+  withBehindVault(({ dir, work, origin, migrationSha }) => {
+    ssPut(dir, 'projects/p/hot.md', 'LOCAL_ONLY_MEMORY_T12\n');
+    ssStart(dir, work);
+    assert.ok(ssContains(dir, migrationSha));
+    assert.equal(ssGitOk(dir, ['rev-list', '--count', `${migrationSha}..HEAD`]).trim(), '1');
+    assert.match(
+      ssGitOk(dir, ['show', '--name-only', '--format=', 'HEAD']),
+      /projects\/p\/sessions\/.*baseline-[0-9a-f]{16}\.md/,
+    );
+    ssGitOk(dir, ['push', '-q', 'origin', 'main']);
+    assert.equal(
+      ssGitOk(origin, ['rev-parse', 'main']).trim(),
+      ssHead(dir),
+      'shared at the next sync',
+    );
+  });
+});
+
+test('(4f) a stop between the fast-forward and the share is finished by the next SessionStart, once', () => {
+  withBehindVault(({ dir, work, migrationSha }) => {
+    ssGitOk(dir, ['fetch', '-q']);
+    ssPut(dir, 'projects/p/hot.md', 'LOCAL_EDIT_T12\n');
+    // the earlier run, up to the point where it stopped: set aside, then merged, nothing shared
+    const pre = ssClearGeneratedPaths(dir, '@{u}');
+    assert.equal(pre.ok, true, JSON.stringify(pre));
+    ssGitOk(dir, ['merge', '-q', '--ff-only', '@{u}']);
+    assert.ok(existsSync(join(dir, '.cache', 'pull-archive.json')), 'the record is left behind');
+    const before = ssCount(dir);
+    ssStart(dir, work);
+    assert.equal(ssCount(dir), before + 1, 'one additional baseline commit');
+    assert.equal(existsSync(join(dir, '.cache', 'pull-archive.json')), false, 'the record is gone');
+    assert.ok(ssContains(dir, migrationSha));
+    const again = ssCount(dir);
+    ssStart(dir, work);
+    assert.equal(ssCount(dir), again, 'a second SessionStart makes no commit');
+  });
+});
+
+test('(4g) a rollback commit over an ignored local file backs the file up instead of overwriting it, and says so', () => {
+  withStartVault({ remote: true }, ({ dir, work, other }) => {
+    const b = other();
+    assert.equal(ssMigrate(b).migrated, true);
+    ssGitOk(b, ['push', '-q', 'origin', 'main']);
+    ssGitOk(dir, ['pull', '-q', '--ff-only']);
+    assert.equal(ssMigrationState(dir), 'migrated', 'this machine is on the migrated side');
+    ssPut(dir, 'projects/p/hot.md', 'LOCAL_IGNORED_HOT\n');
+    // the rollback commit: the block is gone and the view is tracked again
+    ssPut(b, '.gitignore', '.cache/\n');
+    ssPut(b, 'projects/p/hot.md', 'ROLLED_BACK_HOT\n');
+    ssGitOk(b, ['add', '-f', '.gitignore', 'projects/p/hot.md']);
+    ssGitOk(b, ['commit', '-q', '-m', 'rollback']);
+    ssGitOk(b, ['push', '-q', 'origin', 'main']);
+    const { sys } = ssStart(dir, work);
+    assert.equal(ssHead(dir), ssHead(b), 'the rollback commit was taken in');
+    assert.equal(ssRead(dir, 'projects/p/hot.md'), 'ROLLED_BACK_HOT\n');
+    assert.ok(
+      ssBackups(dir, 'projects/p/hot.md').includes('LOCAL_IGNORED_HOT\n'),
+      'the ignored local bytes are kept',
+    );
+    assert.match(sys, /projects\/p\/hot\.md/, 'and the user is told where they went');
+  });
+});
+
+test('(4h) a migration commit takes the clean old files of a hidden project away only after a local copy is kept', () => {
+  withBehindVault(({ dir, work, migrationSha }) => {
+    ssPut(dir, '.hypoignore', 'projects/p/\n');
+    ssStart(dir, work);
+    assert.ok(ssContains(dir, migrationSha), 'the migration commit was taken in');
+    assert.ok(ssBackups(dir, 'projects/p/hot.md').includes(SS_OLD_HOT), 'hot.md is kept locally');
+    assert.ok(
+      ssBackups(dir, 'projects/p/session-state.md').includes(SS_OLD_STATE),
+      'session-state.md is kept locally',
+    );
+  });
+});
+
+test('(F6) after the vault is migrated, an ordinary pull blocked by a dirty file is not reported as a missed migration commit', () => {
+  withStartVault({ remote: true, files: { 'pages/x.md': 'x one\n' } }, ({ dir, work, other }) => {
+    const b = other();
+    assert.equal(ssMigrate(b).migrated, true);
+    ssGitOk(b, ['push', '-q', 'origin', 'main']);
+    ssStart(dir, work, { env: SS_DAY_ONE }); // takes the migration commit
+    assert.equal(ssMigrationState(dir), 'migrated');
+    // another machine edits a page, and this one has an uncommitted edit of the same page
+    ssPut(b, 'pages/x.md', 'x remote\n');
+    ssCommitAll(b, 'edit x');
+    ssGitOk(b, ['push', '-q', 'origin', 'main']);
+    ssPut(dir, 'pages/x.md', 'x local\n');
+    const head = ssHead(dir);
+    const { sys, ctx } = ssStart(dir, work, { env: SS_DAY_TWO });
+    assert.equal(ssHead(dir), head, 'the blocked pull moved nothing');
+    assert.equal(ssRead(dir, 'pages/x.md'), 'x local\n');
+    assert.doesNotMatch(sys, /이행 커밋을 받지 못했습니다/, 'no migration commit is in that range');
+    assert.doesNotMatch(ctx, /이행 커밋을 받지 못했습니다/);
+  });
+});
+
+test('(F9) a fetch that fails ends the pull there: no second network call is made', () => {
+  withStartVault({ remote: true }, ({ root, dir, work }) => {
+    ssGitOk(dir, ['remote', 'set-url', 'origin', join(root, 'nowhere.git')]);
+    const trace = join(root, 'git-trace.txt');
+    ssStart(dir, work, { env: { ...SS_DAY_ONE, GIT_TRACE: trace } });
+    const calls = readFileSync(trace, 'utf-8');
+    assert.match(calls, /built-in: git fetch/, 'the fetch was tried');
+    assert.doesNotMatch(calls, /built-in: git pull/, 'and the pull was not');
+  });
+});
+
+test('(F10) a vault inside another repository still finishes a pull archive left after its merge', () => {
+  withTmpDir((root) => {
+    const top = join(root, 'top');
+    const dir = join(top, 'wiki');
+    const work = join(root, 'work');
+    mkdirSync(work, { recursive: true });
+    mkdirSync(dir, { recursive: true });
+    ssGitOk(top, ['init', '-q', '-b', 'main']);
+    ssIdentify(top);
+    ssPut(dir, 'hypo-config.md', '# config\n');
+    ssPut(
+      dir,
+      'projects/p/index.md',
+      `---\ntitle: p\ntype: project-index\nupdated: 2026-09-01\nworking_dir: "${realpathSync(work)}"\n---\n# p\n`,
+    );
+    ssPut(dir, SS_OFF_MARKER, 'rolled back\n'); // keeps the hook from moving this vault
+    ssCommitAll(top, 'seed');
+    const record = join(dir, '.cache', 'pull-archive.json');
+    ssPut(
+      dir,
+      '.cache/pull-archive.json',
+      JSON.stringify({
+        v: 2,
+        stage: 'merged',
+        targetSha: ssHead(top),
+        gitignoreLines: [],
+        views: [],
+      }),
+    );
+    assert.equal(
+      existsSync(join(dir, '.git')),
+      false,
+      'precondition: the vault has no .git of its own',
+    );
+    ssStart(dir, work, { env: SS_DAY_ONE });
+    assert.equal(existsSync(record), false, 'the archive record was finished and removed');
+  });
+});
+
+// ── a vault that is not a git repository ─────────────────────────────────────
+
+suite(
+  'hypo-session-start.mjs: a vault that is not a git repository moves its old files into baseline entries',
+);
+
+// A vault with no `.git` anywhere above it: project `p` (working dir `work`) with the old two files.
+// There is no root `hot.md`: one that the generator did not write is backed up, which is not what
+// these tests look at.
+function withGitlessVault(opts, fn) {
+  withTmpDir((root) => {
+    const dir = join(root, 'vault');
+    const work = join(root, 'work');
+    mkdirSync(work, { recursive: true });
+    const files = {
+      'hypo-config.md': '# config\n',
+      'projects/p/index.md': `---\ntitle: p\ntype: project-index\nupdated: 2026-09-01\nworking_dir: "${realpathSync(work)}"\n---\n# p\n`,
+      'projects/p/hot.md': SS_OLD_HOT,
+      'projects/p/session-state.md': SS_OLD_STATE,
+      ...opts.files,
+    };
+    for (const [rel, text] of Object.entries(files)) ssPut(dir, rel, text);
+    assert.equal(ssMigrationState(dir), 'migrated', 'precondition: no git, so nothing is tracked');
+    fn({ dir, work });
+  });
+}
+
+const ssBaselineFiles = (dir, slug = 'p') =>
+  readdirSync(join(dir, 'projects', slug, 'sessions'))
+    .filter((n) => /-baseline-[0-9a-f]{16}\.md$/.test(n))
+    .sort();
+const ssHasBackups = (dir) => existsSync(join(dir, '.cache', 'backups'));
+const ssGitlessSnapshot = (dir) =>
+  JSON.stringify(
+    [
+      ...ssBaselineFiles(dir).map((n) => [n, ssRead(dir, `projects/p/sessions/${n}`)]),
+      ...['hot.md', 'projects/p/hot.md', 'projects/p/session-state.md'].map((rel) => [
+        rel,
+        ssRead(dir, rel),
+      ]),
+      ['record', ssRead(dir, '.cache/generated-views.json')],
+    ],
+    null,
+    1,
+  );
+
+test('(n1) the first SessionStart moves the old files into two baseline entries, injects them and backs nothing up', () => {
+  withGitlessVault({}, ({ dir, work }) => {
+    const { ctx } = ssStart(dir, work);
+    const names = ssBaselineFiles(dir);
+    assert.equal(names.length, 2, `one baseline entry per old file: ${names}`);
+    const entries = names.map((n) => ssParse(ssRead(dir, `projects/p/sessions/${n}`)));
+    for (const e of entries) assert.equal(e.ok, true);
+    const hot = entries.find((e) => e.entry.summary !== '').entry;
+    const state = entries.find((e) => e.entry.summary === '').entry;
+    assert.equal(hot.summary, SS_OLD_HOT, 'the old hot.md, whole');
+    assert.equal(state.bodies.legacy, SS_OLD_STATE, 'the old session-state.md, whole');
+    assert.match(ctx, /old state body/, 'the old state body is injected as in a git vault');
+    assert.match(ctx, /old hot body/, 'and the old hot summary');
+    // views are the generator's output now, and nothing was set aside as foreign bytes
+    assert.match(ssRead(dir, 'projects/p/session-state.md'), /generated: sessions/);
+    assert.match(ssRead(dir, 'projects/p/session-state.md'), /old state body/);
+    assert.match(ssRead(dir, 'projects/p/hot.md'), /generated: sessions/);
+    assert.match(ssRead(dir, 'projects/p/hot.md'), /old hot body/);
+    assert.equal(ssHasBackups(dir), false, 'nothing was backed up as unowned bytes');
+    assert.doesNotMatch(ctx, /pre-projection-backup/);
+    const record = JSON.parse(ssRead(dir, '.cache/generated-views.json')).views;
+    assert.equal(
+      record['projects/p/hot.md'],
+      ssCreateHash('sha256').update(ssRead(dir, 'projects/p/hot.md'), 'utf-8').digest('hex'),
+    );
+    assert.match(ctx, /옮겼습니다/, 'the move is told in the injection');
+  });
+});
+
+test('(n2) a second SessionStart changes nothing: same entries, same views, same record', () => {
+  withGitlessVault({}, ({ dir, work }) => {
+    ssStart(dir, work);
+    const first = ssGitlessSnapshot(dir);
+    const { ctx } = ssStart(dir, work);
+    assert.equal(ssGitlessSnapshot(dir), first);
+    assert.equal(ssBaselineFiles(dir).length, 2);
+    assert.match(ctx, /old state body/, 'and the injection still carries the old state');
+    assert.equal(ssHasBackups(dir), false);
+  });
+});
+
+test('(n3) an edit to a generated view after the move is backed up, not made a third baseline', () => {
+  withGitlessVault({}, ({ dir, work }) => {
+    ssStart(dir, work);
+    ssPut(dir, 'projects/p/hot.md', 'typed over the view\n');
+    ssStart(dir, work);
+    assert.equal(ssBaselineFiles(dir).length, 2, 'no new baseline for a post-move edit');
+    assert.ok(ssHasBackups(dir), 'the foreign bytes were backed up');
+    assert.match(ssRead(dir, 'projects/p/hot.md'), /generated: sessions/);
+  });
+});
+
+test('(n4) each old file keeps its own scope: a machine-scoped state file hides only the state entry elsewhere', () => {
+  const scopedState = SS_OLD_STATE.replace(
+    'updated:',
+    'visibility_scope: machine:dev-elsewhere\nupdated:',
+  );
+  withGitlessVault({ files: { 'projects/p/session-state.md': scopedState } }, ({ dir, work }) => {
+    const { ctx } = ssStart(dir, work, { env: { HYPO_DEVICE: 'dev-t12' } });
+    assert.doesNotMatch(ctx, /old state body/, 'the scoped state stays off this machine');
+    assert.match(ctx, /old hot body/, 'the unscoped hot summary is still shown');
+    const scopes = ssBaselineFiles(dir).map(
+      (n) => ssParse(ssRead(dir, `projects/p/sessions/${n}`)).entry.visibilityScope,
+    );
+    assert.deepEqual(scopes.sort(), ['machine:dev-elsewhere', null].sort());
+    assert.doesNotMatch(ssRead(dir, 'projects/p/session-state.md'), /old state body/);
+  });
+});
+
+// The three tests below carry the contracts of the root-projection SessionStart tests that the
+// session-entries generator retired (a held lock, a failed write, a backed-up edit), in the shape
+// the generator has: no touched-paths claim, the notice rides the one health-notice file.
+test('(n5) a view edit that was backed up is named in systemMessage with its backup path and where the text should go', () => {
+  withGitlessVault({}, ({ dir, work }) => {
+    ssStart(dir, work);
+    ssPut(dir, 'projects/p/hot.md', 'typed over the view\n');
+    const { sys } = ssStart(dir, work);
+    assert.ok(ssHasBackups(dir), 'fixture: the edit was backed up');
+    assert.match(sys, /\.cache\/backups\//, `the backup path is named: ${sys}`);
+    assert.match(sys, /projects\/p\/hot\.md/, `the view it came from is named: ${sys}`);
+    assert.match(sys, /notes\.md/, `and so is where the text should go: ${sys}`);
+    assert.match(
+      ssRead(dir, 'projects/p/hot.md'),
+      /generated: sessions/,
+      'the view is regenerated',
+    );
+    assert.equal(ssStart(dir, work).sys, '', 'the notice is shown once');
+  });
+});
+
+test('(n6) a vault lock held by another session leaves the views as they were, says so in systemMessage, and the next start catches up', () => {
+  withGitlessVault({}, ({ dir, work }) => {
+    ssStart(dir, work);
+    const viewBefore = ssRead(dir, 'projects/p/session-state.md');
+    ssPutEntry(dir, 'p', {
+      date: '2026-10-07',
+      sessionId: 'other-session',
+      track: 'main',
+      title: 'Later work',
+      body: 'a body the held lock must not render yet',
+    });
+    const lockPath = `${vaultCommitLockTarget(dir)}.lock`;
+    mkdirSync(dirname(lockPath), { recursive: true });
+    writeFileSync(lockPath, String(process.pid));
+    try {
+      const { sys } = ssStart(dir, work, { env: { HYPO_VAULT_LOCK_TIMEOUT_MS: '200' } });
+      assert.match(sys, /이번에는 갱신하지 않았습니다/, `the skipped refresh is reported: ${sys}`);
+      assert.equal(ssRead(dir, 'projects/p/session-state.md'), viewBefore, 'view bytes unchanged');
+    } finally {
+      rmSync(lockPath, { force: true });
+    }
+    const { sys: later } = ssStart(dir, work);
+    assert.doesNotMatch(later, /이번에는 갱신하지 않았습니다/, 'the notice is shown once');
+    assert.match(
+      ssRead(dir, 'projects/p/session-state.md'),
+      /a body the held lock must not render yet/,
+      'with the lock free the same start renders the new entry',
+    );
+  });
+});
+
+test('(n7) a view that cannot be written is reported in systemMessage and the injection still goes out', () => {
+  withGitlessVault({}, ({ dir, work }) => {
+    ssStart(dir, work);
+    // EISDIR on read: a directory where the generated file should be
+    rmSync(join(dir, 'projects', 'p', 'hot.md'));
+    mkdirSync(join(dir, 'projects', 'p', 'hot.md'));
+    const { sys, ctx } = ssStart(dir, work);
+    assert.match(sys, /세션 현황 파일 갱신에 실패했습니다/, `the failure is reported: ${sys}`);
+    assert.match(ctx, /old state body/, 'the injection is built from the entries regardless');
+  });
+});
+
+// ── sync conflict resolution in pullRemote (view modify/delete, additive .gitignore) ────────────
+//
+// Two real clones of one bare origin. `a` and `b` start at the old state (the three generated views
+// tracked). A "migrated" commit is built by hand: views removed, the ignore block added, one
+// baseline entry per old file. The production code under test runs in this process, so the git identity and
+// config come from a throwaway global config that is set around each body and restored.
+import { createHash } from 'node:crypto';
+import {
+  pullRemote,
+  finishOwnedMerge,
+  clearGeneratedPathsBlockingPull,
+} from '../hooks/hypo-shared.mjs';
+import { buildLegacyBaselines } from '../hooks/session-entries.mjs';
+import { rollbackSessionEntries } from '../scripts/session-entries.mjs';
+
+const SYNC_CONFIG = () => {
+  const path = join(SESSION_TMP_HOME, 'gitconfig-sync-resolve');
+  writeFileSync(
+    path,
+    '[user]\n\tname = t\n\temail = t@example.com\n[init]\n\tdefaultBranch = main\n[commit]\n\tgpgsign = false\n',
+  );
+  return path;
+};
+
+function sgit(dir, args) {
+  return spawnSync('git', args, {
+    cwd: dir,
+    encoding: 'utf-8',
+    env: {
+      ...process.env,
+      HOME: SESSION_TMP_HOME,
+      GIT_CONFIG_GLOBAL: SYNC_CONFIG(),
+      GIT_CONFIG_NOSYSTEM: '1',
+    },
+  });
+}
+
+const sgitOk = (dir, args) => {
+  const r = sgit(dir, args);
+  assert.equal(r.status, 0, `git ${args.join(' ')}: ${r.stderr}`);
+  return r.stdout;
+};
+
+function inSyncEnv(fn) {
+  const saved = {
+    GIT_CONFIG_GLOBAL: process.env.GIT_CONFIG_GLOBAL,
+    GIT_CONFIG_NOSYSTEM: process.env.GIT_CONFIG_NOSYSTEM,
+  };
+  process.env.GIT_CONFIG_GLOBAL = SYNC_CONFIG();
+  process.env.GIT_CONFIG_NOSYSTEM = '1';
+  try {
+    return fn();
+  } finally {
+    for (const [k, v] of Object.entries(saved)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+  }
+}
+
+const SY_HOT = `---
+title: "hot: p"
+type: reference
+updated: 2026-09-20
+visibility_scope: machine:devA
+---
+old hot body
+`;
+const SY_STATE = `---
+type: session-state
+updated: 2026-09-25
+---
+## Next Up
+old state body
+`;
+const SY_W1 = SY_HOT.replace('old hot body', 'local edit one');
+const SY_W2 = SY_HOT.replace('old hot body', 'local edit two');
+const SY_VIEWS = ['hot.md', 'projects/p/hot.md', 'projects/p/session-state.md'];
+const SY_SEED = {
+  '.gitignore': '.cache/\nbase-1\nbase-2\n',
+  'hot.md': 'root hot\n',
+  'projects/p/index.md': '---\ntitle: p\n---\n',
+  'projects/p/hot.md': SY_HOT,
+  'projects/p/session-state.md': SY_STATE,
+  'pages/x.md': 'x\n',
+  'pages/y.md': 'y\n',
+};
+
+function syPut(dir, rel, text) {
+  mkdirSync(dirname(join(dir, rel)), { recursive: true });
+  writeFileSync(join(dir, rel), text);
+}
+const syRead = (dir, rel) => readFileSync(join(dir, rel), 'utf-8');
+// The merge records live in the git directory (a plain clone: `.git/`), never in the vault tree.
+const syOwnedPath = (dir) => join(dir, '.git', 'hypo-merge-owned.json');
+const syIntentPath = (dir) => join(dir, '.git', 'hypo-merge-intent.json');
+const syCommit = (dir, msg = 'x') => {
+  sgitOk(dir, ['add', '-A']);
+  sgitOk(dir, ['commit', '-q', '-m', msg]);
+};
+const syHead = (dir) => sgitOk(dir, ['rev-parse', 'HEAD']).trim();
+const syUnmerged = (dir) => sgitOk(dir, ['ls-files', '-u']).trim();
+const syMergeHead = (dir) => sgit(dir, ['rev-parse', '-q', '--verify', 'MERGE_HEAD']).status === 0;
+const syParents = (dir, rev) =>
+  sgitOk(dir, ['rev-list', '--parents', '-n1', rev]).trim().split(' ').length - 1;
+const syBaselines = (dir, rev = 'HEAD') =>
+  sgitOk(dir, ['ls-tree', '--name-only', '-r', rev, '--', 'projects/p/sessions/'])
+    .split('\n')
+    .filter((n) => /-baseline-[0-9a-f]{16}\.md$/.test(n));
+// The files an ordinary Stop commit would carry: what HEAD changed.
+const syChangedBy = (dir, rev = 'HEAD') =>
+  sgitOk(dir, ['show', '--name-only', '--format=', rev]).split('\n').filter(Boolean);
+const syBackupTexts = (dir, rel = 'projects/p/hot.md') => {
+  const names = (() => {
+    try {
+      return readdirSync(join(dir, '.cache', 'backups', dirname(rel)));
+    } catch {
+      return [];
+    }
+  })();
+  return names
+    .filter((n) => n.startsWith(`${basename(rel)}.pre-`))
+    .map((n) => readFileSync(join(dir, '.cache', 'backups', dirname(rel), n), 'utf-8'));
+};
+
+// Origin seeded with the old state, `a` and `b` cloned from it. `extra` seeds more files.
+function withSyncClones(fn, extra = {}) {
+  inSyncEnv(() =>
+    withTmpDir((root) => {
+      const origin = join(root, 'origin.git');
+      const a = join(root, 'a');
+      const b = join(root, 'b');
+      sgitOk(root, ['init', '-q', '--bare', origin]);
+      sgitOk(root, ['clone', '-q', origin, a]);
+      for (const [rel, text] of Object.entries({ ...SY_SEED, ...extra })) syPut(a, rel, text);
+      syCommit(a);
+      sgitOk(a, ['push', '-q', '-u', 'origin', 'main']);
+      sgitOk(root, ['clone', '-q', origin, b]);
+      fn({ a, b, root, origin });
+    }),
+  );
+}
+
+// What a migration commit does to a clone: the three views leave the tree, the block is added, and
+// one baseline entry per old file is built from `hot` and `state`. Committed, not pushed.
+function syMigrate(dir, hot = SY_HOT, state = SY_STATE) {
+  sgitOk(dir, ['rm', '-q', ...SY_VIEWS]);
+  syPut(dir, '.gitignore', `${syRead(dir, '.gitignore')}${GITIGNORE_BLOCK}`);
+  // One entry per old file (hot first); the project scope narrows both to this machine.
+  for (const baseline of buildLegacyBaselines({
+    hotText: hot,
+    stateText: state,
+    date: '2026-09-25',
+    project: 'p',
+    scopes: { index: 'machine:devA', hot: null, state: null },
+    legacyDone: false,
+  })) {
+    syPut(dir, `projects/p/sessions/${baseline.fileName}`, baseline.text);
+  }
+  syCommit(dir, 'migrate');
+}
+
+const syEditAndPush = (dir, rel, text) => {
+  syPut(dir, rel, text);
+  syCommit(dir, `edit ${rel}`);
+  sgitOk(dir, ['push', '-q']);
+};
+
+// `a` is the old-version machine that edited `projects/p/hot.md` and pushed first; `b` migrated
+// locally (not pushed) and is the one that syncs.
+function withIncomingEdit(fn, { hot = SY_HOT } = {}) {
+  withSyncClones(({ a, b, ...rest }) => {
+    syEditAndPush(a, 'projects/p/hot.md', SY_W1);
+    syMigrate(b, hot);
+    fn({ a, b, ...rest });
+  });
+}
+
+// `a` migrated and pushed first; `b` is the old-version machine whose unpushed commit edited the view.
+function withOurEdit(fn, { hot = SY_HOT } = {}) {
+  withSyncClones(({ a, b, ...rest }) => {
+    syMigrate(a, hot);
+    sgitOk(a, ['push', '-q']);
+    syPut(b, 'projects/p/hot.md', SY_W1);
+    syCommit(b, 'edit view');
+    sgitOk(b, ['fetch', '-q']); // so `@{u}` names the migrated tree
+    fn({ a, b, ...rest });
+  });
+}
+
+suite('sync conflict resolution: view modify/delete');
+
+test('modify/delete, incoming side modified: the pull lands, the incoming bytes are backed up, untracked and shared as one baseline', () => {
+  withIncomingEdit(({ b }) => {
+    const before = syBaselines(b).length;
+    assert.equal(before, 2, 'the local migration baselines, one per old file');
+    const res = pullRemote(b);
+    assert.equal(res.pulled, true, JSON.stringify(res));
+    assert.equal(res.conflict, false);
+    assert.equal(syUnmerged(b), '');
+    assert.equal(syMergeHead(b), false);
+    assert.deepEqual(syBackupTexts(b), [SY_W1], 'the incoming content is the backup');
+    assert.equal(sgitOk(b, ['ls-files', '--', 'projects/p/hot.md']).trim(), '', 'untracked');
+    assert.equal(syParents(b, 'HEAD~1'), 2, 'HEAD~1 is the merge commit');
+    const added = syChangedBy(b).filter((n) => /-baseline-/.test(n));
+    assert.equal(
+      added.length,
+      1,
+      `one additional baseline in the commit after the merge: ${added}`,
+    );
+    assert.match(syRead(b, added[0]), /local edit one/);
+    assert.equal(syBaselines(b).length, before + 1);
+    assert.equal(existsSync(syOwnedPath(b)), false);
+    assert.equal(existsSync(join(b, '.cache', 'pull-archive.json')), false);
+  });
+});
+
+test('modify/delete, our side modified: the same result, with our bytes in the backup', () => {
+  withOurEdit(({ b }) => {
+    const before = syBaselines(b, '@{u}').length;
+    assert.equal(before, 2, 'the migration baselines, one per old file');
+    const res = pullRemote(b);
+    assert.equal(res.pulled, true, JSON.stringify(res));
+    assert.equal(syUnmerged(b), '');
+    assert.equal(syMergeHead(b), false);
+    assert.deepEqual(syBackupTexts(b), [SY_W1], 'our content is the backup');
+    assert.equal(sgitOk(b, ['ls-files', '--', 'projects/p/hot.md']).trim(), '', 'untracked');
+    const added = syChangedBy(b).filter((n) => /-baseline-/.test(n));
+    assert.equal(added.length, 1, `one additional baseline: ${added}`);
+    assert.match(syRead(b, added[0]), /local edit one/);
+    assert.equal(syBaselines(b).length, before + 1);
+  });
+});
+
+test('modify/delete, bytes equal to the remote baseline body: no new original, incoming side', () => {
+  withIncomingEdit(
+    ({ b }) => {
+      const before = syBaselines(b).length;
+      const res = pullRemote(b);
+      assert.equal(res.pulled, true, JSON.stringify(res));
+      assert.equal(syUnmerged(b), '');
+      assert.deepEqual(syBackupTexts(b), [SY_W1], 'the backup is made either way');
+      assert.equal(syBaselines(b).length, before, 'no additional baseline');
+      assert.equal(syParents(b, 'HEAD'), 2, 'HEAD is the merge commit, no commit after it');
+    },
+    { hot: SY_W1 },
+  );
+});
+
+test('modify/delete, bytes equal to the remote baseline body: no new original, our side', () => {
+  withOurEdit(
+    ({ b }) => {
+      const before = syBaselines(b, '@{u}').length;
+      const res = pullRemote(b);
+      assert.equal(res.pulled, true, JSON.stringify(res));
+      assert.equal(syUnmerged(b), '');
+      assert.deepEqual(syBackupTexts(b), [SY_W1]);
+      assert.equal(syBaselines(b).length, before, 'no additional baseline');
+      assert.equal(syParents(b, 'HEAD'), 2);
+    },
+    { hot: SY_W1 },
+  );
+});
+
+test('modify/delete on pages/x.md is not a view path: the merge is aborted and conflict is reported', () => {
+  withSyncClones(({ a, b }) => {
+    syEditAndPush(a, 'pages/x.md', 'x edited upstream\n');
+    sgitOk(b, ['rm', '-q', 'pages/x.md']);
+    syCommit(b, 'delete x');
+    const head = syHead(b);
+    const res = pullRemote(b);
+    assert.equal(res.pulled, false);
+    assert.equal(res.conflict, true, JSON.stringify(res));
+    assert.equal(syMergeHead(b), false, 'aborted');
+    assert.equal(syUnmerged(b), '');
+    assert.equal(syHead(b), head);
+    assert.equal(existsSync(syOwnedPath(b)), false);
+  });
+});
+
+test('modify/delete interrupted after the index change: the next pullRemote finishes the merge it owns', () => {
+  withIncomingEdit(({ b }) => {
+    const first = pullRemote(b, {
+      testHooks: {
+        afterResolveBeforeCommit: () => {
+          throw new Error('killed');
+        },
       },
     });
-    assert.equal(hookCalls, 1, 'the test hook must fire exactly once per write');
-    assert.equal(
-      result.backedUp,
-      false,
-      'ownership already matched current content going in, so the second read must not invent a backup',
-    );
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
+    assert.equal(first.pulled, false);
+    assert.equal(syMergeHead(b), true, 'the merge is left open');
+    assert.equal(existsSync(syOwnedPath(b)), true);
+    const second = pullRemote(b);
+    assert.equal(second.pulled, true, JSON.stringify(second));
+    assert.equal(syMergeHead(b), false);
+    assert.equal(syParents(b, 'HEAD~1'), 2, 'the merge commit');
+    assert.equal(syUnmerged(b), '');
+    assert.deepEqual(syBackupTexts(b), [SY_W1]);
+    assert.equal(syChangedBy(b).filter((n) => /-baseline-/.test(n)).length, 1);
+    assert.equal(existsSync(syOwnedPath(b)), false);
+  });
 });
 
-// ── BLOCKER fix: the projection writer runs inside the vault commit lock ──
-//
-// The writer used to take no lock at all, so a sibling session could replace
-// root hot.md between hypo-auto-commit.mjs's ownership/receipt check and the
-// `git add` right after it, inside the auto-commit's own lock hold: the
-// sibling's bytes went into this session's commit and the record that would
-// have flagged them was gone. Holding the SAME lock the commit fence holds is
-// what makes that check mean anything. What this suite can pin without two
-// real processes is the fence itself: with the lock held, the writer declines
-// to touch the file at all.
-//
-// Deliberately no `suite()` of its own: these belong to the root hot.md
-// projection suite opened above, and splitting it here would move every test
-// below into a new selection unit for no gain.
-
-test('BLOCKER: a held vault lock makes the projection decline to write, and say so', () => {
-  const dir = projectionWikiDir();
-  const prevTimeout = process.env.HYPO_VAULT_LOCK_TIMEOUT_MS;
-  process.env.HYPO_VAULT_LOCK_TIMEOUT_MS = '200'; // fail fast instead of the 5s default
-  try {
-    writeProjectHotFixture(dir, 'alpha', { updated: '2026-01-01' });
-    const hotPath = join(dir, 'hot.md');
-    const sentinel = '# whoever holds the lock owns this file right now\n';
-    writeFileSync(hotPath, sentinel);
-    // Take the lock the way withFileLock itself publishes one: the file's
-    // content is the holder's pid, and ours is alive, so the acquire below
-    // polls and times out rather than stealing it.
-    const lockPath = `${vaultCommitLockTarget(dir)}.lock`;
-    mkdirSync(dirname(lockPath), { recursive: true });
-    writeFileSync(lockPath, String(process.pid));
-
-    const result = writeRootHotProjection(dir, undefined, 'sess-locked-out');
-
-    assert.equal(result.lockTimeout, true, `expected a lock refusal: ${JSON.stringify(result)}`);
-    assert.equal(result.written, false);
-    assert.equal(
-      readFileSync(hotPath, 'utf-8'),
-      sentinel,
-      'the writer must not replace bytes it could not take the lock for',
-    );
-    assert.equal(
-      existsSync(join(dir, `hot.md${ROOT_HOT_BACKUP_SUFFIX}`)),
-      false,
-      'no backup either: the writer never ran, so it had nothing to back up',
-    );
+test('modify/delete: a merge a person opened is left alone (no record, or a record naming another MERGE_HEAD)', () => {
+  withSyncClones(({ a, b }) => {
+    syEditAndPush(a, 'pages/y.md', 'y upstream\n');
+    syPut(b, 'pages/x.md', 'x local\n');
+    syCommit(b, 'local');
+    sgitOk(b, ['fetch', '-q']);
+    sgitOk(b, ['merge', '--no-commit', '--no-ff', '@{u}']);
+    assert.equal(syMergeHead(b), true);
+    const mergeHead = sgitOk(b, ['rev-parse', 'MERGE_HEAD']).trim();
+    const index = sgitOk(b, ['ls-files', '-s']);
+    const y = syRead(b, 'pages/y.md');
+    const noRecord = pullRemote(b);
+    assert.equal(noRecord.pulled, false);
+    assert.equal(noRecord.deferred, 'external', JSON.stringify(noRecord));
     assert.ok(
-      result.warnings.some((w) => w.includes('잠금')),
-      `the refusal must be visible to a caller: ${JSON.stringify(result.warnings)}`,
+      noRecord.notices.some((n) => n.includes('진행 중인 merge가 있어')),
+      String(noRecord.notices),
     );
-  } finally {
-    if (prevTimeout === undefined) delete process.env.HYPO_VAULT_LOCK_TIMEOUT_MS;
-    else process.env.HYPO_VAULT_LOCK_TIMEOUT_MS = prevTimeout;
-    rmSync(dir, { recursive: true, force: true });
-  }
-});
-
-test('the lock is released again: a second write right after a normal one still lands', () => {
-  const dir = projectionWikiDir();
-  try {
-    writeProjectHotFixture(dir, 'alpha', { updated: '2026-01-01' });
-    const first = writeRootHotProjection(dir, undefined, 'sess-a');
-    assert.equal(first.written, true, JSON.stringify(first));
-    // A writer that leaked its lock would make this one time out instead, so
-    // this is the other half of the pin above: the fence must not be a
-    // one-shot that wedges every later session.
-    writeProjectHotFixture(dir, 'beta', { updated: '2026-01-02' });
-    const second = writeRootHotProjection(dir, undefined, 'sess-b');
-    assert.equal(second.lockTimeout, false, JSON.stringify(second));
-    assert.equal(second.written, true, JSON.stringify(second));
-    assert.match(readFileSync(join(dir, 'hot.md'), 'utf-8'), /beta/);
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
-});
-
-// ── minor fix: a failing retry stops stacking identical backups ───────────
-
-test('minor: a repeated backup of the SAME manual content reuses the first backup instead of numbering a new one', () => {
-  const dir = projectionWikiDir();
-  try {
-    writeProjectHotFixture(dir, 'alpha', { updated: '2026-01-01' });
-    const manual = '# hand-written, and the write after the backup keeps failing\n';
-    writeFileSync(join(dir, 'hot.md'), manual);
-    const first = writeRootHotProjection(dir);
-    assert.equal(first.backedUp, true, JSON.stringify(first));
-    // Put the same manual bytes back, exactly as a failed write would leave
-    // them, and let the next run see a non-owned file again.
-    writeFileSync(join(dir, 'hot.md'), manual);
-    const second = writeRootHotProjection(dir);
-    assert.equal(second.backedUp, true, 'the content is still protected');
-    assert.equal(
-      second.backupPath,
-      first.backupPath,
-      'identical content must land in the backup that already holds it, not a numbered copy',
-    );
-    assert.equal(
-      existsSync(join(dir, 'hot.md.pre-projection-backup-2.md')),
-      false,
-      'no second copy of bytes already backed up',
-    );
-    // A DIFFERENT manual edit still gets its own place to land: dedup must not
-    // become "one backup forever".
-    writeFileSync(join(dir, 'hot.md'), '# a different hand edit\n');
-    const third = writeRootHotProjection(dir);
-    assert.equal(third.backedUp, true);
-    assert.notEqual(third.backupPath, first.backupPath);
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
-});
-
-// ── minor fix (r5-w1.md): the backup's own temp file is gitignored too ────
-
-test("minor: the pre-projection backup .gitignore pattern also covers atomicWrite's own temp file for that backup", () => {
-  const dir = projectionWikiDir();
-  try {
-    writeProjectHotFixture(dir, 'alpha', { updated: '2026-09-10' });
+    assert.equal(sgitOk(b, ['rev-parse', 'MERGE_HEAD']).trim(), mergeHead);
+    assert.equal(sgitOk(b, ['ls-files', '-s']), index);
+    assert.equal(syRead(b, 'pages/y.md'), y);
+    // A record that names some other merge: with the same digest and nothing to verify, only the
+    // MERGE_HEAD comparison stands between this merge and a commit.
+    const digest = createHash('sha256').update(index, 'utf-8').digest('hex');
     writeFileSync(
-      join(dir, 'hot.md'),
-      '# hand-authored, must never leak via a crash-mid-backup temp\n',
+      syOwnedPath(b),
+      JSON.stringify({ v: 1, mergeHead: 'f'.repeat(40), indexDigest: digest, resolvedPaths: [] }),
     );
-    const result = writeRootHotProjection(dir);
-    assert.equal(result.backedUp, true);
-    const gitignore = readFileSync(join(dir, '.gitignore'), 'utf-8');
+    const otherRecord = pullRemote(b);
+    assert.equal(otherRecord.pulled, false);
+    assert.equal(otherRecord.deferred, 'external', JSON.stringify(otherRecord));
+    assert.equal(sgitOk(b, ['rev-parse', 'MERGE_HEAD']).trim(), mergeHead);
+    assert.equal(sgitOk(b, ['ls-files', '-s']), index);
+  });
+});
+
+test('modify/delete interrupted, then the recorded backup is deleted: the merge is not finished', () => {
+  withIncomingEdit(({ b }) => {
+    pullRemote(b, {
+      testHooks: {
+        afterResolveBeforeCommit: () => {
+          throw new Error('killed');
+        },
+      },
+    });
+    const head = syHead(b);
+    const owned = JSON.parse(readFileSync(syOwnedPath(b), 'utf-8'));
+    const [{ backupPath }] = owned.resolvedPaths.filter((r) => r.kind === 'modify-delete');
+    rmSync(backupPath, { force: true });
+    const res = pullRemote(b);
+    assert.equal(res.pulled, false);
+    assert.equal(res.deferred, 'stuck', JSON.stringify(res));
     assert.ok(
-      gitignore.includes('/hot.md.pre-projection-backup*.tmp'),
-      `expected the backup TEMP pattern in .gitignore, got: ${gitignore}`,
+      res.notices.some((n) => n.includes('백업')),
+      String(res.notices),
     );
-    // Prove the pattern actually matches the real temp name atomicWrite
-    // leaves behind on a crash, not just that some string got appended.
-    spawnSync('git', ['init', '-q'], { cwd: dir });
-    const tempName = `hot.md${ROOT_HOT_BACKUP_SUFFIX}.${process.pid}.abc123xy.tmp`;
-    writeFileSync(join(dir, tempName), 'leftover from a crashed backup write\n');
-    const check = spawnSync('git', ['-C', dir, 'check-ignore', '-q', tempName]);
-    assert.equal(check.status, 0, `git must recognize ${tempName} as ignored by the new pattern`);
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
+    assert.equal(syMergeHead(b), true);
+    assert.equal(syHead(b), head, 'no merge commit was made');
+  });
 });
 
-// ── rootHotProjectionIsCurrent: the commit-time half of the BLOCKER fix ───
-
-test('rootHotProjectionIsCurrent: true when there is no root hot.md at all', () => {
-  const dir = projectionWikiDir();
-  try {
-    assert.equal(rootHotProjectionIsCurrent(dir), true);
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
+test('modify/delete interrupted, then another path is staged: the merge is not finished until that stage is gone', () => {
+  withIncomingEdit(({ b }) => {
+    pullRemote(b, {
+      testHooks: {
+        afterResolveBeforeCommit: () => {
+          throw new Error('killed');
+        },
+      },
+    });
+    const head = syHead(b);
+    syPut(b, 'pages/y.md', 'y staged by another session\n');
+    sgitOk(b, ['add', 'pages/y.md']);
+    const res = pullRemote(b);
+    assert.equal(res.pulled, false);
+    assert.equal(res.deferred, 'stuck', JSON.stringify(res));
+    assert.ok(
+      res.notices.some((n) => n.includes('스테이징된 변경')),
+      String(res.notices),
+    );
+    assert.equal(syMergeHead(b), true, 'MERGE_HEAD stays');
+    assert.equal(syHead(b), head);
+    assert.ok(sgitOk(b, ['diff', '--cached', '--name-only']).includes('pages/y.md'));
+    // The pair: with the stage gone the same re-entry finishes the merge.
+    sgitOk(b, ['reset', '-q', 'pages/y.md']);
+    const again = pullRemote(b);
+    assert.equal(again.pulled, true, JSON.stringify(again));
+    assert.equal(syMergeHead(b), false);
+    assert.equal(syParents(b, 'HEAD~1'), 2);
+    assert.ok(!syChangedBy(b, 'HEAD~1').includes('pages/y.md'));
+  });
 });
 
-test('rootHotProjectionIsCurrent: true right after a legitimate write, false after an external edit', () => {
-  const dir = projectionWikiDir();
-  try {
-    writeProjectHotFixture(dir, 'alpha', { updated: '2026-09-10' });
-    // n1 fix: sessionId now flows through both sides: the write records
-    // THIS session's receipt, and the check reads that same session's receipt.
-    writeRootHotProjection(dir, undefined, 'sess-legit');
-    assert.equal(rootHotProjectionIsCurrent(dir, 'sess-legit'), true);
-    writeFileSync(join(dir, 'hot.md'), '# someone edited this directly\n');
-    assert.equal(rootHotProjectionIsCurrent(dir, 'sess-legit'), false);
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
+test('modify/delete: finishOwnedMerge on a vault with no merge open is a no-op and drops a stale record', () => {
+  withSyncClones(({ b }) => {
+    assert.deepEqual(finishOwnedMerge(b), { state: 'none', notices: [] });
+    writeFileSync(
+      syOwnedPath(b),
+      JSON.stringify({ v: 1, mergeHead: 'a'.repeat(40), indexDigest: null, resolvedPaths: [] }),
+    );
+    assert.equal(finishOwnedMerge(b).state, 'none');
+    assert.equal(existsSync(syOwnedPath(b)), false);
+  });
 });
 
-// n1 fix (3rd-round codex review): the global ownership hash used to be the
-// ONLY thing this function checked, so any session's write satisfied it --
-// including a SIBLING session's, never this one's own. Each session's own
-// receipt now has to independently agree with what is on disk.
-test("n1: rootHotProjectionIsCurrent is false for session A once session B's write replaces the bytes A itself wrote", () => {
-  const dir = projectionWikiDir();
-  try {
-    writeProjectHotFixture(dir, 'alpha', { updated: '2026-01-01' });
-    writeRootHotProjection(dir, undefined, 'sess-a');
-    writeProjectHotFixture(dir, 'beta', { updated: '2026-02-02' }); // forces B's write to differ
-    writeRootHotProjection(dir, undefined, 'sess-b');
+// ── realistic sizes: the baseline entry holds the views' bytes, so rename detection can pair them ──
+
+const syLines = (n, tag) =>
+  Array.from({ length: n }, (_, i) => `- item ${i} ${tag} lorem ipsum dolor sit amet`).join('\n');
+// About 3KB: more than half of the baseline entry (frontmatter + the small other view + this).
+const SY_BIG_STATE = `---
+type: session-state
+updated: 2026-09-25
+---
+## Next Up
+${syLines(40, 'old')}
+## Notes
+${syLines(10, 'note')}
+`;
+const SY_BIG_HOT = SY_HOT.replace('old hot body\n', `## Now\n${syLines(50, 'old')}\n`);
+const SY_STATE_PATH = 'projects/p/session-state.md';
+const SY_HOT_PATH = 'projects/p/hot.md';
+// `larger` names the view that holds most of the baseline's bytes; the other one stays small.
+const SY_REALISTIC = {
+  state: {
+    path: SY_STATE_PATH,
+    text: SY_BIG_STATE,
+    hot: SY_HOT,
+    state: SY_BIG_STATE,
+    marker: 'type: session-state',
+  },
+  hot: {
+    path: SY_HOT_PATH,
+    text: SY_BIG_HOT,
+    hot: SY_BIG_HOT,
+    state: SY_STATE,
+    marker: 'type: reference',
+  },
+};
+const SY_EDIT_SHAPES = [
+  ['mid-line edit', (t) => t.replace('- item 3 old', '- item 3 CHANGED by the old machine')],
+  ['tail append', (t) => `${t}- appended by the old machine\n`],
+];
+
+// `direction` 'incoming': `a` (old version) edited the view and pushed, `b` migrated locally.
+// 'ours': `a` migrated and pushed, `b` holds the unpushed edit. `fn` gets the baseline path, its
+// blob before the sync, and the edited bytes.
+function withRealisticSizes(larger, direction, edit, fn) {
+  const fx = SY_REALISTIC[larger];
+  withSyncClones(
+    ({ a, b }) => {
+      const edited = edit(fx.text);
+      let rev = 'HEAD';
+      if (direction === 'incoming') {
+        syEditAndPush(a, fx.path, edited);
+        syMigrate(b, fx.hot, fx.state);
+      } else {
+        syMigrate(a, fx.hot, fx.state);
+        sgitOk(a, ['push', '-q']);
+        syPut(b, fx.path, edited);
+        syCommit(b, 'edit view');
+        sgitOk(b, ['fetch', '-q']);
+        rev = '@{u}';
+      }
+      // Each old file is its own baseline entry: take the one that holds the larger view.
+      const holding = syBaselines(b, rev).filter((n) =>
+        sgitOk(b, ['show', `${rev}:${n}`]).includes(fx.marker),
+      );
+      assert.equal(holding.length, 1, `one baseline holds the ${larger} view: ${holding}`);
+      const baseline = holding[0];
+      const blob = sgitOk(b, ['rev-parse', `${rev}:${baseline}`]).trim();
+      assert.ok(
+        Buffer.byteLength(fx.text) * 2 > Buffer.byteLength(sgitOk(b, ['cat-file', '-p', blob])),
+        `the ${larger} view is at least half of the baseline, so a rename can pair them`,
+      );
+      fn({ b, baseline, blob, edited, path: fx.path });
+    },
+    { [fx.path]: fx.text },
+  );
+}
+
+for (const larger of ['state', 'hot']) {
+  for (const direction of ['incoming', 'ours']) {
+    for (const [shape, edit] of SY_EDIT_SHAPES) {
+      test(`modify/delete at realistic sizes, ${larger} larger, ${direction} side, ${shape}: the view conflict is settled and the shared baseline entry is untouched`, () => {
+        withRealisticSizes(larger, direction, edit, ({ b, baseline, blob, edited, path }) => {
+          const res = pullRemote(b);
+          assert.equal(res.pulled, true, JSON.stringify(res));
+          assert.equal(res.conflict, false, JSON.stringify(res));
+          assert.equal(syUnmerged(b), '');
+          assert.equal(syMergeHead(b), false);
+          assert.equal(
+            sgitOk(b, ['rev-parse', `HEAD:${baseline}`]).trim(),
+            blob,
+            'the content-named baseline entry is the blob the migration made',
+          );
+          assert.deepEqual(syBackupTexts(b, path), [edited], 'the backup holds the edit');
+          assert.equal(sgitOk(b, ['ls-files', '--', path]).trim(), '', 'untracked');
+          assert.equal(existsSync(syIntentPath(b)), false);
+          assert.equal(existsSync(syOwnedPath(b)), false);
+        });
+      });
+    }
+  }
+}
+
+test('merge intent: a kill right after the merge left MERGE_HEAD, before any record, is taken back by the next pullRemote, which completes the sync', () => {
+  withIncomingEdit(({ b }) => {
+    const first = pullRemote(b, {
+      testHooks: {
+        afterMergeStarted: () => {
+          throw new Error('killed');
+        },
+      },
+    });
+    assert.equal(first.pulled, false);
+    assert.equal(syMergeHead(b), true, 'the merge is left open');
+    assert.equal(existsSync(syIntentPath(b)), true, 'the intent is kept');
+    assert.equal(existsSync(syOwnedPath(b)), false, 'no resolution record');
+    const second = pullRemote(b);
+    assert.equal(second.pulled, true, JSON.stringify(second));
+    assert.ok(
+      second.notices.some((n) => n.includes('끊긴 동기화가 남긴 merge')),
+      String(second.notices),
+    );
+    assert.equal(syMergeHead(b), false);
+    assert.equal(syUnmerged(b), '');
+    assert.equal(syParents(b, 'HEAD~1'), 2, 'the merge commit');
+    assert.deepEqual(syBackupTexts(b), [SY_W1]);
+    assert.equal(existsSync(syIntentPath(b)), false);
+  });
+});
+
+test('merge intent: a merge a person opened stays alone when an intent names another target or another HEAD', () => {
+  withSyncClones(({ a, b }) => {
+    syEditAndPush(a, 'pages/y.md', 'y upstream\n');
+    syPut(b, 'pages/x.md', 'x local\n');
+    syCommit(b, 'local');
+    sgitOk(b, ['fetch', '-q']);
+    sgitOk(b, ['merge', '--no-commit', '--no-ff', '@{u}']);
+    const mergeHead = sgitOk(b, ['rev-parse', 'MERGE_HEAD']).trim();
+    const head = syHead(b);
+    const index = sgitOk(b, ['ls-files', '-s']);
+    const intents = [
+      ['another target', { v: 1, phase: 'pull', head, target: 'f'.repeat(40) }],
+      ['another HEAD', { v: 1, phase: 'pull', head: 'e'.repeat(40), target: mergeHead }],
+    ];
+    for (const [label, intent] of intents) {
+      writeFileSync(syIntentPath(b), JSON.stringify(intent));
+      const res = pullRemote(b);
+      assert.equal(res.pulled, false, label);
+      assert.equal(res.deferred, 'external', `${label}: ${JSON.stringify(res)}`);
+      assert.equal(sgitOk(b, ['rev-parse', 'MERGE_HEAD']).trim(), mergeHead, label);
+      assert.equal(sgitOk(b, ['ls-files', '-s']), index, label);
+    }
+  });
+});
+
+// The fingerprint `pullRemote` records when the merge command returns with a merge open.
+const syFingerprint = (dir, unmerged = []) => ({
+  index: createHash('sha256')
+    .update(sgitOk(dir, ['ls-files', '-s']), 'utf-8')
+    .digest('hex'),
+  files: Object.fromEntries(
+    unmerged.map((rel) => [
+      rel,
+      createHash('sha256')
+        .update(readFileSync(join(dir, rel)))
+        .digest('hex'),
+    ]),
+  ),
+});
+
+test('merge intent: the pair of the kill test, the intent and a matching fingerprint are what make the open merge ours', () => {
+  withSyncClones(({ a, b }) => {
+    syEditAndPush(a, 'pages/y.md', 'y upstream\n');
+    syPut(b, 'pages/x.md', 'x local\n');
+    syCommit(b, 'local');
+    sgitOk(b, ['fetch', '-q']);
+    const head = syHead(b);
+    const target = sgitOk(b, ['rev-parse', '@{u}']).trim();
+    sgitOk(b, ['merge', '--no-commit', '--no-ff', '@{u}']);
+    const intent = { v: 1, phase: 'pull', head, target };
+    // The intent alone only names the merge: nothing says nobody touched it since, so it stays.
+    writeFileSync(syIntentPath(b), JSON.stringify(intent));
+    const bare = pullRemote(b);
+    assert.equal(bare.pulled, false);
+    assert.equal(bare.deferred, 'external', JSON.stringify(bare));
+    assert.ok(
+      bare.notices.some((n) => n.includes('상태 기록이 없어')),
+      String(bare.notices),
+    );
+    assert.equal(syMergeHead(b), true, 'the merge stays for a person');
+    writeFileSync(syIntentPath(b), JSON.stringify({ ...intent, fingerprint: syFingerprint(b) }));
+    const res = pullRemote(b);
+    assert.equal(res.pulled, true, JSON.stringify(res));
+    assert.equal(syMergeHead(b), false);
+    assert.equal(syRead(b, 'pages/y.md'), 'y upstream\n');
+    assert.equal(syRead(b, 'pages/x.md'), 'x local\n');
+  });
+});
+
+// `a` and `b` both edit pages/x.md: a content conflict Hypomnema cannot settle itself.
+function withContentConflict(fn, extra = {}) {
+  withSyncClones(({ a, b, ...rest }) => {
+    syEditAndPush(a, 'pages/x.md', 'x upstream\n');
+    syPut(b, 'pages/x.md', 'x local\n');
+    syCommit(b, 'local x');
+    fn({ a, b, ...rest });
+  }, extra);
+}
+
+const killAfterMerge = {
+  afterMergeStarted: () => {
+    throw new Error('killed');
+  },
+};
+
+for (const [how, touch] of [
+  [
+    'staged',
+    (b) => {
+      syPut(b, 'pages/x.md', 'human resolved\n');
+      sgitOk(b, ['add', 'pages/x.md']);
+    },
+  ],
+  ['edited in the working tree, not staged', (b) => syPut(b, 'pages/x.md', 'human resolved\n')],
+]) {
+  test(`merge intent: a resolution a person ${how} after the interruption is left alone`, () => {
+    withContentConflict(({ b }) => {
+      const first = pullRemote(b, { testHooks: killAfterMerge });
+      assert.equal(first.pulled, false);
+      assert.equal(syMergeHead(b), true, 'the merge is left open');
+      assert.ok(JSON.parse(readFileSync(syIntentPath(b), 'utf-8')).fingerprint, 'fingerprint kept');
+      touch(b);
+      const index = sgitOk(b, ['ls-files', '-s']);
+      const mergeHead = sgitOk(b, ['rev-parse', 'MERGE_HEAD']).trim();
+      const second = pullRemote(b);
+      assert.equal(second.pulled, false);
+      assert.equal(second.deferred, 'external', JSON.stringify(second));
+      assert.ok(
+        second.notices.some((n) => n.includes('사람이 해소한 내용')),
+        String(second.notices),
+      );
+      assert.equal(syMergeHead(b), true, 'the merge is still open');
+      assert.equal(sgitOk(b, ['rev-parse', 'MERGE_HEAD']).trim(), mergeHead);
+      assert.equal(syRead(b, 'pages/x.md'), 'human resolved\n', 'the resolution bytes stay');
+      assert.equal(sgitOk(b, ['ls-files', '-s']), index, 'the index is unchanged');
+    });
+  });
+}
+
+test('merge intent: the pair of the staged resolution, an untouched interrupted conflict is taken back and retried', () => {
+  withContentConflict(({ b }) => {
+    pullRemote(b, { testHooks: killAfterMerge });
+    assert.equal(syMergeHead(b), true);
+    const second = pullRemote(b);
+    assert.ok(
+      second.notices.some((n) => n.includes('끊긴 동기화가 남긴 merge를 취소')),
+      String(second.notices),
+    );
+    // The retry hits the same content conflict and aborts it in the same run, as any conflict.
+    assert.equal(second.conflict, true, JSON.stringify(second));
+    assert.equal(second.deferred, undefined);
+    assert.equal(syMergeHead(b), false);
+    assert.equal(syRead(b, 'pages/x.md'), 'x local\n');
+  });
+});
+
+test('merge intent: a vault whose .gitignore leaves .cache/ out still recovers an interrupted conflict', () => {
+  withContentConflict(
+    ({ b }) => {
+      pullRemote(b, { testHooks: killAfterMerge });
+      assert.equal(syMergeHead(b), true, 'the merge is left open');
+      assert.equal(existsSync(syIntentPath(b)), true, 'the intent is in the git directory');
+      assert.equal(existsSync(join(b, '.cache', 'merge-intent.json')), false);
+      const second = pullRemote(b);
+      assert.notEqual(second.deferred, 'external', JSON.stringify(second));
+      assert.ok(
+        second.notices.some((n) => n.includes('끊긴 동기화가 남긴 merge를 취소')),
+        String(second.notices),
+      );
+      assert.equal(syMergeHead(b), false, 'the interrupted merge was taken back');
+      assert.equal(
+        sgitOk(b, ['status', '--porcelain', '--', 'pages']).trim(),
+        '',
+        'pages are clean',
+      );
+    },
+    { '.gitignore': 'base-1\nbase-2\n' },
+  );
+});
+
+test('merge intent: a linked worktree keeps its records in its own git directory and recovers from them', () => {
+  withContentConflict(({ b, root }) => {
+    const wt = join(root, 'linked');
+    sgitOk(b, ['worktree', 'add', '-q', '--track', '-b', 'linked', wt, 'origin/main']);
+    syPut(wt, 'pages/x.md', 'x linked\n');
+    syCommit(wt, 'linked x');
+    pullRemote(wt, { testHooks: killAfterMerge });
+    assert.equal(syMergeHead(wt), true, 'the merge is left open in the linked worktree');
+    const own = join(
+      sgitOk(wt, ['rev-parse', '--absolute-git-dir']).trim(),
+      'hypo-merge-intent.json',
+    );
+    assert.ok(own.includes(join('.git', 'worktrees')), own);
+    assert.equal(existsSync(own), true, 'the intent is under the worktree git directory');
     assert.equal(
-      rootHotProjectionIsCurrent(dir, 'sess-a'),
+      existsSync(join(b, '.git', 'hypo-merge-intent.json')),
       false,
-      "A's own receipt still points at A's earlier digest, not B's bytes now on disk",
+      'not the shared one',
     );
-    assert.equal(
-      rootHotProjectionIsCurrent(dir, 'sess-b'),
-      true,
-      "B's own receipt matches exactly what B itself just wrote",
+    const second = pullRemote(wt);
+    assert.ok(
+      second.notices.some((n) => n.includes('끊긴 동기화가 남긴 merge를 취소')),
+      String(second.notices),
     );
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
+    assert.equal(syMergeHead(wt), false);
+  });
+});
+
+test('interrupted resolution with no index record: stuck, and the notice says the resolution was interrupted (not that something was staged meanwhile)', () => {
+  withIncomingEdit(({ b }) => {
+    pullRemote(b, {
+      testHooks: {
+        afterResolveBeforeCommit: () => {
+          throw new Error('killed');
+        },
+      },
+    });
+    const recPath = syOwnedPath(b);
+    const rec = JSON.parse(readFileSync(recPath, 'utf-8'));
+    writeFileSync(recPath, JSON.stringify({ ...rec, indexDigest: null }));
+    const res = pullRemote(b);
+    assert.equal(res.deferred, 'stuck', JSON.stringify(res));
+    const notice = res.notices.join('\n');
+    assert.match(notice, /끊겨 인덱스 기록이 없습니다/);
+    assert.equal(notice.includes('스테이징된 변경'), false, notice);
+    assert.equal(syMergeHead(b), true, 'MERGE_HEAD stays');
+  });
+});
+
+test('a vault hook that rejects the merge commit: the stuck notice carries the hook output, and the merge is finished once the hook passes', () => {
+  withIncomingEdit(({ b }) => {
+    pullRemote(b, {
+      testHooks: {
+        afterResolveBeforeCommit: () => {
+          throw new Error('killed');
+        },
+      },
+    });
+    const hook = join(b, '.git', 'hooks', 'pre-commit');
+    writeFileSync(hook, '#!/bin/sh\necho "REJECTED-BY-VAULT-HOOK: frontmatter" >&2\nexit 1\n');
+    chmodSync(hook, 0o755);
+    const res = pullRemote(b);
+    assert.equal(res.deferred, 'stuck', JSON.stringify(res));
+    assert.ok(
+      res.notices.some((n) => n.includes('REJECTED-BY-VAULT-HOOK: frontmatter')),
+      String(res.notices),
+    );
+    assert.equal(syMergeHead(b), true, 'MERGE_HEAD stays');
+    // The pair: the same vault with a hook that passes finishes the merge.
+    rmSync(hook);
+    const again = pullRemote(b);
+    assert.equal(again.pulled, true, JSON.stringify(again));
+    assert.equal(syMergeHead(b), false);
+  });
+});
+
+test('sync notices: a line left by an earlier sync is kept and not added twice, and leaveNotices: false leaves none', () => {
+  const noticeFile = (b) => join(b, '.cache', 'root-hot-projection-notice.json');
+  withSyncClones(({ a, b }) => {
+    syEditAndPush(a, 'pages/y.md', 'y upstream\n');
+    syPut(b, 'pages/x.md', 'x local\n');
+    syCommit(b, 'local');
+    sgitOk(b, ['fetch', '-q']);
+    sgitOk(b, ['merge', '--no-commit', '--no-ff', '@{u}']); // a merge a person opened: a notice every sync
+    writeRootHotHealthNotice(b, 'earlier notice');
+    const silent = pullRemote(b, { leaveNotices: false });
+    assert.equal(silent.deferred, 'external');
+    assert.ok(silent.notices.length > 0, 'the notices are still returned');
+    assert.equal(JSON.parse(readFileSync(noticeFile(b), 'utf-8')).message, 'earlier notice');
+    pullRemote(b);
+    pullRemote(b);
+    const lines = JSON.parse(readFileSync(noticeFile(b), 'utf-8')).message.split('\n');
+    assert.equal(lines[0], 'earlier notice');
+    assert.equal(lines.length, new Set(lines).size, `no line twice: ${lines.join(' | ')}`);
+    assert.equal(lines.filter((l) => l.includes('진행 중인 merge가 있어')).length, 1);
+  });
+});
+
+suite('sync conflict resolution: gitignore union');
+
+// `a` and `b` both change `.gitignore` (base: `.cache/`, `base-1`, `base-2`) next to each other, so
+// git reports a content conflict with three stages. `a` pushes first; `b` syncs.
+function gitignoreConflict(aText, bText, fn) {
+  withSyncClones(({ a, b }) => {
+    syEditAndPush(a, '.gitignore', aText);
+    syPut(b, '.gitignore', bText);
+    syCommit(b, 'b ignore');
+    fn({ a, b });
+  });
+}
+const BASE_IGNORE = '.cache/\nbase-1\nbase-2\n';
+
+function assertAborted(b, head, ours) {
+  const res = pullRemote(b);
+  assert.equal(res.pulled, false);
+  assert.equal(res.conflict, true, JSON.stringify(res));
+  assert.equal(syMergeHead(b), false);
+  assert.equal(syUnmerged(b), '');
+  assert.equal(syHead(b), head);
+  assert.equal(syRead(b, '.gitignore'), ours, 'ours is untouched');
+}
+
+test('gitignore union: both sides added different lines, the conflict is resolved and each line is there once', () => {
+  gitignoreConflict(`${BASE_IGNORE}a-line\n`, `${BASE_IGNORE}b-line\n`, ({ b }) => {
+    const res = pullRemote(b);
+    assert.equal(res.pulled, true, JSON.stringify(res));
+    assert.equal(res.conflict, false);
+    assert.equal(syUnmerged(b), '');
+    assert.equal(syMergeHead(b), false);
+    assert.equal(syParents(b, 'HEAD'), 2);
+    const lines = sgitOk(b, ['show', 'HEAD:.gitignore']).split('\n');
+    assert.equal(lines.filter((l) => l === 'a-line').length, 1);
+    assert.equal(lines.filter((l) => l === 'b-line').length, 1);
+    assert.equal(syRead(b, '.gitignore'), sgitOk(b, ['show', 'HEAD:.gitignore']));
+  });
+});
+
+test('gitignore union: one side deleted a base line, the merge is aborted', () => {
+  gitignoreConflict('.cache/\nbase-1\n', `${BASE_IGNORE}b-line\n`, ({ b }) => {
+    assertAborted(b, syHead(b), `${BASE_IGNORE}b-line\n`);
+  });
+});
+
+test('gitignore union: the incoming side added a negation, the merge is aborted', () => {
+  gitignoreConflict(`${BASE_IGNORE}!keep.md\n`, `${BASE_IGNORE}b-line\n`, ({ b }) => {
+    assertAborted(b, syHead(b), `${BASE_IGNORE}b-line\n`);
+  });
+});
+
+test('gitignore union: our side added !keep.md and theirs added *.md, the merge is aborted', () => {
+  gitignoreConflict(`${BASE_IGNORE}*.md\n`, `${BASE_IGNORE}!keep.md\n`, ({ b }) => {
+    assertAborted(b, syHead(b), `${BASE_IGNORE}!keep.md\n`);
+  });
+});
+
+test('gitignore union: a rule ours appended again after a base negation survives the merge, so the private file stays ignored', () => {
+  withSyncClones(
+    ({ a, b }) => {
+      syEditAndPush(a, '.gitignore', '.cache/\n*.md\n!secret.md\na-line\n');
+      syPut(b, '.gitignore', '.cache/\n*.md\n!secret.md\n*.md\n');
+      syCommit(b, 'b re-ignores');
+      syPut(b, 'secret.md', 'private\n');
+      assert.equal(sgit(b, ['check-ignore', '-q', 'secret.md']).status, 0, 'ignored before');
+      const res = pullRemote(b);
+      assert.equal(res.pulled, true, JSON.stringify(res));
+      assert.equal(syMergeHead(b), false);
+      const merged = sgitOk(b, ['show', 'HEAD:.gitignore']);
+      assert.equal(merged, '.cache/\n*.md\n!secret.md\na-line\n*.md\n');
+      assert.equal(sgit(b, ['check-ignore', '-q', 'secret.md']).status, 0, 'still ignored');
+      sgitOk(b, ['add', '-A']);
+      assert.equal(sgitOk(b, ['diff', '--cached', '--name-only']).trim(), '', 'nothing staged');
+    },
+    { '.gitignore': '.cache/\n*.md\n!secret.md\n' },
+  );
+});
+
+suite('sync conflict resolution: diverged catch-up');
+
+// `a` migrates and pushes. `b` has a local, unpushed commit (so the history diverges) and the
+// edits `dirty` makes to its working tree.
+function divergedCatchUp(dirty, fn, extra = {}) {
+  withSyncClones(({ a, b, ...rest }) => {
+    syMigrate(a);
+    sgitOk(a, ['push', '-q']);
+    syPut(b, 'pages/local.md', 'local commit\n');
+    syCommit(b, 'local');
+    dirty(b);
+    fn({ a, b, ...rest });
+  }, extra);
+}
+
+test('diverged catch-up (W2): an unpushed commit and an uncommitted view edit still receive the migration', () => {
+  divergedCatchUp(
+    (b) => syPut(b, 'projects/p/hot.md', SY_W1),
+    ({ b }) => {
+      const res = pullRemote(b);
+      assert.equal(res.pulled, true, JSON.stringify(res));
+      assert.equal(res.conflict, false);
+      assert.equal(syUnmerged(b), '');
+      assert.deepEqual(syBackupTexts(b), [SY_W1]);
+      assert.equal(syParents(b, 'HEAD~1'), 2, 'the merge commit');
+      const added = syChangedBy(b).filter((n) => /-baseline-/.test(n));
+      assert.equal(added.length, 1, `one additional baseline commit: ${added}`);
+      assert.match(syRead(b, added[0]), /local edit one/);
+      assert.equal(existsSync(join(b, '.cache', 'pull-archive.json')), false);
+    },
+  );
+});
+
+test('diverged catch-up (W3): a staged view edit is backed up as its stage bytes and the stage is gone', () => {
+  divergedCatchUp(
+    (b) => {
+      syPut(b, 'projects/p/hot.md', SY_W1);
+      sgitOk(b, ['add', 'projects/p/hot.md']);
+    },
+    ({ b }) => {
+      const res = pullRemote(b);
+      assert.equal(res.pulled, true, JSON.stringify(res));
+      assert.equal(syUnmerged(b), '');
+      assert.deepEqual(syBackupTexts(b), [SY_W1]);
+      assert.equal(sgitOk(b, ['diff', '--cached', '--name-only']).trim(), '');
+    },
+  );
+});
+
+test('diverged catch-up: a pull that fails on another conflict puts the view bytes back as they were', () => {
+  const states = [
+    ['unstaged edit', (b) => syPut(b, 'projects/p/hot.md', SY_W1)],
+    [
+      'staged edit, then a later working-tree edit',
+      (b) => {
+        syPut(b, 'projects/p/hot.md', SY_W1);
+        sgitOk(b, ['add', 'projects/p/hot.md']);
+        syPut(b, 'projects/p/hot.md', SY_W2);
+      },
+    ],
+  ];
+  for (const [label, dirty] of states) {
+    withSyncClones(({ a, b }) => {
+      // The migration commit also edits pages/x.md, which b deleted: a conflict that is not ours to settle.
+      syMigrate(a);
+      syPut(a, 'pages/x.md', 'x edited upstream\n');
+      syCommit(a, 'edit x');
+      sgitOk(a, ['push', '-q']);
+      sgitOk(b, ['rm', '-q', 'pages/x.md']);
+      syCommit(b, 'delete x');
+      dirty(b);
+      const snap = () => ({
+        head: syHead(b),
+        status: sgitOk(b, ['status', '--porcelain']),
+        diff: sgitOk(b, ['diff']),
+        cached: sgitOk(b, ['diff', '--cached']),
+        hot: syRead(b, 'projects/p/hot.md'),
+      });
+      const before = snap();
+      const res = pullRemote(b);
+      assert.equal(res.pulled, false, label);
+      assert.equal(res.conflict, true, `${label}: ${JSON.stringify(res)}`);
+      assert.deepEqual(
+        snap(),
+        before,
+        `${label}: worktree, git diff and git diff --cached as before`,
+      );
+      assert.equal(existsSync(join(b, '.cache', 'pull-archive.json')), false, label);
+    });
   }
+});
+
+test('diverged catch-up: a pull that fails without a conflict also puts the view bytes back', () => {
+  divergedCatchUp(
+    (b) => syPut(b, 'projects/p/hot.md', SY_W1),
+    ({ b }) => {
+      // The merge fails with nothing unmerged (a vault hook rejects the merge commit): what the
+      // clearing step moved has to come back. The fetch happens once, before the clearing step, so a
+      // remote that goes away afterwards no longer reaches the merge; a rejected merge does.
+      const hook = join(b, '.git', 'hooks', 'pre-merge-commit');
+      writeFileSync(hook, '#!/bin/sh\necho rejected by the vault hook >&2\nexit 1\n');
+      chmodSync(hook, 0o755);
+      const head = syHead(b);
+      const res = pullRemote(b);
+      assert.equal(res.pulled, false, JSON.stringify(res));
+      assert.equal(res.conflict, false, JSON.stringify(res));
+      assert.equal(syHead(b), head);
+      assert.equal(syMergeHead(b), false);
+      assert.equal(syUnmerged(b), '');
+      assert.equal(syRead(b, 'projects/p/hot.md'), SY_W1, 'the edit is back in the working tree');
+      assert.equal(existsSync(join(b, '.cache', 'pull-archive.json')), false);
+    },
+  );
+});
+
+test('behind machine with a local view edit (no local commit) receives the migration through pullRemote', () => {
+  withSyncClones(({ a, b }) => {
+    syMigrate(a);
+    sgitOk(a, ['push', '-q']);
+    syPut(b, 'projects/p/hot.md', SY_W1);
+    const res = pullRemote(b);
+    assert.equal(res.pulled, true, JSON.stringify(res));
+    assert.equal(syUnmerged(b), '');
+    assert.deepEqual(syBackupTexts(b), [SY_W1]);
+    // The two remote baselines (hot and state) plus one for the hot.md this machine set aside:
+    // only the kinds a machine archived are shared, so the untouched state view adds none.
+    assert.equal(syBaselines(b).length, 3, 'the remote baselines and the additional hot one');
+    assert.equal(sgitOk(b, ['ls-files', '--', 'projects/p/hot.md']).trim(), '');
+  });
+});
+
+test('diverged catch-up: a merge that landed before its archive was shared is picked up by the next pullRemote, even when the pull fails', () => {
+  withSyncClones(({ a, b, root }) => {
+    syMigrate(a);
+    sgitOk(a, ['push', '-q']);
+    syPut(b, 'projects/p/hot.md', SY_W1);
+    sgitOk(b, ['fetch', '-q']);
+    // The state a run killed between the merge and the share leaves: the record is written and
+    // the merge has landed, nothing is shared.
+    assert.equal(clearGeneratedPathsBlockingPull(b, '@{u}').ok, true);
+    sgitOk(b, ['merge', '--ff-only', '@{u}']);
+    const archive = join(b, '.cache', 'pull-archive.json');
+    assert.equal(existsSync(archive), true);
+    assert.equal(syBaselines(b).length, 2, 'only the migration baselines, nothing shared yet');
+    // A pull that cannot fetch must still share what the landed merge set aside.
+    sgitOk(b, ['remote', 'set-url', 'origin', join(root, 'gone.git')]);
+    const res = pullRemote(b);
+    assert.equal(res.pulled, false, 'the pull itself failed');
+    assert.equal(syBaselines(b).length, 3, JSON.stringify(res));
+    assert.equal(existsSync(archive), false);
+  });
+});
+
+test('diverged catch-up: a vault whose .gitignore leaves .cache/ out still receives the migration when there is nothing to set aside', () => {
+  withSyncClones(
+    ({ a, b }) => {
+      syMigrate(a);
+      sgitOk(a, ['push', '-q']);
+      // The generator's record vouches for the root hot.md, so no backup is needed for it.
+      syPut(
+        b,
+        '.cache/generated-views.json',
+        JSON.stringify({
+          views: { 'hot.md': createHash('sha256').update('root hot\n').digest('hex') },
+        }),
+      );
+      sgitOk(b, ['fetch', '-q']);
+      const cleared = clearGeneratedPathsBlockingPull(b, '@{u}');
+      assert.equal(cleared.ok, true, JSON.stringify(cleared));
+      assert.deepEqual(
+        [cleared.backups, cleared.archived, cleared.localOnly, cleared.unowned, cleared.cleared],
+        [[], [], [], [], []],
+      );
+      assert.equal(existsSync(join(b, '.cache', 'backups')), false, 'nothing was written');
+      const res = pullRemote(b);
+      assert.equal(res.pulled, true, JSON.stringify(res));
+      assert.equal(res.deferred, undefined);
+      assert.equal(migrationState(b), 'migrated');
+      assert.equal(sgitOk(b, ['ls-files', '--', 'projects/p/hot.md']).trim(), '', 'untracked');
+      assert.equal(existsSync(syIntentPath(b)), false);
+    },
+    { '.gitignore': 'base-1\nbase-2\n' },
+  );
+});
+
+test('fetch once per sync, and a failed fetch is recorded as the pull failure with no merge', () => {
+  withSyncClones(({ a, b, root }) => {
+    syEditAndPush(a, 'pages/y.md', 'y upstream\n');
+    syPut(b, 'pages/x.md', 'x local\n');
+    syCommit(b, 'local');
+    // Every fetch from origin runs through this wrapper, which counts it.
+    const count = join(root, 'fetch-count');
+    const wrapper = join(root, 'upload-pack.sh');
+    writeFileSync(wrapper, `#!/bin/sh\necho x >> '${count}'\nexec git upload-pack "$@"\n`);
+    chmodSync(wrapper, 0o755);
+    sgitOk(b, ['config', 'remote.origin.uploadpack', wrapper]);
+    const res = pullRemote(b);
+    assert.equal(res.pulled, true, JSON.stringify(res));
+    assert.equal(syRead(b, 'pages/y.md'), 'y upstream\n');
+    assert.equal(readFileSync(count, 'utf-8').trim().split('\n').length, 1, 'one fetch');
+    // The pair: a remote that cannot be fetched stops the sync before any merge.
+    syEditAndPush(a, 'pages/y.md', 'y upstream again\n');
+    sgitOk(b, ['remote', 'set-url', 'origin', join(root, 'gone.git')]);
+    const head = syHead(b);
+    const failed = pullRemote(b);
+    assert.equal(failed.pulled, false, JSON.stringify(failed));
+    assert.equal(failed.conflict, false);
+    assert.equal(syHead(b), head);
+    assert.equal(syMergeHead(b), false);
+    const entries = readFileSync(join(b, '.cache', 'sync-state.json'), 'utf-8')
+      .split('\n')
+      .filter(Boolean)
+      .map((l) => JSON.parse(l));
+    assert.deepEqual(
+      entries.map((e) => e.op),
+      ['pull'],
+      'the fetch failure is the pull failure',
+    );
+  });
+});
+
+suite('Stop sync: owned merges, a pull that did not land, a migrated upstream');
+
+// The Stop hook over two real clones. `runStop` inherits the throwaway git config `inSyncEnv` sets.
+const syStop = (dir, sid) => runStop('hypo-auto-commit.mjs', dir, { session_id: sid });
+const syTouch = (dir, sid, rel, text = 'note\n') => {
+  syPut(dir, rel, text);
+  recordTouchedPaths(dir, sid, rel);
+};
+const syOpsOf = (dir) => readSyncEntries(dir).map((e) => e.op);
+const syRemoteHead = (origin) => sgitOk(origin, ['rev-parse', 'main']).trim();
+const syHealthNotice = (dir) => {
+  const p = join(dir, '.cache', 'root-hot-projection-notice.json');
+  return existsSync(p) ? JSON.parse(readFileSync(p, 'utf-8')).message : '';
+};
+// A merge a person opened (no owned record) in `b`, with a local commit so it is a real merge.
+function syOpenPersonMerge(a, b) {
+  syEditAndPush(a, 'pages/y.md', 'y upstream\n');
+  syPut(b, 'pages/x.md', 'x local\n');
+  syCommit(b, 'local');
+  sgitOk(b, ['fetch', '-q']);
+  sgitOk(b, ['merge', '--no-commit', '--no-ff', '@{u}']);
+  assert.equal(syMergeHead(b), true);
+}
+
+test('Stop finishes a merge this tool left open before it commits, and then pushes', () => {
+  withIncomingEdit(({ b, origin }) => {
+    pullRemote(b, {
+      testHooks: {
+        afterResolveBeforeCommit: () => {
+          throw new Error('killed');
+        },
+      },
+    });
+    assert.equal(syMergeHead(b), true, 'precondition: the merge is left open');
+    assert.equal(existsSync(syOwnedPath(b)), true, 'precondition: and it is ours');
+    syTouch(b, 'sess-owned', 'pages/note.md');
+    const r = syStop(b, 'sess-owned');
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    assert.equal(syMergeHead(b), false, 'the open merge was finished');
+    assert.equal(existsSync(syOwnedPath(b)), false);
+    assert.equal(sgitOk(b, ['rev-list', '--merges', '--count', 'HEAD']).trim(), '1', 'one merge');
+    assert.match(sgitOk(b, ['ls-tree', 'HEAD', 'pages/note.md']), /pages\/note\.md/, 'committed');
+    assert.equal(syRemoteHead(origin), syHead(b), 'and pushed');
+  });
+});
+
+test('Stop leaves a merge a person opened alone: nothing committed, nothing pushed, the notice says why', () => {
+  withSyncClones(({ a, b, origin }) => {
+    syOpenPersonMerge(a, b);
+    const remote = syRemoteHead(origin);
+    const head = syHead(b);
+    syTouch(b, 'sess-person', 'pages/note.md');
+    const r = syStop(b, 'sess-person');
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    assert.equal(syMergeHead(b), true, 'their merge is still open');
+    assert.equal(syHead(b), head, 'no commit on top of it');
+    assert.equal(sgitOk(b, ['ls-tree', 'HEAD', 'pages/note.md']).trim(), '');
+    assert.equal(syRemoteHead(origin), remote, 'nothing pushed');
+    assert.match(syHealthNotice(b), /진행 중인 merge가 있어/);
+    assert.deepEqual(
+      JSON.parse(readFileSync(touchedPathsPath(b, 'sess-person'), 'utf-8')),
+      ['pages/note.md'],
+      'the touched path stays for the next Stop',
+    );
+  });
+});
+
+const syAutoStage = (dir, sid, rel) =>
+  spawnSync(process.execPath, [join(HOOKS, 'hypo-auto-stage.mjs')], {
+    input: JSON.stringify({
+      session_id: sid,
+      tool_name: 'Write',
+      tool_input: { file_path: join(dir, rel), content: 'z\n' },
+    }),
+    encoding: 'utf-8',
+    env: { ...process.env, HOME: SESSION_TMP_HOME, HYPO_DIR: dir },
+  });
+
+test('auto-stage does not run git add while a merge is open, and still records the path', () => {
+  withSyncClones(({ a, b }) => {
+    syOpenPersonMerge(a, b);
+    syPut(b, 'pages/z.md', 'z\n');
+    const r = syAutoStage(b, 'sess-stage', 'pages/z.md');
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    assert.equal(sgitOk(b, ['ls-files', '--', 'pages/z.md']).trim(), '', 'not staged');
+    assert.deepEqual(
+      JSON.parse(readFileSync(touchedPathsPath(b, 'sess-stage'), 'utf-8')),
+      ['pages/z.md'],
+      'Stop will commit it once the merge is done',
+    );
+    // The pair: with the merge gone, the same write is staged.
+    sgitOk(b, ['merge', '--abort']);
+    assert.equal(syMergeHead(b), false);
+    const again = syAutoStage(b, 'sess-stage', 'pages/z.md');
+    assert.equal(again.status, 0, `stderr: ${again.stderr}`);
+    assert.equal(sgitOk(b, ['ls-files', '--', 'pages/z.md']).trim(), 'pages/z.md', 'staged');
+  });
+});
+
+test('Stop does not push after a conflicting pull: the last sync record is the conflict and SessionStart shows its guidance', () => {
+  withSyncClones(({ a, b, origin }) => {
+    syEditAndPush(a, 'pages/y.md', 'y from a\n');
+    const remote = syRemoteHead(origin);
+    syTouch(b, 'sess-conflict', 'pages/y.md', 'y from b\n');
+    const r = syStop(b, 'sess-conflict');
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    assert.match(sgitOk(b, ['log', '-1', '--format=%s', '--', 'pages/y.md']), /\S/, 'committed');
+    assert.equal(syMergeHead(b), false, 'the conflicting merge was aborted');
+    assert.deepEqual(syOpsOf(b), ['conflict'], 'no push was attempted after it');
+    assert.equal(syRemoteHead(origin), remote);
+    const start = runStart(b);
+    const ctx = injectedContext(JSON.parse(start.stdout)) || '';
+    assert.match(ctx, /remote diverged/, ctx);
+    assert.doesNotMatch(ctx, /last sync failed: push/, ctx);
+  });
+});
+
+test('Stop does not push after a deferred pull: the last record names the deferral, not a rejected push', () => {
+  withSyncClones(({ a, b, origin }) => {
+    syMigrate(a);
+    sgitOk(a, ['push', '-q']);
+    const remote = syRemoteHead(origin);
+    // The catch-up defers on a .gitignore that is not a pure addition.
+    syPut(b, '.gitignore', '.cache/\n!keep.md\n');
+    syTouch(b, 'sess-deferred', 'pages/note.md');
+    const r = syStop(b, 'sess-deferred');
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    assert.match(sgitOk(b, ['ls-tree', 'HEAD', 'pages/note.md']), /pages\/note\.md/, 'committed');
+    const entries = readSyncEntries(b);
+    assert.deepEqual(
+      entries.map((e) => e.op),
+      ['pull'],
+      JSON.stringify(entries),
+    );
+    assert.match(entries[0].error, /\.gitignore/, 'the record names the deferral');
+    assert.equal(syRemoteHead(origin), remote, 'nothing pushed');
+  });
+});
+
+// One .gitignore line staged and another only in the work tree. The catch-up used to put both
+// lines back into the work tree alone, delete the saved bytes, and leave the stage empty. Disabling:
+// in `clearBlockingPaths` (hooks/hypo-shared.mjs) change `if (staged.has('.gitignore') &&
+// blocked.includes('.gitignore')) {` to `if (false) {`. The stage, deferral and backup assertions go red.
+test('Stop defers a catch-up pull when .gitignore has a staged change, and leaves the stage and the work tree as they were', () => {
+  withSyncClones(({ a, b, origin }) => {
+    syMigrate(a);
+    sgitOk(a, ['push', '-q']);
+    const remote = syRemoteHead(origin);
+    const base = syRead(b, '.gitignore');
+    syPut(b, '.gitignore', `${base}staged-line/\n`);
+    sgitOk(b, ['add', '.gitignore']);
+    syPut(b, '.gitignore', `${base}staged-line/\nunstaged-line/\n`);
+    syTouch(b, 'sess-split-gitignore', 'pages/note.md');
+    const r = syStop(b, 'sess-split-gitignore');
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    assert.match(sgitOk(b, ['ls-tree', 'HEAD', 'pages/note.md']), /pages\/note\.md/, 'committed');
+    const entries = readSyncEntries(b);
+    assert.deepEqual(
+      entries.map((e) => e.op),
+      ['pull'],
+      JSON.stringify(entries),
+    );
+    assert.match(entries.at(-1).error, /\.gitignore/, 'the last record is the deferral');
+    assert.equal(
+      sgitOk(b, ['show', ':.gitignore']),
+      `${base}staged-line/\n`,
+      'the stage is what it was',
+    );
+    assert.equal(syRead(b, '.gitignore'), `${base}staged-line/\nunstaged-line/\n`);
+    assert.equal(existsSync(join(b, '.cache', 'pull-archive.json')), false, 'nothing is archived');
+    assert.equal(existsSync(join(b, '.cache', 'backups')), false, 'and no backup is made');
+    assert.equal(syRemoteHead(origin), remote, 'nothing pushed');
+  });
+});
+
+test('Stop does not push after a failed pull: only the pull failure is recorded', () => {
+  withSyncClones(({ b, root }) => {
+    sgitOk(b, ['remote', 'set-url', 'origin', join(root, 'gone.git')]);
+    syTouch(b, 'sess-failed', 'pages/note.md');
+    const r = syStop(b, 'sess-failed');
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    assert.match(sgitOk(b, ['ls-tree', 'HEAD', 'pages/note.md']), /pages\/note\.md/, 'committed');
+    assert.deepEqual(syOpsOf(b), ['pull'], 'the pull failure, and no push on top of it');
+  });
+});
+
+test('a pull failure record names the paths that blocked the merge', () => {
+  withSyncClones(({ a, b }) => {
+    syEditAndPush(a, 'pages/new.md', 'from a\n');
+    syPut(b, 'pages/new.md', 'untracked here\n');
+    const res = pullRemote(b);
+    assert.equal(res.pulled, false, JSON.stringify(res));
+    const entries = readSyncEntries(b);
+    assert.equal(entries.at(-1).op, 'pull');
+    assert.match(entries.at(-1).error, /would be overwritten by merge/);
+    assert.match(entries.at(-1).error, /pages\/new\.md/, 'the blocking path is in the record');
+  });
+});
+
+test('a push failure record says non-fast-forward, not just the "To <url>" line', () => {
+  withSyncClones(({ a, b }) => {
+    syEditAndPush(a, 'pages/y.md', 'y upstream\n');
+    syPut(b, 'pages/x.md', 'x local\n');
+    syCommit(b, 'local');
+    const res = pushRemote(b, resolvePushTarget(b));
+    assert.equal(res.pushed, false);
+    const last = readSyncEntries(b).at(-1);
+    assert.equal(last.op, 'push');
+    assert.match(last.error, /non-fast-forward/, last.error);
+    assert.doesNotMatch(last.error, /^To /, last.error);
+  });
+});
+
+test('under a migrated upstream, Stop withholds a push of a tree that tracks generated views, and says so', () => {
+  withSyncClones(({ a, b, origin }) => {
+    syMigrate(a);
+    // An old-version machine pushed on top: the view is tracked again (force-added past the ignore).
+    syPut(a, 'projects/p/hot.md', SY_W1);
+    sgitOk(a, ['add', '-f', 'projects/p/hot.md']);
+    sgitOk(a, ['commit', '-q', '-m', 'old machine re-tracks the view']);
+    sgitOk(a, ['push', '-q']);
+    const remote = syRemoteHead(origin);
+    syTouch(b, 'sess-tracked', 'pages/note.md');
+    const r = syStop(b, 'sess-tracked');
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    assert.equal(
+      sgit(b, ['merge-base', '--is-ancestor', remote, 'HEAD']).status,
+      0,
+      'the pull landed: HEAD holds the remote tip',
+    );
+    assert.match(sgitOk(b, ['ls-tree', 'HEAD', 'pages/note.md']), /pages\/note\.md/, 'committed');
+    assert.match(sgitOk(b, ['ls-tree', '-r', '--name-only', 'HEAD']), /projects\/p\/hot\.md/);
+    assert.equal(syRemoteHead(origin), remote, 'nothing pushed');
+    const notice = syHealthNotice(b);
+    assert.match(notice, /projects\/p\/hot\.md/, notice);
+    assert.match(notice, /push하지 않았습니다/, notice);
+    assert.equal(existsSync(join(b, '.cache', 'sync-state.json')), false, 'not a sync failure');
+  });
+});
+
+test('under a migrated upstream, Stop pushes a tree that tracks no generated view', () => {
+  withSyncClones(({ a, b, origin }) => {
+    syMigrate(a);
+    sgitOk(a, ['push', '-q']);
+    syTouch(b, 'sess-untracked', 'pages/note.md');
+    const r = syStop(b, 'sess-untracked');
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    assert.equal(syRemoteHead(origin), syHead(b), 'pushed');
+    assert.doesNotMatch(
+      sgitOk(b, ['ls-tree', '-r', '--name-only', 'HEAD']),
+      /projects\/p\/hot\.md/,
+    );
+    assert.doesNotMatch(syHealthNotice(b), /push하지 않았습니다/);
+  });
+});
+
+// A rollback on purpose tracks the flat files in HEAD while the remote still carries the block, which
+// is the same tree shape the guard withholds. The off marker in HEAD is what tells them apart.
+test('after a rollback, the next Stop pushes it: the remote head is the rollback commit', () => {
+  withSyncClones(({ a, origin }) => {
+    syMigrate(a);
+    sgitOk(a, ['push', '-q']);
+    const migrated = syHead(a);
+    const rb = rollbackSessionEntries(a, { at: migrated });
+    assert.equal(rb.rolledBack, true, JSON.stringify(rb));
+    assert.equal(syHead(a), rb.commit);
+    assert.match(sgitOk(a, ['ls-tree', '-r', '--name-only', 'HEAD']), /projects\/p\/hot\.md/);
+    assert.equal(syRemoteHead(origin), migrated, 'precondition: only this clone has the rollback');
+    const r = syStop(a, 'sess-rollback');
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    assert.equal(syRemoteHead(origin), rb.commit, 'the rollback reached the remote');
+    assert.doesNotMatch(syHealthNotice(a), /rm --cached/, 'no re-track notice');
+  });
+});
+
+test('a re-track without the rollback marker is still withheld, with the repair in the notice', () => {
+  withSyncClones(({ a, origin }) => {
+    syMigrate(a);
+    sgitOk(a, ['push', '-q']);
+    const migrated = syHead(a);
+    syPut(a, 'projects/p/hot.md', SY_W1);
+    sgitOk(a, ['add', '-f', 'projects/p/hot.md']);
+    sgitOk(a, ['commit', '-q', '-m', 'track the view again']);
+    const r = syStop(a, 'sess-retrack');
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    assert.equal(syRemoteHead(origin), migrated, 'nothing pushed');
+    assert.match(syHealthNotice(a), /rm --cached -- 'projects\/p\/hot\.md'/);
+  });
 });

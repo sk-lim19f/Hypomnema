@@ -18,8 +18,9 @@ import {
   lstatSync,
   symlinkSync,
   unlinkSync,
+  chmodSync,
 } from 'node:fs';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { parseSchemaVocab } from '../scripts/lib/schema-vocab.mjs';
 import {
@@ -30,6 +31,13 @@ import { isHypomnemaPluginEnabled } from '../scripts/lib/plugin-detect.mjs';
 import { wikiPreCommitContent } from '../scripts/lib/git-hooks-dir.mjs';
 import { writeDualSkipProvenance } from '../scripts/lib/pkg-json.mjs';
 import { PROVENANCE_FILENAME } from '../scripts/lib/pkg-provenance.mjs';
+import {
+  GITATTRIBUTES_BLOCK,
+  GITIGNORE_BLOCK,
+  PREVIOUS_GITATTRIBUTES_BLOCKS,
+  PREVIOUS_GITIGNORE_BLOCKS,
+} from '../hooks/session-entries.mjs';
+import { migrationState } from '../hooks/hypo-shared.mjs';
 import { test, suite } from './harness.mjs';
 import {
   HOME,
@@ -2880,4 +2888,454 @@ test('a vault with the pre-rewrite SCHEMA.md and hypo-guide.md is told both chan
       );
     });
   });
+});
+
+// ── --migrate-sessions: the migration path of a vault that has a git remote ──
+//
+// Real clones of one bare origin, the real script as a child process. Every child (git and node)
+// gets HOME in the session temp dir and a throwaway global git config, so nothing reads or writes
+// the developer's own.
+suite('upgrade.mjs: --migrate-sessions');
+
+const MS_GITCONFIG = join(SESSION_TMP_HOME, 'gitconfig-migrate-sessions');
+const MS_SUBJECT = 'hypomnema: move session state into projects/*/sessions entries';
+const MS_SEED = {
+  '.gitignore': '.cache/\n',
+  'hot.md': 'root hot\n',
+  'projects/p/index.md': '---\ntitle: p\n---\n',
+  'projects/p/hot.md':
+    '---\ntitle: "hot: p"\ntype: reference\nupdated: 2026-09-20\n---\n## Summary\nold summary\n',
+  'projects/p/session-state.md':
+    '---\ntype: session-state\nupdated: 2026-09-25\n---\n## Next Up\nold state body\n',
+  'pages/x.md': 'x\n',
+};
+
+function msEnv() {
+  writeFileSync(
+    MS_GITCONFIG,
+    '[user]\n\tname = t\n\temail = t@example.com\n[init]\n\tdefaultBranch = main\n[commit]\n\tgpgsign = false\n[pull]\n\trebase = false\n',
+  );
+  return {
+    ...process.env,
+    HYPO_DIR: '',
+    HOME: SESSION_TMP_HOME,
+    GIT_CONFIG_GLOBAL: MS_GITCONFIG,
+    GIT_CONFIG_NOSYSTEM: '1',
+  };
+}
+function msGit(dir, args) {
+  const r = spawnSync('git', args, { cwd: dir, encoding: 'utf-8', env: msEnv() });
+  assert.equal(r.status, 0, `git ${args.join(' ')}: ${r.stderr}`);
+  return r.stdout.trim();
+}
+// Raw text, not trimmed: a block's last byte is a newline.
+function msText(dir, args) {
+  const r = spawnSync('git', args, { cwd: dir, encoding: 'utf-8', env: msEnv() });
+  assert.equal(r.status, 0, `git ${args.join(' ')}: ${r.stderr}`);
+  return r.stdout;
+}
+function msPut(dir, rel, text) {
+  mkdirSync(dirname(join(dir, rel)), { recursive: true });
+  writeFileSync(join(dir, rel), text);
+}
+function msCommit(dir, files, message = 'x') {
+  for (const [rel, text] of Object.entries(files)) msPut(dir, rel, text);
+  msGit(dir, ['add', '-A']);
+  msGit(dir, ['commit', '-q', '-m', message]);
+}
+function msRun(dir, extra = []) {
+  return spawnSync(
+    process.execPath,
+    [join(SCRIPTS, 'upgrade.mjs'), '--migrate-sessions', `--hypo-dir=${dir}`, ...extra],
+    { encoding: 'utf-8', env: msEnv() },
+  );
+}
+// `a` seeds the origin and `b` clones it: two machines at the old state. `a` and `b` track `main`.
+function withMsPair(fn, seed = MS_SEED) {
+  withTmpDir((root) => {
+    const origin = join(root, 'origin.git');
+    const a = join(root, 'a');
+    const b = join(root, 'b');
+    msGit(root, ['init', '-q', '--bare', origin]);
+    msGit(root, ['clone', '-q', origin, a]);
+    msCommit(a, seed);
+    msGit(a, ['push', '-q', '-u', 'origin', 'main']);
+    msGit(root, ['clone', '-q', origin, b]);
+    fn({ a, b, origin });
+  });
+}
+const msSubjects = (dir, rev = 'HEAD') => msGit(dir, ['log', '--format=%s', rev]).split('\n');
+const msTree = (dir, rev = 'HEAD') => msGit(dir, ['ls-tree', '-r', '--name-only', rev]).split('\n');
+
+test('migrate-sessions: a clone behind an already-migrated remote takes the commit in and migrates nothing', () => {
+  withMsPair(({ a, b, origin }) => {
+    const first = msRun(a);
+    assert.equal(first.status, 0, `${first.stdout}${first.stderr}`);
+    const moved = msGit(origin, ['rev-parse', 'main']);
+    assert.equal(moved, msGit(a, ['rev-parse', 'HEAD']), 'a pushed its migration commit');
+    const count = msGit(origin, ['rev-list', '--count', 'main']);
+
+    const r = msRun(b);
+    assert.equal(r.status, 0, `${r.stdout}${r.stderr}`);
+    assert.match(r.stdout, /Another machine already moved this vault/);
+    assert.equal(msGit(b, ['rev-parse', 'HEAD']), moved, 'b is at the remote head');
+    assert.equal(msGit(origin, ['rev-list', '--count', 'main']), count, 'no new commit anywhere');
+    assert.equal(msGit(b, ['ls-files', 'hot.md', 'projects/p/hot.md']), '', 'views untracked');
+    assert.equal(msSubjects(b).filter((m) => m === MS_SUBJECT).length, 1);
+  });
+});
+
+test('migrate-sessions: a remote that is not migrated gets one migration commit, pushed', () => {
+  withMsPair(({ a, origin }) => {
+    const r = msRun(a);
+    assert.equal(r.status, 0, `${r.stdout}${r.stderr}`);
+    // Hot and state are separate baseline entries, one per old file.
+    assert.match(r.stdout, /Migrated: commit [0-9a-f]{8}, 2 baseline entries/);
+    assert.match(r.stdout, /Pushed\./);
+    const head = msGit(origin, ['rev-parse', 'main']);
+    assert.equal(head, msGit(a, ['rev-parse', 'HEAD']));
+    assert.equal(msGit(origin, ['log', '-1', '--format=%s', 'main']), MS_SUBJECT);
+    const tree = msTree(origin, 'main');
+    for (const gone of ['hot.md', 'projects/p/hot.md', 'projects/p/session-state.md']) {
+      assert.ok(!tree.includes(gone), `${gone} is untracked on the remote`);
+    }
+    assert.equal(
+      tree.filter((f) => /^projects\/p\/sessions\/.*baseline-[0-9a-f]+\.md$/.test(f)).length,
+      2,
+      'one baseline per old file',
+    );
+    assert.ok(msText(origin, ['show', 'main:.gitignore']).includes(GITIGNORE_BLOCK));
+  });
+});
+
+test('migrate-sessions: a vault with the rollback marker is moved and the marker removed in that commit', () => {
+  withMsPair(
+    ({ a, origin }) => {
+      const r = msRun(a);
+      assert.equal(r.status, 0, `${r.stdout}${r.stderr}`);
+      assert.equal(msGit(origin, ['log', '-1', '--format=%s', 'main']), MS_SUBJECT);
+      assert.ok(!msTree(origin, 'main').includes('.hypo-session-entries-off'), 'marker removed');
+      assert.equal(msGit(origin, ['rev-parse', 'main']), msGit(a, ['rev-parse', 'HEAD']));
+    },
+    { ...MS_SEED, '.hypo-session-entries-off': 'rolled back\n' },
+  );
+});
+
+test('migrate-sessions: a project directory with a space in its name exits 1 with the rename command, writes and pushes nothing', () => {
+  const state = MS_SEED['projects/p/session-state.md'];
+  withMsPair(
+    ({ a, origin }) => {
+      const before = msGit(origin, ['rev-parse', 'main']);
+      const r = msRun(a);
+      assert.equal(r.status, 1, `${r.stdout}${r.stderr}`);
+      assert.match(r.stdout, /projects\/my project:/);
+      assert.ok(
+        r.stdout.includes('/hypo:rename --from="projects/my project/" --to="projects/my-project/"'),
+        r.stdout,
+      );
+      assert.match(r.stderr, /migration did not run \(invalid-project-name\)/);
+      assert.equal(msGit(a, ['rev-parse', 'HEAD']), before, 'no commit on a');
+      assert.equal(msGit(origin, ['rev-parse', 'main']), before, 'nothing pushed');
+      assert.equal(msGit(a, ['status', '--porcelain']), '', 'nothing written');
+      // The pair: renamed and committed, the command goes through.
+      msGit(a, ['mv', 'projects/my project', 'projects/my-project']);
+      msGit(a, ['commit', '-q', '-m', 'rename']);
+      const again = msRun(a);
+      assert.equal(again.status, 0, `${again.stdout}${again.stderr}`);
+      assert.match(again.stdout, /Migrated: commit [0-9a-f]{8}, 4 baseline entries/);
+    },
+    {
+      ...MS_SEED,
+      'projects/my project/index.md': '---\ntitle: m\n---\n',
+      'projects/my project/hot.md': '---\ntitle: m\n---\nhot\n',
+      'projects/my project/session-state.md': state,
+    },
+  );
+});
+
+test('migrate-sessions: upgrade --apply alone does not put the session block in .gitignore', () => {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      const initR = runWithHome('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-git-init'], home);
+      assert.equal(initR.status, 0, `init failed: ${initR.stderr}`);
+      const gitignorePath = join(hypoDir, '.gitignore');
+      writeFileSync(gitignorePath, '# legacy\nnode_modules/\n');
+      msGit(hypoDir, ['init', '-q']);
+      msCommit(hypoDir, {
+        'projects/p/hot.md': 'old hot\n',
+        'projects/p/session-state.md': 'old state\n',
+      });
+      const r = runWithHome('upgrade.mjs', [`--hypo-dir=${hypoDir}`, '--json', '--apply'], home);
+      assert.equal(r.status, 0, `--apply failed: ${r.stderr}`);
+      assert.ok(JSON.parse(r.stdout).applied.gitignore.includes('.cache/'), '--apply did run');
+      const text = readFileSync(gitignorePath, 'utf-8');
+      assert.ok(
+        !text.includes(GITIGNORE_BLOCK.split('\n')[0]),
+        `the block belongs to the migration commit only:\n${text}`,
+      );
+    });
+  });
+});
+
+test('migrate-sessions: a rejected push is retried by the same command with no new commit', () => {
+  withMsPair(({ a, origin }) => {
+    const hook = join(origin, 'hooks', 'pre-receive');
+    mkdirSync(dirname(hook), { recursive: true });
+    writeFileSync(hook, '#!/bin/sh\necho "read-only for now" >&2\nexit 1\n', { mode: 0o755 });
+    const before = msGit(origin, ['rev-parse', 'main']);
+    const failed = msRun(a);
+    assert.equal(failed.status, 1, `${failed.stdout}${failed.stderr}`);
+    assert.match(failed.stderr, /push failed/);
+    assert.equal(msGit(origin, ['rev-parse', 'main']), before, 'the remote did not move');
+    const migrated = msGit(a, ['rev-parse', 'HEAD']);
+    assert.equal(
+      msGit(a, ['log', '-1', '--format=%s']),
+      MS_SUBJECT,
+      'the move is committed locally',
+    );
+
+    unlinkSync(hook);
+    const again = msRun(a);
+    assert.equal(again.status, 0, `${again.stdout}${again.stderr}`);
+    assert.match(again.stdout, /Pushed\./);
+    assert.equal(msGit(origin, ['rev-parse', 'main']), migrated, 'the first run commit went out');
+    assert.equal(msGit(a, ['rev-parse', 'HEAD']), migrated, 'no new commit on this machine');
+    assert.equal(msSubjects(a).filter((m) => m === MS_SUBJECT).length, 1);
+  });
+});
+
+test('migrate-sessions: a remote that is not migrated but ahead is merged first, so the push is a fast-forward', () => {
+  withMsPair(({ a, b, origin }) => {
+    msCommit(b, { 'pages/ahead.md': 'ahead\n' }, 'ahead of a');
+    msGit(b, ['push', '-q']);
+    const ahead = msGit(b, ['rev-parse', 'HEAD']);
+
+    const r = msRun(a);
+    assert.equal(r.status, 0, `${r.stdout}${r.stderr}`);
+    assert.equal(msGit(origin, ['rev-parse', 'main']), msGit(a, ['rev-parse', 'HEAD']));
+    assert.equal(msGit(origin, ['log', '-1', '--format=%s', 'main']), MS_SUBJECT);
+    assert.equal(msGit(origin, ['rev-parse', 'main^']), ahead, 'the migration commit sits on it');
+    assert.ok(
+      msTree(origin, 'main').includes('pages/ahead.md'),
+      'its file is in the migrated tree',
+    );
+  });
+});
+
+test('migrate-sessions: a migrated remote is never migrated again, and a merge that brings old-scheme views back is not pushed', () => {
+  withMsPair(({ a, b, origin }) => {
+    assert.equal(msRun(a).status, 0);
+    const remoteHead = msGit(origin, ['rev-parse', 'main']);
+    // b made a project in the old scheme and has not pushed it: after it takes the remote in, the
+    // tree still tracks views, so migrationState alone would call it not-migrated.
+    msCommit(b, {
+      'projects/p2/hot.md': 'p2 hot\n',
+      'projects/p2/session-state.md': 'p2 state\n',
+    });
+    const r = msRun(b);
+    assert.equal(r.status, 1, `${r.stdout}${r.stderr}`);
+    assert.match(r.stderr, /projects\/p2\/hot\.md/, 'the stop names the tracked views');
+    assert.match(r.stderr, /projects\/p2\/session-state\.md/);
+    assert.match(r.stderr, /git rm --cached/, 'and the repair');
+    assert.equal(msSubjects(b).filter((m) => m === MS_SUBJECT).length, 1, 'no second migration');
+    assert.equal(msGit(origin, ['rev-parse', 'main']), remoteHead, 'nothing was pushed');
+    assert.equal(r.stdout.includes('Pushed.'), false);
+    // The pair: the repair the message gives lets the same command finish and push.
+    msGit(b, ['rm', '-q', '--cached', '--', 'projects/p2/hot.md', 'projects/p2/session-state.md']);
+    msGit(b, ['commit', '-q', '-m', 'untrack the views']);
+    const again = msRun(b);
+    assert.equal(again.status, 0, `${again.stdout}${again.stderr}`);
+    assert.match(again.stdout, /Another machine already moved this vault/);
+    assert.match(again.stdout, /Pushed\./);
+    assert.equal(msGit(origin, ['rev-parse', 'main']), msGit(b, ['rev-parse', 'HEAD']), 'pushed');
+    assert.equal(msGit(b, ['ls-files', 'projects/p2/hot.md']), '', 'untracked');
+  });
+});
+
+test('migrate-sessions: a local .gitignore edit that is not a pure addition stops the catch-up with exit 1', () => {
+  withMsPair(({ a, b, origin }) => {
+    assert.equal(msRun(a).status, 0);
+    const bHead = msGit(b, ['rev-parse', 'HEAD']);
+    const remoteHead = msGit(origin, ['rev-parse', 'main']);
+    writeFileSync(join(b, '.gitignore'), '# my own rules\n');
+    const r = msRun(b);
+    assert.equal(r.status, 1, `${r.stdout}${r.stderr}`);
+    assert.match(r.stderr, /\.gitignore/);
+    assert.equal(msGit(b, ['rev-parse', 'HEAD']), bHead, 'nothing moved');
+    assert.equal(msGit(origin, ['rev-parse', 'main']), remoteHead);
+    assert.equal(readFileSync(join(b, '.gitignore'), 'utf-8'), '# my own rules\n', 'bytes kept');
+  });
+});
+
+// The block edition the first builds wrote, before the temp-file patterns and `/.cache/` were added.
+const MS_OLD_GITIGNORE_BLOCK = `# Hypomnema: session views generated from projects/*/sessions/ (not committed)
+/hot.md
+/projects/*/hot.md
+/projects/*/session-state.md
+/hot.md.pre-projection-backup*.md
+/hot.md.pre-projection-backup*.tmp
+/projects/*/*.pre-projection-backup*.md
+/projects/*/*.pre-projection-backup*.tmp
+/projects/*/sessions/*.tmp
+`;
+const MS_OLD_GITATTRIBUTES_BLOCK = `# Hypomnema: session-log shards are append-only, keep both sides on a merge
+projects/*/session-log/*.md merge=union
+`;
+
+test('migrate-sessions: a vault moved with an older block edition is brought to the current block', () => {
+  withMsPair(
+    ({ a, origin }) => {
+      assert.equal(migrationState(a), 'incomplete-block', 'the fixture reads as stopped');
+      const r = msRun(a);
+      assert.equal(r.status, 0, `${r.stdout}${r.stderr}`);
+      assert.equal(migrationState(a), 'migrated', 'rendering can resume');
+      const ignore = msText(a, ['show', 'HEAD:.gitignore']);
+      assert.ok(ignore.includes(GITIGNORE_BLOCK), 'current block in place');
+      assert.ok(ignore.startsWith('local-note.md\n.cache/\n'), 'lines before the block untouched');
+      assert.ok(ignore.endsWith(`${GITIGNORE_BLOCK}after-block.md\n`), 'lines after it untouched');
+      assert.match(msText(a, ['show', 'HEAD:.gitattributes']), /text eol=lf/);
+      assert.equal(msGit(origin, ['rev-parse', 'main']), msGit(a, ['rev-parse', 'HEAD']));
+    },
+    {
+      '.gitignore': `local-note.md\n.cache/\n${MS_OLD_GITIGNORE_BLOCK}after-block.md\n`,
+      '.gitattributes': MS_OLD_GITATTRIBUTES_BLOCK,
+      'projects/p/index.md': '---\ntitle: p\n---\n',
+    },
+  );
+});
+
+// The edition before the root log.md line: the entry eol line was already there.
+const MS_OLD_GITATTRIBUTES_BLOCK_EOL = `${MS_OLD_GITATTRIBUTES_BLOCK}# Session entries are parsed byte-exact: keep LF in the working tree even where autocrlf is on
+projects/*/sessions/*.md text eol=lf
+`;
+
+test('migrate-sessions: a vault moved with the edition that lacks the root log.md line gets it once, with no line doubled', () => {
+  withMsPair(
+    ({ a }) => {
+      assert.equal(msText(a, ['show', 'HEAD:.gitattributes']), MS_OLD_GITATTRIBUTES_BLOCK_EOL);
+      const r = msRun(a);
+      assert.equal(r.status, 0, `${r.stdout}${r.stderr}`);
+      assert.match(r.stdout, /Updated \.gitattributes to the current block/);
+      assert.equal(msText(a, ['show', 'HEAD:.gitattributes']), GITATTRIBUTES_BLOCK);
+      assert.equal(msGit(a, ['check-attr', 'merge', '--', 'log.md']).split(': ').pop(), 'union');
+    },
+    {
+      '.gitignore': `.cache/\n${GITIGNORE_BLOCK}`,
+      '.gitattributes': MS_OLD_GITATTRIBUTES_BLOCK_EOL,
+      'projects/p/index.md': '---\ntitle: p\n---\n',
+    },
+  );
+});
+
+test('migrate-sessions: an exception from the migration prints one line naming the cause, exits 1, and leaves the vault as it was', () => {
+  if (process.getuid?.() === 0) return; // root reads a mode 000 directory
+  withMsPair(({ a }) => {
+    const head = msGit(a, ['rev-parse', 'HEAD']);
+    const status = msGit(a, ['status', '--porcelain']);
+    const gitignore = readFileSync(join(a, '.gitignore'), 'utf-8');
+    chmodSync(join(a, 'projects'), 0o000);
+    let r;
+    try {
+      r = msRun(a);
+    } finally {
+      chmodSync(join(a, 'projects'), 0o755);
+    }
+    assert.equal(r.status, 1, `${r.stdout}${r.stderr}`);
+    assert.doesNotMatch(r.stderr, /\n\s+at /, `no stack trace: ${r.stderr}`);
+    const lines = r.stderr.split('\n').filter(Boolean);
+    assert.equal(lines.length, 1, r.stderr);
+    assert.match(lines[0], /EACCES/, 'names the cause');
+    assert.match(lines[0], /run (the command|it) again/, 'says what to do');
+    assert.equal(msGit(a, ['rev-parse', 'HEAD']), head, 'no commit');
+    assert.equal(msGit(a, ['status', '--porcelain']), status, 'working tree as it was');
+    assert.equal(readFileSync(join(a, '.gitignore'), 'utf-8'), gitignore);
+  });
+});
+
+test('migrate-sessions: a remote whose block lost a line is not called migrated, and nothing is repaired', () => {
+  const lines = GITIGNORE_BLOCK.split('\n').filter((l) => l !== '/projects/*/session-state.md');
+  withMsPair(
+    ({ a }) => {
+      const before = msGit(a, ['rev-parse', 'HEAD']);
+      const r = msRun(a);
+      assert.equal(r.status, 1, `${r.stdout}${r.stderr}`);
+      assert.match(r.stderr, /block in \.gitignore lacks some of its lines/);
+      assert.equal(msGit(a, ['rev-parse', 'HEAD']), before, 'no commit');
+    },
+    { '.gitignore': `.cache/\n${lines.join('\n')}`, 'projects/p/index.md': 'p\n' },
+  );
+});
+
+test('migrate-sessions: the two blocks are pinned, so an edit of either cannot skip PREVIOUS_*_BLOCKS', () => {
+  // `staleBlockWrites` swaps an old edition for the current one only when the old edition is listed
+  // in PREVIOUS_GITIGNORE_BLOCKS / PREVIOUS_GITATTRIBUTES_BLOCKS (hooks/session-entries.mjs), a list kept by
+  // hand. A vault migrated with an unlisted edition is never repaired.
+  const sha = (text) => createHash('sha256').update(text).digest('hex');
+  const pinned = [
+    [
+      'GITIGNORE_BLOCK',
+      GITIGNORE_BLOCK,
+      'ebf4c3cb1c15c6a08c932a5317fe6b9b6e55c8f7b933e8fb9d131515922a166f',
+    ],
+    [
+      'GITATTRIBUTES_BLOCK',
+      GITATTRIBUTES_BLOCK,
+      'dd7e25e0bc970ef00c8e31af8682657cdf81f9f4ccac965d9dff4e9aefc430d4',
+    ],
+  ];
+  for (const [name, block, expected] of pinned) {
+    assert.equal(
+      sha(block),
+      expected,
+      `${name} changed. Add the outgoing edition (its exact bytes) to PREVIOUS_${name}S in hooks/session-entries.mjs, then update the pinned sha256 in this test to ${sha(block)}.`,
+    );
+  }
+});
+
+test('migrate-sessions: every edition of the two blocks that ever shipped is current or listed in PREVIOUS_*_BLOCKS', () => {
+  // The pin above fails when a block changes, but a person can satisfy it by updating the hash alone.
+  // This one compares the lists: `editions` is every edition that shipped, oldest first, ending with
+  // the current one. Changing a block means appending its new hash here, and then every earlier
+  // edition has to sit in PREVIOUS_*_BLOCKS, or `staleBlockWrites` never repairs a vault that was
+  // moved with it.
+  const sha = (text) => createHash('sha256').update(text).digest('hex');
+  const lists = [
+    [
+      'GITIGNORE_BLOCK',
+      GITIGNORE_BLOCK,
+      PREVIOUS_GITIGNORE_BLOCKS,
+      [
+        'd61dc88b20eb0f5fd0ebaf680f00614d40ea67b2072d14156558733dd6b9eea2',
+        'ebf4c3cb1c15c6a08c932a5317fe6b9b6e55c8f7b933e8fb9d131515922a166f',
+      ],
+    ],
+    [
+      'GITATTRIBUTES_BLOCK',
+      GITATTRIBUTES_BLOCK,
+      PREVIOUS_GITATTRIBUTES_BLOCKS,
+      [
+        'b215a98b587951d684fa739649b9b57c2a43b90e66317bb1dd3c5f57268c4544',
+        '5924078f8b9e575df7f2a6efef63769eae5eb0a8bc86008a9c54eefd0636d0bf',
+        'dd7e25e0bc970ef00c8e31af8682657cdf81f9f4ccac965d9dff4e9aefc430d4',
+      ],
+    ],
+  ];
+  for (const [name, current, previous, editions] of lists) {
+    assert.equal(
+      editions.at(-1),
+      sha(current),
+      `${name} changed: append ${sha(current)} to this test's editions and put the outgoing edition in PREVIOUS_${name}S`,
+    );
+    assert.deepEqual(
+      previous.map(sha).sort(),
+      editions.slice(0, -1).sort(),
+      `PREVIOUS_${name}S must hold exactly the earlier editions, byte for byte`,
+    );
+    assert.equal(
+      previous.map(sha).includes(sha(current)),
+      false,
+      `${name} is not its own previous`,
+    );
+  }
 });
