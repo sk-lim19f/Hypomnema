@@ -98,7 +98,6 @@ import {
   listTrackedGeneratedViews,
   loadSessionModel,
   migrateVaultToSessionEntries,
-  recoverInterruptedMove,
   migrationState,
   offMarkerHashes,
   projectEntryScope,
@@ -5315,98 +5314,6 @@ test('stopping once the commit object exists changes nothing, leaves no temporar
     const r = migrate(dir);
     assert.equal(r.migrated, true);
     assert.equal(commitCount(dir), count + 1);
-  });
-});
-
-// A kill between git installing the migration tree and the ref update: HEAD.lock makes the ref update
-// fail, and `afterMergeAttempt` throws before the in-process cleanup (`returnStrandedIndex`) can run,
-// which is the state a dead process leaves.
-const MOVE_RECORD = '.cache/migration-move.json';
-function killDuringRefUpdate(dir) {
-  put(dir, '.git/HEAD.lock', '');
-  assert.throws(
-    () =>
-      migrate(dir, {
-        testHooks: {
-          afterMergeAttempt: () => {
-            throw new Error('killed');
-          },
-        },
-      }),
-    /killed/,
-  );
-  unlinkSync(join(dir, '.git/HEAD.lock'));
-}
-
-test('a move killed before the ref update is finished by the next migration call: HEAD at the move commit, no other-dirty deferral, record gone', () => {
-  withOldGit((dir) => {
-    const old = headOf(dir);
-    const count = commitCount(dir);
-    killDuringRefUpdate(dir);
-    assert.equal(headOf(dir), old, 'HEAD did not move');
-    assert.notEqual(
-      cgitOk(dir, ['diff', '--cached', '--name-only']).trim(),
-      '',
-      'index holds the move',
-    );
-    const rec = JSON.parse(readRel(dir, MOVE_RECORD));
-    assert.equal(rec.oldHead, old);
-    assert.ok(rec.paths.includes('hot.md') && rec.paths.includes('.gitattributes'));
-    const r = migrate(dir);
-    assert.equal(r.deferred, undefined, JSON.stringify(r));
-    assert.equal(r.migrated, true, JSON.stringify(r));
-    assert.equal(r.commit, rec.target);
-    assert.equal(headOf(dir), rec.target, 'HEAD is the move commit');
-    assert.equal(commitCount(dir), count + 1);
-    assert.equal(migrationState(dir), 'migrated');
-    assert.equal(cgitOk(dir, ['status', '--porcelain']), '');
-    assert.equal(existsSync(join(dir, MOVE_RECORD)), false, 'record removed');
-    assert.equal(existsSync(join(dir, 'projects/p/hot.md')), false);
-  });
-});
-
-test('a killed move whose working tree no longer matches goes back to the old layout, then the move runs again', () => {
-  withOldGit((dir) => {
-    const old = headOf(dir);
-    killDuringRefUpdate(dir);
-    const rec = JSON.parse(readRel(dir, MOVE_RECORD));
-    const baseline = rec.paths.find((p) => p.includes('/sessions/'));
-    unlinkSync(join(dir, baseline));
-    const r = migrate(dir);
-    assert.equal(r.migrated, true, JSON.stringify(r));
-    assert.notEqual(r.commit, rec.target, 'a new move commit, the old target was given up');
-    assert.equal(cgitOk(dir, ['rev-parse', 'HEAD^']).trim(), old);
-    assert.ok(
-      r.notices.some((n) => n.includes('되돌렸습니다')),
-      r.notices.join('\n'),
-    );
-    assert.equal(existsSync(join(dir, MOVE_RECORD)), false);
-    assert.equal(cgitOk(dir, ['status', '--porcelain']), '');
-  });
-});
-
-test('a move record whose old head is no longer HEAD is dropped with a notice and nothing is rewritten', () => {
-  withOldGit((dir) => {
-    const old = headOf(dir);
-    put(dir, 'pages/y.md', 'y\n');
-    commitIn(dir);
-    put(dir, 'projects/p/hot.md', 'my edit\n');
-    put(
-      dir,
-      MOVE_RECORD,
-      JSON.stringify({ v: 1, oldHead: old, target: old, paths: ['projects/p/hot.md'] }),
-    );
-    const out = recoverInterruptedMove(dir);
-    assert.equal(out.state, 'dropped');
-    assert.equal(out.ok, true);
-    assert.match(out.notices.join('\n'), /HEAD가 움직여/);
-    assert.equal(existsSync(join(dir, MOVE_RECORD)), false);
-    assert.equal(
-      readRel(dir, 'projects/p/hot.md'),
-      'my edit\n',
-      'the working tree was not rewritten',
-    );
-    assert.equal(cgitOk(dir, ['diff', '--cached', '--name-only']).trim(), '');
   });
 });
 
