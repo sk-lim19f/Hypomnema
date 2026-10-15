@@ -1,6 +1,6 @@
 # Hypomnema — Architecture
 
-> Internal reference for v1.1. For the user-facing pitch, see [README.md](../README.md).
+> Internal reference for the current release. For the user-facing pitch, see [README.md](../README.md).
 
 ---
 
@@ -18,10 +18,12 @@ Hypomnema is a Claude Code extension with three runtime layers stacked on a plai
 │           ↓ writes / reads                                    │
 │  Wiki vault (markdown + git)                                 │
 │           ↑ reads / stages / commits                          │
-│  Lifecycle hooks (10)         (background automation)         │
+│  Lifecycle hooks              (background automation)         │
 │  ├──► SessionStart, UserPromptSubmit, PreCompact,             │
-│  │    PostToolUse, Stop, CwdChanged, FileChanged              │
-│  └──► hypo-shared.mjs         (deployed inline; no imports)   │
+│  │    PreToolUse, PostToolUse, Stop, SessionEnd,              │
+│  │    CwdChanged, FileChanged                                 │
+│  └──► hypo-shared.mjs + other (copied beside the hooks,       │
+│       shared modules           no imports outside the dir)    │
 └──────────────────────────────────────────────────────────────┘
 ```
 
@@ -34,35 +36,37 @@ The three layers are deliberately **decoupled by file artifacts**. Slash command
 ```
 hypomnema/
 ├── commands/                 ← slash command definitions (.md prompts)
-├── hooks/                    ← lifecycle hooks deployed to ~/.claude/hooks/
-│   ├── hypo-*.mjs                ← 10 hook files (see Hook registry below)
-│   ├── hypo-shared.mjs           ← shared utilities, inlined at deploy
-│   └── hooks.json                ← single source of truth for event ↔ hook mapping
+├── hooks/                    ← lifecycle hooks (copied to ~/.claude/hooks/ on the npm channel)
+│   ├── hypo-*.mjs                ← hook entry points and modules (see Hook registry below)
+│   ├── hypo-shared.mjs           ← shared utilities, copied beside the hooks
+│   ├── hooks.json                ← source of truth for the event to hook map
+│   └── shared.json               ← source of truth for the shared module list
 ├── scripts/                  ← Node.js implementations
 │   ├── init.mjs / upgrade.mjs / uninstall.mjs / doctor.mjs
 │   ├── ingest.mjs / query.mjs / lint.mjs / verify.mjs / graph.mjs / stats.mjs
-│   ├── crystallize.mjs / resume.mjs / feedback.mjs
-│   ├── bump-version.mjs          ← release helper
-│   └── lib/                      ← scripts-only helpers
-│       ├── frontmatter.mjs
-│       ├── hypo-root.mjs
-│       └── hypo-ignore.mjs
+│   ├── crystallize.mjs / resume.mjs / feedback.mjs / feedback-sync.mjs
+│   ├── capture.mjs / rename.mjs / proposal.mjs / session-entries.mjs
+│   ├── session-audit.mjs / weekly-report.mjs
+│   └── lib/                      ← helpers that scripts import (shipped set: `files` in package.json; one hook, hypo-pre-commit.mjs, also imports from here)
 ├── skills/                   ← directory-form Agent Skills (skills/<name>/SKILL.md)
 ├── templates/                ← baseline files copied on init
-│   ├── hypo-config.md, index.md, hot.md, log.md, SCHEMA.md, hypo-guide.md
+│   ├── hypo-config.md, index.md, log.md, SCHEMA.md, hypo-guide.md, session-state.md
 │   ├── Home.md, Overview.md, hypo-automation.md, hypo-help.md
-│   ├── pages/_index.md
+│   ├── .hypoignore, .hyposcanignore, gitignore, gitattributes
+│   ├── pages/_index.md, pages/observability/_index.md
 │   └── projects/_template/
 ├── tests/
 │   ├── harness.mjs               ← test()/testAsync()/suite(), selection, reporting
 │   ├── helpers.mjs               ← fixtures shared by more than one area file
 │   ├── runner.mjs                ← entry: imports every *.test.mjs, owns no tests
 │   ├── parallel.mjs              ← runs the entry as N processes (`npm test`)
-│   └── <area>.test.mjs           ← one file per production area (26)
+│   └── <area>.test.mjs           ← one file per production area
 ├── docs/                     ← ARCHITECTURE.md, CONTRIBUTING.md
 ├── .claude-plugin/plugin.json← plugin manifest
 └── package.json              ← npm metadata, no runtime deps
 ```
+
+On the npm channel, which `scripts/` files ship is decided by the `files` list in `package.json`, which names each one. Anything under `scripts/` that is not on that list is maintainer tooling (release checks, the git-hook installer, and similar) and is absent from the npm package. A product script left off `files` is missing from the npm package only. A hook helper left off `hooks/shared.json` breaks in every install that copies the hooks and runs the copy (the npm channel, a checkout deployed with init or upgrade, and `--codex` copies in `~/.codex/hooks`). It still works where hooks run in place: the plugin channel and a checkout run directly. The plugin channel ships the whole tracked tree instead (see the "What ships" row under Install channels). The entry points above are the ones a user runs.
 
 The package has **zero npm runtime dependencies**. Everything is Node.js built-ins (`fs`, `path`, `os`, `child_process`, `crypto`).
 
@@ -77,7 +81,7 @@ Each user-facing operation is a pair: an LLM-facing prompt + a Node.js script.
 | `commands/<name>.md` | Prompt definition — instructions Claude follows when the command is invoked |
 | `scripts/<name>.mjs` | Script implementation — Node.js logic the prompt may call via Bash |
 
-**Commands shipped in v1.1:** `init`, `doctor`, `upgrade`, `uninstall`, `ingest`, `query`, `crystallize`, `resume`, `feedback`, `verify`, `lint`, `stats`, `graph`.
+**Commands** (one file each under `commands/`): `init`, `doctor`, `upgrade`, `uninstall`, `ingest`, `query`, `crystallize`, `resume`, `feedback`, `verify`, `lint`, `stats`, `graph`, `audit`, `capture`, `rename`.
 
 Every one of those files is itself an Agent Skill; see below.
 
@@ -107,18 +111,22 @@ won every one of them. `scripts/smoke-plugin.mjs` now fails the build on a colli
 
 ## Lifecycle hooks
 
-Hooks run automatically at Claude Code lifecycle events. They are deployed to `~/.claude/hooks/` by `init` / `upgrade`, and registered in `~/.claude/settings.json`.
+Hooks run automatically at Claude Code lifecycle events. On the plugin channel the harness runs them straight from the plugin directory. On the npm channel `init` / `upgrade` copy them to `~/.claude/hooks/` and register them in `~/.claude/settings.json` (see Install channels below).
 
 ### Hook registry (`hooks/hooks.json`)
 
-`hooks.json` is the **single source of truth** for hook ↔ event mapping. `init`, `upgrade`, and `doctor` all read from it; the previous v1.0 design that maintained three separate `HOOK_MAP` constants was deleted in v1.1. A `git post-commit` hook re-applies upgrades when this file changes.
+`hooks.json` is the **single source of truth** for hook ↔ event mapping. `init`, `upgrade`, and `doctor` all read from it; the previous v1.0 design that maintained three separate `HOOK_MAP` constants was deleted in v1.1. A `git post-commit` hook in a checkout re-applies the upgrade, but only when the last commit changed something under `hooks/`.
+
+Counts are left out on purpose, because they go stale: `hooks/hooks.json` lists the events and registered handlers, and `hooks/shared.json` lists the modules copied beside them. At the time of writing that is nine events and twelve handlers.
 
 | Event | Hooks (in order) |
 |---|---|
+| `PreToolUse` | `hypo-close-guard.mjs` |
 | `SessionStart` | `hypo-session-start.mjs` |
+| `SessionEnd` | `hypo-session-end.mjs` |
 | `UserPromptSubmit` | `hypo-first-prompt.mjs` → `hypo-lookup.mjs` → `hypo-compact-guard.mjs` |
 | `PreCompact` | `hypo-personal-check.mjs` |
-| `PostToolUse` (Write/Edit) | `hypo-auto-stage.mjs` |
+| `PostToolUse` (no matcher in `hooks.json`; each hook filters on `tool_name` itself) | `hypo-auto-stage.mjs` (Write/Edit/MultiEdit) → `hypo-web-fetch-ingest.mjs` (WebFetch/WebSearch) |
 | `Stop` | `hypo-stop.mjs` (runs `hypo-hot-rebuild.mjs` → `hypo-session-record.mjs` → `hypo-auto-commit.mjs` → `hypo-auto-minimal-crystallize.mjs` as ordered stages, not separate registrations) |
 | `CwdChanged` | `hypo-cwd-change.mjs` |
 | `FileChanged` | `hypo-file-watch.mjs` |
@@ -128,11 +136,14 @@ Hooks run automatically at Claude Code lifecycle events. They are deployed to `~
 | Hook | Responsibility |
 |---|---|
 | `hypo-session-start` | Run `git pull --ff-only` (silent fail on missing remote), rebuild the generated session views from `projects/*/sessions/` (not on a vault with a remote that has not moved yet, which gets a notice instead), inject `index.md`, root `hot.md`, project `hot.md`/`session-state.md` |
+| `hypo-close-guard` | `PreToolUse`: denies a direct Write/Edit/MultiEdit to a generated session view (root `hot.md`, a project's `hot.md` or `session-state.md`) or to a session entry under `projects/<p>/sessions/`. Writes made through Bash are out of its scope, and the regular close apply runs through Bash |
+| `hypo-session-end` | `SessionEnd`: on `reason=clear` only, writes `.cache/clear-marker.json` so the next `SessionStart` (`source=clear`) can issue a recovery nudge. It also records the close-gate resolution in `.cache/close-gate/<session-id>.json` (the close gate is the check that a substantial session has been closed; `/clear` ends the session, so it counts as resolving the gate). That record is best effort: it is written only when the session's transcript resolves, and a failure never blocks `/clear`. Other exit reasons write nothing |
+| `hypo-web-fetch-ingest` | `PostToolUse`: after a WebFetch or WebSearch, injects a nudge to run `/hypo:ingest` (URL reduced to origin and path). It is a signal only and never ingests anything itself |
 | `hypo-first-prompt` | Reads the marker left by `hypo-session-start` or `hypo-cwd-change` and forces a one-line resume on the first user prompt (10-min TTL). It does not re-read or re-inject `hot.md` |
 | `hypo-lookup` | BM25 search over the wiki on every prompt. **HIT** → inject top-3 page snippets (≤2000 chars each; a page whose `verify_by_date` is overdue gets a `[STALE verify_by_date=…]` marker prepended). **MISS** → emit closest-slug signal that prompts Claude to research + `/hypo:ingest` |
 | `hypo-compact-guard` | Detect `/compact` or `/clear` typed in chat and, if session close is incomplete, tell Claude so. It never blocks `/compact` |
 | `hypo-personal-check` | PreCompact detection: lint blockers, uncommitted changes, missing session-log entries surface as a `systemMessage`; `/compact` is never blocked here |
-| `hypo-auto-stage` | After Write/Edit on a wiki path, run `git add` (skips paths matching `.hypoignore`, and every path while a merge is open) |
+| `hypo-auto-stage` | After Write/Edit/MultiEdit on a wiki path, run `git add` (skips paths matching `.hypoignore`, and every path while a merge is open) |
 | `hypo-hot-rebuild` | At session stop, regenerate the generated session views (root `hot.md`, project `hot.md` and `session-state.md`; the same generator `hypo-session-start` also calls); emit growth metrics + cache for next SessionStart. A scan failure (not just an empty `projects/`) skips the write and leaves a health notice for the next `SessionStart` to surface |
 | `hypo-session-record` | At session stop, append `{session_id, transcript_path, recorded_at, cwd, device}` to `.cache/sessions/index.jsonl` (primary source for the observability audit) |
 | `hypo-auto-commit` | At session stop, filter changed paths through `.hypoignore`, finish a merge Hypomnema left open, commit non-ignored changes, `git pull --no-rebase` + `git push` (silent fail on missing remote; the push is skipped after a pull that did not land, and when the tree tracks generated views under a migrated upstream) |
@@ -141,12 +152,12 @@ Hooks run automatically at Claude Code lifecycle events. They are deployed to `~
 
 ### Deployment constraint
 
-Hooks run in an isolated environment at `~/.claude/hooks/`. They **cannot import from relative paths** outside their own directory. Therefore:
+On the npm channel hooks run from `~/.claude/hooks/`, an isolated directory. They **cannot import from anything outside their own directory**; sibling modules in that directory are fine. Therefore:
 
-- Shared hook logic lives in the modules `hooks/shared.json` declares, not only in `hypo-shared.mjs`. That file (a plain JSON array of `.mjs` basenames) is the source of truth for the list and is copied alongside hooks at deploy time. It used to be a `shared` field inside `hooks.json` itself; it moved to this sibling file because the harness started warning on that unknown top-level key once it began validating `hooks.json` against its own hook-registration schema.
-- Hook utilities use **only Node.js built-ins** — no relative imports, no npm dependencies.
+- Shared hook logic lives in the modules `hooks/shared.json` declares, not only in `hypo-shared.mjs`. That file (a plain JSON array of `.mjs` basenames) is the source of truth for the list. Each listed file is copied next to the hooks at deploy time, not inlined into them. It used to be a `shared` field inside `hooks.json` itself; it moved to this sibling file because the harness started warning on that unknown top-level key once it began validating `hooks.json` against its own hook-registration schema.
+- Hook utilities use **only Node.js built-ins** and sibling modules: no imports outside the hooks directory, no npm dependencies.
 
-Scripts in `scripts/` are not deployed — they run from the package install path — so they can import from `scripts/lib/`.
+Scripts in `scripts/` are not copied anywhere. They run from the package install path, so they can import from `scripts/lib/`, and they may import from `hooks/`. The reverse is not allowed for any file that gets copied to `~/.claude/hooks` (anything in `hooks.json` or `shared.json`): a copied hook that imported from `scripts/` would resolve in a checkout and on the plugin channel, where hooks run in place, and fail with `ERR_MODULE_NOT_FOUND` wherever the hooks are copied (the npm channel, a checkout deployed with init or upgrade, and `--codex` copies in `~/.codex/hooks`). The one exception is `hooks/hypo-pre-commit.mjs`. It is a git hook worker that runs from the install root and is never copied, so it imports `../scripts/lib/hypo-ignore.mjs`.
 
 ---
 
@@ -156,26 +167,36 @@ Scripts in `scripts/` are not deployed — they run from the package install pat
 |---|---|
 | `HYPO_DIR` | Resolved wiki root path |
 | `PKG_ROOT` | Package install path, read from `~/.claude/hypo-pkg.json` |
-| `resolveHypoRoot()` | `HYPO_DIR` env → `hypo-config.md` scan (cwd → `$HOME`) → `~/hypomnema` fallback |
+| `resolveHypoRoot()` | `HYPO_DIR` env → `hypo-config.md` in a fixed list of candidate directories (see Configuration resolution) → `~/hypomnema` fallback |
 | `loadHypoIgnore()` | Parse `.hypoignore` into a pattern list |
 | `isIgnored(path)` | Test a path against `.hypoignore` patterns |
 | `hypoIsClean()` | Check git status + unpushed commits |
 | `hotMdIsClean()` | Validate `hot.md` structure |
 | `isCompactCommand(prompt)` | Detect `/compact` invocations |
 | `buildOutput(hookEventName, context, extra)` | Build hook output that nests `additionalContext` under `hookSpecificOutput`, keeping control fields as top-level siblings. The event name is required: Claude Code drops a payload whose `hookEventName` does not match the firing event |
-| `SESSION_STATE_NEXT_HEADINGS` | Allowed headings for "next tasks" — `## 다음 이어받기` / `## 다음 작업`. Lint reuses this constant (DRY) |
+| `SESSION_STATE_NEXT_HEADINGS` | Allowed headings for "next tasks": `## 다음 이어받기`, `## 다음 작업`, `## Next Up`, `## Next`. Lint reuses this constant (DRY) |
+
+`hypo-shared.mjs` is one of the shared modules. The full list is `hooks/shared.json`; besides the session-close stores and the update-check modules it includes `session-entries.mjs`, which holds the session entry format and the renderers, and `session-views.mjs`, which loads the entries and writes the generated views.
 
 ---
 
 ## Scripts lib (`scripts/lib/`)
 
-Helpers used by command scripts only. Not deployed to hooks.
+Helpers used by command scripts. They are not copied beside the hooks. The only hook that imports from here is `hypo-pre-commit.mjs`, a git hook worker that runs from the install root (see Deployment constraint). On the npm channel the shipped set is the `scripts/lib/` entries in `package.json`'s `files`. The main ones:
 
 | File | Purpose |
 |---|---|
 | `frontmatter.mjs` | Parse and serialize YAML frontmatter |
 | `hypo-root.mjs` | Wiki root resolution (mirrors hook logic, allows imports) |
 | `hypo-ignore.mjs` | `.hypoignore` parsing (mirrors hook logic, allows imports) |
+| `project-create.mjs` | Creates a project: `index.md`, `prd.md`, `decisions/`, `session-log/` |
+| `crystallize-close-*.mjs` | The session-close check, gate and apply behind `/hypo:crystallize` |
+| `extensions.mjs` | Syncs the vault's `extensions/` into `~/.claude` |
+| `plugin-detect.mjs` | Detects whether the plugin is also enabled, so the npm path does not register every hook twice |
+| `wikilink.mjs`, `slug-resolver.mjs` | Wikilink parsing and slug resolution |
+| `rename-marker.mjs` | The crash-recovery marker `rename.mjs --apply` writes and `doctor.mjs` reads |
+
+The session entry format and the generated views are not here. `hooks/session-entries.mjs` and `hooks/session-views.mjs` own them, because hooks need them too and scripts may import from `hooks/` but not the other way round. `scripts/session-entries.mjs` is the command-line entry for them (`rollback` and `render`; the move to entries is `/hypo:upgrade --migrate-sessions`).
 
 ---
 
@@ -190,10 +211,20 @@ Helpers used by command scripts only. Not deployed to hooks.
 ├── SCHEMA.md             ← type system reference
 ├── hypo-guide.md         ← operations guide
 ├── .hypoignore           ← glob patterns the hooks must ignore
+├── .hyposcanignore       ← glob patterns excluded from catalog scans only (not a privacy boundary)
+├── .gitignore            ← written by init (generated views, .cache/)
+├── .gitattributes        ← written by init
+├── extensions/           ← your own agents/commands/hooks/skills, mirrored to ~/.claude
+│   └── {agents,commands,hooks,skills}/
 ├── pages/                ← permanent knowledge pages
-│   └── feedback/         ← AI behavior corrections
+│   ├── feedback/         ← AI behavior corrections
+│   └── observability/    ← _index.md (the autonomy score definition)
 ├── projects/             ← per-project artifacts
+│   ├── _template/        ← scaffold: index.md, prd.md, decisions/, session-log/
 │   └── <name>/
+│       ├── index.md          ← overview (working_dir: field)
+│       ├── prd.md            ← purpose / success criteria
+│       ├── decisions/        ← ADRs (created with the project)
 │       ├── sessions/         ← one entry per session close (source of truth, never deleted)
 │       ├── notes.md          ← notes every session shares (hand-written, optional)
 │       ├── hot.md            ← recent session summaries (generated, not committed)
@@ -204,10 +235,11 @@ Helpers used by command scripts only. Not deployed to hooks.
 │   ├── daily/
 │   ├── weekly/
 │   └── monthly/
-└── sources/              ← raw ingested sources (append-only, never edit)
+├── sources/              ← raw ingested sources (append-only, never edit)
+└── .cache/               ← runtime state (gitignored): session index, markers, backups
 ```
 
-`hypo-config.md` presence is the wiki root marker. `resolveHypoRoot()` scans for it from cwd up to `$HOME`.
+`hypo-config.md` presence is the wiki root marker. `resolveHypoRoot()` checks a fixed list of candidate directories under `$HOME` for it (it does not walk up from the cwd).
 
 ---
 
@@ -216,36 +248,57 @@ Helpers used by command scripts only. Not deployed to hooks.
 The wiki path is resolved in this order:
 
 1. **`HYPO_DIR` environment variable** — explicit override
-2. **`hypo-config.md` scan** — walk from current dir up to `$HOME`
-3. **`~/hypomnema`** — default fallback
+2. **`hypo-config.md` scan**: the first of these directories that holds a `hypo-config.md` wins: `~/hypomnema`, `~/wiki`, `~/notes`, `~/knowledge`, `~/Documents/hypomnema`, `~/Documents/wiki`, and, in scripts only, `~/Documents/notes`
+3. **`~/hypomnema`**: default fallback
 
-Hooks inline this logic in `hypo-shared.mjs`. Scripts use `scripts/lib/hypo-root.mjs` (functionally identical, but importable).
+Hooks carry this logic in `hypo-shared.mjs`. Scripts use `scripts/lib/hypo-root.mjs`, which is importable but not identical: its candidate list has the extra `~/Documents/notes` entry that the hook copy lacks.
 
 `PKG_ROOT` is stored in `~/.claude/hypo-pkg.json` by `init`. `hypo-personal-check.mjs` uses it to locate the lint script (`PKG_ROOT ?? HYPO_DIR`); `upgrade --apply` detects drift and refreshes it.
 
 ---
 
+## Install channels
+
+Hypomnema reaches a machine through two channels, and they deploy hooks differently.
+
+| | Plugin channel | npm channel |
+|---|---|---|
+| Who runs the hooks | The harness, straight from `${CLAUDE_PLUGIN_ROOT}/hooks` as `hooks/hooks.json` says | `~/.claude/hooks/`, registered in `~/.claude/settings.json` |
+| What ships | The whole git-tracked tree of that commit. Observed 2026-10-15 in the plugin cache (`~/.claude/plugins/cache/hypomnema/hypo/1.10.0/`): it holds `scripts/bump-version.mjs`, `scripts/lib/check-tracker-ids.mjs` and `tests/` | The `package.json` `files` allowlist, which names each shipped `scripts/` file one by one. `npm run check:pack-surface` compares the tarball against a committed snapshot |
+| Deploy step | None for the Claude hooks. `--codex` still copies hooks to `~/.codex/hooks` | `init` and `upgrade` copy the hooks and shared modules to `~/.claude/hooks`, then merge `settings.json` |
+| How an update arrives | The installer caches each version in a directory named after `plugin.json`'s `version` string. If the version has not changed, the directory already exists and new commits never reach the installed copy | `npm install -g hypomnema` fetches the new package, then `upgrade --apply` copies again |
+
+The consequence for releases: on the plugin channel a fix reaches nobody until the version string moves. `init` and `upgrade` detect an enabled plugin and skip the copy and the `settings.json` merge, because doing both would fire every hook twice. In the steps below, each step is marked `[both]`, `[npm only]`, or `[plugin: skipped]`.
+
 ## Init and upgrade flow
 
 ### `/hypo:init`
 
-1. Wizard collects: wiki path, hook scope (`~/.claude` and/or `~/.codex`), git remote URL.
-2. Creates the vault directory structure: `pages/`, `projects/`, `sources/`, `journal/{daily,weekly,monthly}/`.
-3. Copies `templates/` files: 5 root files (`hypo-config.md`, `index.md`, `log.md`, `SCHEMA.md`, `hypo-guide.md`) and a generated root `hot.md` + 4 helpers (`Home.md`, `Overview.md`, `hypo-automation.md`, `hypo-help.md`) + `pages/_index.md` + `projects/_template/`.
-4. Deploys 10 hooks to `~/.claude/hooks/` and merges entries into `~/.claude/settings.json` (idempotent; preserves non-hypo hooks).
-5. Writes `~/.claude/hypo-pkg.json` with `pkgRoot` for upgrade tracking (skipped when the
+1. `[both]` Wizard collects: wiki path, hook scope (`~/.claude` and/or `~/.codex`), git remote URL.
+2. `[both]` Creates the vault directory structure: `pages/`, `pages/observability/`, `projects/`, `sources/`, `journal/{daily,weekly,monthly}/`, and `extensions/{hooks,commands,skills,agents}/` (each with a `.gitkeep`).
+3. `[both]` Copies `templates/` files: `index.md`, a generated root `hot.md`, `log.md`, `SCHEMA.md`, `hypo-guide.md`, the helpers `Home.md`, `Overview.md`, `hypo-help.md`, `hypo-automation.md`, a root `session-state.md`, `pages/_index.md`, `pages/observability/_index.md`, and `projects/_template/` (`index.md`, `prd.md`, `decisions/`, `session-log/`). It then writes `hypo-config.md`, `.hypoignore`, `.hyposcanignore`, `.gitignore` and `.gitattributes`.
+4. `[npm only]` Copies the hooks and shared modules to `~/.claude/hooks/`, installs the commands under `~/.claude/commands/hypo/`, and merges entries into `~/.claude/settings.json` (idempotent; preserves non-hypo hooks). `[plugin: skipped]` when the plugin is enabled.
+5. `[both]` Writes `~/.claude/hypo-pkg.json` with `pkgRoot` for upgrade tracking (skipped when the
    plugin channel judgment fails; see `init.mjs`'s `resolveDurableRoot`).
-6. `git init` + first commit `init: hypomnema wiki`. Pushes to remote when one is provided.
+6. `[both]` Syncs the vault's `extensions/` into `~/.claude` (with hooks enabled), and into `~/.codex` for `--codex`. The codex mirror covers hooks and commands only; skills and agents are skipped.
+7. `[both]` Installs the `claude()` shell function into the shell rc file (unless shell setup is turned off).
+8. `[both]` With `--codex`, copies the hooks to `~/.codex/hooks` and merges `~/.codex/settings.json`. The plugin does not provide this surface.
+9. `[both]` `git init` for the vault.
+10. `[both]` Installs the vault's pre-commit hook, which guards `.hypoignore`. It is skipped when the channel judgment fails.
+11. `[both]` Installs a post-commit hook in the package checkout that re-syncs the hooks after a commit there that changed files under `hooks/`. It is skipped when the package is not a git checkout, which is the case for npm and plugin installs.
+12. `[both]` First commit `chore: init hypomnema (<date>)`. Pushes to remote when one is provided.
 
 `--dry-run` previews; `--no-hooks` and `--no-git-init` are also supported. Re-running `init` is idempotent — existing files are skipped, never overwritten.
 
 ### `/hypo:upgrade`
 
-1. Reads `pkgRoot` from `~/.claude/hypo-pkg.json`.
-2. Re-deploys hooks from the current package version.
-3. Re-merges `settings.json` entries.
-4. Detects drift (e.g., `pkgRoot` no longer exists) and refreshes the pointer.
-5. `--json` output emits `{ schema, hooks, settings, applied }`. `--dry-run` previews; `--apply` commits changes.
+1. `[both]` Reads `pkgRoot` from `~/.claude/hypo-pkg.json`.
+2. `[npm only]` Re-deploys hooks from the current package version.
+3. `[npm only]` Re-merges `settings.json` entries.
+4. `[both]` Detects drift (e.g., `pkgRoot` no longer exists) and refreshes the pointer.
+5. `[both]` Re-copies hooks for `--codex` and syncs vault extensions. Only the Claude core surface is skipped on the plugin channel.
+6. `[both]` The check reports `hypo-guide.md` drift (a vault guide whose stamp is older than the package template's, or that has no stamp) as a warning and a non-zero exit, and `--apply` never overwrites the vault's guide. A stamp ahead of the package, or one that cannot be compared, is a warning without the non-zero exit. To clear drift, run the `diff` command the check prints against the package template, merge the changed parts by hand while keeping your own edits, raise `version:` in the vault guide's frontmatter to the package value, and run the check again. The stamp records that you reviewed the template. It does not prove the contents match.
+7. `--json` output emits `{ schema, hooks, settings, applied }`. `--dry-run` previews; `--apply` commits changes.
 
 The SessionStart hook (`hooks/hypo-session-start.mjs`) is a third writer of this file, outside init/upgrade entirely. `hooks/hypo-shared.mjs`'s `pkgRootDriftStatus` detects drift by comparing the canonicalized `pkgRoot` alone, not `pkgVersion`, so a file whose `pkgRoot` already matches self-location reads as `match` even when its `pkgVersion` is stale. Only a `pkgRoot` mismatch triggers the rewrite (temp file, then rename), and `pkgVersion` is carried along in that same write rather than checked or fixed on its own. The rewrite is guarded by a lockfile, so two sessions self-locating to different install roots at once cannot race each other's write, and it writes nothing on a downgrade (self-location resolves to an older version than the file already records), an incoming version that fails to parse as semver, a lock it could not acquire, or an opted-out session.
 
@@ -304,8 +357,12 @@ SessionStart
   │     ├─► hypo-lookup.mjs (BM25 inject)
   │     └─► hypo-compact-guard.mjs (report incomplete checklist; never blocks /compact)
   │
-  ├─► PostToolUse(Write/Edit)
-  │     └─► hypo-auto-stage.mjs (git add)
+  ├─► PreToolUse
+  │     └─► hypo-close-guard.mjs (denies a direct write to a generated view or a session entry)
+  │
+  ├─► PostToolUse (no matcher; each hook filters on tool_name)
+  │     ├─► hypo-auto-stage.mjs (Write/Edit/MultiEdit: git add)
+  │     └─► hypo-web-fetch-ingest.mjs (WebFetch/WebSearch: nudge toward /hypo:ingest, never ingests)
   │
   ├─► PreCompact
   │     └─► hypo-personal-check.mjs (lint + session-close gate)
@@ -313,12 +370,18 @@ SessionStart
   ├─► CwdChanged
   │     └─► hypo-cwd-change.mjs (builds a hot.md notice on systemMessage; the reference documents the terminal notification, tracing the installed binary as of Claude Code 2.1.276, checked 2026-09-18 and reconfirmed on 2.1.283, shows it does not reach the model, and no live-session observation exists either way; see the hook table above)
   │
-  └─► Stop
-        └─► hypo-stop.mjs, running four stages in order:
-              ├─► hypo-hot-rebuild.mjs (regenerate the session views + growth cache; SessionStart also calls this generator)
-              ├─► hypo-session-record.mjs (append .cache/sessions/index.jsonl)
-              ├─► hypo-auto-commit.mjs (.hypoignore-filtered stage + commit + pull + push)
-              └─► hypo-auto-minimal-crystallize.mjs (blocks Stop if session close never ran)
+  ├─► FileChanged
+  │     └─► hypo-file-watch.mjs (builds a notice for a changed wiki file; no trigger on a stock install, treated as not reaching the model; see the hook table above)
+  │
+  ├─► Stop
+  │     └─► hypo-stop.mjs, running four stages in order:
+  │           ├─► hypo-hot-rebuild.mjs (regenerate the session views + growth cache; SessionStart also calls this generator)
+  │           ├─► hypo-session-record.mjs (append .cache/sessions/index.jsonl)
+  │           ├─► hypo-auto-commit.mjs (.hypoignore-filtered stage + commit + pull + push)
+  │           └─► hypo-auto-minimal-crystallize.mjs (blocks Stop if session close never ran)
+  │
+  └─► SessionEnd
+        └─► hypo-session-end.mjs (on /clear only: writes .cache/clear-marker.json for the next SessionStart, and the close-gate resolution record .cache/close-gate/<session-id>.json)
 ```
 
 Root hot.md's frontmatter `updated:` is the max of every project row date, and a row's date is the
@@ -481,7 +544,7 @@ tests/
 ├── helpers.mjs          ← fixtures used by more than one area file
 ├── runner.mjs           ← the entry: imports every *.test.mjs, owns no tests itself
 ├── parallel.mjs         ← runs the entry as N concurrent processes (`npm test`)
-└── <area>.test.mjs      ← one file per production area (26 of them)
+└── <area>.test.mjs      ← one file per production area
 ```
 
 Tests live next to the thing they test: `extensions.test.mjs`, `lint.test.mjs`,
@@ -493,9 +556,10 @@ Everything uses Node built-ins only. Fixtures are built in code with scoped help
 
 **Selection is by suite, never by test.** `suite(label)` opens a selection unit, and
 `--shard=i/n` keeps a whole suite in one process, in order. So tests inside one suite may build
-on each other, and suites may not build on each other. `node tests/parallel.mjs --shards=237`
-runs every suite alone in a fresh process and is the proof of that invariant. Run it whenever
-you add or split a suite.
+on each other, and suites may not build on each other. `node tests/parallel.mjs --shards=<n>`,
+with `n` at or above the current `suite()` count, runs every suite alone in a fresh process and
+is the proof of that invariant. A smaller `n` stops proving it. Run it whenever you add or split
+a suite.
 
 | Command | What it does |
 |---|---|
@@ -504,11 +568,11 @@ you add or split a suite.
 | `node tests/runner.mjs --grep=<regex>` | just the matching tests, in seconds |
 | `node tests/runner.mjs --file=lint` | one area file |
 | `node tests/parallel.mjs --by-file` | one process per area file |
-| `node tests/parallel.mjs --shards=237` | every suite alone: the order-independence proof |
+| `node tests/parallel.mjs --shards=<n>` | every suite alone, with `n` at or above the `suite()` count: the order-independence proof |
 
 Round-robin is the default rather than one-process-per-file, and the reason is measured, not
 assumed: on a 2026 laptop the whole suite runs in about 70s round-robined and about 100s
-`--by-file`. The areas differ by an order of magnitude in size, and `--by-file` starts all 26
+`--by-file`. The areas differ by an order of magnitude in size, and `--by-file` starts every area
 at once, which oversubscribes the cores. The big files (`extensions`, `proposal-base`,
 `close-global`) then finish last under contention while the small ones exit in seconds and
 leave the tail of the run half idle. Reach for `--by-file` to read one area's output, not to go
@@ -572,7 +636,7 @@ Requires `NPM_TOKEN` secret.
           {
             "type": "command",
             "command": "node ${CLAUDE_PLUGIN_ROOT}/hooks/hypo-<name>.mjs",
-            "timeout": <ms>
+            "timeout": <seconds>
           }
         ]
       }
@@ -587,7 +651,7 @@ The shared-file list (helpers a registered hook imports, such as `hypo-shared.mj
 ["hypo-shared.mjs", "version-check.mjs", "..."]
 ```
 
-`hooks/hooks.json` is still the source of truth for the event-to-hook map; `hooks/shared.json` is the source of truth for the shared-file list. A hook registered in the former, or a helper listed in the latter, is what init/upgrade deploy. Anything left off either file never reaches an installed copy.
+`hooks/hooks.json` is still the source of truth for the event-to-hook map; `hooks/shared.json` is the source of truth for the shared-file list. A hook registered in the former, or a helper listed in the latter, is what init/upgrade copy on the npm channel. A hook left off the former never fires on the plugin channel either, because the harness reads that file. A helper left off the latter still resolves on the plugin channel, where the whole tree is present, and fails with `ERR_MODULE_NOT_FOUND` only in installs that copy the hooks (npm, a checkout deployed with init or upgrade, `--codex` copies) (see the "What ships" row under Install channels).
 
 `claude plugin validate .` is run as part of CI's plugin-snapshot checks.
 

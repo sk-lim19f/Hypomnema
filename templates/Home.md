@@ -19,7 +19,7 @@ tags: [wiki, home]
 - [[SCHEMA]] — type system reference
 - [[hypo-guide]] — operations guide
 
-> **Auto-ingest rule**: after any `WebFetch` / `WebSearch` that yields relevant knowledge, run `/hypo:ingest` immediately without waiting for an explicit request.
+> **Ingest nudge**: after a `WebFetch` / `WebSearch`, a hook only reminds Claude about `/hypo:ingest`. When the result is worth keeping, Claude runs `/hypo:ingest` itself.
 
 ---
 
