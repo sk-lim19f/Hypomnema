@@ -173,7 +173,7 @@ To turn the entries back on, run `/hypo:upgrade --migrate-sessions`.
 
 ### Ingest (external source → wiki)
 
-**Auto-trigger rule**: after any `WebFetch` / `WebSearch` that yields new knowledge relevant to the current task, run `/hypo:ingest` immediately — do not wait for the user to ask.
+**Ingest nudge**: after a `WebFetch` / `WebSearch`, a hook only reminds Claude about `/hypo:ingest`. It never ingests anything itself. When the result is worth keeping, Claude runs `/hypo:ingest`, without waiting for the user to ask.
 
 1. Save raw source to `sources/<slug>.<ext>` (never edit after)
 2. Read and synthesize
@@ -186,7 +186,7 @@ To turn the entries back on, run `/hypo:upgrade --migrate-sessions`.
 1. Read `index.md` first
 2. Cross-reference related pages
 3. Synthesize answer — cite `[[page-slug]]` links
-4. **On miss**: research externally (`WebFetch` / `WebSearch`), then auto-ingest — omitting `/hypo:ingest` after external research is a defect
+4. **On miss**: research externally (`WebFetch` / `WebSearch`), then run `/hypo:ingest` on what is worth keeping (the hook only nudges, so Claude has to act on it). Skipping `/hypo:ingest` after external research that produced reusable knowledge is a defect
 
 ---
 
@@ -208,10 +208,12 @@ To turn the entries back on, run `/hypo:upgrade --migrate-sessions`.
 projects/<name>/
 ├── index.md          (working_dir: /path/to/repo)
 ├── prd.md
+├── decisions/        (empty, for ADRs)
+├── session-log/      (empty, for daily narrative shards)
 └── sessions/         (created by the first session close)
 ```
 
-`hot.md` and `session-state.md` are not files you create. They are generated from `sessions/`, and the root table is built from every project that has an `index.md` or a `sessions/` directory, so `index.md` is what puts a new project in the table. The first session close writes the first entry, and the next session start or stop builds the views. The auto-project offer below creates the project files for you.
+The project helper creates `index.md`, `prd.md`, `decisions/` and `session-log/`. `hot.md` and `session-state.md` are not files you create. They are generated from `sessions/`, and the root table is built from every project that has an `index.md` or a `sessions/` directory, so `index.md` is what puts a new project in the table. The first session close writes the first entry, and the next session start or stop builds the views. The auto-project offer below creates the project files for you.
 
 #### Auto-project offer
 

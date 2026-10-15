@@ -250,7 +250,7 @@ Nine commands cover the full capture → retrieval → consolidation cycle.
 | `/hypo:graph` | Generates a wikilink dependency graph | When you want to see how the structure grew |
 | `/hypo:rename` | Renames a page or directory and rewrites inbound `[[wikilinks]]` | When a page or project folder needs a new name |
 
-### Lifecycle hooks (15)
+### Lifecycle hooks (12)
 
 | Hook | Event | Role |
 |---|---|---|
