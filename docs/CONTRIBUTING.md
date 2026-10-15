@@ -489,6 +489,18 @@ token authenticates without publishing anything.
 
 Major bumps must include an `upgrade.mjs` migration fixture in `tests/upgrade.test.mjs`.
 
+v1.10.0 shipped as a minor as an exception to the vault-layout row above. It moved sessions into
+per-close entries under `projects/<name>/sessions/`. What motivated the exception: a vault with a
+git remote migrates only when someone runs `--migrate-sessions`, and a rollback command restores
+the flat files. What it does not cover: a vault without a remote attempts the migration by itself
+at session start, and having no remote does not mean only one installation uses the vault (a
+synced or shared folder can carry it to several machines). Even before migration, an upgraded
+close writes entries that older versions cannot read, while leaving the old flat files unchanged. So every
+installation sharing a vault must be upgraded first, and nothing checks that. The README, the
+session-start notice, the CHANGELOG callout and `doctor`'s diagnostics explain the transition and
+catch some of the problems; they do not enforce compatibility. Other vault-layout migrations
+remain major.
+
 ---
 
 ## What not to do
