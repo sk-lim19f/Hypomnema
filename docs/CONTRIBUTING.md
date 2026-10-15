@@ -82,7 +82,7 @@ Hook code may use only Node.js built-ins and sibling modules in `hooks/`, with n
 2. If it's new, register it in `hooks/hooks.json` under the correct event key.
 3. Shared utilities go in a module listed in `hooks/shared.json`, usually `hypo-shared.mjs`.
 4. Add a contract test in the hook's area file, e.g. `tests/session-hooks.test.mjs` (input → expected `additionalContext` shape).
-5. After your change, run `/hypo:upgrade` in a real Claude Code session and verify the hook fires.
+5. After your change, load the checkout with `claude --plugin-dir <path to your checkout>`, trigger the hook's event in that session, and confirm the hook path the session runs is under the checkout. `/hypo:upgrade` is not a check for this: it uses the installed package, and in plugin mode `--apply` skips the core hook deployment. If the installed plugin is enabled too, the two copies can compete, so disable it for the test.
 
 ### Modifying `hypo-shared.mjs`
 
@@ -227,8 +227,8 @@ For non-trivial changes, request a second review before merging — a peer revie
 Before opening:
 
 1. `npm test` and `npm run lint` both pass.
-2. If you changed a hook, you ran the manual verification step in a real Claude Code session.
-3. If you changed `hypo-shared.mjs`, the copied hook works after `/hypo:upgrade` (npm channel). On the plugin channel the installed plugin directory is what runs, and it picks up the change only after a release moves the version string.
+2. If you changed a hook, you ran the manual verification step: a session started with `claude --plugin-dir <path to your checkout>` that triggers the event and runs the hook from the checkout.
+3. If you changed `hypo-shared.mjs`, the copied hook also works after `/hypo:upgrade` on the npm channel. On the plugin channel the installed plugin directory is what runs for users, and it picks up the change only after a release moves the version string.
 4. If you changed a template or `init` flow, a fresh `init` produces the expected vault structure.
 5. README / ARCHITECTURE / docs are updated to match.
 

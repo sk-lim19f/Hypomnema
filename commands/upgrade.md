@@ -44,6 +44,15 @@ Show the output verbatim.
 - `⚠` — minor update available (stale hook or missing settings entry)
 - `✗` — major version bump or missing hook files (action required)
 
+If a `⚠ hypo-guide.md` line appears, `--apply` will not fix it: it never overwrites the vault's guide. Tell the user to finish it by hand, and offer to do the merge:
+
+1. Run the `diff` command printed on that line to compare the package template with the vault's `hypo-guide.md`.
+2. Merge the changed parts into the vault copy and keep the user's own edits.
+3. Set `version:` in the vault copy's frontmatter to the package version shown on that line.
+4. Run the check again. The warning clears.
+
+The stamp only records that the template was reviewed. It does not prove the contents match, so do not raise it before the merge is done.
+
 For a **major SCHEMA bump**: warn the user that `--apply` will additionally write a `MIGRATION-vX.Y.md` informational file in their Hypomnema root and that they must manually merge the SCHEMA diff after applying.
 
 ---

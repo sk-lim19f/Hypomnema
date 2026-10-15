@@ -213,7 +213,7 @@ projects/<name>/
 └── sessions/         (created by the first session close)
 ```
 
-The project helper creates `index.md`, `prd.md`, `decisions/` and `session-log/`. `hot.md` and `session-state.md` are not files you create. They are generated from `sessions/`, and the root table is built from every project that has an `index.md` or a `sessions/` directory, so `index.md` is what puts a new project in the table. The first session close writes the first entry, and the next session start or stop builds the views. The auto-project offer below creates the project files for you.
+The project helper creates `index.md`, `prd.md`, `decisions/` and `session-log/`. `hot.md` and `session-state.md` are not files you create. They are generated from `sessions/`, and the root table is built from every project that has an `index.md` or a `sessions/` directory, so `index.md` is what puts a new project in the table. The views are built right away when the project is created and again right after each session close applies. Session start and stop refresh them later and rebuild any that went missing. The first session close writes the first entry. The auto-project offer below creates the project files for you.
 
 #### Auto-project offer
 
