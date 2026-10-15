@@ -5488,6 +5488,11 @@ export function applySessionClose(args, testHooks = null) {
   // committed under this close, before its own close finishes. The locks are the same
   // primitive the appends always used. The order is shard, then log.md, then the vault
   // commit lock, and no path takes any two of them the other way round.
+  // Today the shard lock is redundant: every close takes the log.md lock right after the shard
+  // lock (runHoldingAppendLocks), whether or not it appends there, so two closes that share a
+  // shard are already serialized by it. It stays because it is the only
+  // guard the shard would have if a writer ever appended to it without taking log.md, and
+  // dropping it would not shorten any wait (the cost is the log.md lock, held by every close).
   const shardTarget = join(args.hypoDir, 'projects', project, 'session-log', `${date}.md`);
   const appendTargets = [
     appendTarget(join('projects', project, 'session-log', `${date}.md`), shardTarget),
