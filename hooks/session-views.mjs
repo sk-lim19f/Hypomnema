@@ -942,7 +942,7 @@ function returnStrandedIndex(hypoDir, sha, headBefore) {
  * Returns `{ok, pre, deferred?, reason?, notice?}` where `pre` is the clearing step's result (its
  * `archived[]`, `localOnly[]`, `unowned[]` and `cleared[]` are for the caller, after a successful
  * merge). The `.gitignore` goes back as the exact bytes it held (`undoClearedPaths`), not as lines
- * appended; a staged `.gitignore` is deferred, never moved.
+ * appended; a `.gitignore` that is staged when the clearing step checks is deferred, not moved.
  * `notice` carries git's whole stderr after a failed merge, which names the files in the way, and
  * any path that could not be put back.
  */

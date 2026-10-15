@@ -3259,7 +3259,7 @@ export function resumePullArchive(hypoDir, { announced = [] } = {}) {
       gitignoreSaved: [],
     });
     notices.push(
-      `공유하지 못한 보관 항목이 있어 기록(${PULL_ARCHIVE_REL})에 그것만 남겼습니다: ${shared.unresolved.map((v) => `${v.relPath} (${v.backupPath})`).join(', ')}. 다음 실행이 다시 시도합니다. 같은 실행이 매번 같은 결과를 내므로, 공유하지 않아도 되면 백업을 확인하고 ${PULL_ARCHIVE_REL}의 stage 가 merged 이고 views 에 위 항목만 있을 때 그 파일을 직접 지우세요. 백업 파일은 그대로 남고 이 알림은 멈춥니다.`,
+      `공유하지 못한 보관 항목이 있어 기록(${PULL_ARCHIVE_REL})에 그것만 남겼습니다: ${shared.unresolved.map((v) => `${v.relPath} (${v.backupPath})`).join(', ')}. 다음 실행이 다시 시도합니다. 백업이 달라졌거나 같은 이름에 다른 파일이 있으면 대개 저절로 풀리지 않습니다. 공유하지 않아도 되면, 다른 터미널에서 동기화가 돌지 않을 때 백업을 확인하고 ${PULL_ARCHIVE_REL}의 stage 가 merged 이고 views 에 위 항목만 있으며 gitignoreLines, gitignoreSaved, localOnly, unowned, cleared 가 모두 비어 있을 때만 그 파일을 직접 지우세요. 백업 파일은 그대로 남고 이 알림은 멈춥니다.`,
     );
   } else {
     rmSync(join(hypoDir, PULL_ARCHIVE_REL), { force: true });

@@ -4655,8 +4655,21 @@ test('deleting the record of an unresolved member, as its notice says, stops the
       first.notices.some((n) => n.includes('직접 지우세요')),
       first.notices.join('\n'),
     );
+    // The advice is safe only for a record that holds nothing else to recover, so it names every
+    // other list, and the record this run wrote does hold nothing else.
+    const advice = first.notices.find((n) => n.includes('직접 지우세요'));
+    for (const list of ['gitignoreLines', 'gitignoreSaved', 'localOnly', 'unowned', 'cleared']) {
+      assert.ok(advice.includes(list), `the advice names ${list}: ${advice}`);
+    }
     const record = JSON.parse(readRel(b, '.cache/pull-archive.json'));
     assert.equal(record.stage, 'merged', 'the condition the notice names holds');
+    assert.deepEqual(
+      record.views.map((v) => v.relPath),
+      ['projects/p/hot.md'],
+    );
+    for (const list of ['gitignoreLines', 'gitignoreSaved', 'localOnly', 'unowned', 'cleared']) {
+      assert.deepEqual(record[list], [], `${list} is empty when the advice is given`);
+    }
     unlinkSync(join(b, '.cache', 'pull-archive.json'));
     const after = resumePullArchive(b);
     assert.equal(after.resumed, false);
