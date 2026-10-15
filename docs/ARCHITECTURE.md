@@ -167,7 +167,7 @@ Scripts in `scripts/` are not copied anywhere. They run from the package install
 |---|---|
 | `HYPO_DIR` | Resolved wiki root path |
 | `PKG_ROOT` | Package install path, read from `~/.claude/hypo-pkg.json` |
-| `resolveHypoRoot()` | `HYPO_DIR` env → `hypo-config.md` scan (cwd → `$HOME`) → `~/hypomnema` fallback |
+| `resolveHypoRoot()` | `HYPO_DIR` env → `hypo-config.md` in a fixed list of candidate directories (see Configuration resolution) → `~/hypomnema` fallback |
 | `loadHypoIgnore()` | Parse `.hypoignore` into a pattern list |
 | `isIgnored(path)` | Test a path against `.hypoignore` patterns |
 | `hypoIsClean()` | Check git status + unpushed commits |
@@ -285,7 +285,7 @@ The consequence for releases: on the plugin channel a fix reaches nobody until t
 8. `[both]` With `--codex`, copies the hooks to `~/.codex/hooks` and merges `~/.codex/settings.json`. The plugin does not provide this surface.
 9. `[both]` `git init` for the vault.
 10. `[both]` Installs the vault's pre-commit hook, which guards `.hypoignore`. It is skipped when the channel judgment fails.
-11. `[both]` Installs a post-commit hook in the package checkout that re-syncs the hooks after each commit there. It is skipped when the package is not a git checkout, which is the case for npm and plugin installs.
+11. `[both]` Installs a post-commit hook in the package checkout that re-syncs the hooks after a commit there that changed files under `hooks/`. It is skipped when the package is not a git checkout, which is the case for npm and plugin installs.
 12. `[both]` First commit `chore: init hypomnema (<date>)`. Pushes to remote when one is provided.
 
 `--dry-run` previews; `--no-hooks` and `--no-git-init` are also supported. Re-running `init` is idempotent — existing files are skipped, never overwritten.
@@ -297,7 +297,7 @@ The consequence for releases: on the plugin channel a fix reaches nobody until t
 3. `[npm only]` Re-merges `settings.json` entries.
 4. `[both]` Detects drift (e.g., `pkgRoot` no longer exists) and refreshes the pointer.
 5. `[both]` Re-copies hooks for `--codex` and syncs vault extensions. Only the Claude core surface is skipped on the plugin channel.
-6. `[both]` The check reports `hypo-guide.md` drift (a version stamp that differs from the package template) as a warning and a non-zero exit, and `--apply` never overwrites the vault's guide. To clear it, run the `diff` command the check prints against the package template, merge the changed parts by hand while keeping your own edits, raise `version:` in the vault guide's frontmatter to the package value, and run the check again. The stamp records that you reviewed the template. It does not prove the contents match.
+6. `[both]` The check reports `hypo-guide.md` drift (a vault guide whose stamp is older than the package template's, or that has no stamp) as a warning and a non-zero exit, and `--apply` never overwrites the vault's guide. A stamp ahead of the package, or one that cannot be compared, is a warning without the non-zero exit. To clear drift, run the `diff` command the check prints against the package template, merge the changed parts by hand while keeping your own edits, raise `version:` in the vault guide's frontmatter to the package value, and run the check again. The stamp records that you reviewed the template. It does not prove the contents match.
 7. `--json` output emits `{ schema, hooks, settings, applied }`. `--dry-run` previews; `--apply` commits changes.
 
 The SessionStart hook (`hooks/hypo-session-start.mjs`) is a third writer of this file, outside init/upgrade entirely. `hooks/hypo-shared.mjs`'s `pkgRootDriftStatus` detects drift by comparing the canonicalized `pkgRoot` alone, not `pkgVersion`, so a file whose `pkgRoot` already matches self-location reads as `match` even when its `pkgVersion` is stale. Only a `pkgRoot` mismatch triggers the rewrite (temp file, then rename), and `pkgVersion` is carried along in that same write rather than checked or fixed on its own. The rewrite is guarded by a lockfile, so two sessions self-locating to different install roots at once cannot race each other's write, and it writes nothing on a downgrade (self-location resolves to an older version than the file already records), an incoming version that fails to parse as semver, a lock it could not acquire, or an opted-out session.

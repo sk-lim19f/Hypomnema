@@ -44,7 +44,7 @@ Show the output verbatim.
 - `⚠` — minor update available (stale hook or missing settings entry)
 - `✗` — major version bump or missing hook files (action required)
 
-If a `⚠ hypo-guide.md` line appears, `--apply` will not fix it: it never overwrites the vault's guide. Tell the user to finish it by hand, and offer to do the merge:
+If a `⚠ hypo-guide.md` line shows a version change (`vN → vM`) or says the installed copy has no version stamp, `--apply` will not fix it: it never overwrites the vault's guide. Tell the user to finish it by hand, and offer to do the merge. A line that says the installed copy is ahead of the package, or that the versions cannot be compared, is not drift: leave the stamp alone and only report it.
 
 1. Run the `diff` command printed on that line to compare the package template with the vault's `hypo-guide.md`.
 2. Merge the changed parts into the vault copy and keep the user's own edits.
