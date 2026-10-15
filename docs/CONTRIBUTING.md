@@ -60,7 +60,7 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the full breakdown. Short version:
 
 ## Hook deployment constraint
 
-Code that hooks and scripts share lives in `hooks/` and is listed in `hooks/shared.json`. Hooks never import from `scripts/`. The reasoning and the one exception are in the [Deployment constraint](ARCHITECTURE.md#deployment-constraint) section of ARCHITECTURE.md.
+Code that hooks and scripts share lives in `hooks/` and is listed in `hooks/shared.json`. Hooks do not import from `scripts/`, with one exception. The reasoning and the exception are in the [Deployment constraint](ARCHITECTURE.md#deployment-constraint) section of ARCHITECTURE.md.
 
 Hook code may use only Node.js built-ins and sibling modules in `hooks/`, with no npm dependencies.
 
@@ -86,7 +86,7 @@ Hook code may use only Node.js built-ins and sibling modules in `hooks/`, with n
 
 ### Modifying `hypo-shared.mjs`
 
-This file is deployed verbatim to `~/.claude/hooks/`. Constraints:
+On the npm channel this file is copied verbatim to `~/.claude/hooks/`. On the plugin channel the harness runs it from the plugin directory. Constraints:
 
 - Only Node.js built-ins.
 - No imports outside `hooks/`.
@@ -228,7 +228,7 @@ Before opening:
 
 1. `npm test` and `npm run lint` both pass.
 2. If you changed a hook, you ran the manual verification step in a real Claude Code session.
-3. If you changed `hypo-shared.mjs`, the deployed copy works after `/hypo:upgrade`.
+3. If you changed `hypo-shared.mjs`, the copied hook works after `/hypo:upgrade` (npm channel). On the plugin channel the installed plugin directory is what runs, and it picks up the change only after a release moves the version string.
 4. If you changed a template or `init` flow, a fresh `init` produces the expected vault structure.
 5. README / ARCHITECTURE / docs are updated to match.
 

@@ -137,7 +137,7 @@ Counts are left out on purpose, because they go stale: `hooks/hooks.json` lists 
 |---|---|
 | `hypo-session-start` | Run `git pull --ff-only` (silent fail on missing remote), rebuild the generated session views from `projects/*/sessions/` (not on a vault with a remote that has not moved yet, which gets a notice instead), inject `index.md`, root `hot.md`, project `hot.md`/`session-state.md` |
 | `hypo-close-guard` | `PreToolUse`: denies a direct Write/Edit/MultiEdit to a generated session view (root `hot.md`, a project's `hot.md` or `session-state.md`) or to a session entry under `projects/<p>/sessions/`. Writes made through Bash are out of its scope, and the regular close apply runs through Bash |
-| `hypo-session-end` | `SessionEnd`: on `reason=clear` only, writes `.cache/clear-marker.json` so the next `SessionStart` (`source=clear`) can issue a recovery nudge. It also records the close-gate resolution in `.cache/close-gate/<session-id>.json` (the close gate is the check that a substantial session has been closed; `/clear` ends the session, so it counts as resolving the gate). Other exit reasons write nothing |
+| `hypo-session-end` | `SessionEnd`: on `reason=clear` only, writes `.cache/clear-marker.json` so the next `SessionStart` (`source=clear`) can issue a recovery nudge. It also records the close-gate resolution in `.cache/close-gate/<session-id>.json` (the close gate is the check that a substantial session has been closed; `/clear` ends the session, so it counts as resolving the gate). That record is best effort: it is written only when the session's transcript resolves, and a failure never blocks `/clear`. Other exit reasons write nothing |
 | `hypo-web-fetch-ingest` | `PostToolUse`: after a WebFetch or WebSearch, injects a nudge to run `/hypo:ingest` (URL reduced to origin and path). It is a signal only and never ingests anything itself |
 | `hypo-first-prompt` | Reads the marker left by `hypo-session-start` or `hypo-cwd-change` and forces a one-line resume on the first user prompt (10-min TTL). It does not re-read or re-inject `hot.md` |
 | `hypo-lookup` | BM25 search over the wiki on every prompt. **HIT** → inject top-3 page snippets (≤2000 chars each; a page whose `verify_by_date` is overdue gets a `[STALE verify_by_date=…]` marker prepended). **MISS** → emit closest-slug signal that prompts Claude to research + `/hypo:ingest` |
@@ -285,7 +285,8 @@ The consequence for releases: on the plugin channel a fix reaches nobody until t
 8. `[both]` With `--codex`, copies the hooks to `~/.codex/hooks` and merges `~/.codex/settings.json`. The plugin does not provide this surface.
 9. `[both]` `git init` for the vault.
 10. `[both]` Installs the vault's pre-commit hook, which guards `.hypoignore`. It is skipped when the channel judgment fails.
-11. `[both]` First commit `init: hypomnema wiki`. Pushes to remote when one is provided.
+11. `[both]` Installs a post-commit hook in the package checkout that re-syncs the hooks after each commit there. It is skipped when the package is not a git checkout, which is the case for npm and plugin installs.
+12. `[both]` First commit `init: hypomnema wiki`. Pushes to remote when one is provided.
 
 `--dry-run` previews; `--no-hooks` and `--no-git-init` are also supported. Re-running `init` is idempotent — existing files are skipped, never overwritten.
 
