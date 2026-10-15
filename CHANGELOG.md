@@ -5,6 +5,25 @@ All notable changes to Hypomnema are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.10.0] - 2026-10-15
+
+> [!IMPORTANT]
+> **Update every installation that uses a vault before you start sessions on 1.10.0 there. Hypomnema does not check the other installations' versions.** Before migration, a close on 1.10.0 writes a session entry and leaves the old `hot.md` and `session-state.md` unchanged, and older versions cannot read the new entries. A vault without a git remote attempts the migration by itself when a session starts, including a vault shared through a synced folder. For a vault with a git remote, run `/hypo:upgrade --migrate-sessions` once on one machine after every installation is updated: it commits the migration and tries to push it when an upstream branch is set. An installation still on an older version loses `hot.md` and `session-state.md` once it has the migration, and cannot complete a close (session-log text may still be written); update it and run `/hypo:doctor`. To go back to flat files, see the rollback command in the README.
+
+> [!IMPORTANT]
+> **볼트를 쓰는 모든 기기의 Hypomnema 를 업데이트한 뒤에 그 볼트에서 1.10.0 세션을 시작하세요. 다른 기기의 버전은 자동으로 확인하지 않습니다.** 이전 전에도 1.10.0 은 세션을 마감할 때 세션 기록을 쓰지만, 기존 `hot.md` 와 `session-state.md` 는 갱신하지 않습니다. 구버전은 새 세션 기록을 읽지 못합니다. git 원격 저장소가 없는 볼트는 세션을 시작할 때 자동으로 이전을 시도하며, 동기화 폴더로 공유하는 볼트도 마찬가지입니다. git 원격 저장소가 있는 볼트는 모든 기기를 업데이트한 뒤 한 기기에서 `/hypo:upgrade --migrate-sessions` 를 한 번 실행하세요. 이 명령은 이전 내용을 커밋하고, 업스트림 브랜치가 설정되어 있으면 바로 push 를 시도합니다. 구버전 기기는 이전 내용을 받는 순간 `hot.md` 와 `session-state.md` 가 사라지고, 세션 마감을 정상적으로 끝내지 못합니다(세션 로그에는 일부 기록이 남을 수 있습니다). 그 기기의 Hypomnema 를 업데이트한 뒤 `/hypo:doctor` 를 실행하세요. 평면 파일로 되돌리는 방법은 README 의 rollback 명령을 보세요.
+
+### New Features
+#### English
+- Session close writes one immutable entry per close under `projects/<name>/sessions/`, and `hot.md` and `session-state.md` are generated from the entries, so sessions that close at the same time no longer overwrite each other. An existing vault attempts the migration on its own without a remote and moves with `/hypo:upgrade --migrate-sessions` with one; a rollback command goes back to flat files. Project names may use any script, and a close refuses a vault stopped mid-merge or mid-rebase before writing. ([#316](https://github.com/sk-lim19f/Hypomnema/pull/316))
+#### 한국어
+- 세션을 마감할 때마다 `projects/<name>/sessions/` 아래에 수정하지 않는 기록 하나를 쓰고, `hot.md` 와 `session-state.md` 는 그 기록들로 만듭니다. 그래서 동시에 마감하는 세션이 더 이상 서로를 덮어쓰지 않습니다. 기존 볼트는 원격 저장소가 없으면 세션 시작 시 자동으로 이전을 시도하고, 있으면 `/hypo:upgrade --migrate-sessions` 로 이전하며, rollback 명령으로 평면 파일로 되돌릴 수 있습니다. 프로젝트 이름에는 한글 등 여러 문자 체계의 글자와 숫자를 쓸 수 있고, merge 나 rebase 도중인 볼트에서는 마감이 아무것도 쓰기 전에 거부됩니다. ([#316](https://github.com/sk-lim19f/Hypomnema/pull/316))
+
+### Changelog
+- [#317](https://github.com/sk-lim19f/Hypomnema/pull/317) fix(session-entries): drop unreachable staged .gitignore handling and say how to stop an unresolved archive notice
+- [#316](https://github.com/sk-lim19f/Hypomnema/pull/316) feat(session-close): write one entry per close and generate hot.md and session-state.md from the entries
+Contributors: @sk-lim19f
+
 ## [1.9.1] - 2026-10-12
 
 ### Bug Fixes
