@@ -4615,6 +4615,18 @@ test('resumePullArchive keeps the record with only the unresolved members when a
       first.notices.some((n) => n.includes('projects/p/hot.md') && n.includes('다시 시도')),
       first.notices.join('\n'),
     );
+    // A retry cannot clear a changed backup or a clashing name by itself, so the notice that
+    // repeats every start must say how to stop it and where the backup is.
+    assert.ok(
+      first.notices.some(
+        (n) =>
+          n.includes('다시 시도') &&
+          n.includes(view.backupPath) &&
+          n.includes('.cache/pull-archive.json의 stage 가 merged') &&
+          n.includes('직접 지우세요'),
+      ),
+      first.notices.join('\n'),
+    );
     const second = resumePullArchive(b);
     assert.equal(second.resumed, true, 'the next resume picks it up again');
     assert.ok(
@@ -4627,6 +4639,43 @@ test('resumePullArchive keeps the record with only the unresolved members when a
     const third = resumePullArchive(b);
     assert.equal(third.created.length, 1, JSON.stringify(third));
     assert.equal(existsSync(join(b, '.cache', 'pull-archive.json')), false);
+  });
+});
+
+// The unresolved notice tells the user that deleting the record stops it and keeps the backup.
+// Disabling: make resumePullArchive return a notice when it finds no record, and this goes red.
+test('deleting the record of an unresolved member, as its notice says, stops the notice and keeps the backup', () => {
+  withCatchUp(({ b }) => {
+    put(b, 'projects/p/hot.md', W1);
+    const pre = catchUpAndMerge(b);
+    const [view] = pre.archived;
+    writeFileSync(view.backupPath, 'changed by hand\n');
+    const first = resumePullArchive(b);
+    assert.ok(
+      first.notices.some((n) => n.includes('직접 지우세요')),
+      first.notices.join('\n'),
+    );
+    // The advice is safe only for a record that holds nothing else to recover, so it names every
+    // other list, and the record this run wrote does hold nothing else.
+    const advice = first.notices.find((n) => n.includes('직접 지우세요'));
+    for (const list of ['gitignoreLines', 'gitignoreSaved', 'localOnly', 'unowned', 'cleared']) {
+      assert.ok(advice.includes(list), `the advice names ${list}: ${advice}`);
+    }
+    const record = JSON.parse(readRel(b, '.cache/pull-archive.json'));
+    assert.equal(record.stage, 'merged', 'the condition the notice names holds');
+    assert.deepEqual(
+      record.views.map((v) => v.relPath),
+      ['projects/p/hot.md'],
+    );
+    for (const list of ['gitignoreLines', 'gitignoreSaved', 'localOnly', 'unowned', 'cleared']) {
+      assert.deepEqual(record[list], [], `${list} is empty when the advice is given`);
+    }
+    unlinkSync(join(b, '.cache', 'pull-archive.json'));
+    const after = resumePullArchive(b);
+    assert.equal(after.resumed, false);
+    assert.deepEqual(after.notices ?? [], []);
+    assert.equal(existsSync(view.backupPath), true, 'the backup stays');
+    assert.equal(readFileSync(view.backupPath, 'utf-8'), 'changed by hand\n');
   });
 });
 

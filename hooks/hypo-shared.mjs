@@ -2340,8 +2340,9 @@ export function markPullArchiveMerged(hypoDir) {
  *
  * The paths looked at are the ones `targetRev` changes since its merge-base with HEAD (so a
  * diverged history counts only what is coming in). A local change on any of them that is not a
- * generated view or `.gitignore` stops everything (`reason: 'other-dirty'`), and so does a
- * `.gitignore` edit that is not a pure addition (`deferred: 'gitignore'`); both leave the vault
+ * generated view or `.gitignore` stops everything (`reason: 'other-dirty'`), and so does a staged
+ * `.gitignore` (`deferred: 'gitignore'`, `reason: 'gitignore-staged'`) or a `.gitignore` edit that
+ * cannot be merged as a pure addition (`deferred: 'gitignore'`); all of these leave the vault
  * untouched. Otherwise: an ignored project's generated paths that `targetRev` deletes are backed
  * up even when clean (the merge deletes them from the working tree), and go to `localOnly[]`
  * only; every blocked generated path gets its working-tree bytes, and its staged bytes when
@@ -2353,8 +2354,9 @@ export function markPullArchiveMerged(hypoDir) {
  * (`{relPath, backupPath}`), not in `archived[]`: it is not a view this machine meant to keep, so
  * it is never shared as a baseline, and `undoClearedPaths` still puts it back. `gitignoreLines` are the uncommitted `.gitignore` additions the
  * caller appends back after the merge (`restoreGitignoreLines`). `gitignoreSaved[]` holds the exact
- * working-tree and staged bytes of a blocked `.gitignore` (`{relPath, kind, backupPath}`, backed up
- * like a view), which `undoClearedPaths` puts back when the merge does not happen.
+ * working-tree bytes of a blocked `.gitignore` (`{relPath, kind, backupPath}`, backed up like a
+ * view; a staged one was deferred above), which `undoClearedPaths` puts back when the merge does
+ * not happen.
  *
  * Before anything is removed or unstaged, everything set aside (`archived`, `localOnly`, `unowned`,
  * `cleared`, `gitignoreSaved`, the lines) is written to `.cache/pull-archive.json`, so a crash at
@@ -2464,7 +2466,7 @@ function clearBlockingPaths(hypoDir, targetRev, opts) {
       : null;
   // The exact `.gitignore` bytes of that run come back first (guarded like any undo). The lines are
   // the fallback for a record that has none or whose bytes could not be put back (that entry is
-  // carried on); appended after an exact restore they would put a staged-only line in the working tree.
+  // carried on); appended after an exact restore they would repeat lines that are already back.
   let carriedGitignore = [];
   if (recovered) {
     let exactBack = false;
@@ -2536,10 +2538,12 @@ function clearBlockingPaths(hypoDir, targetRev, opts) {
     return stop({ reason: 'other-dirty' });
   }
 
-  // 4. `.gitignore`: only a pure addition (stage and working tree alike) can be set aside. A staged
-  // one is not set aside at all: the merge would take it out of the index and the lines come back
-  // to the working tree only, so a person's stage boundary would be gone and the backup the notice
-  // names deleted. It waits until they commit or unstage it.
+  // 4. `.gitignore`: only a pure working-tree addition can be set aside. A staged one is not set
+  // aside at all: the merge would take it out of the index and the lines come back to the working
+  // tree only, so a person's stage boundary would be gone and the backup the notice names deleted.
+  // It waits until they commit or unstage it. Everything below this check therefore sees a
+  // `.gitignore` that was unstaged when step 3 looked, and keeps no stage copy of it. A stage made
+  // after step 3 and before the snapshot below is not caught here (a known, narrow window).
   if (staged.has('.gitignore') && blocked.includes('.gitignore')) {
     return stop({
       deferred: 'gitignore',
@@ -2551,23 +2555,17 @@ function clearBlockingPaths(hypoDir, targetRev, opts) {
   if (blocked.includes('.gitignore')) {
     const headText = gitShowText(hypoDir, 'HEAD', '.gitignore') ?? '';
     const targetText = gitShowText(hypoDir, target, '.gitignore') ?? '';
-    const stageText = staged.has('.gitignore')
-      ? (gitShowText(hypoDir, ':0', '.gitignore') ?? '')
-      : headText;
-    const added = [];
-    for (const text of [readTextOrNull(join(hypoDir, '.gitignore')) ?? '', stageText]) {
-      if (!mergeAdditiveGitignore(headText, text, targetText).ok) {
-        return stop({
-          deferred: 'gitignore',
-          reason: 'gitignore-not-additive',
-          notice:
-            '스테이징됐거나 커밋되지 않은 .gitignore 변경이 순수 추가가 아니어서 이행 커밋을 받지 못했습니다. 그 변경을 커밋하거나 되돌리세요',
-        });
-      }
-      const own = mergeAdditiveGitignore(headText, text, headText);
-      added.push(...own.merged.slice(headText.length).split('\n').filter(Boolean));
+    const text = readTextOrNull(join(hypoDir, '.gitignore')) ?? '';
+    if (!mergeAdditiveGitignore(headText, text, targetText).ok) {
+      return stop({
+        deferred: 'gitignore',
+        reason: 'gitignore-not-additive',
+        notice:
+          '커밋되지 않은 .gitignore 변경과 받을 커밋의 .gitignore 를 순수 추가로 합칠 수 없어 이행 커밋을 받지 못했습니다. 그 변경을 커밋하거나 되돌리세요',
+      });
     }
-    gitignoreLines = [...new Set(added)];
+    const own = mergeAdditiveGitignore(headText, text, headText);
+    gitignoreLines = [...new Set(own.merged.slice(headText.length).split('\n').filter(Boolean))];
   }
 
   const patterns = loadHypoIgnore(hypoDir);
@@ -2649,14 +2647,12 @@ function clearBlockingPaths(hypoDir, targetRev, opts) {
       else fresh.push({ ...where, sha256: sha256Hex(text), companionRev: head, run });
     }
   }
-  // The `.gitignore` of a blocked run: its exact working-tree and staged bytes, so a failed move can
-  // put them back as they were (the lines in `gitignoreLines` are all the merge's success keeps).
+  // The `.gitignore` of a blocked run: its exact working-tree bytes, so a failed move can put them
+  // back as they were (the lines in `gitignoreLines` are all the merge's success keeps). One that
+  // was staged when step 3 looked never gets here (step 4 defers it).
   if (blocked.includes('.gitignore')) {
-    const { work, index } = snapshot.get('.gitignore');
+    const { work } = snapshot.get('.gitignore');
     if (work !== null) gitignoreSaved.push(backUp('.gitignore', 'worktree', work));
-    if (staged.has('.gitignore') && index !== null) {
-      gitignoreSaved.push(backUp('.gitignore', 'stage', index));
-    }
   }
   // 6b. A path `target` adds as tracked, held here as an untracked file: git overwrites it without a
   // word (rollback commits do this to every view), so it is moved out below. Its bytes are backed up
@@ -3263,7 +3259,7 @@ export function resumePullArchive(hypoDir, { announced = [] } = {}) {
       gitignoreSaved: [],
     });
     notices.push(
-      `공유하지 못한 보관 항목이 있어 기록(${PULL_ARCHIVE_REL})에 그것만 남겼습니다: ${shared.unresolved.map((v) => v.relPath).join(', ')}. 다음 실행이 다시 시도합니다.`,
+      `공유하지 못한 보관 항목이 있어 기록(${PULL_ARCHIVE_REL})에 그것만 남겼습니다: ${shared.unresolved.map((v) => `${v.relPath} (${v.backupPath})`).join(', ')}. 다음 실행이 다시 시도합니다. 백업이 달라졌거나 같은 이름에 다른 파일이 있으면 대개 저절로 풀리지 않습니다. 공유하지 않아도 되면, 다른 터미널에서 동기화가 돌지 않을 때 백업을 확인하고 ${PULL_ARCHIVE_REL}의 stage 가 merged 이고 views 에 위 항목만 있으며 gitignoreLines, gitignoreSaved, localOnly, unowned, cleared 가 모두 비어 있을 때만 그 파일을 직접 지우세요. 백업 파일은 그대로 남고 이 알림은 멈춥니다.`,
     );
   } else {
     rmSync(join(hypoDir, PULL_ARCHIVE_REL), { force: true });
