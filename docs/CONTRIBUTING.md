@@ -60,13 +60,9 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the full breakdown. Short version:
 
 ## Hook deployment constraint
 
-**Hooks run in `~/.claude/hooks/` in isolation. They cannot import from relative paths.**
+Code that hooks and scripts share lives in `hooks/` and is listed in `hooks/shared.json`. Hooks never import from `scripts/`. The reasoning and the one exception are in the [Deployment constraint](ARCHITECTURE.md#deployment-constraint) section of ARCHITECTURE.md.
 
-- Shared logic must live in one of the modules `hooks/shared.json` declares, not only in `hypo-shared.mjs`. That file (a plain JSON array of `.mjs` basenames) is the source of truth for the list and is copied alongside each hook at deploy time. It used to be a `shared` field inside `hooks.json` itself; that moved to this sibling file once the harness started warning on that unknown top-level key.
-- Hook utilities may use **only** Node.js built-ins (`fs`, `path`, `os`, `child_process`, `crypto`).
-- No relative imports, no npm dependencies.
-
-Scripts under `scripts/` are not deployed and may freely import from `scripts/lib/`. If you find yourself wanting to share logic between scripts and hooks, the canonical pattern is: implement it inline in `hypo-shared.mjs`, then have `scripts/lib/` mirror the function (or thin-wrap it via the deployed copy).
+Hook code may use only Node.js built-ins and sibling modules in `hooks/`, with no npm dependencies.
 
 ---
 
@@ -93,7 +89,7 @@ Scripts under `scripts/` are not deployed and may freely import from `scripts/li
 This file is deployed verbatim to `~/.claude/hooks/`. Constraints:
 
 - Only Node.js built-ins.
-- No relative imports.
+- No imports outside `hooks/`.
 - No npm dependencies.
 - Keep exports minimal — the file ships in every wiki install.
 

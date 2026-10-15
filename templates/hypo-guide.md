@@ -2,7 +2,7 @@
 title: Wiki Operations Guide
 type: reference
 updated: YYYY-MM-DD
-version: 3
+version: 4
 tags: [wiki, guide, operations]
 ---
 
@@ -46,7 +46,7 @@ Over time, new sources *update* pages more than they *create* them — that's wh
 │       ├── notes.md          ← notes every session shares (optional, written by hand)
 │       ├── hot.md            ← recent session summaries (generated)
 │       ├── session-state.md  ← next-session handoff (generated)
-│       ├── session-log/      ← monthly narrative logs
+│       ├── session-log/      ← daily narrative shards (YYYY-MM-DD.md)
 │       └── decisions/        ← ADRs (0001-*.md …)
 └── sources/            ← raw ingested sources (never edit)
 ```

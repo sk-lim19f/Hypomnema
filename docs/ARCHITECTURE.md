@@ -1,6 +1,6 @@
 # Hypomnema — Architecture
 
-> Internal reference for v1.1. For the user-facing pitch, see [README.md](../README.md).
+> Internal reference for the current release. For the user-facing pitch, see [README.md](../README.md).
 
 ---
 
@@ -47,12 +47,13 @@ hypomnema/
 │   ├── crystallize.mjs / resume.mjs / feedback.mjs / feedback-sync.mjs
 │   ├── capture.mjs / rename.mjs / proposal.mjs / session-entries.mjs
 │   ├── session-audit.mjs / weekly-report.mjs
-│   └── lib/                      ← helpers only scripts import (about 30 files)
+│   └── lib/                      ← helpers only scripts import (shipped set: `files` in package.json)
 ├── skills/                   ← directory-form Agent Skills (skills/<name>/SKILL.md)
 ├── templates/                ← baseline files copied on init
-│   ├── hypo-config.md, index.md, hot.md, log.md, SCHEMA.md, hypo-guide.md
+│   ├── hypo-config.md, index.md, log.md, SCHEMA.md, hypo-guide.md, session-state.md
 │   ├── Home.md, Overview.md, hypo-automation.md, hypo-help.md
-│   ├── pages/_index.md
+│   ├── .hypoignore, .hyposcanignore, gitignore, gitattributes
+│   ├── pages/_index.md, pages/observability/_index.md
 │   └── projects/_template/
 ├── tests/
 │   ├── harness.mjs               ← test()/testAsync()/suite(), selection, reporting
@@ -65,7 +66,7 @@ hypomnema/
 └── package.json              ← npm metadata, no runtime deps
 ```
 
-Which `scripts/` files ship is decided by the `files` list in `package.json`, which names each one. Anything under `scripts/` that is not on that list is maintainer tooling (release checks, the git-hook installer, and similar) and never reaches an installed copy. The entry points above are the ones a user runs.
+On the npm channel, which `scripts/` files ship is decided by the `files` list in `package.json`, which names each one. Anything under `scripts/` that is not on that list is maintainer tooling (release checks, the git-hook installer, and similar) and is absent from the npm package. A product file left off `files` or off `hooks/shared.json` still works on the plugin channel and in a checkout, and breaks only on npm. The plugin channel ships the whole tracked tree instead (see the "What ships" row under Install channels). The entry points above are the ones a user runs.
 
 The package has **zero npm runtime dependencies**. Everything is Node.js built-ins (`fs`, `path`, `os`, `child_process`, `crypto`).
 
@@ -80,7 +81,7 @@ Each user-facing operation is a pair: an LLM-facing prompt + a Node.js script.
 | `commands/<name>.md` | Prompt definition — instructions Claude follows when the command is invoked |
 | `scripts/<name>.mjs` | Script implementation — Node.js logic the prompt may call via Bash |
 
-**Commands shipped in v1.1:** `init`, `doctor`, `upgrade`, `uninstall`, `ingest`, `query`, `crystallize`, `resume`, `feedback`, `verify`, `lint`, `stats`, `graph`.
+**Commands** (one file each under `commands/`): `init`, `doctor`, `upgrade`, `uninstall`, `ingest`, `query`, `crystallize`, `resume`, `feedback`, `verify`, `lint`, `stats`, `graph`, `audit`, `capture`, `rename`.
 
 Every one of those files is itself an Agent Skill; see below.
 
@@ -136,13 +137,13 @@ Counts are left out on purpose, because they go stale: `hooks/hooks.json` lists 
 |---|---|
 | `hypo-session-start` | Run `git pull --ff-only` (silent fail on missing remote), rebuild the generated session views from `projects/*/sessions/` (not on a vault with a remote that has not moved yet, which gets a notice instead), inject `index.md`, root `hot.md`, project `hot.md`/`session-state.md` |
 | `hypo-close-guard` | `PreToolUse`: denies a direct Write/Edit/MultiEdit to a generated session view (root `hot.md`, a project's `hot.md` or `session-state.md`) or to a session entry under `projects/<p>/sessions/`. Writes made through Bash are out of its scope, and the regular close apply runs through Bash |
-| `hypo-session-end` | `SessionEnd`: on `reason=clear` only, writes `.cache/clear-marker.json` so the next `SessionStart` (`source=clear`) can issue a recovery nudge. Other exit reasons write nothing |
+| `hypo-session-end` | `SessionEnd`: on `reason=clear` only, writes `.cache/clear-marker.json` so the next `SessionStart` (`source=clear`) can issue a recovery nudge. It also records the close-gate resolution in `.cache/close-gate/<session-id>.json` (the close gate is the check that a substantial session has been closed; `/clear` ends the session, so it counts as resolving the gate). Other exit reasons write nothing |
 | `hypo-web-fetch-ingest` | `PostToolUse`: after a WebFetch or WebSearch, injects a nudge to run `/hypo:ingest` (URL reduced to origin and path). It is a signal only and never ingests anything itself |
 | `hypo-first-prompt` | Reads the marker left by `hypo-session-start` or `hypo-cwd-change` and forces a one-line resume on the first user prompt (10-min TTL). It does not re-read or re-inject `hot.md` |
 | `hypo-lookup` | BM25 search over the wiki on every prompt. **HIT** → inject top-3 page snippets (≤2000 chars each; a page whose `verify_by_date` is overdue gets a `[STALE verify_by_date=…]` marker prepended). **MISS** → emit closest-slug signal that prompts Claude to research + `/hypo:ingest` |
 | `hypo-compact-guard` | Detect `/compact` or `/clear` typed in chat and, if session close is incomplete, tell Claude so. It never blocks `/compact` |
 | `hypo-personal-check` | PreCompact detection: lint blockers, uncommitted changes, missing session-log entries surface as a `systemMessage`; `/compact` is never blocked here |
-| `hypo-auto-stage` | After Write/Edit on a wiki path, run `git add` (skips paths matching `.hypoignore`, and every path while a merge is open) |
+| `hypo-auto-stage` | After Write/Edit/MultiEdit on a wiki path, run `git add` (skips paths matching `.hypoignore`, and every path while a merge is open) |
 | `hypo-hot-rebuild` | At session stop, regenerate the generated session views (root `hot.md`, project `hot.md` and `session-state.md`; the same generator `hypo-session-start` also calls); emit growth metrics + cache for next SessionStart. A scan failure (not just an empty `projects/`) skips the write and leaves a health notice for the next `SessionStart` to surface |
 | `hypo-session-record` | At session stop, append `{session_id, transcript_path, recorded_at, cwd, device}` to `.cache/sessions/index.jsonl` (primary source for the observability audit) |
 | `hypo-auto-commit` | At session stop, filter changed paths through `.hypoignore`, finish a merge Hypomnema left open, commit non-ignored changes, `git pull --no-rebase` + `git push` (silent fail on missing remote; the push is skipped after a pull that did not land, and when the tree tracks generated views under a migrated upstream) |
@@ -151,12 +152,12 @@ Counts are left out on purpose, because they go stale: `hooks/hooks.json` lists 
 
 ### Deployment constraint
 
-On the npm channel hooks run from `~/.claude/hooks/`, an isolated directory. They **cannot import from relative paths** outside their own directory. Therefore:
+On the npm channel hooks run from `~/.claude/hooks/`, an isolated directory. They **cannot import from anything outside their own directory**; sibling modules in that directory are fine. Therefore:
 
 - Shared hook logic lives in the modules `hooks/shared.json` declares, not only in `hypo-shared.mjs`. That file (a plain JSON array of `.mjs` basenames) is the source of truth for the list. Each listed file is copied next to the hooks at deploy time, not inlined into them. It used to be a `shared` field inside `hooks.json` itself; it moved to this sibling file because the harness started warning on that unknown top-level key once it began validating `hooks.json` against its own hook-registration schema.
-- Hook utilities use **only Node.js built-ins** — no relative imports, no npm dependencies.
+- Hook utilities use **only Node.js built-ins** and sibling modules: no imports outside the hooks directory, no npm dependencies.
 
-Scripts in `scripts/` are not copied anywhere. They run from the package install path, so they can import from `scripts/lib/`, and they may import from `hooks/`. The reverse is never allowed: a hook that imported from `scripts/` would resolve in a checkout and fail in every installed copy.
+Scripts in `scripts/` are not copied anywhere. They run from the package install path, so they can import from `scripts/lib/`, and they may import from `hooks/`. The reverse is not allowed for any file that gets copied to `~/.claude/hooks` (anything in `hooks.json` or `shared.json`): a copied hook that imported from `scripts/` would resolve in a checkout and on the plugin channel, and fail with `MODULE_NOT_FOUND` on the npm channel. The one exception is `hooks/hypo-pre-commit.mjs`. It is a git hook worker that runs from the install root and is never copied, so it imports `../scripts/lib/hypo-ignore.mjs`.
 
 ---
 
@@ -181,7 +182,7 @@ Scripts in `scripts/` are not copied anywhere. They run from the package install
 
 ## Scripts lib (`scripts/lib/`)
 
-Helpers used by command scripts only. They are not copied beside the hooks. There are about 30 of them, and the shipped set is the `scripts/lib/` entries in `package.json`'s `files`. The main ones:
+Helpers used by command scripts only. They are not copied beside the hooks. On the npm channel the shipped set is the `scripts/lib/` entries in `package.json`'s `files`. The main ones:
 
 | File | Purpose |
 |---|---|
@@ -263,8 +264,9 @@ Hypomnema reaches a machine through two channels, and they deploy hooks differen
 | | Plugin channel | npm channel |
 |---|---|---|
 | Who runs the hooks | The harness, straight from `${CLAUDE_PLUGIN_ROOT}/hooks` as `hooks/hooks.json` says | `~/.claude/hooks/`, registered in `~/.claude/settings.json` |
-| Deploy step | None | `init` and `upgrade` copy the hooks and shared modules, then merge `settings.json` |
-| How an update arrives | The installer caches each version in a directory named after `plugin.json`'s `version` string. If the version has not changed, the directory already exists and new commits never reach the installed copy | `upgrade` re-copies from the package |
+| What ships | The whole git-tracked tree of that commit. Observed 2026-10-15 in the plugin cache (`~/.claude/plugins/cache/hypomnema/hypo/1.10.0/`): it holds `scripts/bump-version.mjs`, `scripts/lib/check-tracker-ids.mjs` and `tests/` | The `package.json` `files` allowlist, which names each shipped `scripts/` file one by one. `npm run check:pack-surface` compares the tarball against a committed snapshot |
+| Deploy step | None for the Claude hooks. `--codex` still copies hooks to `~/.codex/hooks` | `init` and `upgrade` copy the hooks and shared modules to `~/.claude/hooks`, then merge `settings.json` |
+| How an update arrives | The installer caches each version in a directory named after `plugin.json`'s `version` string. If the version has not changed, the directory already exists and new commits never reach the installed copy | `npm install -g hypomnema` fetches the new package, then `upgrade --apply` copies again |
 
 The consequence for releases: on the plugin channel a fix reaches nobody until the version string moves. `init` and `upgrade` detect an enabled plugin and skip the copy and the `settings.json` merge, because doing both would fire every hook twice. In the steps below, each step is marked `[both]`, `[npm only]`, or `[plugin: skipped]`.
 
@@ -278,7 +280,12 @@ The consequence for releases: on the plugin channel a fix reaches nobody until t
 4. `[npm only]` Copies the hooks and shared modules to `~/.claude/hooks/`, installs the commands under `~/.claude/commands/hypo/`, and merges entries into `~/.claude/settings.json` (idempotent; preserves non-hypo hooks). `[plugin: skipped]` when the plugin is enabled.
 5. `[both]` Writes `~/.claude/hypo-pkg.json` with `pkgRoot` for upgrade tracking (skipped when the
    plugin channel judgment fails; see `init.mjs`'s `resolveDurableRoot`).
-6. `git init` + first commit `init: hypomnema wiki`. Pushes to remote when one is provided.
+6. `[both]` Syncs the vault's `extensions/` into `~/.claude` (with hooks enabled), and into `~/.codex` for `--codex`.
+7. `[both]` Installs the `claude()` shell function into the shell rc file (unless shell setup is turned off).
+8. `[both]` With `--codex`, copies the hooks to `~/.codex/hooks` and merges `~/.codex/settings.json`. The plugin does not provide this surface.
+9. `[both]` `git init` for the vault.
+10. `[both]` Installs the vault's pre-commit hook, which guards `.hypoignore`. It is skipped when the channel judgment fails.
+11. `[both]` First commit `init: hypomnema wiki`. Pushes to remote when one is provided.
 
 `--dry-run` previews; `--no-hooks` and `--no-git-init` are also supported. Re-running `init` is idempotent — existing files are skipped, never overwritten.
 
@@ -288,7 +295,8 @@ The consequence for releases: on the plugin channel a fix reaches nobody until t
 2. `[npm only]` Re-deploys hooks from the current package version.
 3. `[npm only]` Re-merges `settings.json` entries.
 4. `[both]` Detects drift (e.g., `pkgRoot` no longer exists) and refreshes the pointer.
-5. `--json` output emits `{ schema, hooks, settings, applied }`. `--dry-run` previews; `--apply` commits changes.
+5. `[both]` Re-copies hooks for `--codex` and syncs vault extensions. Only the Claude core surface is skipped on the plugin channel.
+6. `--json` output emits `{ schema, hooks, settings, applied }`. `--dry-run` previews; `--apply` commits changes.
 
 The SessionStart hook (`hooks/hypo-session-start.mjs`) is a third writer of this file, outside init/upgrade entirely. `hooks/hypo-shared.mjs`'s `pkgRootDriftStatus` detects drift by comparing the canonicalized `pkgRoot` alone, not `pkgVersion`, so a file whose `pkgRoot` already matches self-location reads as `match` even when its `pkgVersion` is stale. Only a `pkgRoot` mismatch triggers the rewrite (temp file, then rename), and `pkgVersion` is carried along in that same write rather than checked or fixed on its own. The rewrite is guarded by a lockfile, so two sessions self-locating to different install roots at once cannot race each other's write, and it writes nothing on a downgrade (self-location resolves to an older version than the file already records), an incoming version that fails to parse as semver, a lock it could not acquire, or an opted-out session.
 
@@ -360,6 +368,9 @@ SessionStart
   ├─► CwdChanged
   │     └─► hypo-cwd-change.mjs (builds a hot.md notice on systemMessage; the reference documents the terminal notification, tracing the installed binary as of Claude Code 2.1.276, checked 2026-09-18 and reconfirmed on 2.1.283, shows it does not reach the model, and no live-session observation exists either way; see the hook table above)
   │
+  ├─► FileChanged
+  │     └─► hypo-file-watch.mjs (builds a notice for a changed wiki file; no trigger on a stock install, treated as not reaching the model; see the hook table above)
+  │
   ├─► Stop
   │     └─► hypo-stop.mjs, running four stages in order:
   │           ├─► hypo-hot-rebuild.mjs (regenerate the session views + growth cache; SessionStart also calls this generator)
@@ -368,7 +379,7 @@ SessionStart
   │           └─► hypo-auto-minimal-crystallize.mjs (blocks Stop if session close never ran)
   │
   └─► SessionEnd
-        └─► hypo-session-end.mjs (on /clear only: writes .cache/clear-marker.json for the next SessionStart)
+        └─► hypo-session-end.mjs (on /clear only: writes .cache/clear-marker.json for the next SessionStart, and the close-gate resolution record .cache/close-gate/<session-id>.json)
 ```
 
 Root hot.md's frontmatter `updated:` is the max of every project row date, and a row's date is the
@@ -623,7 +634,7 @@ Requires `NPM_TOKEN` secret.
           {
             "type": "command",
             "command": "node ${CLAUDE_PLUGIN_ROOT}/hooks/hypo-<name>.mjs",
-            "timeout": <ms>
+            "timeout": <seconds>
           }
         ]
       }
@@ -638,7 +649,7 @@ The shared-file list (helpers a registered hook imports, such as `hypo-shared.mj
 ["hypo-shared.mjs", "version-check.mjs", "..."]
 ```
 
-`hooks/hooks.json` is still the source of truth for the event-to-hook map; `hooks/shared.json` is the source of truth for the shared-file list. A hook registered in the former, or a helper listed in the latter, is what init/upgrade deploy. Anything left off either file never reaches an installed copy.
+`hooks/hooks.json` is still the source of truth for the event-to-hook map; `hooks/shared.json` is the source of truth for the shared-file list. A hook registered in the former, or a helper listed in the latter, is what init/upgrade copy on the npm channel. A hook left off the former never fires on the plugin channel either, because the harness reads that file. A helper left off the latter still resolves on the plugin channel, where the whole tree is present, and fails with `MODULE_NOT_FOUND` only for npm installs (see the "What ships" row under Install channels).
 
 `claude plugin validate .` is run as part of CI's plugin-snapshot checks.
 
