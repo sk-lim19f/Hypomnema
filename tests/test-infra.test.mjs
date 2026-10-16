@@ -54,8 +54,10 @@ test('withWiki cleanup survives a late writer in .git/objects/pack', () => {
   const scratch = mkdtempSync(join(tmpdir(), 'hypo-late-writer-'));
   const ready = join(scratch, 'ready');
   const script = join(scratch, 'late-writer.mjs');
-  // Writes a fresh file every few ms for 500ms and stops on the first failure
-  // (ENOENT once the directory is gone). It never recreates the directory.
+  // Writes fresh files as fast as it can for 500ms and stops on the first failure
+  // (ENOENT once the directory is gone). It never recreates the directory. A
+  // pause between writes lets one rmdir win the race every time on a fast disk,
+  // and the test then stays green with the retry turned off.
   writeFileSync(
     script,
     `import { writeFileSync } from 'node:fs';
@@ -66,7 +68,6 @@ try {
   while (Date.now() < end) {
     writeFileSync(pack + '/late-' + n++, 'x');
     if (n === 1) writeFileSync(ready, 'up');
-    await new Promise((r) => setTimeout(r, 3));
   }
 } catch {}
 `,
