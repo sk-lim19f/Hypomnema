@@ -18,9 +18,18 @@
  *                by an order of magnitude in size, so wall clock is whatever the
  *                biggest file takes and the small processes idle.
  *
- *   --shards=237 Every suite alone in a fresh process. This is the proof that no
+ *   --shards=<suite count>
+ *                Every suite alone in a fresh process. This is the proof that no
  *                suite depends on another having run first — the thing that
  *                licenses sharding at all. Run it when you add or split a suite.
+ *                Count them with `grep -c '^suite(' tests/*.test.mjs` and add the
+ *                per-file counts up. That is hundreds of processes, so they do
+ *                not all start at once: --jobs caps how many run at the same time.
+ *
+ *   --jobs=N     Cap on concurrently running child processes, for either cut.
+ *                Defaults to the CPU count. Without a cap, a few hundred runner
+ *                starts oversubscribe the machine and tests that depend on
+ *                timing fail for reasons that have nothing to do with the code.
  *
  * Shards never share state: each selects whole suites and builds its own
  * fixtures under a HOME pinned to a tmp dir. Verdicts come back as JSON files
@@ -30,6 +39,7 @@
  * Usage:
  *   node tests/parallel.mjs                  # cpu-count shards
  *   node tests/parallel.mjs --shards=4
+ *   node tests/parallel.mjs --shards=<suite count> --jobs=8
  *   node tests/parallel.mjs --by-file
  *   node tests/parallel.mjs --grep=proposal  # pass-through to the runner
  *   node tests/parallel.mjs --timing
@@ -55,7 +65,7 @@ function die(msg) {
 // Same reasoning as the runner's own check: a silently ignored `--shardz=4` or a
 // bare `--grep` would run the default shape and report a green nobody asked for.
 // Value flags demand a value; boolean flags refuse one; nothing repeats.
-const VALUE_FLAGS = new Set(['shards', 'grep', 'json']);
+const VALUE_FLAGS = new Set(['shards', 'grep', 'json', 'jobs']);
 const BOOL_FLAGS = new Set(['timing', 'by-file']);
 const KNOWN = [...VALUE_FLAGS, ...BOOL_FLAGS];
 
@@ -92,6 +102,15 @@ const SHARDS = (() => {
   return n;
 })();
 
+// How many children may run at once. Unlike --shards this applies to both cuts.
+const JOBS = (() => {
+  const raw = argValue('jobs');
+  if (raw === undefined) return Math.max(1, cpus().length);
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n < 1) die(`--jobs expects a positive integer, got: ${raw}`);
+  return n;
+})();
+
 const FILES = readdirSync(HERE)
   .filter((f) => f.endsWith('.test.mjs'))
   .sort();
@@ -111,10 +130,14 @@ const UNITS = BY_FILE
       index: i + 1,
     }));
 
-// --shards, --by-file and --json are ours. --shard, --file, --child and the
+// --shards, --jobs, --by-file and --json are ours. --shard, --file, --child and the
 // report path are ours to set, so a caller cannot fight us for them.
 const PASSTHROUGH = ARGV.filter(
-  (a) => !a.startsWith('--shards=') && !a.startsWith('--json=') && a !== '--by-file',
+  (a) =>
+    !a.startsWith('--shards=') &&
+    !a.startsWith('--jobs=') &&
+    !a.startsWith('--json=') &&
+    a !== '--by-file',
 );
 const TIMING = ARGS.has('timing');
 const JSON_OUT = argValue('json');
@@ -194,22 +217,26 @@ console.error(
     : `running ${SHARDS} shards over ${FILES.length} test files`,
 );
 
-const results = await Promise.all(
-  UNITS.map((u) =>
-    runUnit(u).then((r) => {
-      const label = `  ${r.label.padEnd(BY_FILE ? 20 : 14)}`;
-      if (r.crashed) {
-        console.error(`${label}  CRASHED (${r.crashReason}) after ${r.seconds.toFixed(1)}s`);
-      } else {
-        const verdict = r.failed > 0 ? `${r.failed} failed` : 'green';
-        console.error(
-          `${label}  ${String(r.passed).padStart(4)} passed, ${verdict}  (${r.seconds.toFixed(1)}s)`,
-        );
-      }
-      return r;
-    }),
-  ),
-);
+// A fixed pool of workers pulls units off one shared cursor, so at most
+// min(JOBS, UNITS.length) children are alive at any moment.
+const results = [];
+let nextUnit = 0;
+async function worker() {
+  while (nextUnit < UNITS.length) {
+    const r = await runUnit(UNITS[nextUnit++]);
+    const label = `  ${r.label.padEnd(BY_FILE ? 20 : 14)}`;
+    if (r.crashed) {
+      console.error(`${label}  CRASHED (${r.crashReason}) after ${r.seconds.toFixed(1)}s`);
+    } else {
+      const verdict = r.failed > 0 ? `${r.failed} failed` : 'green';
+      console.error(
+        `${label}  ${String(r.passed).padStart(4)} passed, ${verdict}  (${r.seconds.toFixed(1)}s)`,
+      );
+    }
+    results.push(r);
+  }
+}
+await Promise.all(Array.from({ length: Math.min(JOBS, UNITS.length) }, worker));
 
 rmSync(tmp, { recursive: true, force: true });
 

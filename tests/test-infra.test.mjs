@@ -19,6 +19,7 @@ import { pathToFileURL } from 'node:url';
 import { test, suite } from './harness.mjs';
 import {
   HOOKS,
+  REPO,
   SESSION_TMP_HOME,
   hookWriteFaultPreload,
   settingsWriteFaultPreload,
@@ -211,4 +212,38 @@ if (action === 'rename') {
       assert.ok(bytesOk(readFileSync(hook, 'utf-8')), `${label}: hook bytes`);
     });
   }
+});
+
+const PARALLEL = join(REPO, 'tests', 'parallel.mjs');
+const REJECTS_JOBS =
+  'parallel.mjs rejects --jobs=0 and --jobs=x with exit 2 before spawning anything';
+
+// parallel.mjs inherits HOME on purpose, so the test pins it for the child here.
+function runParallel(args) {
+  const dir = mkdtempSync(join(tmpdir(), 'hypo-parallel-'));
+  try {
+    return spawnSync(process.execPath, [PARALLEL, ...args], {
+      encoding: 'utf-8',
+      env: childEnv(dir, { HOME: SESSION_TMP_HOME }),
+    });
+  } finally {
+    spawnSync('rm', ['-rf', dir]);
+  }
+}
+
+test(REJECTS_JOBS, () => {
+  for (const bad of ['--jobs=0', '--jobs=x']) {
+    const r = runParallel([bad]);
+    assert.equal(r.status, 2, `${bad}: exit ${r.status}`);
+    assert.ok(r.stderr.includes('--jobs'), `${bad}: stderr ${r.stderr}`);
+    // Validation happens before any shard starts, so no progress line was printed.
+    assert.ok(!r.stderr.includes('running'), `${bad}: spawned anyway`);
+  }
+});
+
+test('parallel.mjs strips --jobs before it reaches the runner', () => {
+  // The runner exits 2 on an argument it does not know, so a leaked --jobs fails this run.
+  const r = runParallel(['--shards=1', '--jobs=1', `--grep=${REJECTS_JOBS}`]);
+  assert.equal(r.status, 0, `exit ${r.status}: ${r.stderr}`);
+  assert.ok(r.stdout.includes('1 passed, 0 failed'), r.stdout);
 });
