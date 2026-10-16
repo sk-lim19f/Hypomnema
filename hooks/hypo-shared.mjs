@@ -2377,6 +2377,12 @@ export function markPullArchiveMerged(hypoDir) {
  * file with the bytes just backed up). A difference means another process wrote meanwhile: nothing
  * more is changed and `{ok: false, deferred: 'concurrent-change'}` comes back.
  *
+ * Right after those bytes are read (the snapshot), a blocked path that step 3 saw unstaged but
+ * whose index blob now differs from HEAD, or a blocked `.gitignore` whose bytes differ from the
+ * ones step 4 judged, stops the run the same way: another process staged or edited it in the
+ * window between the scan and the snapshot. `testHooks.beforeSnapshot` runs just before the
+ * snapshot is read.
+ *
  * `testHooks.beforeUnstage` runs before the first of those comparisons, `testHooks.afterArchive`
  * after the archive record is written and the stage is released, before the second (and before any
  * working-tree path is restored). `testHooks.beforeBackupWrite` goes to the backups.
@@ -2543,7 +2549,9 @@ function clearBlockingPaths(hypoDir, targetRev, opts) {
   // tree only, so a person's stage boundary would be gone and the backup the notice names deleted.
   // It waits until they commit or unstage it. Everything below this check therefore sees a
   // `.gitignore` that was unstaged when step 3 looked, and keeps no stage copy of it. A stage made
-  // after step 3 and before the snapshot below is not caught here (a known, narrow window).
+  // after step 3 and before the snapshot below is caught right after the snapshot (`lateStage`),
+  // and so is an edit of the `.gitignore` after this step read it (`lateGitignoreEdit`).
+  let judgedGitignoreText = null;
   if (staged.has('.gitignore') && blocked.includes('.gitignore')) {
     return stop({
       deferred: 'gitignore',
@@ -2555,7 +2563,8 @@ function clearBlockingPaths(hypoDir, targetRev, opts) {
   if (blocked.includes('.gitignore')) {
     const headText = gitShowText(hypoDir, 'HEAD', '.gitignore') ?? '';
     const targetText = gitShowText(hypoDir, target, '.gitignore') ?? '';
-    const text = readTextOrNull(join(hypoDir, '.gitignore')) ?? '';
+    judgedGitignoreText = readTextOrNull(join(hypoDir, '.gitignore'));
+    const text = judgedGitignoreText ?? '';
     if (!mergeAdditiveGitignore(headText, text, targetText).ok) {
       return stop({
         deferred: 'gitignore',
@@ -2626,6 +2635,19 @@ function clearBlockingPaths(hypoDir, targetRev, opts) {
     }
   }
 
+  // The vault's own writers are shut out by the vault commit lock the caller holds, so a change
+  // since the snapshot came from another Hypomnema process that does not take it, or a person.
+  // Either way this run changes nothing more and the bytes stay where they are. ponytail: an
+  // external editor can still save between this re-read and the git command right after it; that
+  // window (milliseconds) is accepted, a compare-and-swap does not exist for a working tree.
+  const changedSince = () => ({
+    deferred: 'concurrent-change',
+    reason: 'changed-during-clear',
+    notice:
+      '이행 커밋을 받는 도중 생성 파일이나 인덱스가 바뀌어 아무것도 더 바꾸지 않고 미뤘습니다. 다음 동기화에서 다시 시도합니다',
+  });
+  testHooks?.beforeSnapshot?.();
+
   // 6. Blocked generated paths: the working-tree bytes, and the staged bytes of a staged path.
   // `snapshot` is what every blocked path (`.gitignore` too) held when its backup was taken: the
   // unstage and the restore below run only while the bytes still match it (`drifted`).
@@ -2635,6 +2657,17 @@ function clearBlockingPaths(hypoDir, targetRev, opts) {
       { work: readTextOrNull(join(hypoDir, p)), index: gitShowText(hypoDir, ':0', p) },
     ]),
   );
+  // Steps 3 and 4 judged these paths earlier. A path they saw unstaged that holds a different index
+  // blob than HEAD now was staged in between, and a `.gitignore` whose bytes are not the ones step 4
+  // judged was edited in between. No blocked path has been backed up or recorded yet, so stopping
+  // here leaves the stage and the bytes as the other writer left them.
+  const lateStage = blocked.some(
+    (p) => !staged.has(p) && snapshot.get(p).index !== gitShowText(hypoDir, 'HEAD', p),
+  );
+  if (lateStage) return stop(changedSince());
+  const lateGitignoreEdit =
+    blocked.includes('.gitignore') && snapshot.get('.gitignore').work !== judgedGitignoreText;
+  if (lateGitignoreEdit) return stop(changedSince());
   for (const path of blocked.filter(isGeneratedViewPath)) {
     const versions = [];
     const { work, index } = snapshot.get(path);
@@ -2724,17 +2757,6 @@ function clearBlockingPaths(hypoDir, targetRev, opts) {
       return stop({ reason: 'notice-write-failed' });
     }
   }
-  // The vault's own writers are shut out by the vault commit lock the caller holds, so a change
-  // since the snapshot came from another Hypomnema process that does not take it, or a person.
-  // Either way this run changes nothing more and the bytes stay where they are. ponytail: an
-  // external editor can still save between this re-read and the git command right after it; that
-  // window (milliseconds) is accepted, a compare-and-swap does not exist for a working tree.
-  const changedSince = () => ({
-    deferred: 'concurrent-change',
-    reason: 'changed-during-clear',
-    notice:
-      '이행 커밋을 받는 도중 생성 파일이나 인덱스가 바뀌어 아무것도 더 바꾸지 않고 미뤘습니다. 다음 동기화에서 다시 시도합니다',
-  });
   const read = (p) => {
     try {
       return readTextOrNull(join(hypoDir, p));

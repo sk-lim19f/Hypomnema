@@ -4069,6 +4069,75 @@ test('(b) an index entry changed after the backup defers too', () => {
   });
 });
 
+// The scan of step 3 and the snapshot are separate reads: a stage or an edit that lands between them
+// is judged by neither. Disabling the stage axis: in `clearBlockingPaths` (hooks/hypo-shared.mjs)
+// change `if (lateStage) return stop(changedSince());` to `if (false) return stop(changedSince());`.
+test('(b) a .gitignore staged after the local-change scan, before the snapshot, defers and keeps the stage', () => {
+  withCatchUp(({ b }) => {
+    put(b, 'projects/p/hot.md', W1);
+    put(b, '.gitignore', '.cache/\nmine/\n'); // a pure unstaged addition: step 4 lets it through
+    const r = clear(b, '@{u}', {
+      testHooks: { beforeSnapshot: () => cgitOk(b, ['add', '.gitignore']) },
+    });
+    assert.equal(r.ok, false, JSON.stringify(r));
+    assert.equal(r.deferred, 'concurrent-change');
+    assert.equal(r.reason, 'changed-during-clear');
+    assert.ok(
+      cgitOk(b, ['diff', '--cached', '--name-only']).split('\n').includes('.gitignore'),
+      'still staged',
+    );
+    assert.equal(readRel(b, '.gitignore'), '.cache/\nmine/\n');
+    assert.equal(readRel(b, 'projects/p/hot.md'), W1, 'nothing was moved');
+  });
+});
+
+// Disabling the edit axis: change `if (lateGitignoreEdit) return stop(changedSince());` to
+// `if (false) return stop(changedSince());`.
+test('(b) a .gitignore line appended after step 4 read it, before the snapshot, defers and keeps the line', () => {
+  withCatchUp(({ b }) => {
+    put(b, 'projects/p/hot.md', W1);
+    put(b, '.gitignore', '.cache/\nmine/\n');
+    const r = clear(b, '@{u}', {
+      testHooks: {
+        beforeSnapshot: () => put(b, '.gitignore', '.cache/\nmine/\nappended-late/\n'),
+      },
+    });
+    assert.equal(r.ok, false, JSON.stringify(r));
+    assert.equal(r.deferred, 'concurrent-change');
+    assert.equal(r.reason, 'changed-during-clear');
+    assert.equal(readRel(b, '.gitignore'), '.cache/\nmine/\nappended-late/\n', 'the line stays');
+    assert.equal(readRel(b, 'projects/p/hot.md'), W1, 'nothing was moved');
+  });
+});
+
+test('(b) a view staged after the local-change scan, before the snapshot, defers', () => {
+  withCatchUp(({ b }) => {
+    put(b, 'projects/p/hot.md', W1);
+    const r = clear(b, '@{u}', {
+      testHooks: { beforeSnapshot: () => cgitOk(b, ['add', 'projects/p/hot.md']) },
+    });
+    assert.equal(r.ok, false, JSON.stringify(r));
+    assert.equal(r.deferred, 'concurrent-change');
+    assert.equal(r.reason, 'changed-during-clear');
+    assert.equal(
+      cgitOk(b, ['diff', '--cached', '--name-only']).trim(),
+      'projects/p/hot.md',
+      'the view stays staged',
+    );
+    assert.equal(readRel(b, 'projects/p/hot.md'), W1);
+  });
+});
+
+test('(b) nothing written in the snapshot window: the clearing step completes', () => {
+  withCatchUp(({ b }) => {
+    put(b, 'projects/p/hot.md', W1);
+    put(b, '.gitignore', '.cache/\nmine/\n');
+    const r = clear(b, '@{u}', { testHooks: { beforeSnapshot: () => {} } });
+    assert.equal(r.ok, true, JSON.stringify(r));
+    assert.ok(r.archived.length > 0, 'the view was set aside');
+  });
+});
+
 test('(b) hypo-auto-stage takes the vault commit lock: with it held the add is skipped, without it the file is staged; a Read never stages', () => {
   withTmpDir((dir) => {
     cgitOk(dir, ['init', '-q']);
