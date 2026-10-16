@@ -3525,7 +3525,7 @@ function entryMatchesPath(text, relPath) {
 // already in HEAD and since modified is not new, and git failing to answer is not
 // "absent": both stay blocking. The file must also be the entry its path names
 // (entryMatchesPath).
-export function isForeignUncommittedEntry(hypoDir, relPath, sessionId) {
+export function isForeignUncommittedEntry(hypoDir, relPath, sessionId, { deadline } = {}) {
   if (!isValidSessionId(sessionId) || !isSessionEntryPath(relPath)) return false;
   const m = /^projects\/[^/]+\/sessions\/\d{4}-\d{2}-\d{2}-(.+-\d+)\.md$/.exec(relPath);
   if (!m) return false;
@@ -3538,7 +3538,7 @@ export function isForeignUncommittedEntry(hypoDir, relPath, sessionId) {
     return false;
   }
   if (!entryMatchesPath(text, relPath)) return false;
-  return headPathState(hypoDir, relPath) === 'absent';
+  return headPathState(hypoDir, relPath, { deadline }) === 'absent';
 }
 
 const FOREIGN_ENTRY_NOTICE = (f) =>
@@ -3662,9 +3662,9 @@ function foreignShardAppends(hypoDir, relPath, sessionId) {
 // of those appends (a staged edit or deletion). A shard this session recorded counts
 // only when the bytes it recorded are the ones HEAD holds (its own write committed),
 // the same retirement commitTouchedPaths applies.
-export function isForeignAppendOnlyShard(hypoDir, relPath, sessionId) {
+export function isForeignAppendOnlyShard(hypoDir, relPath, sessionId, { deadline } = {}) {
   if (!isValidSessionId(sessionId) || !CLOSE_FILE_RE.test(relPath)) return false;
-  const head = headBlob(hypoDir, relPath);
+  const head = headBlob(hypoDir, relPath, { deadline });
   if (!head) return false;
   let disk;
   try {
@@ -3688,7 +3688,7 @@ export function isForeignAppendOnlyShard(hypoDir, relPath, sessionId) {
     pos += r.addedLen;
     ends.push(pos);
   }
-  const touched = readTouchedPathsStrict(hypoDir, sessionId);
+  const touched = readTouchedPathsStrict(hypoDir, sessionId, touchedLockBudget(deadline));
   if (touched.state === 'locked' || touched.state === 'unreadable') return false;
   // The bytes this session recorded writing, when it wrote this shard. They must be
   // HEAD's, or HEAD's up to a line end: a pathspec commit (`--only`) reads each path
@@ -3708,7 +3708,7 @@ export function isForeignAppendOnlyShard(hypoDir, relPath, sessionId) {
   }
   // The index: HEAD, HEAD plus recorded appends another close is staging right now,
   // or (the same race) the shorter bytes this session's committed write left there.
-  const index = headBlob(hypoDir, relPath, { index: true });
+  const index = headBlob(hypoDir, relPath, { index: true, deadline });
   if (!index) return false;
   if (ends.some((e) => e === index.length && disk.subarray(0, e).equals(index))) return true;
   return own !== null && sha256Hex(index) === own;
@@ -3814,11 +3814,16 @@ export const CLOSE_LOGS_MISSING_NOTICE_TYPE = 'close-logs-missing';
  * `projectOverride`: the project to check; when omitted, the active project
  * resolved from root hot.md (recency).
  *
+ * `deadline` (optional, `{end}` as `remainingSpawnTimeoutMs` reads it): the budget for the git
+ * read of the entry's committed blob. When it runs out before git answers, the result carries
+ * `incomplete: 'deadline'` and `ok: false`, with neither `stale` nor `missing` naming the entry:
+ * the proof was not finished, which is not the same as the close having failed.
+ *
  * @param {string} hypoDir
- * @param {{scope: 'session'|'global', closeId?: string|null, projectOverride?: string|null}} opts
+ * @param {{scope: 'session'|'global', closeId?: string|null, projectOverride?: string|null, deadline?: {end: number}}} opts
  * @returns {{ok: boolean, project: string|null, dates: string[], stale: string[], missing: string[],
  *   sessionLogEvidence: {path: string, date: string}|null, entry: string|null,
- *   notices: {type: string, project: string, reason: string}[]}}
+ *   notices: {type: string, project: string, reason: string}[], incomplete?: 'deadline'}}
  */
 export function sessionCloseFileStatus(hypoDir, opts) {
   const scope = opts?.scope;
@@ -3848,6 +3853,7 @@ export function sessionCloseFileStatus(hypoDir, opts) {
   let dates = freshDates();
   let entry = null;
   let sessionLogEvidence = null;
+  let incomplete = null;
 
   if (scope === 'session') {
     const closeId = opts.closeId;
@@ -3878,8 +3884,9 @@ export function sessionCloseFileStatus(hypoDir, opts) {
           stale.push(entry);
         }
       } else {
-        const blob = headBlob(hypoDir, entry);
-        if (!blob || !entryMatchesPath(blob.toString('utf-8'), entry)) stale.push(entry);
+        const blob = headBlob(hypoDir, entry, { deadline: opts.deadline });
+        if (!blob && remainingSpawnTimeoutMs(opts.deadline) === 0) incomplete = 'deadline';
+        else if (!blob || !entryMatchesPath(blob.toString('utf-8'), entry)) stale.push(entry);
       }
       const logStale = [];
       const logMissing = [];
@@ -3919,7 +3926,7 @@ export function sessionCloseFileStatus(hypoDir, opts) {
   }
 
   return {
-    ok: stale.length === 0 && missing.length === 0,
+    ok: stale.length === 0 && missing.length === 0 && !incomplete,
     project,
     dates,
     stale,
@@ -3927,6 +3934,7 @@ export function sessionCloseFileStatus(hypoDir, opts) {
     sessionLogEvidence,
     entry,
     notices,
+    ...(incomplete ? { incomplete } : {}),
   };
 }
 
@@ -5718,14 +5726,14 @@ function headBlobState(hypoDir, relPath, { deadline } = {}) {
  * when it dies between creating the project index and writing its seed. `headBlobState` answering
  * `error` gives no hint, since "not in HEAD" is then unknown.
  */
-function emptyNewIndexHint(hypoDir, relPath) {
+function emptyNewIndexHint(hypoDir, relPath, { deadline } = {}) {
   if (!/^projects\/[^/]+\/index\.md$/.test(relPath)) return false;
   try {
     if (statSync(join(hypoDir, relPath)).size !== 0) return false;
   } catch {
     return false;
   }
-  return headBlobState(hypoDir, relPath).state === 'absent';
+  return headBlobState(hypoDir, relPath, { deadline }).state === 'absent';
 }
 
 /**
@@ -5827,9 +5835,9 @@ function dropTouchedPathsFailedEntries(hypoDir, sessionId, paths) {
  * committed, HEAD moved means it was (what is dirty now may be another writer's). A flag entry
  * with no hash, or a HEAD lookup that fails now, is no evidence of a move, so it stays pending.
  */
-function flaggedPathStillPending(hypoDir, relPath, entry) {
+function flaggedPathStillPending(hypoDir, relPath, entry, { deadline } = {}) {
   if (!entry || !Object.hasOwn(entry, 'headSha256')) return true;
-  const now = headBlobState(hypoDir, relPath);
+  const now = headBlobState(hypoDir, relPath, { deadline });
   if (now.state === 'error') return true;
   return (now.state === 'present' ? now.sha256 : null) === entry.headSha256;
 }
@@ -6185,6 +6193,12 @@ export function readTouchedPathsStrict(hypoDir, sessionId, opts = {}) {
       ? { state: 'locked', paths: [] }
       : { state: 'unreadable', paths: [], cause: 'lock-failed' };
   }
+}
+
+/** The touched-paths lock wait of a reader that runs under a gate `deadline`: the lock's own cap
+ * (5000 ms) or the time left, whichever is smaller. `{}` (the lock's own default) without a deadline. */
+function touchedLockBudget(deadline) {
+  return deadline ? { timeoutMs: Math.min(5000, remainingSpawnTimeoutMs(deadline)) } : {};
 }
 
 /** `withFileLock` options for a reader's optional `timeoutMs` (the lock wait cap): unset keeps the
@@ -8432,6 +8446,35 @@ export function resolveCloseScope(hypoDir, opts = {}, marker = null) {
 }
 
 // ── PreCompact gate — single source of truth ────────────────────────────────
+
+// One monotonic deadline for the whole gate, below the smallest caller limit (the Stop
+// stage's 10000 ms) minus the work a caller does before and after the gate. Every wait
+// the gate starts (git, the touched-paths lock, lint, feedback-sync) is cut to the time
+// left on it. No environment knob: a stale value in a user's environment would switch
+// the checks off or block every close. Tests inject `opts.deadline` instead.
+const GATE_DEADLINE_MS = 7000;
+
+/**
+ * How a child process ended: 'timeout' (the `timeout` the gate gave spawnSync killed it, Node
+ * reports `error.code === 'ETIMEDOUT'`), 'spawn-error' (it never ran), 'signal' (killed from
+ * outside, such as an OOM kill), 'exit' (a non-zero exit) or 'ok'. Same order as `stageFailure`
+ * in hypo-stop.mjs, which cannot import this module (it uses Node built-ins only): keep the two
+ * orders equal.
+ *
+ * @param {{error?: {code?: string}, status?: number|null, signal?: string|null}} res
+ * @returns {'ok'|'timeout'|'spawn-error'|'signal'|'exit'}
+ */
+function spawnEndKind(res) {
+  if (res.error?.code === 'ETIMEDOUT') return 'timeout';
+  if (res.error) return 'spawn-error';
+  if (res.signal) return 'signal';
+  return res.status === 0 ? 'ok' : 'exit';
+}
+
+// The lint and feedback-sync runner of the gate. `opts.runCheck` replaces it in tests.
+const defaultRunCheck = (name, args, spawnOpts) =>
+  spawnSync(name === 'lint' ? 'node' : process.execPath, args, spawnOpts);
+
 /**
  * The full PreCompact gate decision as a READ-ONLY status. This is the single
  * source of truth for "is the wiki compact-ready?": both hypo-personal-check.mjs
@@ -8493,14 +8536,55 @@ export function resolveCloseScope(hypoDir, opts = {}, marker = null) {
  * way it injects `opts.closeMarker`: close-gate-store.mjs imports this module.
  * A call that reaches the check without them throws (sessionProofCloseId).
  *
- * @param {{lintScope?: Iterable<string>, transcriptPath?: string|null, claudeHome?: string, projectOverride?: string|null, attributionScope?: string|null, sessionCwd?: string|null, sessionId?: string|null, checkpointMode?: boolean, closeMarker?: object|null, logOnly?: boolean, closeScope?: string[], closeOpen?: boolean, resolvedAtIndex?: number|null}} [opts]
- * @returns {{ok: boolean, close: object, blockers: {type:string,reason:string}[], notices: {type:string,reason:string,file?:string}[], driftTargets: string[], skipped: {lint:boolean, feedback:boolean}}}
+ * Internal opts, not set by an operating caller: `opts.deadline` (`{end}`, default one built
+ * from GATE_DEADLINE_MS at entry; PreCompact passes its own so its follow-up calls share the
+ * budget) and `opts.runCheck(name, args, spawnOpts)` (the lint / feedback-sync runner, tests
+ * inject results). A wait that outlives the deadline is a time limit: the check is skipped
+ * and said so in a notice, never a blocker. A check that ended by an error (a crash, an
+ * outside kill, output that does not parse) is a `check-skipped` blocker for every caller,
+ * `checkpointMode` or not. `skippedWhy` names the cause of each skip.
+ *
+ * @param {{lintScope?: Iterable<string>, transcriptPath?: string|null, claudeHome?: string, projectOverride?: string|null, attributionScope?: string|null, sessionCwd?: string|null, sessionId?: string|null, checkpointMode?: boolean, closeMarker?: object|null, logOnly?: boolean, closeScope?: string[], closeOpen?: boolean, resolvedAtIndex?: number|null, deadline?: {end: number}, runCheck?: (name: 'lint'|'feedback', args: string[], spawnOpts: object) => object}} [opts]
+ * @returns {{ok: boolean, close: object, blockers: {type:string,reason:string}[], notices: {type:string,reason:string,file?:string}[], driftTargets: string[], skipped: {lint:boolean, feedback:boolean}, skippedWhy: {lint?: string, feedback?: string}}}
  */
 export function precompactGateStatus(hypoDir, opts = {}) {
   const blockers = [];
   const notices = [];
   const driftTargets = [];
   const skipped = { lint: false, feedback: false };
+  const skippedWhy = {};
+  const deadline = opts.deadline ?? { end: performance.now() + GATE_DEADLINE_MS };
+  const cut = () => remainingSpawnTimeoutMs(deadline) === 0;
+  const runCheck = opts.runCheck ?? defaultRunCheck;
+  // Starts one lint / feedback-sync run under the time left, or reports that none is left.
+  const startCheck = (name, args, spawnOpts) => {
+    const left = remainingSpawnTimeoutMs(deadline);
+    if (left === 0) return { kind: 'deadline' };
+    const t0 = performance.now();
+    const res = runCheck(name, args, { ...spawnOpts, timeout: Math.min(30000, left) });
+    return { res, kind: spawnEndKind(res), ms: Math.round(performance.now() - t0) };
+  };
+  // A time limit (the child hit its timeout, or no time was left to start it): a notice.
+  const checkTimeLimit = (check, run) => {
+    skipped[check] = true;
+    const why =
+      run.kind === 'deadline'
+        ? `the gate deadline (${GATE_DEADLINE_MS} ms) was used up before it could start`
+        : `it was still running after ${run.ms} ms (gate deadline ${GATE_DEADLINE_MS} ms)`;
+    skippedWhy[check] = `time limit: ${why}`;
+    notices.push({ type: check, reason: `${check} skipped (time limit, fail-open): ${why}` });
+  };
+  // An error: the check did not run to a verdict, so this close has no verified lint /
+  // feedback state. Blocks every caller, so no receipt is issued for it.
+  const checkFailed = (check, msg) => {
+    skipped[check] = true;
+    skippedWhy[check] = `error: ${msg}`;
+    blockers.push({
+      type: 'check-skipped',
+      check,
+      reason: `${check} check could not run to a result: ${msg} (${check === 'lint' ? 'lint' : '`feedback-sync --check`'} 를 직접 돌려 원인을 고친 뒤 close 를 다시 하면 된다. 영수증이 없으면 Stop 이 계속 close 를 요구한다)`,
+    });
+  };
 
   // log-only synthetic close mode. A non-project (tooling / wiki-only)
   // session has no project to close. Activated either by the explicit writer flag
@@ -8567,7 +8651,7 @@ export function precompactGateStatus(hypoDir, opts = {}) {
   //    here (the shared gate) keeps the marker == compact-ready invariant:
   //    a committed-but-unpushed close marks AND compacts, instead of the close writer
   //    committing its own payload and then being blocked by its own (unpushed) commit.
-  const git = hypoIsClean(hypoDir);
+  const git = hypoIsClean(hypoDir, { deadline });
   // One git axis for every caller (Stop, PreCompact, check, --mark, apply): the
   // question is "is there an uncommitted write THIS session recorded (or failed
   // to record)". The project folder being closed blocks only what the record
@@ -8584,18 +8668,39 @@ export function precompactGateStatus(hypoDir, opts = {}) {
       reason: 'checkpointMode requires a validated sessionId',
     });
   } else if (git.uncommitted) {
-    const dirty = gitDirtyFiles(hypoDir);
+    const dirty = gitDirtyFiles(hypoDir, { deadline });
     if (dirty.length === 0) {
       // Enumeration itself failed (or nothing is actually dirty despite the
       // porcelain status): "cannot attribute" is not "clean", so fail closed.
-      blockers.push({ type: 'git', reason: git.reason });
+      // One exception: the gate deadline ran out, so there is no file list to
+      // judge. That blocks only when this session has a record of writing
+      // anything (touched-paths or a failure flag), else it is a notice.
+      const timedOut = cut();
+      const recorded =
+        isValidSessionId(opts.sessionId) &&
+        (readTouchedPathsStrict(hypoDir, opts.sessionId, touchedLockBudget(deadline)).state !==
+          'empty' ||
+          readTouchedPathsFailed(hypoDir, opts.sessionId).failed);
+      if (timedOut && !recorded) {
+        notices.push({
+          type: 'unresolved',
+          reason: `could not list the uncommitted files within the gate deadline (${GATE_DEADLINE_MS} ms), and this session has no record of writing (마감 안에 미커밋 파일을 열거하지 못함)`,
+        });
+      } else {
+        blockers.push({
+          type: 'git',
+          reason: timedOut
+            ? `could not list the uncommitted files within the gate deadline (${GATE_DEADLINE_MS} ms) and this session has a record of writing (마감 안에 미커밋 파일을 열거하지 못함, 이 세션의 기록이 있다. 다시 시도하면 된다)`
+            : git.reason,
+        });
+      }
     } else {
       // No valid session id (a check run without --session-id): there is no
       // record to read, so nothing can be told apart as this session's and
       // the project folder rule below applies to every file in it.
       const hasSession = isValidSessionId(opts.sessionId);
       const touched = hasSession
-        ? readTouchedPathsStrict(hypoDir, opts.sessionId)
+        ? readTouchedPathsStrict(hypoDir, opts.sessionId, touchedLockBudget(deadline))
         : { state: 'empty', paths: [] };
       if (touched.state === 'locked') {
         // Another writer holds this session's touched-paths lock right now
@@ -8634,7 +8739,7 @@ export function precompactGateStatus(hypoDir, opts = {}) {
           : { failed: false, entries: {}, pathsUnknown: false, reasons: [] };
         const flagged = (pf) =>
           Object.hasOwn(failed.entries, pf) &&
-          flaggedPathStillPending(hypoDir, pf, failed.entries[pf]);
+          flaggedPathStillPending(hypoDir, pf, failed.entries[pf], { deadline });
         const folderWide = !hasSession || failed.pathsUnknown || touched.state === 'unreadable';
         const cacheDir = hasSession ? `.cache/sessions/${sanitizeSessionId(opts.sessionId)}` : '';
         const folderWideExit = [
@@ -8660,7 +8765,11 @@ export function precompactGateStatus(hypoDir, opts = {}) {
             : !logOnly && f.startsWith('projects/');
         const touchedSet = new Set((touched.paths || []).map(posixPath));
         const driftedSet = new Set(
-          hasSession ? readTouchedPathsDrifted(hypoDir, opts.sessionId).map(posixPath) : [],
+          hasSession
+            ? readTouchedPathsDrifted(hypoDir, opts.sessionId, touchedLockBudget(deadline)).map(
+                posixPath,
+              )
+            : [],
         );
         const ignorePatterns = loadHypoIgnore(hypoDir);
         // A session entry of a `.hypoignore` project is never committed by
@@ -8702,7 +8811,10 @@ export function precompactGateStatus(hypoDir, opts = {}) {
             });
             continue;
           }
-          if (isForeignAppendOnlyShard(hypoDir, pf, opts.sessionId)) {
+          // Past the deadline the ownership exceptions below (another session's
+          // append or entry) cannot be judged, so they are not applied: a file
+          // this session recorded still blocks, any other is an unresolved notice.
+          if (!cut() && isForeignAppendOnlyShard(hypoDir, pf, opts.sessionId, { deadline })) {
             // Ahead of the touched-set check: the shard this session's close
             // committed stays in its set until Stop, and the later close of the
             // same project appends to it before this marker gate is done.
@@ -8714,7 +8826,7 @@ export function precompactGateStatus(hypoDir, opts = {}) {
             // dirty forever on its own: say how to get out. A file whose
             // bytes changed after this session recorded it is kept out of
             // the auto-commit (commitTouchedPaths), so say that too.
-            const pathHint = emptyNewIndexHint(hypoDir, pf)
+            const pathHint = emptyNewIndexHint(hypoDir, pf, { deadline })
               ? ' (빈 파일이다. 이 세션의 close 가 만들다 멈춘 것이니 지우고 close 를 다시 하면 된다)'
               : ignorePatterns.length > 0 && isIgnored(join(hypoDir, f), hypoDir, ignorePatterns)
                 ? ' (.hypoignore 대상이라 자동 커밋되지 않는다. 손으로 커밋하거나 .hypoignore 에서 빼야 close 가 된다)'
@@ -8726,7 +8838,10 @@ export function precompactGateStatus(hypoDir, opts = {}) {
               file: f,
               reason: `this session's own write is still uncommitted: ${f}${pathHint}`,
             });
-          } else if (isForeignUncommittedEntry(hypoDir, pf, opts.sessionId)) {
+          } else if (
+            !cut() &&
+            isForeignUncommittedEntry(hypoDir, pf, opts.sessionId, { deadline })
+          ) {
             // Two sessions closing one project at once: the other one's entry
             // is published and its commit has not landed yet.
             notices.push({ type: 'foreign-entry', file: f, reason: FOREIGN_ENTRY_NOTICE(f) });
@@ -8744,7 +8859,9 @@ export function precompactGateStatus(hypoDir, opts = {}) {
             notices.push({
               type: 'unresolved',
               file: f,
-              reason: `uncommitted changes, ownership unknown: ${f}`,
+              reason: cut()
+                ? `uncommitted changes, ownership not judged within the gate deadline (${GATE_DEADLINE_MS} ms): ${f} (마감 안에 귀속을 정하지 못함)`
+                : `uncommitted changes, ownership unknown: ${f}`,
             });
           }
         }
@@ -8916,6 +9033,7 @@ export function precompactGateStatus(hypoDir, opts = {}) {
           project: cwdProject,
         }),
         projectOverride: cwdProject,
+        deadline,
       });
       // The notices of the session-scope check (a project with no log lines under the
       // entry's date) belong to the gate result: a caller that reads only `notices[]` would
@@ -8931,10 +9049,12 @@ export function precompactGateStatus(hypoDir, opts = {}) {
         blockers.push({
           type: 'close-cwd',
           project: cwdProject,
-          reason: `session cwd project '${cwdProject}' has an incomplete session close: ${[
-            ...s.missing.map((f) => `${f} (missing)`),
-            ...s.stale.map((f) => `${f} (stale)`),
-          ].join(', ')}`,
+          reason: s.incomplete
+            ? `could not finish proving this session's close of '${cwdProject}' within the gate deadline (${GATE_DEADLINE_MS} ms, slow git). The close did not fail; try again (마감 안에 이 세션의 close 증명을 마치지 못함)`
+            : `session cwd project '${cwdProject}' has an incomplete session close: ${[
+                ...s.missing.map((f) => `${f} (missing)`),
+                ...s.stale.map((f) => `${f} (stale)`),
+              ].join(', ')}`,
         });
         // If the partition demoted this project to foreign debt, it is NOT another
         // session's work — it is THIS session's, and we just BLOCKED on it. Remove
@@ -8970,6 +9090,7 @@ export function precompactGateStatus(hypoDir, opts = {}) {
   const lintPath = PKG_ROOT ? join(PKG_ROOT, 'scripts', 'lint.mjs') : null;
   if (!lintPath || !existsSync(lintPath)) {
     skipped.lint = true; // no package → fail-open (never block on missing tooling)
+    skippedWhy.lint = 'tool missing: scripts/lint.mjs not found (no package root or no such file)';
   } else {
     try {
       // Pass --hypo-dir explicitly: lint.mjs resolves the vault via HYPO_DIR /
@@ -8978,18 +9099,23 @@ export function precompactGateStatus(hypoDir, opts = {}) {
       // maxBuffer matches crystallize's runLint (64 MiB): warn-heavy output on a
       // large wiki easily exceeds Node's 1 MiB default, which would truncate
       // stdout and (via the catch below) silently fail-open this gate.
-      const r = spawnSync('node', [lintPath, '--json', `--hypo-dir=${hypoDir}`], {
+      const run = startCheck('lint', [lintPath, '--json', `--hypo-dir=${hypoDir}`], {
         encoding: 'utf-8',
         cwd: hypoDir,
-        timeout: 30000,
         maxBuffer: 64 * 1024 * 1024,
       });
-      // A spawn failure (ENOENT), a timeout/kill (status === null), or a crash
-      // that produced no stdout must NOT be parsed as `{}` and treated as a clean
+      const r = run.res;
+      // The time limit the gate gave (or none left to start): a notice, handled
+      // in the catch below, never a blocker.
+      if (run.kind === 'deadline' || run.kind === 'timeout') {
+        throw Object.assign(new Error('lint hit the gate time limit'), { timeLimit: run });
+      }
+      // A spawn failure (ENOENT), an outside kill (a signal), or a crash that
+      // produced no stdout must NOT be parsed as `{}` and treated as a clean
       // lint — that path leaves skipped.lint=false with no notice, an INVISIBLE
-      // fail-open. Throw instead so the catch below records skipped.lint=true WITH
-      // a reason notice.
-      if (r.error || r.status === null) {
+      // fail-open. Throw instead so the catch below records skipped.lint=true and
+      // a `check-skipped` blocker.
+      if (run.kind === 'spawn-error' || run.kind === 'signal') {
         throw new Error(`lint spawn failed: ${r.error?.code || `signal ${r.signal}`}`);
       }
       if (!r.stdout || !r.stdout.trim()) {
@@ -9049,13 +9175,10 @@ export function precompactGateStatus(hypoDir, opts = {}) {
       for (const w of w8Notice)
         notices.push({ type: 'design-history', file: w.file, reason: w.file });
     } catch (e) {
-      skipped.lint = true; // fail-open on tooling error
-      // Surface WHY the gate skipped lint (truncated stdout, timeout, spawn error)
-      // instead of silently dropping the check — a fail-open is invisible otherwise.
-      notices.push({
-        type: 'lint',
-        reason: `lint skipped (fail-open): ${e.message || e.code || 'unknown error'}`,
-      });
+      // Only a time limit fails open (a notice). Anything else (a crash, an
+      // outside kill, no or broken stdout) blocks, with the cause in the reason.
+      if (e.timeLimit) checkTimeLimit('lint', e.timeLimit);
+      else checkFailed('lint', e.message || e.code || 'unknown error');
     }
   }
 
@@ -9066,10 +9189,12 @@ export function precompactGateStatus(hypoDir, opts = {}) {
   const claudeHome = opts.claudeHome || join(HOME, '.claude');
   if (!feedbackPath || !existsSync(feedbackPath)) {
     skipped.feedback = true;
+    skippedWhy.feedback =
+      'tool missing: scripts/feedback-sync.mjs not found (no package root or no such file)';
   } else {
     try {
-      const r = spawnSync(
-        process.execPath,
+      const run = startCheck(
+        'feedback',
         [
           feedbackPath,
           '--check',
@@ -9079,10 +9204,13 @@ export function precompactGateStatus(hypoDir, opts = {}) {
           `--hypo-dir=${hypoDir}`,
           `--claude-home=${claudeHome}`,
         ],
-        { encoding: 'utf-8', timeout: 30000 },
+        { encoding: 'utf-8' },
       );
-      if (r.error || r.status === null) {
-        skipped.feedback = true; // spawn failure → fail-open
+      const r = run.res;
+      if (run.kind === 'deadline' || run.kind === 'timeout') {
+        checkTimeLimit('feedback', run); // a time limit: notice, fail-open
+      } else if (run.kind === 'spawn-error' || run.kind === 'signal') {
+        throw new Error(`feedback-sync spawn failed: ${r.error?.code || `signal ${r.signal}`}`);
       } else {
         // A non-zero exit carries an actionable issue. A clean check exits 0 and is NOT
         // skipped, just nothing to do, except that its report can still carry
@@ -9092,7 +9220,18 @@ export function precompactGateStatus(hypoDir, opts = {}) {
         try {
           report = JSON.parse(r.stdout || '');
         } catch {
-          /* unparseable → fail-open below */
+          /* unparseable: an error, thrown below */
+        }
+        // Output that does not parse, or a report that says `error`, is an error
+        // whatever the exit code (a broken or empty report on exit 0 included).
+        // A parsed report without `error` and without anything to act on stays
+        // fail-open below, even on a non-zero (strict) exit.
+        if (!report || typeof report !== 'object' || report.error) {
+          throw new Error(
+            report?.error
+              ? `feedback-sync reported an error: ${report.error}`
+              : `feedback-sync output did not parse (exit=${r.status})${r.stderr ? `: ${String(r.stderr).slice(-500)}` : ''}`,
+          );
         }
         const entries = report ? Object.entries(report.targets || {}) : [];
         const conflictedT = entries
@@ -9139,7 +9278,8 @@ export function precompactGateStatus(hypoDir, opts = {}) {
               sideWarnT.length
             ))
         ) {
-          skipped.feedback = true; // unparseable / non-actionable → fail-open
+          skipped.feedback = true; // parsed, no error, nothing actionable → fail-open
+          skippedWhy.feedback = `not actionable: feedback-sync --strict exited ${r.status} with nothing to act on`;
         } else if (buildErrT.length) {
           // Name the EXACT target file and the remedy for THIS cause. "Restore
           // the managed container" with no path is a dead end, and so is naming
@@ -9218,12 +9358,12 @@ export function precompactGateStatus(hypoDir, opts = {}) {
           });
         }
       }
-    } catch {
-      skipped.feedback = true;
+    } catch (e) {
+      checkFailed('feedback', e.message || e.code || 'unknown error');
     }
   }
 
-  return { ok: blockers.length === 0, close, blockers, notices, driftTargets, skipped };
+  return { ok: blockers.length === 0, close, blockers, notices, driftTargets, skipped, skippedWhy };
 }
 
 // ── session-close checklist ────────────────────────────────────────────────

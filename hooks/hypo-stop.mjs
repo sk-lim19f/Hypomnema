@@ -96,6 +96,11 @@ function parseStageOutput(stdout) {
  * reports the kill as ETIMEDOUT); `signal` without a timeout is a death from
  * outside, such as an OOM kill.
  *
+ * `spawnEndKind` in hypo-shared.mjs makes the same judgment for the lint and
+ * feedback runs of the close gate, in the same order (timeout, spawn error,
+ * signal, exit status). This file uses Node built-ins only, so the two cannot
+ * share one function: change the order in both or in neither.
+ *
  * @param {{file: string, timeoutMs: number}} stage
  * @param {{error?: Error, status: number|null, signal: string|null}} res
  * @returns {string|null}

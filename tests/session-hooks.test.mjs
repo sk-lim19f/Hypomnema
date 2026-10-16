@@ -4577,6 +4577,316 @@ test('checkpointMode: the same appended shard with no flag is a foreign-append n
   });
 });
 
+// ── The gate deadline and the lint / feedback runner (direct calls) ──────────
+// `opts.runCheck` injects what lint and feedback-sync "returned"; `opts.deadline` injects the
+// budget. Neither is an operating knob: no caller outside these tests sets them.
+const T7_SID = 'sess-t7-gate';
+const T7_LINT_OK = { status: 0, stdout: JSON.stringify({ errors: [], warns: [] }) };
+const T7_FEEDBACK_OK = { status: 0, stdout: JSON.stringify({ mode: 'check', targets: {} }) };
+const t7Crash = {
+  'spawn error': {
+    error: Object.assign(new Error('spawn node ENOENT'), { code: 'ENOENT' }),
+    status: null,
+    signal: null,
+    stdout: '',
+  },
+  'empty stdout': { status: 0, stdout: '' },
+  'broken JSON': { status: 0, stdout: '{not json' },
+};
+// calls: the runner invocations, `{name, timeout}`, so a test can see what was started and with what limit.
+function t7Runner(lint, feedback = T7_FEEDBACK_OK, calls = []) {
+  return (name, _args, spawnOpts) => {
+    calls.push({ name, timeout: spawnOpts.timeout });
+    return name === 'lint' ? lint : feedback;
+  };
+}
+function t7Gate(dir, { lint = T7_LINT_OK, feedback = T7_FEEDBACK_OK, calls, ...extra } = {}) {
+  return precompactGateStatus(dir, {
+    claudeHome: join(dir, '.claude-none'),
+    sessionId: T7_SID,
+    runCheck: t7Runner(lint, feedback, calls),
+    ...extra,
+  });
+}
+const t7Skipped = (gate, check) =>
+  (gate.blockers || []).find((b) => b.type === 'check-skipped' && b.check === check);
+// A deadline that reads as ample for its first `n` reads and as spent after: one stage of the
+// gate runs out while the stages before it finish. `n` counts reads of `end` (each
+// remainingSpawnTimeoutMs call is one): the enumeration of a dirty tree takes 6 (two for
+// hypoIsClean, two for gitDirtyFiles, one for the touched-paths lock, one for the drift lock),
+// so `deadlineAfterReads(6)` is spent when the first file is judged.
+function deadlineAfterReads(n) {
+  let reads = 0;
+  return {
+    get end() {
+      return reads++ < n ? performance.now() + 600000 : 0;
+    },
+  };
+}
+const T7_PAST = { end: 0 };
+
+// Distinguishes: a lint run that died by an error (no result to trust) from one that
+// finished. A close with no lint verdict gets no receipt, for a marker writer
+// (checkpointMode) and a reader alike.
+test('a lint check that crashes adds a check-skipped blocker, for a writer and a reader alike', () => {
+  withSyncedWiki((dir) => {
+    for (const [label, lint] of Object.entries(t7Crash)) {
+      for (const checkpointMode of [true, false]) {
+        const gate = t7Gate(dir, { lint, checkpointMode });
+        const b = t7Skipped(gate, 'lint');
+        assert.ok(
+          b,
+          `${label}, checkpointMode=${checkpointMode}: ${JSON.stringify(gate.blockers)}`,
+        );
+        assert.match(b.reason, /lint/);
+        assert.equal(gate.skipped.lint, true, label);
+        assert.match(gate.skippedWhy.lint, /^error:/, label);
+        assert.ok(
+          !gate.notices.some((n) => n.type === 'lint' && /skipped/.test(n.reason)),
+          `${label}: the same fact is not also a notice: ${JSON.stringify(gate.notices)}`,
+        );
+        assert.equal(gate.ok, false, label);
+      }
+    }
+  });
+});
+
+test('a lint run that finishes adds no check-skipped blocker', () => {
+  withSyncedWiki((dir) => {
+    // exit 1 with a parsed report is lint saying "found problems", not a failed run
+    for (const lint of [
+      T7_LINT_OK,
+      { status: 1, stdout: JSON.stringify({ errors: [], warns: [] }) },
+    ]) {
+      const calls = [];
+      const gate = t7Gate(dir, { lint, calls, checkpointMode: true });
+      assert.equal(t7Skipped(gate, 'lint'), undefined, JSON.stringify(gate.blockers));
+      assert.equal(gate.skipped.lint, false);
+      assert.equal(gate.skippedWhy.lint, undefined);
+      const timeout = calls.find((c) => c.name === 'lint')?.timeout;
+      assert.ok(timeout > 0 && timeout <= 30000, `lint runs under the time left, got ${timeout}`);
+    }
+  });
+});
+
+// Distinguishes: a child killed from outside (a signal, no ETIMEDOUT: an OOM kill) from the
+// timeout the gate itself gave it (ETIMEDOUT, a signal too in a real spawnSync).
+test('an externally killed lint (SIGKILL) adds a check-skipped blocker', () => {
+  withSyncedWiki((dir) => {
+    const gate = t7Gate(dir, { lint: { status: null, signal: 'SIGKILL', stdout: '' } });
+    const b = t7Skipped(gate, 'lint');
+    assert.ok(b, JSON.stringify(gate.blockers));
+    assert.ok(b.reason.includes('SIGKILL'), `the signal is named: ${b.reason}`);
+  });
+});
+
+test('a lint that hit its own timeout (ETIMEDOUT) is a notice, not a blocker', () => {
+  withSyncedWiki((dir) => {
+    // what a real spawnSync returns when its `timeout` kills the child
+    const lint = {
+      error: Object.assign(new Error('spawnSync node ETIMEDOUT'), { code: 'ETIMEDOUT' }),
+      status: null,
+      signal: 'SIGTERM',
+      stdout: '',
+    };
+    const gate = t7Gate(dir, { lint });
+    assert.equal(t7Skipped(gate, 'lint'), undefined, JSON.stringify(gate.blockers));
+    assert.equal(gate.skipped.lint, true);
+    assert.match(gate.skippedWhy.lint, /^time limit:/);
+    assert.ok(
+      gate.notices.some((n) => n.type === 'lint' && /time limit/.test(n.reason)),
+      JSON.stringify(gate.notices),
+    );
+  });
+});
+
+// Distinguishes: a time limit (the gate deadline already used up, so lint is never started)
+// from an error. Only a notice, and the runner is not called at all.
+test('a lint run cut by the gate deadline is a notice, not a blocker', () => {
+  withSyncedWiki((dir) => {
+    const calls = [];
+    const gate = t7Gate(dir, { deadline: T7_PAST, calls });
+    assert.deepEqual(calls, [], 'no time left: neither check is started');
+    assert.equal(t7Skipped(gate, 'lint'), undefined, JSON.stringify(gate.blockers));
+    assert.equal(t7Skipped(gate, 'feedback'), undefined, JSON.stringify(gate.blockers));
+    assert.equal(gate.skipped.lint, true);
+    assert.equal(gate.skipped.feedback, true);
+    assert.match(gate.skippedWhy.lint, /^time limit:/);
+    assert.ok(
+      gate.notices.some((n) => n.type === 'lint' && /time limit/.test(n.reason)),
+      JSON.stringify(gate.notices),
+    );
+  });
+});
+
+// Distinguishes: a feedback-sync that printed nothing usable (an error, whatever its exit code)
+// from a report that parses and has nothing to do (also a non-zero strict exit).
+test('feedback output that is broken JSON with exit 0 adds a check-skipped blocker', () => {
+  withSyncedWiki((dir) => {
+    for (const [label, feedback] of [
+      ['broken JSON, exit 0', { status: 0, stdout: '{not json' }],
+      ['empty output, exit 0', { status: 0, stdout: '' }],
+      ['an error report', { status: 1, stdout: JSON.stringify({ error: 'wiki not found: /x' }) }],
+      ['a signal', { status: null, signal: 'SIGKILL', stdout: '' }],
+      [
+        'a spawn error',
+        {
+          error: Object.assign(new Error('spawn ENOENT'), { code: 'ENOENT' }),
+          status: null,
+          stdout: '',
+        },
+      ],
+    ]) {
+      for (const checkpointMode of [true, false]) {
+        const gate = t7Gate(dir, { feedback, checkpointMode });
+        assert.ok(
+          t7Skipped(gate, 'feedback'),
+          `${label}, checkpointMode=${checkpointMode}: ${JSON.stringify(gate.blockers)}`,
+        );
+        assert.match(gate.skippedWhy.feedback, /^error:/, label);
+      }
+    }
+  });
+});
+
+test('a clean feedback report with exit 0 adds none', () => {
+  withSyncedWiki((dir) => {
+    const gate = t7Gate(dir, { feedback: T7_FEEDBACK_OK });
+    assert.equal(t7Skipped(gate, 'feedback'), undefined, JSON.stringify(gate.blockers));
+    assert.equal(gate.skipped.feedback, false);
+    // a parsed report with nothing to act on, on a non-zero strict exit, is not an error either
+    const strict = t7Gate(dir, {
+      feedback: { status: 1, stdout: JSON.stringify({ targets: {} }) },
+    });
+    assert.equal(t7Skipped(strict, 'feedback'), undefined, JSON.stringify(strict.blockers));
+    assert.equal(strict.skipped.feedback, true, 'the strict-only exit is still a skip');
+    assert.match(strict.skippedWhy.feedback, /^not actionable:/);
+  });
+});
+
+test('a feedback-sync that hit its own timeout (ETIMEDOUT) is a notice, not a blocker', () => {
+  withSyncedWiki((dir) => {
+    const feedback = {
+      error: Object.assign(new Error('spawnSync ETIMEDOUT'), { code: 'ETIMEDOUT' }),
+      status: null,
+      signal: 'SIGTERM',
+      stdout: '',
+    };
+    const gate = t7Gate(dir, { feedback });
+    assert.equal(t7Skipped(gate, 'feedback'), undefined, JSON.stringify(gate.blockers));
+    assert.equal(gate.skipped.feedback, true);
+    assert.match(gate.skippedWhy.feedback, /^time limit:/);
+  });
+});
+
+// Distinguishes: the deadline passing while the dirty files are being judged (enumeration
+// finished, ownership not) from the same state with time to spare. A recorded file still blocks;
+// the exceptions that excuse a file as another session's (a foreign append) are not applied
+// because they could not be judged.
+test('a dirty file whose ownership cannot be judged before the deadline blocks if this session recorded it, else is a notice', () => {
+  withAppendedShard((dir, rel) => {
+    const gate = t7Gate(dir, { deadline: deadlineAfterReads(6) });
+    // the enumeration finished: no enumeration blocker or file-less notice, the shard is listed
+    assert.ok(
+      !(gate.blockers || []).some((b) => b.type === 'git' && !b.file) &&
+        !(gate.notices || []).some((n) => n.type === 'unresolved' && !n.file),
+      `precondition, enumeration finished: ${JSON.stringify([gate.blockers, gate.notices])}`,
+    );
+    const n = (gate.notices || []).find((x) => x.type === 'unresolved' && x.file === rel);
+    assert.ok(n, `an unrecorded shard is an unresolved notice: ${JSON.stringify(gate.notices)}`);
+    assert.ok(n.reason.includes('마감 안에 귀속을 정하지 못함'), n.reason);
+    assert.ok(
+      !noticeOn(gate, 'foreign-append', rel),
+      'the foreign-append exception is not applied',
+    );
+    assert.equal(blockerOn(gate, rel), undefined, JSON.stringify(gate.blockers));
+    // the same state with time to spare: the shard is another session's append
+    const roomy = t7Gate(dir);
+    assert.ok(noticeOn(roomy, 'foreign-append', rel), JSON.stringify(roomy.notices));
+    assert.ok(!noticeOn(roomy, 'unresolved', rel), JSON.stringify(roomy.notices));
+  });
+});
+
+test('a dirty file whose ownership cannot be judged before the deadline blocks when this session recorded it', () => {
+  withAppendedShard((dir, rel) => {
+    assert.equal(recordTouchedPaths(dir, T7_SID, [rel]), true);
+    const gate = t7Gate(dir, { deadline: deadlineAfterReads(6) });
+    assert.equal(blockerOn(gate, rel)?.type, 'known-session-write', JSON.stringify(gate.blockers));
+    assert.ok(!noticeOn(gate, 'foreign-append', rel), JSON.stringify(gate.notices));
+  });
+});
+
+// Distinguishes: no time left to list the dirty files (a file-less verdict) with a record of
+// this session writing, from the same with no record, from a roomy deadline. Per-file
+// verdicts are not asserted here.
+test("with the deadline already past, enumeration itself fails: this session's record blocks, no record is a notice", () => {
+  withSyncedWiki((dir) => {
+    writeFileSync(join(dir, 'pending.md'), '# pending\n');
+    const none = t7Gate(dir, { deadline: T7_PAST });
+    assert.ok(
+      !(none.blockers || []).some((b) => b.type === 'git' || b.type === 'known-session-write'),
+      `no record, no git-axis blocker: ${JSON.stringify(none.blockers)}`,
+    );
+    assert.ok(
+      (none.notices || []).some((x) => x.type === 'unresolved' && /열거하지 못함/.test(x.reason)),
+      JSON.stringify(none.notices),
+    );
+    assert.equal(recordTouchedPaths(dir, T7_SID, ['pending.md']), true);
+    const rec = t7Gate(dir, { deadline: T7_PAST });
+    const b = (rec.blockers || []).find((x) => x.type === 'git');
+    assert.ok(
+      b && /마감 안에 미커밋 파일을 열거하지 못함/.test(b.reason),
+      JSON.stringify(rec.blockers),
+    );
+    // time to spare: the recorded file is listed and blocks by name
+    assert.equal(blockerOn(t7Gate(dir), 'pending.md')?.type, 'known-session-write');
+  });
+});
+
+// Distinguishes: a gate that hands its deadline to the git calls (past: none of the status,
+// cat-file or ls-tree calls the git axis makes is started) from one that does not. A shim
+// `git` first on PATH logs each call and runs the real one.
+test('the gate bounds hypoIsClean, gitDirtyFiles and the shard check by its deadline', () => {
+  withTmpDir((shimDir) => {
+    const realGit = spawnSync('which', ['git'], { encoding: 'utf-8' }).stdout.trim();
+    const log = join(shimDir, 'git.log');
+    writeFileSync(
+      join(shimDir, 'git'),
+      `#!/bin/sh\necho "$@" >> '${log}'\nexec '${realGit}' "$@"\n`,
+      { mode: 0o755 },
+    );
+    const count = (re) =>
+      existsSync(log)
+        ? readFileSync(log, 'utf-8')
+            .split('\n')
+            .filter((l) => re.test(l)).length
+        : 0;
+    const axis = /\b(status|cat-file|ls-tree)\b/;
+    const oldPath = process.env.PATH;
+    process.env.PATH = `${shimDir}:${oldPath}`;
+    try {
+      withAppendedShard((dir) => {
+        rmSync(log, { force: true });
+        t7Gate(dir, { deadline: T7_PAST });
+        assert.equal(count(axis), 0, 'a spent deadline starts no git call of the git axis');
+        rmSync(log, { force: true });
+        t7Gate(dir, { deadline: deadlineAfterReads(6) });
+        assert.ok(count(/\bstatus\b/) >= 1, 'precondition: the enumeration ran');
+        assert.equal(
+          count(/\b(cat-file|ls-tree)\b/),
+          0,
+          'the shard check starts no git call past it',
+        );
+        rmSync(log, { force: true });
+        t7Gate(dir);
+        assert.ok(count(/\bcat-file\b/) >= 1, 'with time to spare the shard check reads blobs');
+      });
+    } finally {
+      process.env.PATH = oldPath;
+    }
+  });
+});
+
 // Distinguishes: a lock that cannot be created (the cause is the directory, so the reason sends
 // the user to its permissions and disk space and never tells them to delete a file) from a corrupt
 // record (delete it) and a paths-unknown flag (delete the flag).

@@ -51,6 +51,7 @@ import {
   readClosePin,
   sessionCloseFileStatus,
   sessionProofCloseId,
+  headBlob,
   VIEW_BACKUP_DIR_REL,
   rootHotBackupRecoveryNotice,
   consumeRootHotHealthNotice,
@@ -5993,6 +5994,105 @@ test('P2: a complete cwd project close adds no blocker', () => {
       gate.blockers.some((b) => b.type === 'close-cwd'),
       false,
       'a completed cwd project close gains no new blocker',
+    );
+  });
+});
+
+// A deadline that reads as ample for its first `n` reads of `end` and as spent after, so one
+// stage of the gate runs out while the stages before it finish (the same helper as in
+// session-hooks.test.mjs: one area each, nothing shared). On a clean tree hypoIsClean reads
+// twice, so `deadlineAfterReads(2)` is spent when the close proof starts.
+function deadlineAfterReads(n) {
+  let reads = 0;
+  return {
+    get end() {
+      return reads++ < n ? performance.now() + 600000 : 0;
+    },
+  };
+}
+const NO_TOOLS = () => ({
+  status: 0,
+  stdout: JSON.stringify({ errors: [], warns: [], targets: {} }),
+});
+
+// Distinguishes: a close proof the deadline cut short (git was never asked, so nothing says
+// the close failed) from one that ran: the first is an `incomplete` close-cwd blocker that tells
+// the user to retry, the second a complete close with no blocker.
+test('a session close proof cut by the deadline is an incomplete close-cwd blocker, not a missing-file report', () => {
+  const CWD = '/tmp/cwdproj-deadline';
+  withClosePartitionWiki([{ slug: 'cwd-proj', date: todayLocal() }], [], (dir) => {
+    setWorkingDir(dir, 'cwd-proj', CWD);
+    pinCommittedClose(dir, 's-t7-proof', { project: 'cwd-proj' });
+    const base = {
+      claudeHome: join(dir, '.claude-none'),
+      sessionCwd: CWD,
+      sessionId: 's-t7-proof',
+      closeOpen: false,
+      resolvedAtIndex: null,
+      runCheck: NO_TOOLS,
+    };
+    const roomy = precompactGateStatus(dir, base);
+    assert.equal(
+      roomy.blockers.some((b) => b.type === 'close-cwd'),
+      false,
+      `a finished proof of a committed close adds no blocker: ${JSON.stringify(roomy.blockers)}`,
+    );
+    const cut = precompactGateStatus(dir, { ...base, deadline: deadlineAfterReads(2) });
+    const b = cut.blockers.find((x) => x.type === 'close-cwd');
+    assert.ok(b, `the unfinished proof blocks: ${JSON.stringify(cut.blockers)}`);
+    assert.equal(b.project, 'cwd-proj');
+    assert.ok(b.reason.includes('증명을 마치지 못함'), b.reason);
+    assert.ok(!/\((missing|stale)\)/.test(b.reason), `no file list: ${b.reason}`);
+    assert.ok(
+      !cut.blockers.some((x) => x.type === 'git'),
+      `precondition, the enumeration before the proof finished: ${JSON.stringify(cut.blockers)}`,
+    );
+  });
+});
+
+test('sessionCloseFileStatus: a spent deadline is incomplete, not stale and not missing', () => {
+  withClosePartitionWiki([{ slug: 'cwd-proj', date: todayLocal() }], [], (dir) => {
+    pinCommittedClose(dir, 's-t7-status', { project: 'cwd-proj' });
+    const args = {
+      scope: 'session',
+      closeId: closeIdFor('s-t7-status', 0),
+      projectOverride: 'cwd-proj',
+    };
+    const done = sessionCloseFileStatus(dir, args);
+    assert.equal(done.ok, true, JSON.stringify(done));
+    assert.equal(done.incomplete, undefined);
+    const spent = sessionCloseFileStatus(dir, { ...args, deadline: { end: 0 } });
+    assert.equal(spent.ok, false);
+    assert.equal(spent.incomplete, 'deadline');
+    assert.deepEqual([spent.stale, spent.missing], [[], []], 'the entry is not reported as a gap');
+  });
+});
+
+// Distinguishes: headBlob keeps handing back raw bytes (a Buffer that survives bytes which are
+// not valid UTF-8) with and without a deadline. A text decode would turn ff into U+FFFD.
+test('headBlob returns the committed bytes as a Buffer, with and without a deadline', () => {
+  withClosePartitionWiki([{ slug: 'cwd-proj', date: todayLocal() }], [], (dir) => {
+    const bytes = Buffer.from([0xff, 0x00, 0x61]);
+    writeFileSync(join(dir, 'raw.bin'), bytes);
+    for (const a of [
+      ['add', '--', 'raw.bin'],
+      ['commit', '-q', '-m', 'raw', '--', 'raw.bin'],
+    ]) {
+      const r = spawnSync('git', ['-C', dir, ...a], {
+        encoding: 'utf-8',
+        env: { ...process.env, HOME: SESSION_TMP_HOME },
+      });
+      assert.equal(r.status, 0, r.stderr);
+    }
+    for (const opts of [undefined, { deadline: { end: performance.now() + 600000 } }]) {
+      const got = headBlob(dir, 'raw.bin', opts);
+      assert.ok(Buffer.isBuffer(got), `a Buffer back, deadline=${Boolean(opts)}`);
+      assert.deepEqual([...got], [0xff, 0x00, 0x61]);
+    }
+    assert.equal(
+      headBlob(dir, 'raw.bin', { deadline: { end: 0 } }),
+      null,
+      'no time left: no answer',
     );
   });
 });
