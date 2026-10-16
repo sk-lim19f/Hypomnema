@@ -2233,10 +2233,20 @@ function readPullArchive(hypoDir) {
 
 // Durable, and only ever called after every backup it names was written durably: nothing is
 // removed from the index or the working tree until this record is on disk.
+const pullArchiveText = (rec) => `${JSON.stringify(rec, null, 2)}\n`;
 const writePullArchive = (hypoDir, rec) =>
-  atomicWrite(join(hypoDir, PULL_ARCHIVE_REL), `${JSON.stringify(rec, null, 2)}\n`, {
-    durable: true,
-  });
+  atomicWrite(join(hypoDir, PULL_ARCHIVE_REL), pullArchiveText(rec), { durable: true });
+
+// Whether the record on disk is byte for byte `text` (null: whether there is no record). Null when
+// the record cannot be read. A write that threw says nothing about what was published (`atomicWrite`
+// renames first and syncs the directory after), so the caller asks the disk.
+function pullArchiveHolds(hypoDir, text) {
+  try {
+    return readTextOrNull(join(hypoDir, PULL_ARCHIVE_REL)) === text;
+  } catch {
+    return null;
+  }
+}
 
 // Line endings as git stores them: `core.autocrlf=true` checks a file out with CRLF, so a working
 // tree text and the HEAD blob of the same file only match once both are read this way.
@@ -2884,7 +2894,12 @@ function clearBlockingPaths(hypoDir, targetRev, opts) {
  * (and for `unowned[]`) are deleted, and `.cache/pull-archive.json` loses the entries this run took
  * back (`pullArchiveWithout`; deleted when nothing is left); otherwise those stay for the next
  * catch-up to carry. The order is record, then the notice lines, then the backups: a stop in
- * between leaves a backup nobody names, never a record naming a backup that is gone. The record is
+ * between leaves a backup nobody names, never a record naming a backup that is gone. When the
+ * record cannot be rewritten (the disk does not hold the bytes the rewrite meant, `pullArchiveHolds`;
+ * a throw after the rename published them counts as written), the result is `ok: false` with a
+ * notice naming the record, and the record, the notice lines and every backup stay. The callers
+ * (`fastForwardTo`, `pullRemote`) read only `.notices`, so that sentence is the user's only signal;
+ * `fastForwardTo` appends it to its `notice`. The record is
  * touched only when `moved.recordWritten` says this run wrote it; an earlier run's record is left
  * byte for byte. A backup the record on disk or `moved.priorRecord` still names is never deleted
  * (a run that finds the same bytes already backed up reuses that file, so the earlier run and this
@@ -2995,13 +3010,34 @@ export function undoClearedPaths(hypoDir, moved, { keepRecord = false } = {}) {
     // names a backup that is gone. Only a record this run wrote is touched; one written by an
     // earlier run stays as it is. What this run took back leaves the record, what an earlier run
     // left in it stays, and a record with nothing left is deleted.
+    let rewriteFailed = false;
     if (moved.recordWritten && !keepRecord && all.length + (moved.unowned ?? []).length > 0) {
       const record = join(hypoDir, PULL_ARCHIVE_REL);
       const rec = readPullArchive(hypoDir);
       const rest = rec && pullArchiveWithout(rec, moved, all);
-      if (rest) writePullArchive(hypoDir, rest);
-      else rmSync(record, { force: true });
-      syncDir(dirname(record));
+      const intendedRecordText = rest ? pullArchiveText(rest) : null;
+      try {
+        if (rest) writePullArchive(hypoDir, rest);
+        else rmSync(record, { force: true });
+        syncDir(dirname(record));
+      } catch {
+        // A throw after the rename still left the intended bytes on disk: go on as written.
+        const published = pullArchiveHolds(hypoDir, intendedRecordText) === true;
+        rewriteFailed = !published;
+      }
+    }
+    // The record is in an unknown state (the disk holds neither the bytes this run meant to write
+    // nor, necessarily, the earlier ones): it stays as it is, the notice lines stay (they name the
+    // backups) and no backup is deleted. The callers read only `.notices` of this result, so this
+    // sentence is what reaches the user.
+    if (rewriteFailed) {
+      return {
+        ok: false,
+        notices: [
+          ...notices,
+          `보관 기록(${PULL_ARCHIVE_REL})을 다시 쓰지 못해 기록과 백업 파일을 모두 그대로 남겼습니다. 기록이 가리키는 항목을 확인한 뒤 정리하세요.`,
+        ],
+      };
     }
     // Every path is back where it was, so the lines naming the backups are retracted before the
     // backups go. A stop in between leaves a notice for a backup that is still there.

@@ -5964,6 +5964,94 @@ test('a run stopped before it wrote the record leaves the earlier record and its
   });
 });
 
+// Fails the `nth` rename onto `recordPath` (the archive record): 'before' throws without moving
+// it, 'after' throws once the new bytes are published, 'garbled' publishes other bytes and then
+// throws. `fn` gets `{fired}` to tell whether the fault was reached. Only that path is touched, so
+// the notice file and the backups behave as they do outside the test.
+function withRecordRenameFault(recordPath, { when, nth }, fn) {
+  const nodeFs = createRequire(import.meta.url)('node:fs');
+  const { renameSync } = nodeFs;
+  const state = { fired: false };
+  let seen = 0;
+  nodeFs.renameSync = (from, to) => {
+    if (String(to) !== recordPath || ++seen !== nth) return renameSync(from, to);
+    state.fired = true;
+    if (when !== 'before') {
+      renameSync(from, to);
+      if (when === 'garbled') nodeFs.writeFileSync(to, 'not the intended bytes\n');
+    }
+    throw Object.assign(new Error('injected rename fault'), { code: 'EIO' });
+  };
+  syncBuiltinESMExports();
+  try {
+    return fn(state);
+  } finally {
+    nodeFs.renameSync = renameSync;
+    syncBuiltinESMExports();
+  }
+}
+
+// An earlier merged record plus a new blocked view, so this run writes a record (its own rename is
+// the 1st onto the record) and a notice line naming the view's backup, and the checkout fails.
+function runUndoWithRecordFault(b, when) {
+  const earlier = earlierView(b);
+  seedRecord(b, { stage: 'merged', targetSha: headOf(b), views: [earlier] });
+  put(b, 'projects/p/hot.md', W1);
+  const noticeRel = '.cache/root-hot-projection-notice.json';
+  const seen = {};
+  let state;
+  const r = withRecordRenameFault(join(b, RECORD_REL), { when, nth: 2 }, (s) => {
+    state = s;
+    return fastForwardTo(b, '@{u}', {
+      testHooks: {
+        afterArchive: () => {
+          put(b, '.git/index.lock', '');
+          seen.record = readRel(b, RECORD_REL);
+          seen.notice = readRel(b, noticeRel);
+        },
+      },
+    });
+  });
+  const notice = existsSync(join(b, noticeRel)) ? readRel(b, noticeRel) : '';
+  return { r, earlier, seen, notice, state };
+}
+const VIEW_NOTICE = /projects\/p\/hot\.md의 이 기계 쪽 작업 트리본/;
+
+test('a failed rewrite of the archive record during undo keeps the record, its notice and every backup', () => {
+  withCatchUp(({ b }) => {
+    const { r, earlier, seen, notice, state } = runUndoWithRecordFault(b, 'before');
+    assert.match(seen.notice, VIEW_NOTICE, 'the notice for this run view was written first');
+    assert.equal(state.fired, true, 'the rewrite was the failing rename');
+    assert.equal(r.reason, 'checkout-failed');
+    assert.equal(r.pre.archived.length, 1);
+    assert.equal(readRel(b, 'projects/p/hot.md'), W1, 'the undo put the bytes back');
+    assert.equal(readRel(b, RECORD_REL), seen.record, 'the record is as this run wrote it');
+    assert.equal(existsSync(r.pre.archived[0].backupPath), true, 'this run backup stays');
+    assert.equal(existsSync(earlier.backupPath), true, 'the earlier backup stays');
+    assert.match(notice, VIEW_NOTICE, 'the notice naming the backup is not retracted');
+    assert.match(r.notice, /\.cache\/pull-archive\.json/);
+  });
+});
+
+test('an undo whose record rewrite throws after publishing goes on as written', () => {
+  withCatchUp(({ b }) => {
+    const { r, earlier, notice, state } = runUndoWithRecordFault(b, 'after');
+    assert.equal(state.fired, true, 'the rewrite threw after its rename');
+    assert.equal(r.reason, 'checkout-failed');
+    const rec = readRecord(b);
+    assert.equal(rec.stage, 'merged');
+    assert.deepEqual(
+      rec.views.map((v) => v.backupPath),
+      [earlier.backupPath],
+      'the record is what the undo meant to write: the earlier view only',
+    );
+    assert.equal(existsSync(r.pre.archived[0].backupPath), false, 'this run backup is deleted');
+    assert.equal(existsSync(earlier.backupPath), true, 'the earlier backup stays');
+    assert.doesNotMatch(notice, VIEW_NOTICE, 'this run notice line is retracted');
+    assert.doesNotMatch(r.notice ?? '', /pull-archive\.json/);
+  });
+});
+
 test('a user .gitignore rule that hides projects/*/sessions/ defers the move and touches nothing', () => {
   withOldGit(
     (dir) => {
