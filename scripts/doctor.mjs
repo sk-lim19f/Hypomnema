@@ -677,7 +677,18 @@ function checkGit(hypoDir) {
     // plugin-cache leaf-drift precedent: reporting must never turn into
     // filtering, or a still-real, still-resolvable root looks like it vanished).
     const parsedRoot = parseWikiPreCommitRoot(content);
-    if (parsedRoot.ok && parsedRoot.root === null) {
+    if (parsedRoot.ok && parsedRoot.previousResolver === true) {
+      // Also resolves at commit time, but through the previous resolver, which
+      // reads the sidecar before the enabled plugin and so can keep running a
+      // stale install. Only the current form earns the pass below.
+      warn(
+        `${label} root`,
+        'Uses an older commit-time resolver that reads the sidecar before the enabled ' +
+          `plugin, so it can run a stale install. Run ${upgradeApplyHint(
+            pluginMode || hypomnemaPluginEnabled,
+          )} to update it.`,
+      );
+    } else if (parsedRoot.ok && parsedRoot.root === null) {
       // The runtime-resolving form: the hook looks up its own
       // install root at commit time, so there is no baked value to compare
       // against the active install — it cannot structurally go stale the way

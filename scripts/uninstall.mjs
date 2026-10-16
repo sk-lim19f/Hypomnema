@@ -80,6 +80,7 @@ import {
   provenancePath,
 } from './lib/pkg-provenance.mjs';
 import { loadHookInventory } from './lib/hook-inventory.mjs';
+import { writeSettingsJson } from './lib/settings-write.mjs';
 import {
   hooksDirForInstall,
   unsafeHookTargetReason,
@@ -463,7 +464,7 @@ function stripExtensionSettings(settingsPath, hooksDir, apply, ownedCommands = n
   }
 
   if (changed && apply) {
-    writeFileSync(settingsPath, JSON.stringify(settings, null, 2) + '\n');
+    writeSettingsJson(settingsPath, JSON.stringify(settings, null, 2) + '\n');
   }
   return { stripped };
 }
@@ -892,7 +893,7 @@ function stripSettingsJson(settingsPath, hooksDir, hookFiles, apply) {
   }
 
   if (changed && apply) {
-    writeFileSync(settingsPath, JSON.stringify(settings, null, 2) + '\n');
+    writeSettingsJson(settingsPath, JSON.stringify(settings, null, 2) + '\n');
   }
 
   return { stripped, kept: 0 };

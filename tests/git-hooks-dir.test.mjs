@@ -10,6 +10,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  readdirSync,
   realpathSync,
   rmSync,
   statSync,
@@ -17,6 +18,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { join } from 'node:path';
+import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { test, suite } from './harness.mjs';
@@ -26,6 +28,8 @@ import {
   unsafeHookTargetReason,
   parseWikiPreCommitRoot,
   wikiPreCommitContent,
+  previousFormPreCommitContent,
+  publishHookFile,
   WIKI_PRE_COMMIT_MARKER_START,
   WIKI_PRE_COMMIT_MARKER_END,
   PRE_COMMIT_RESOLVER_LINE,
@@ -33,7 +37,15 @@ import {
   isOwnedWikiPreCommitBody,
   findMarkerSpan,
 } from '../scripts/lib/git-hooks-dir.mjs';
-import { runWithHome, withTmpHome, legacyWikiPreCommitContent } from './helpers.mjs';
+import { resolveCommitTimeRoot } from '../scripts/lib/plugin-detect.mjs';
+import { compareSemver } from '../hooks/version-check.mjs';
+import {
+  hookWriteFaultPreload,
+  legacyWikiPreCommitContent,
+  runWithHome,
+  withTmpDir,
+  withTmpHome,
+} from './helpers.mjs';
 
 const git = (cwd, args) => execFileSync('git', args, { cwd, encoding: 'utf-8' }).trim();
 
@@ -619,6 +631,118 @@ test('isOwnedWikiPreCommitBody (strict/delete path, default predicate): still re
 // in it must actually find and run an install described only by
 // ~/.claude/hypo-pkg.json or ~/.claude/plugins/installed_plugins.json.
 
+// ── the previous commit-time resolver ───────────────────────────────────────
+// Hooks written before the enabled plugin root was consulted ahead of the
+// sidecar embed an older resolver script. The live builder no longer produces
+// it, so ownership recognition rebuilds it from a frozen copy.
+
+suite('git-hooks-dir.mjs: hooks on the previous resolver');
+
+// sha256 of the hook files v1.10.0 wrote for hypoDir "/v", measured from the
+// shipped module (every release that has the two-argument writer produced the
+// same bytes). A frozen copy that drifts from them recognizes nothing.
+const SHIPPED_PREVIOUS_SHA256 = {
+  worker: 'a363c220b5399e80eca2f501365a08ea0db974162e0b66a8204d27cd32a1674b',
+  lint: 'fc72b7830082816590dbb6379c0b7b1156b9b0aac16373fdbacb39ab3a72b115',
+};
+const sha256 = (s) => createHash('sha256').update(s).digest('hex');
+
+test('the frozen previous resolver reproduces the shipped v1.10.0 bytes', () => {
+  assert.equal(sha256(previousFormPreCommitContent('/v', false)), SHIPPED_PREVIOUS_SHA256.worker);
+  assert.equal(sha256(previousFormPreCommitContent('/v', true)), SHIPPED_PREVIOUS_SHA256.lint);
+  assert.notEqual(
+    sha256(wikiPreCommitContent('/v', false)),
+    SHIPPED_PREVIOUS_SHA256.worker,
+    'the live resolver must differ from the shipped one, or this pin separates nothing',
+  );
+});
+
+test('a hook on the previous resolver is owned and parsed with previousResolver: true, a mixed previous and current body is not', () => {
+  for (const lintStrict of [false, true]) {
+    const content = previousFormPreCommitContent('/v', lintStrict);
+    const span = findMarkerSpan(content, WIKI_PRE_COMMIT_MARKER_START, WIKI_PRE_COMMIT_MARKER_END);
+    assert.equal(
+      isOwnedWikiPreCommitBody(content, span),
+      true,
+      `strict (delete) path, lint ${lintStrict}`,
+    );
+    const parsed = parseWikiPreCommitRoot(content);
+    assert.equal(parsed.ok, true, `lint ${lintStrict}`);
+    assert.equal(parsed.previousResolver, true, `lint ${lintStrict}`);
+    assert.equal(parsed.root, null);
+    assert.equal(parsed.lintStrict, lintStrict);
+    assert.equal(parsed.hypoDir, lintStrict ? '/v' : null);
+    assert.notEqual(
+      parseWikiPreCommitRoot(wikiPreCommitContent('/v', lintStrict)).previousResolver,
+      true,
+      'the live form must not read as the previous one',
+    );
+  }
+
+  const stepsOf = (c) => c.split('\n').filter((l) => l.startsWith('node '));
+  const join2 = (a, b) =>
+    `#!/bin/sh\n${WIKI_PRE_COMMIT_MARKER_START}\n${a}\n${b}\nexit 0\n${WIKI_PRE_COMMIT_MARKER_END}\n`;
+  const prev = stepsOf(previousFormPreCommitContent('/v', true));
+  const cur = stepsOf(wikiPreCommitContent('/v', true));
+  for (const [name, body] of [
+    ['previous worker, current lint', join2(prev[0], cur[1])],
+    ['current worker, previous lint', join2(cur[0], prev[1])],
+  ]) {
+    const span = findMarkerSpan(body, WIKI_PRE_COMMIT_MARKER_START, WIKI_PRE_COMMIT_MARKER_END);
+    assert.equal(parseWikiPreCommitRoot(body).ok, false, name);
+    assert.equal(isOwnedWikiPreCommitBody(body, span), false, `${name} (strict path)`);
+  }
+});
+
+suite('git-hooks-dir.mjs: publishHookFile');
+
+test('publishHookFile leaves the live hook whole and no candidate when the rename fails', () => {
+  withTmpDir((dir) => {
+    const { preloadPath, firedPath } = hookWriteFaultPreload(dir);
+    const hook = join(dir, 'pre-commit');
+    const OLD = '#!/bin/sh\necho old\n';
+    const NEW = '#!/bin/sh\necho new\n';
+    writeFileSync(hook, OLD, { mode: 0o644 });
+    const script = join(dir, 'publish.mjs');
+    writeFileSync(
+      script,
+      `import { publishHookFile } from ${JSON.stringify(new URL('../scripts/lib/git-hooks-dir.mjs', import.meta.url).href)};
+const r = publishHookFile(process.argv[2], ${JSON.stringify(NEW)});
+console.log(JSON.stringify({ ok: r.ok, cleaned: r.cleaned, candidate: r.candidatePath, code: r.error?.code }));
+`,
+    );
+    const run = (fault) =>
+      spawnSync(process.execPath, ['-r', preloadPath, script, hook], {
+        encoding: 'utf-8',
+        env: { ...process.env, HOME: dir, ...(fault ? { HYPO_TEST_HOOK_FAULT: fault } : {}) },
+      });
+
+    const failed = run('rename');
+    assert.equal(failed.status, 0, failed.stderr);
+    const out = JSON.parse(failed.stdout);
+    assert.equal(out.ok, false);
+    assert.equal(out.cleaned, true);
+    assert.equal(out.code, 'EIO');
+    assert.equal(readFileSync(firedPath, 'utf-8'), hook, 'the rename onto the hook failed');
+    assert.equal(readFileSync(hook, 'utf-8'), OLD, 'live hook untouched');
+    assert.equal(existsSync(out.candidate), false, 'candidate removed');
+    assert.deepEqual(
+      readdirSync(dir).filter((f) => f.endsWith('.tmp')),
+      [],
+    );
+
+    const done = run(undefined);
+    assert.equal(done.status, 0, done.stderr);
+    assert.equal(JSON.parse(done.stdout).ok, true);
+    assert.equal(readFileSync(hook, 'utf-8'), NEW);
+    assert.equal(statSync(hook).mode & 0o777, 0o755, 'published hook is executable');
+    assert.deepEqual(
+      readdirSync(dir).filter((f) => f.endsWith('.tmp')),
+      [],
+    );
+  });
+});
+
 suite('git-hooks-dir.mjs — runtime install-root resolver (no baked root)');
 
 test('wikiPreCommitContent never bakes an absolute install root into the generated hook body', () => {
@@ -860,4 +984,249 @@ test('a hypo@hypomnema array of only unusable rows still falls through to a usab
     assert.equal(run.status, 0, `hook did not exit 0:\n${run.stdout}${run.stderr}`);
     assert.match(run.stdout, /STUB_PRE_COMMIT_RAN/);
   });
+});
+
+// ── the enabled plugin root is read before the sidecar, and the newer wins ──────
+
+suite('git-hooks-dir.mjs: the resolver prefers the enabled plugin root over the sidecar');
+
+// A hypomnema-shaped root under `base`: absolute, named, versioned, and carrying
+// a worker that prints which root ran. `name` lets a row fake a foreign package.
+function makeRoot(base, label, version, name = 'hypomnema') {
+  const root = join(base, label);
+  mkdirSync(join(root, 'hooks'), { recursive: true });
+  writeFileSync(join(root, 'package.json'), JSON.stringify({ name, version }));
+  writeFileSync(
+    join(root, 'hooks', 'hypo-pre-commit.mjs'),
+    `console.log("ROOT=" + ${JSON.stringify(root)});\n`,
+  );
+  return root;
+}
+
+// Writes the three files the resolver reads. A string is written raw (to
+// fake a corrupt file), an object as JSON, null/undefined not at all.
+function writeResolverInputs(home, { settings, registry, sidecar }) {
+  const put = (path, v) => {
+    if (v == null) return;
+    mkdirSync(join(path, '..'), { recursive: true });
+    writeFileSync(path, typeof v === 'string' ? v : JSON.stringify(v));
+  };
+  put(join(home, '.claude', 'settings.json'), settings);
+  put(join(home, '.claude', 'plugins', 'installed_plugins.json'), registry);
+  put(join(home, '.claude', 'hypo-pkg.json'), sidecar == null ? null : { pkgRoot: sidecar });
+}
+
+const hypoKey = (root) => ({ 'hypo@hypomnema': [{ scope: 'user', installPath: root }] });
+const enabled = { enabledPlugins: { 'hypo@hypomnema': true } };
+
+function ranRoot(run) {
+  return /ROOT=(.*)/.exec(run.stdout)?.[1] ?? null;
+}
+
+test("an enabled plugin's user-scope registry root wins over a valid but older sidecar", () => {
+  withResolverFixture(({ base, home, vault }) => {
+    const plugin = makeRoot(base, 'plugin', '1.10.1');
+    const sidecar = makeRoot(base, 'sidecar', '1.10.0');
+    writeResolverInputs(home, {
+      settings: enabled,
+      registry: { plugins: hypoKey(plugin) },
+      sidecar,
+    });
+    const run = runGeneratedHook(base, vault, wikiPreCommitContent(vault, false), home);
+    assert.equal(run.status, 0, `hook did not exit 0:\n${run.stdout}${run.stderr}`);
+    assert.equal(ranRoot(run), plugin, `expected the plugin root: ${run.stdout}`);
+  });
+});
+
+test('with no enabled plugin the sidecar root is used', () => {
+  withResolverFixture(({ base, home, vault }) => {
+    const plugin = makeRoot(base, 'plugin', '9.9.9');
+    const sidecar = makeRoot(base, 'sidecar', '1.0.0');
+    // The registry holds a newer row, but nothing in settings.json enables it.
+    writeResolverInputs(home, { registry: { plugins: hypoKey(plugin) }, sidecar });
+    const run = runGeneratedHook(base, vault, wikiPreCommitContent(vault, false), home);
+    assert.equal(run.status, 0, `hook did not exit 0:\n${run.stdout}${run.stderr}`);
+    assert.equal(ranRoot(run), sidecar, `expected the sidecar root: ${run.stdout}`);
+  });
+});
+
+test('a sidecar newer than the enabled plugin root wins (work profile healed by SessionStart)', () => {
+  withResolverFixture(({ base, home, vault }) => {
+    const plugin = makeRoot(base, 'plugin', '1.10.0');
+    const sidecar = makeRoot(base, 'sidecar', '1.10.1');
+    writeResolverInputs(home, {
+      settings: enabled,
+      registry: { plugins: hypoKey(plugin) },
+      sidecar,
+    });
+    const run = runGeneratedHook(base, vault, wikiPreCommitContent(vault, false), home);
+    assert.equal(run.status, 0, `hook did not exit 0:\n${run.stdout}${run.stderr}`);
+    assert.equal(ranRoot(run), sidecar, `expected the newer sidecar root: ${run.stdout}`);
+  });
+});
+
+// Each row names the root that must run, written by hand. The expected value is
+// not computed by either implementation: a shared mistake in the hook script and
+// in resolveCommitTimeRoot would otherwise pass this table together.
+// `cmp: true` rows are version-only rows (both roots usable, settings enable the
+// plugin), which the next test also holds against compareSemver.
+const ROOT_ROWS = [
+  {
+    name: 'a project row ahead of the user row is skipped',
+    plugin: '1.10.0',
+    sidecar: '1.0.0',
+    registry: ({ plugin, extra }) => ({
+      plugins: {
+        'hypo@hypomnema': [
+          { scope: 'project', installPath: extra },
+          { scope: 'user', installPath: plugin },
+        ],
+      },
+    }),
+    expect: 'plugin',
+  },
+  {
+    name: 'an enabled legacy hypomnema@ key',
+    plugin: '1.10.0',
+    sidecar: '1.0.0',
+    settings: { enabledPlugins: { 'hypomnema@hypomnema': true } },
+    registry: ({ plugin }) => ({
+      plugins: { 'hypomnema@hypomnema': [{ scope: 'user', installPath: plugin }] },
+    }),
+    expect: 'plugin',
+  },
+  {
+    name: 'a false key beside a registry row nobody enabled',
+    plugin: '9.9.9',
+    sidecar: '1.0.0',
+    settings: { enabledPlugins: { 'hypo@hypomnema': false } },
+    expect: 'sidecar',
+  },
+  {
+    name: 'an enabled key from another marketplace with no registry row',
+    plugin: '9.9.9',
+    sidecar: '1.0.0',
+    settings: { enabledPlugins: { 'hypo@hypomnema': false, 'hypo@other': true } },
+    expect: 'sidecar',
+  },
+  {
+    name: 'a key with no @',
+    plugin: '9.9.9',
+    sidecar: '1.0.0',
+    settings: { enabledPlugins: { hypo: true } },
+    expect: 'sidecar',
+  },
+  {
+    name: 'a corrupt settings.json',
+    plugin: '9.9.9',
+    sidecar: '1.0.0',
+    settings: '{ not json',
+    expect: 'sidecar',
+  },
+  {
+    name: 'a registry row whose package has another name',
+    plugin: '9.9.9',
+    pluginName: 'someone-elses-tool',
+    sidecar: '1.0.0',
+    expect: 'sidecar',
+  },
+  {
+    name: 'an unreadable registry',
+    plugin: '9.9.9',
+    sidecar: '1.0.0',
+    registry: () => '{ not json',
+    expect: 'sidecar',
+  },
+  {
+    name: 'a plugin root whose version is not semver',
+    plugin: 'banana',
+    sidecar: '1.0.0',
+    expect: 'sidecar',
+  },
+  {
+    name: 'work profile: sidecar 1.10.1, registry 1.10.0',
+    plugin: '1.10.0',
+    sidecar: '1.10.1',
+    expect: 'sidecar',
+    cmp: true,
+  },
+  {
+    name: 'original report: registry 1.10.1, sidecar 1.10.0',
+    plugin: '1.10.1',
+    sidecar: '1.10.0',
+    expect: 'plugin',
+    cmp: true,
+  },
+  { name: 'the same version', plugin: '1.10.0', sidecar: '1.10.0', expect: 'plugin', cmp: true },
+  {
+    name: 'release against its prerelease',
+    plugin: '1.10.1',
+    sidecar: '1.10.1-rc.1',
+    expect: 'plugin',
+    cmp: true,
+  },
+  {
+    name: 'prereleases rc.2 against rc.10',
+    plugin: '1.10.1-rc.2',
+    sidecar: '1.10.1-rc.10',
+    expect: 'sidecar',
+    cmp: true,
+  },
+  {
+    name: 'a v prefix on the sidecar',
+    plugin: '1.10.0',
+    sidecar: 'v1.10.1',
+    expect: 'sidecar',
+    cmp: true,
+  },
+  {
+    name: 'build metadata on the sidecar',
+    plugin: '1.10.1',
+    sidecar: '1.10.1+build.1',
+    expect: 'plugin',
+    cmp: true,
+  },
+];
+
+// Builds one row's HOME and returns the roots it created.
+function buildRootRow(row, base, home) {
+  const plugin = makeRoot(base, 'plugin', row.plugin, row.pluginName);
+  const sidecar = makeRoot(base, 'sidecar', row.sidecar);
+  const extra = makeRoot(base, 'extra', '1.10.0');
+  const roots = { plugin, sidecar, extra };
+  writeResolverInputs(home, {
+    settings: row.settings ?? enabled,
+    registry: row.registry ? row.registry(roots) : { plugins: hypoKey(plugin) },
+    sidecar,
+  });
+  return roots;
+}
+
+test('the resolver and resolveCommitTimeRoot pick the same root on every fixture', () => {
+  for (const row of ROOT_ROWS) {
+    withResolverFixture(({ base, home, vault }) => {
+      const roots = buildRootRow(row, base, home);
+      const want = roots[row.expect];
+      const claude = join(home, '.claude');
+      const body = resolveCommitTimeRoot(
+        join(claude, 'settings.json'),
+        join(claude, 'plugins', 'installed_plugins.json'),
+        join(claude, 'hypo-pkg.json'),
+      );
+      assert.equal(body, want, `[${row.name}] resolveCommitTimeRoot`);
+      const run = runGeneratedHook(base, vault, wikiPreCommitContent(vault, false), home);
+      assert.equal(ranRoot(run), want, `[${row.name}] generated hook: ${run.stdout}${run.stderr}`);
+    });
+  }
+});
+
+test('resolveCommitTimeRoot agrees with compareSemver on prerelease, v prefix and build metadata', () => {
+  for (const row of ROOT_ROWS.filter((r) => r.cmp)) {
+    const verdict = compareSemver(row.plugin, row.sidecar) < 0 ? 'sidecar' : 'plugin';
+    assert.equal(
+      verdict,
+      row.expect,
+      `[${row.name}] the hand-written expectation disagrees with compareSemver`,
+    );
+  }
 });

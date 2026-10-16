@@ -17,6 +17,7 @@
 
 import { readFileSync, existsSync } from 'node:fs';
 import { isAbsolute, join } from 'node:path';
+import { compareSemver, parseSemver } from '../../hooks/version-check.mjs';
 
 /**
  * @param {string} settingsPath  path to a Claude Code settings.json (e.g. ~/.claude/settings.json)
@@ -284,6 +285,36 @@ export function resolveEnabledPluginEntry(settingsPath, registryPath) {
 // repo's existing callers already know.
 export function resolveEnabledPluginRoot(settingsPath, registryPath) {
   return resolveEnabledPluginEntry(settingsPath, registryPath).root;
+}
+
+// The install root the vault's pre-commit hook should run when a vault
+// operation fires it: the enabled plugin's root (resolveEnabledPluginEntry) and
+// the sidecar `pkgRoot` from hypo-pkg.json (`pkgJsonPath`), whichever carries the
+// higher package.json version, the plugin root on a tie. The sidecar is only a
+// candidate when isHypomnemaInstallRoot accepts it. A root whose version
+// parseSemver cannot read is dropped as a candidate, and null means neither
+// root qualified. The comparison is hooks/version-check.mjs compareSemver, the
+// same judgment SessionStart's downgrade guard makes: one question, one rule.
+//
+// The generated hook (scripts/lib/git-hooks-dir.mjs) runs standalone and carries
+// its own copy of this choice, so this function is the reference its tests hold
+// the script against.
+export function resolveCommitTimeRoot(settingsPath, registryPath, pkgJsonPath) {
+  const candidate = (root) => (root && parseSemver(readPkgVersionAt(root)) ? root : null);
+  const plugin = candidate(resolveEnabledPluginEntry(settingsPath, registryPath).root);
+  let sidecar = null;
+  try {
+    const pkgRoot = JSON.parse(readFileSync(pkgJsonPath, 'utf-8'))?.pkgRoot;
+    sidecar = isHypomnemaInstallRoot(pkgRoot) ? candidate(pkgRoot) : null;
+  } catch {
+    // unreadable or corrupt sidecar: no sidecar candidate
+  }
+  if (plugin && sidecar) {
+    return compareSemver(readPkgVersionAt(plugin), readPkgVersionAt(sidecar)) < 0
+      ? sidecar
+      : plugin;
+  }
+  return plugin ?? sidecar;
 }
 
 // Single-computation answer to "is Claude's core hook/command surface

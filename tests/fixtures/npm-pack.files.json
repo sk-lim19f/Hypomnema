@@ -408,6 +408,10 @@
     "exec": false
   },
   {
+    "path": "scripts/lib/settings-write.mjs",
+    "exec": false
+  },
+  {
     "path": "scripts/lib/slug-resolver.mjs",
     "exec": false
   },
@@ -573,10 +577,6 @@
   },
   {
     "path": "templates/projects/_template/prd.md",
-    "exec": false
-  },
-  {
-    "path": "templates/session-state.md",
     "exec": false
   }
 ]
