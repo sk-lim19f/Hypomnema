@@ -27,6 +27,8 @@ import { homedir } from 'os';
 import {
   HYPO_DIR,
   PKG_ROOT,
+  GATE_DEADLINE_MS,
+  remainingSpawnTimeoutMs,
   precompactGateStatus,
   readChecklist,
   isGateSkipped,
@@ -119,6 +121,9 @@ process.stdin.on('end', () => {
   const attributionScope = resolveGateProjectOverride(HYPO_DIR, { sessionCwd });
 
   let gate;
+  // One deadline for the gate and for the feedback follow-up calls below, so a slow gate leaves
+  // them less time instead of stacking a second full budget on top of it.
+  const deadline = { end: performance.now() + GATE_DEADLINE_MS };
   try {
     // The marker only scopes this gate (log-only mode, attribution) when
     // closeCheckpointState calls this session's close finished, the verdict
@@ -138,6 +143,7 @@ process.stdin.on('end', () => {
         : {}),
       ...(sessionCwd ? { sessionCwd } : {}),
       ...(attributionScope ? { attributionScope } : {}),
+      deadline,
     });
   } catch (err) {
     // Defense-in-depth: precompactGateStatus fails open per-check, but if it ever
@@ -166,24 +172,33 @@ process.stdin.on('end', () => {
   const healNotices = [];
   if (gate.ok && gate.driftTargets.length > 0) {
     const feedbackPath = PKG_ROOT ? join(PKG_ROOT, 'scripts', 'feedback-sync.mjs') : null;
-    const w = feedbackPath
-      ? spawnSync(
-          process.execPath,
-          [
-            feedbackPath,
-            '--write',
-            '--no-input',
-            '--json',
-            // this hook shows the report's warnings below, so notices an older hook run
-            // left pending can be reported (and cleared) here
-            '--ack-notices',
-            `--hypo-dir=${HYPO_DIR}`,
-            `--claude-home=${join(homedir(), '.claude')}`,
-          ],
-          { encoding: 'utf-8', timeout: 30000 },
-        )
-      : { status: 1 };
-    if (w.error || w.status === null || w.status !== 0) {
+    const writeLeft = remainingSpawnTimeoutMs(deadline);
+    const w =
+      writeLeft === 0
+        ? { skippedForTime: true }
+        : feedbackPath
+          ? spawnSync(
+              process.execPath,
+              [
+                feedbackPath,
+                '--write',
+                '--no-input',
+                '--json',
+                // this hook shows the report's warnings below, so notices an older hook run
+                // left pending can be reported (and cleared) here
+                '--ack-notices',
+                `--hypo-dir=${HYPO_DIR}`,
+                `--claude-home=${join(homedir(), '.claude')}`,
+              ],
+              { encoding: 'utf-8', timeout: Math.min(30000, writeLeft) },
+            )
+          : { status: 1 };
+    if (w.skippedForTime) {
+      // No time left after the gate: not a failure of the sync, the next /compact repeats it.
+      healNotices.push(
+        `[WIKI CHECK] feedback projection drift (${gate.driftTargets.join(', ')}) was not re-synced: the gate used up its ${GATE_DEADLINE_MS} ms deadline. The next /compact tries again.`,
+      );
+    } else if (w.error || w.status === null || w.status !== 0) {
       gate.ok = false;
       gate.blockers.push({
         type: 'feedback',
@@ -223,29 +238,36 @@ process.stdin.on('end', () => {
     // notices and removes them on exit 0, so they reach a reader here. Only those notices are
     // shown: --check's other warnings (a skipped MEMORY projection) are not new information
     // on every compact. Fail open: any fault means no extra notice.
-    try {
-      const c = spawnSync(
-        process.execPath,
-        [
-          join(PKG_ROOT, 'scripts', 'feedback-sync.mjs'),
-          '--check',
-          '--no-input',
-          '--json',
-          '--ack-notices',
-          `--hypo-dir=${HYPO_DIR}`,
-          `--claude-home=${join(homedir(), '.claude')}`,
-        ],
-        { encoding: 'utf-8', timeout: 30000 },
+    const checkLeft = remainingSpawnTimeoutMs(deadline);
+    if (checkLeft === 0) {
+      healNotices.push(
+        `[WIKI CHECK] feedback-sync notice check skipped: the gate used up its ${GATE_DEADLINE_MS} ms deadline. Pending notices stay for the next /compact.`,
       );
-      if (!c.error && c.status === 0) {
-        const report = JSON.parse(c.stdout || '');
-        for (const m of Array.isArray(report.warnings) ? report.warnings : []) {
-          if (typeof m === 'string' && /kept the hand-written line in /.test(m))
-            healNotices.push(`[WIKI CHECK] feedback-sync notice: ${m}`);
+    } else {
+      try {
+        const c = spawnSync(
+          process.execPath,
+          [
+            join(PKG_ROOT, 'scripts', 'feedback-sync.mjs'),
+            '--check',
+            '--no-input',
+            '--json',
+            '--ack-notices',
+            `--hypo-dir=${HYPO_DIR}`,
+            `--claude-home=${join(homedir(), '.claude')}`,
+          ],
+          { encoding: 'utf-8', timeout: Math.min(30000, checkLeft) },
+        );
+        if (!c.error && c.status === 0) {
+          const report = JSON.parse(c.stdout || '');
+          for (const m of Array.isArray(report.warnings) ? report.warnings : []) {
+            if (typeof m === 'string' && /kept the hand-written line in /.test(m))
+              healNotices.push(`[WIKI CHECK] feedback-sync notice: ${m}`);
+          }
         }
+      } catch {
+        /* fail open */
       }
-    } catch {
-      /* fail open */
     }
   }
 
@@ -271,12 +293,15 @@ process.stdin.on('end', () => {
   // unresolved: a dirty file this session has no record of writing, so it is
   // not blocking and its owner is unknown (the gate's git axis, which is the
   // same for every caller).
-  const unresolvedGit = byType('unresolved');
+  const unresolvedGit = byType('unresolved').filter((n) => n.file);
   if (unresolvedGit.length > 0) {
     noticeLines.push(
-      `[WIKI CHECK] ${unresolvedGit.length} uncommitted file(s) this session has no record of writing (not blocking): ${foldNames(unresolvedGit.map((n) => n.file || n.reason))}.`,
+      `[WIKI CHECK] ${unresolvedGit.length} uncommitted file(s) this session has no record of writing (not blocking): ${foldNames(unresolvedGit.map((n) => n.file))}.`,
     );
   }
+  // An enumeration the gate deadline cut has no file to name: its reason is the whole sentence.
+  for (const n of byType('unresolved').filter((x) => !x.file))
+    noticeLines.push(`[WIKI CHECK] ${n.reason}.`);
   // foreign-entry, foreign-append, local-entry, touched-paths-unreadable: each
   // carries its own full sentence in `reason` (what the file is and what to do
   // or not do about it), so it is one line apiece. Past the cap the rest fold
@@ -379,13 +404,19 @@ process.stdin.on('end', () => {
     return;
   }
 
+  // What was skipped and why, from the gate's own `skippedWhy` (a missing tool, a time limit, an
+  // error). A check that ended by an error already has a `check-skipped` blocker whose reason
+  // says so, so it is not listed twice.
+  const skipLines = Object.entries({ lint: 'lint', feedback: 'feedback-sync' })
+    .filter(
+      ([c]) =>
+        gate.skipped[c] && !gate.blockers.some((b) => b.type === 'check-skipped' && b.check === c),
+    )
+    .map(([c, name]) => `${name} skipped (${gate.skippedWhy[c]})`);
+
   // ── Bypass 3: HYPO_SKIP_GATE ──
   if (isGateSkipped()) {
-    const skipped = [
-      ...gate.blockers.map((b) => b.reason),
-      gate.skipped.lint ? 'lint skipped (hypo-pkg.json missing)' : '',
-      gate.skipped.feedback ? 'feedback-sync skipped (hypo-pkg.json missing)' : '',
-    ]
+    const skipped = [...gate.blockers.map((b) => b.reason), ...skipLines]
       .filter(Boolean)
       .join(', ');
     console.log(
@@ -405,10 +436,7 @@ process.stdin.on('end', () => {
   // gate.blockers already carry per-type reasons in the canonical order
   // (git, hot, close, lint, design-history, feedback) — same strings as before
   // Now sourced from the shared gate instead of inline checks.
-  const reasons = [
-    ...gate.blockers.map((b) => b.reason),
-    gate.skipped.lint ? 'lint skipped (run `hypomnema init` to enable lint gate)' : '',
-  ].filter(Boolean);
+  const reasons = [...gate.blockers.map((b) => b.reason), ...skipLines].filter(Boolean);
 
   const checklist = readChecklist(today);
   const checklistText =

@@ -4887,6 +4887,253 @@ test('the gate bounds hypoIsClean, gitDirtyFiles and the shard check by its dead
   });
 });
 
+// ── The gate through a copy of the package (end to end) ─────────────────────
+// PKG_ROOT is where the running hook lives, so a copy of hooks/, scripts/ and package.json runs
+// its own scripts. The copy gets a defective lint or feedback-sync, or a shorter deadline, and
+// nothing is written inside the checkout. One area, one file: close-global.test.mjs keeps its own
+// copy of these helpers.
+function withPackageCopy(fn) {
+  const root = mkdtempSync(join(tmpdir(), 'hypo-pkgcopy-'));
+  try {
+    for (const d of ['hooks', 'scripts']) cpSync(join(REPO, d), join(root, d), { recursive: true });
+    cpSync(join(REPO, 'package.json'), join(root, 'package.json'));
+    fn(root);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+function shrinkGateDeadline(root, ms) {
+  const f = join(root, 'hooks', 'hypo-shared.mjs');
+  const src = readFileSync(f, 'utf-8');
+  const next = src.replace(
+    'export const GATE_DEADLINE_MS = 7000;',
+    `export const GATE_DEADLINE_MS = ${ms};`,
+  );
+  assert.notEqual(next, src, 'the copy has the deadline constant to shrink');
+  writeFileSync(f, next);
+}
+// HOME and HYPO_DIR are pinned: a hook writes under ~/.claude and resolves the vault from HYPO_DIR.
+function spawnFromCopy(root, rel, args, hypoDir, { input = '', env = {} } = {}) {
+  return spawnSync(process.execPath, [join(root, rel), ...args], {
+    input,
+    encoding: 'utf-8',
+    env: { ...process.env, HOME: SESSION_TMP_HOME, HYPO_DIR: hypoDir, ...env },
+  });
+}
+const LINT_KILLED = "process.kill(process.pid, 'SIGKILL');\n";
+const LINT_SLOW = 'setTimeout(() => {}, 120000);\n';
+const LINT_FINE = `console.log(JSON.stringify({ errors: [], warns: [] }));\n`;
+// A feedback-sync stand-in that reports a clean check and appends a line to `log` per run.
+const feedbackCounting = (log) =>
+  `import { appendFileSync } from 'node:fs'; appendFileSync(${JSON.stringify(log)}, 'run\\n'); console.log(JSON.stringify({ mode: 'check', targets: {}, warnings: [] }));\n`;
+const preCompactPayload = { session_id: 'sess-t7-copy', cwd: join(tmpdir(), 'hypo-t7-no-project') };
+
+// Distinguishes: a crashed lint on the two read callers (the PreCompact hook and the
+// --check-session-close CLI) from a lint that finishes in the same vault. Both callers carry the
+// check-skipped blocker, not only the writers.
+test('PreCompact and --check-session-close both report a crashed lint as check-skipped', () => {
+  withPackageCopy((root) => {
+    withCleanWiki((dir) => {
+      const readers = () => {
+        const hook = spawnFromCopy(root, 'hooks/hypo-personal-check.mjs', [], dir, {
+          input: JSON.stringify(preCompactPayload),
+        });
+        const check = spawnFromCopy(
+          root,
+          'scripts/crystallize.mjs',
+          [`--hypo-dir=${dir}`, '--check-session-close', '--json'],
+          dir,
+        );
+        return {
+          msg: JSON.parse(hook.stdout).systemMessage || '',
+          blockers: JSON.parse(check.stdout).blockers || [],
+        };
+      };
+      writeFileSync(join(root, 'scripts', 'lint.mjs'), LINT_FINE);
+      const fine = readers();
+      assert.ok(!/could not run to a result/.test(fine.msg), fine.msg);
+      assert.ok(!fine.blockers.some((b) => b.type === 'check-skipped'), JSON.stringify(fine));
+      writeFileSync(join(root, 'scripts', 'lint.mjs'), LINT_KILLED);
+      const crashed = readers();
+      assert.match(
+        crashed.msg,
+        /lint check could not run to a result: lint spawn failed: signal SIGKILL/,
+      );
+      assert.ok(
+        crashed.blockers.some((b) => b.type === 'check-skipped' && b.check === 'lint'),
+        JSON.stringify(crashed.blockers),
+      );
+    });
+  });
+});
+
+// Distinguishes: a gate that used up the deadline (the feedback follow-up has no time, is not
+// started, and a notice says so) from one with time to spare (the gate's own feedback run and the
+// follow-up each start the script once).
+test('PreCompact skips its feedback follow-up when the gate used up the deadline, and says so', () => {
+  const run = (root, dir, log) => {
+    writeFileSync(join(root, 'scripts', 'feedback-sync.mjs'), feedbackCounting(log));
+    const r = spawnFromCopy(root, 'hooks/hypo-personal-check.mjs', [], dir, {
+      input: JSON.stringify(preCompactPayload),
+    });
+    const runs = existsSync(log)
+      ? readFileSync(log, 'utf-8').split('\n').filter(Boolean).length
+      : 0;
+    return { msg: JSON.parse(r.stdout).systemMessage || '', runs };
+  };
+  withCleanWiki((dir) => {
+    withPackageCopy((root) => {
+      writeFileSync(join(root, 'scripts', 'lint.mjs'), LINT_FINE);
+      const roomy = run(root, dir, join(root, 'roomy.log'));
+      assert.equal(
+        roomy.runs,
+        2,
+        `the gate and the follow-up each ran feedback-sync: ${roomy.msg}`,
+      );
+      assert.ok(!/notice check skipped/.test(roomy.msg), roomy.msg);
+    });
+    withPackageCopy((root) => {
+      shrinkGateDeadline(root, 2500);
+      writeFileSync(join(root, 'scripts', 'lint.mjs'), LINT_SLOW);
+      const cut = run(root, dir, join(root, 'cut.log'));
+      assert.match(
+        cut.msg,
+        /lint skipped \(time limit/,
+        `precondition, lint ran out of time: ${cut.msg}`,
+      );
+      assert.equal(
+        cut.runs,
+        0,
+        `neither the gate nor the follow-up had time to run it: ${cut.msg}`,
+      );
+      assert.match(
+        cut.msg,
+        /feedback-sync notice check skipped: the gate used up its 2500 ms deadline/,
+      );
+    });
+  });
+});
+
+// Distinguishes: the cause the gate recorded (a time limit; a tool that is really missing) from
+// the old fixed wording that blamed a missing hypo-pkg.json whatever happened. Both render
+// branches: the HYPO_SKIP_GATE bypass line and the advisory reasons.
+test('PreCompact names the real skip cause, not a missing hypo-pkg.json', () => {
+  const sid = 'sess-t7-skip-cause';
+  const messages = (root, dir, env = {}) => {
+    const r = spawnFromCopy(root, 'hooks/hypo-personal-check.mjs', [], dir, {
+      input: JSON.stringify({ session_id: sid, cwd: preCompactPayload.cwd }),
+      env,
+    });
+    return JSON.parse(r.stdout).systemMessage || '';
+  };
+  withCleanWiki((dir) => {
+    // a recorded dirty file keeps the gate from being ok, so both branches render the skips
+    mkdirSync(join(dir, 'pages'), { recursive: true });
+    writeFileSync(join(dir, 'pages', 'x.md'), '# wip\n');
+    assert.equal(recordTouchedPaths(dir, sid, ['pages/x.md']), true);
+    withPackageCopy((root) => {
+      shrinkGateDeadline(root, 2500);
+      writeFileSync(join(root, 'scripts', 'lint.mjs'), LINT_SLOW);
+      const advisory = messages(root, dir);
+      assert.match(
+        advisory,
+        /own write is still uncommitted: pages\/x\.md/,
+        `precondition: ${advisory}`,
+      );
+      assert.match(
+        advisory,
+        /lint skipped \(time limit: it was still running after \d+ ms/,
+        advisory,
+      );
+      assert.match(advisory, /feedback-sync skipped \(time limit: the gate deadline/, advisory);
+      const bypass = messages(root, dir, { HYPO_SKIP_GATE: '1' });
+      assert.match(
+        bypass,
+        /gate bypassed via HYPO_SKIP_GATE=1 \(incomplete: .*lint skipped \(time limit/,
+        bypass,
+      );
+      for (const m of [advisory, bypass])
+        assert.ok(
+          !/hypo-pkg\.json missing|hypomnema init/.test(m),
+          `the old wording is gone: ${m}`,
+        );
+    });
+    withPackageCopy((root) => {
+      rmSync(join(root, 'scripts', 'lint.mjs'));
+      const advisory = messages(root, dir);
+      assert.match(advisory, /lint skipped \(tool missing: scripts\/lint\.mjs not found/, advisory);
+    });
+  });
+});
+
+// Distinguishes: an enumeration the deadline cut (no file to name, so the reason is the whole
+// line) from a dirty file with no record (named inside the "no record of writing" line).
+test('PreCompact renders a deadline-cut enumeration as its own line, not as a file name', () => {
+  withPackageCopy((root) => {
+    shrinkGateDeadline(root, 1);
+    withCleanWiki((dir) => {
+      writeFileSync(join(dir, 'pending.md'), '# pending\n');
+      const r = spawnFromCopy(root, 'hooks/hypo-personal-check.mjs', [], dir, {
+        input: JSON.stringify(preCompactPayload),
+      });
+      const msg = JSON.parse(r.stdout).systemMessage || '';
+      assert.match(
+        msg,
+        /\[WIKI CHECK\] could not list the uncommitted files within the gate deadline \(1 ms\)/,
+        msg,
+      );
+      assert.ok(!/uncommitted file\(s\) this session has no record of writing/.test(msg), msg);
+    });
+  });
+});
+
+// Distinguishes: a feedback-sync that died by a signal (an error: no verdict, a blocker for a
+// marker writer too) from a strict exit that only repeats a warning (see the pair below).
+test('checkpointMode: a feedback-sync that crashes adds a check-skipped blocker', () => {
+  withSyncedWiki((dir) => {
+    const gate = t7Gate(dir, {
+      feedback: { status: null, signal: 'SIGKILL', stdout: '' },
+      checkpointMode: true,
+    });
+    const b = t7Skipped(gate, 'feedback');
+    assert.ok(b, JSON.stringify(gate.blockers));
+    assert.ok(b.reason.includes('SIGKILL'), b.reason);
+  });
+});
+
+// Distinguishes: a vault whose real `feedback-sync --check --strict` exits 1 on a warning alone
+// (a private feedback page is excluded, nothing to act on: fail-open, skipped but no blocker)
+// from the crash above. The real script runs, so the fixture proves the exit shape itself.
+test('checkpointMode: a strict-only feedback exit stays fail-open', () => {
+  withSyncedWiki((dir) => {
+    mkdirSync(join(dir, 'pages', 'feedback'), { recursive: true });
+    writeFileSync(
+      join(dir, 'pages', 'feedback', 'private-one.md'),
+      '---\ntitle: T\ntype: feedback\nstatus: active\nscope: global\ntier: L1\ntargets: [project-memory, claude-learned]\nsensitivity: private\npriority: 3\nmemory_summary: m\nglobal_summary: g\npromote_to_global: true\nreason: r\nsource: session:2026-05-20\nupdated: 2026-05-20\ntags: [feedback]\n---\nbody\n',
+    );
+    const real = (name, args, spawnOpts) =>
+      name === 'lint'
+        ? T7_LINT_OK
+        : spawnSync(process.execPath, args, {
+            ...spawnOpts,
+            env: { ...process.env, HOME: SESSION_TMP_HOME, HYPO_DIR: dir },
+          });
+    const gate = precompactGateStatus(dir, {
+      claudeHome: join(dir, '.claude-none'),
+      sessionId: T7_SID,
+      runCheck: real,
+      checkpointMode: true,
+    });
+    assert.equal(
+      gate.skipped.feedback,
+      true,
+      `precondition, the strict exit is a skip: ${JSON.stringify(gate.skippedWhy)}`,
+    );
+    assert.match(gate.skippedWhy.feedback, /^not actionable:/);
+    assert.equal(t7Skipped(gate, 'feedback'), undefined, JSON.stringify(gate.blockers));
+  });
+});
+
 // Distinguishes: a lock that cannot be created (the cause is the directory, so the reason sends
 // the user to its permissions and disk space and never tells them to delete a file) from a corrupt
 // record (delete it) and a paths-unknown flag (delete the flag).

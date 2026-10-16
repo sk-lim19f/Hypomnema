@@ -7632,6 +7632,143 @@ test('Q7 (344): the Stop hook blocks on this session close in the X1 state', () 
   });
 });
 
+// ── The close gate through a copy of the package (end to end) ───────────────
+// PKG_ROOT is where the running hook or script lives, so a copy of hooks/, scripts/ and
+// package.json runs its own lint. The copy gets a defective lint or a shorter deadline and
+// nothing is written inside the checkout. One area, one file: session-hooks.test.mjs keeps its
+// own copy of these helpers.
+function withPackageCopy(fn) {
+  const root = mkdtempSync(join(tmpdir(), 'hypo-pkgcopy-'));
+  try {
+    for (const d of ['hooks', 'scripts']) cpSync(join(REPO, d), join(root, d), { recursive: true });
+    cpSync(join(REPO, 'package.json'), join(root, 'package.json'));
+    fn(root);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+function shrinkGateDeadline(root, ms) {
+  const f = join(root, 'hooks', 'hypo-shared.mjs');
+  const src = readFileSync(f, 'utf-8');
+  const next = src.replace(
+    'export const GATE_DEADLINE_MS = 7000;',
+    `export const GATE_DEADLINE_MS = ${ms};`,
+  );
+  assert.notEqual(next, src, 'the copy has the deadline constant to shrink');
+  writeFileSync(f, next);
+}
+// HOME and HYPO_DIR are pinned: a hook writes under ~/.claude and resolves the vault from HYPO_DIR.
+function spawnFromCopy(root, rel, args, hypoDir, input = '') {
+  return spawnSync(process.execPath, [join(root, rel), ...args], {
+    input,
+    encoding: 'utf-8',
+    env: { ...process.env, HOME: SESSION_TMP_HOME, HYPO_DIR: hypoDir },
+  });
+}
+const LINT_KILLED = "process.kill(process.pid, 'SIGKILL');\n";
+const LINT_SLOW = 'setTimeout(() => {}, 120000);\n';
+
+// A committed close whose receipt has not been issued yet, marked by the copied CLI.
+function markFromCopy(root, dir, sid) {
+  const cleanup = seedCloseTranscript(sid);
+  try {
+    pinCommittedClose(dir, sid);
+    const r = spawnFromCopy(
+      root,
+      'scripts/crystallize.mjs',
+      [
+        `--hypo-dir=${dir}`,
+        '--mark-session-closed',
+        `--session-id=${sid}`,
+        '--project=test-project',
+        '--json',
+      ],
+      dir,
+    );
+    return {
+      r,
+      out: JSON.parse(r.stdout),
+      receipt: existsSync(join(dir, '.cache', 'sessions', sid, 'close-receipt.json')),
+    };
+  } finally {
+    cleanup();
+  }
+}
+
+// Distinguishes: a lint that died by an error (no verdict to certify: exit 1, a check-skipped
+// blocker, no receipt) from a lint that only ran out of the gate's time (a notice, the receipt is
+// issued). Spec: an error withholds the receipt, a time limit does not.
+test('--mark-session-closed: a crashed lint withholds the receipt and names check-skipped', () => {
+  withPackageCopy((root) => {
+    writeFileSync(join(root, 'scripts', 'lint.mjs'), LINT_KILLED);
+    withWiki(null, (dir) => {
+      const { r, out, receipt } = markFromCopy(root, dir, 's-t7-mark-crash');
+      assert.equal(r.status, 1, `${r.stdout}\n${r.stderr}`);
+      assert.ok(
+        (out.blockers || []).some((b) => b.type === 'check-skipped' && b.check === 'lint'),
+        JSON.stringify(out.blockers),
+      );
+      assert.equal(receipt, false, 'no receipt for a close whose lint never gave a verdict');
+    });
+  });
+});
+
+test('--mark-session-closed: a lint cut by the deadline still issues the receipt', () => {
+  withPackageCopy((root) => {
+    shrinkGateDeadline(root, 2500);
+    writeFileSync(join(root, 'scripts', 'lint.mjs'), LINT_SLOW);
+    withWiki(null, (dir) => {
+      const { r, out, receipt } = markFromCopy(root, dir, 's-t7-mark-slow');
+      assert.equal(r.status, 0, `${r.stdout}\n${r.stderr}`);
+      assert.equal(out.ok, true);
+      assert.ok(
+        (out.notices || []).some((n) => n.type === 'lint' && /time limit/.test(n.reason)),
+        `the time limit is reported: ${JSON.stringify(out.notices)}`,
+      );
+      assert.equal(receipt, true, 'a time limit is not an error: the receipt is issued');
+    });
+  });
+});
+
+// Distinguishes: the Stop supervisor with the gate on its deadline (the copied crystallize stage
+// answers inside its 10000 ms stage budget although lint would sleep for minutes) from a gate that
+// leaves the wait to the 30 s lint timeout alone (the supervisor would kill the stage:
+// "timed out"). The three stages before it are stubs so only the real stage's time is measured.
+test('the copied Stop stage returns within its 10-second budget when lint would run long', () => {
+  const sid = 's-t7-stop-budget';
+  withPackageCopy((root) => {
+    const ok = 'console.log(JSON.stringify({ continue: true, suppressOutput: true }));\n';
+    for (const stub of ['hypo-hot-rebuild', 'hypo-session-record', 'hypo-auto-commit'])
+      writeFileSync(join(root, 'hooks', `${stub}.mjs`), ok);
+    const started = join(root, 'lint-started');
+    writeFileSync(
+      join(root, 'scripts', 'lint.mjs'),
+      `import { writeFileSync } from 'node:fs'; writeFileSync(${JSON.stringify(started)}, 'x'); ${LINT_SLOW}`,
+    );
+    withWiki(anchorTestProject, (dir) => {
+      const cleanup = seedCloseTranscript(sid, { toolUseLines: [T10_EDIT_LINE] });
+      try {
+        const t0 = Date.now();
+        const r = spawnFromCopy(
+          root,
+          'hooks/hypo-stop.mjs',
+          [],
+          dir,
+          JSON.stringify({ session_id: sid, transcript_path: t10Transcript(sid), cwd: T10_CWD }),
+        );
+        const ms = Date.now() - t0;
+        const reply = JSON.parse(r.stdout.trim().split('\n').pop());
+        assert.ok(existsSync(started), `precondition, the gate started lint: ${r.stdout}`);
+        assert.ok(!/timed out/.test(reply.systemMessage || ''), `a stage timed out: ${r.stdout}`);
+        assert.equal(reply.decision, 'block', `the crystallize stage answered: ${r.stdout}`);
+        assert.ok(ms < 10000, `the whole Stop chain took ${ms} ms`);
+      } finally {
+        cleanup();
+      }
+    });
+  });
+});
+
 test('Q7 (772): --mark-session-closed with a session cwd refuses at its gate in the X1 state', () => {
   const sid = 's-t10-q7-mark';
   withResolvedClose(sid, { secondSignal: true }, (dir) => {

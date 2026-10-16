@@ -8451,8 +8451,9 @@ export function resolveCloseScope(hypoDir, opts = {}, marker = null) {
 // stage's 10000 ms) minus the work a caller does before and after the gate. Every wait
 // the gate starts (git, the touched-paths lock, lint, feedback-sync) is cut to the time
 // left on it. No environment knob: a stale value in a user's environment would switch
-// the checks off or block every close. Tests inject `opts.deadline` instead.
-const GATE_DEADLINE_MS = 7000;
+// the checks off or block every close. Tests inject `opts.deadline` instead. Exported only so
+// PreCompact can build the same deadline for its follow-up calls.
+export const GATE_DEADLINE_MS = 7000;
 
 /**
  * How a child process ended: 'timeout' (the `timeout` the gate gave spawnSync killed it, Node
