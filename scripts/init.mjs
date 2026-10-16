@@ -26,7 +26,6 @@ import {
   mkdirSync,
   readFileSync,
   writeFileSync,
-  chmodSync,
   copyFileSync,
   readdirSync,
   renameSync,
@@ -49,6 +48,7 @@ import {
   SHELL_FUNCTION_BODY,
   wikiPreCommitContent,
   uniqueBakPath,
+  publishHookFile,
 } from './lib/git-hooks-dir.mjs';
 import { loadHookInventory } from './lib/hook-inventory.mjs';
 import { renderViews, missingBlockLines, GITATTRIBUTES_BLOCK } from '../hooks/session-entries.mjs';
@@ -759,6 +759,22 @@ function installPkgGitHook(dryRun) {
 // it generates resolves that itself, at commit time, so there is nothing here
 // for a plugin-channel version bump to make stale.
 
+// Replaces the hook through a complete candidate file, so a write that fails
+// partway leaves the live hook as it was. A failure is reported as an error
+// with the .bak path (when one was written) and any candidate that could not be
+// removed; the caller stops without logging the hook as written.
+function publishWikiHook(hookPath, newContent, bakPath) {
+  const published = publishHookFile(hookPath, newContent);
+  if (published.ok) return true;
+  const code = published.error.code || published.error.message;
+  const saved = bakPath ? `; the existing hook is unchanged and also saved at ${bakPath}` : '';
+  const leftover = published.cleaned
+    ? ''
+    : `; the unused candidate file ${published.candidatePath} could not be removed`;
+  log('errors', `${hookPath} (could not write the pre-commit hook: ${code}${saved}${leftover})`);
+  return false;
+}
+
 function installWikiPreCommitHook(hypoDir, dryRun, force, lintStrict) {
   const { dir: hooksDir, skip } = hooksDirForInstall(hypoDir);
   if (!hooksDir) {
@@ -799,8 +815,7 @@ function installWikiPreCommitHook(hypoDir, dryRun, force, lintStrict) {
       }
       if (!dryRun) {
         writeFileSync(bakPath, existing);
-        writeFileSync(hookPath, newContent);
-        chmodSync(hookPath, 0o755);
+        if (!publishWikiHook(hookPath, newContent, bakPath)) return;
       }
       log('merged', `${hookPath} (pre-commit updated, backup at ${basename(bakPath)})`);
     } else if (force) {
@@ -818,8 +833,7 @@ function installWikiPreCommitHook(hypoDir, dryRun, force, lintStrict) {
       }
       if (!dryRun) {
         writeFileSync(bakPath, existing);
-        writeFileSync(hookPath, newContent);
-        chmodSync(hookPath, 0o755);
+        if (!publishWikiHook(hookPath, newContent, bakPath)) return;
       }
       log('merged', `${hookPath} (force-overwritten, backup at ${basename(bakPath)})`);
     } else {
@@ -832,7 +846,7 @@ function installWikiPreCommitHook(hypoDir, dryRun, force, lintStrict) {
   }
   if (!dryRun) {
     mkdirSync(hooksDir, { recursive: true });
-    writeFileSync(hookPath, newContent, { mode: 0o755 });
+    if (!publishWikiHook(hookPath, newContent)) return;
   }
   log('created', hookPath);
 }
