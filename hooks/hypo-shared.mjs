@@ -2380,8 +2380,10 @@ export function markPullArchiveMerged(hypoDir) {
  * A stopped run (`ok: false`) reports everything it had moved up to that point in the same lists,
  * so the caller can take it back. `priorRecord` is the whole archive record this run read before it
  * wrote its own (null when there was none), and `recordWritten` is true only once this run's own
- * write of the record returned: until then the record on disk is the earlier run's, and the undo
- * leaves it alone.
+ * write of the record returned (or threw after the disk already held its bytes): until then the
+ * record on disk is the earlier run's, and the undo leaves it alone. `recordUncertain` is true when
+ * that write threw and the disk holds neither its bytes nor the earlier ones; the undo then leaves
+ * the record and every backup in place.
  *
  * The paths looked at are the ones `targetRev` changes since its merge-base with HEAD (so a
  * diverged history counts only what is coming in). A local change on any of them that is not a
@@ -2501,6 +2503,9 @@ function clearBlockingPaths(hypoDir, targetRev, opts) {
   // True once this run's `writePullArchive` returned. Until then the record on disk is an earlier
   // run's, and the undo must not rewrite or delete it.
   let recordWritten = false;
+  // True when this run's record write threw and the disk holds neither the bytes it meant nor the
+  // earlier ones: whether the record was published cannot be judged.
+  let recordUncertain = false;
   const stop = (extra) => ({
     ok: false,
     backups,
@@ -2513,6 +2518,7 @@ function clearBlockingPaths(hypoDir, targetRev, opts) {
     ownedRemoved,
     priorRecord: prior ?? null,
     recordWritten,
+    recordUncertain,
     ...extra,
   });
 
@@ -2520,6 +2526,13 @@ function clearBlockingPaths(hypoDir, targetRev, opts) {
   // archived bytes into this run. The `.gitignore` write is a restore, so it is safe before the
   // checks below.
   const prior = readPullArchive(hypoDir);
+  // The earlier record's exact bytes (null: no file), what a throwing write is judged against.
+  let priorRecordText;
+  try {
+    priorRecordText = readTextOrNull(join(hypoDir, PULL_ARCHIVE_REL));
+  } catch {
+    priorRecordText = undefined; // unreadable: no later read can match it
+  }
   const recovered =
     prior && prior.stage === 'archived' && !isAncestorOfHead(hypoDir, prior.targetSha)
       ? prior
@@ -2802,20 +2815,26 @@ function clearBlockingPaths(hypoDir, targetRev, opts) {
   const touchesRecord = thisRunSetAside || recoveredCarries;
   if (touchesRecord) {
     cacheGate();
+    const record = {
+      v: 2,
+      stage: 'archived',
+      targetSha: target,
+      gitignoreLines: [...new Set([...(prior?.gitignoreLines ?? []), ...gitignoreLines])],
+      views: mergeViews(prior?.views ?? [], archived),
+      localOnly: mergeItems(prior?.localOnly ?? [], localOnly),
+      unowned: mergeItems(prior?.unowned ?? [], unowned),
+      cleared: mergeItems(prior?.cleared ?? [], cleared),
+      gitignoreSaved: mergeItems(prior?.gitignoreSaved ?? [], gitignoreSaved),
+    };
+    const intendedRecordText = pullArchiveText(record);
     try {
-      writePullArchive(hypoDir, {
-        v: 2,
-        stage: 'archived',
-        targetSha: target,
-        gitignoreLines: [...new Set([...(prior?.gitignoreLines ?? []), ...gitignoreLines])],
-        views: mergeViews(prior?.views ?? [], archived),
-        localOnly: mergeItems(prior?.localOnly ?? [], localOnly),
-        unowned: mergeItems(prior?.unowned ?? [], unowned),
-        cleared: mergeItems(prior?.cleared ?? [], cleared),
-        gitignoreSaved: mergeItems(prior?.gitignoreSaved ?? [], gitignoreSaved),
-      });
+      writePullArchive(hypoDir, record);
       recordWritten = true;
     } catch {
+      // A throw can come after the rename published the record (the directory sync): ask the disk.
+      const heldIntended = pullArchiveHolds(hypoDir, intendedRecordText) === true;
+      if (heldIntended) recordWritten = true;
+      else if (pullArchiveHolds(hypoDir, priorRecordText) !== true) recordUncertain = true;
       return stop({ reason: 'archive-write-failed' });
     }
     // The notice naming every backup is on disk before anything is removed or unstaged: a stop at
@@ -2880,6 +2899,7 @@ function clearBlockingPaths(hypoDir, targetRev, opts) {
     ownedRemoved,
     priorRecord: prior ?? null,
     recordWritten,
+    recordUncertain,
   };
 }
 
@@ -2999,6 +3019,18 @@ export function undoClearedPaths(hypoDir, moved, { keepRecord = false } = {}) {
         `${item.relPath}를 원래대로 되돌리지 못했습니다. 보관한 내용은 ${item.backupPath}에 있습니다.`,
       );
     }
+  }
+  // The record may or may not be the one this run meant to write: it stays as it is, the notice
+  // lines stay and no backup is deleted. The callers read only `.notices`, so this sentence is what
+  // reaches the user.
+  if (moved.recordUncertain) {
+    return {
+      ok: false,
+      notices: [
+        ...notices,
+        `보관 기록(${PULL_ARCHIVE_REL})이 게시됐는지 판정하지 못해 기록과 백업 파일을 모두 그대로 남겼습니다. 기록이 가리키는 항목을 확인한 뒤 정리하세요.`,
+      ],
+    };
   }
   if (allBack) {
     // Each deletion is synced before the next step relies on it: a power loss that replays the

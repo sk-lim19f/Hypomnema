@@ -6052,6 +6052,93 @@ test('an undo whose record rewrite throws after publishing goes on as written', 
   });
 });
 
+// The clearing step's own record write is the 1st rename onto the record. An earlier merged record
+// plus a new blocked view means this run has something to set aside, so it writes a record.
+function runClearWithRecordFault(b, when) {
+  const earlier = earlierView(b);
+  seedRecord(b, { stage: 'merged', targetSha: headOf(b), views: [earlier] });
+  const startBytes = readRel(b, RECORD_REL);
+  put(b, 'projects/p/hot.md', W1);
+  let state;
+  const r = withRecordRenameFault(join(b, RECORD_REL), { when, nth: 1 }, (s) => {
+    state = s;
+    return fastForwardTo(b, '@{u}');
+  });
+  return { r, earlier, startBytes, state };
+}
+
+test('a record write that throws after publishing stops the run as written and undo keeps the earlier entries', () => {
+  withCatchUp(({ b }) => {
+    const { r, earlier, state } = runClearWithRecordFault(b, 'after');
+    assert.equal(state.fired, true, 'the clearing step write was the failing rename');
+    assert.equal(r.pre.reason, 'archive-write-failed');
+    assert.equal(r.pre.recordWritten, true, 'the disk held the bytes it meant to write');
+    assert.equal(r.pre.recordUncertain, false);
+    const rec = readRecord(b);
+    assert.equal(rec.stage, 'merged');
+    assert.deepEqual(
+      rec.views.map((v) => v.backupPath),
+      [earlier.backupPath],
+      'the undo took this run view out and kept the earlier one',
+    );
+    assert.equal(existsSync(earlier.backupPath), true, 'the earlier backup stays');
+    assert.equal(readRel(b, 'projects/p/hot.md'), W1);
+  });
+});
+
+test('a record write that throws before publishing leaves the earlier record byte for byte', () => {
+  withCatchUp(({ b }) => {
+    const { r, earlier, startBytes, state } = runClearWithRecordFault(b, 'before');
+    assert.equal(state.fired, true);
+    assert.equal(r.pre.reason, 'archive-write-failed');
+    assert.equal(r.pre.recordWritten, false);
+    assert.equal(r.pre.recordUncertain, false);
+    assert.equal(readRel(b, RECORD_REL), startBytes);
+    assert.equal(existsSync(earlier.backupPath), true, 'the earlier backup stays');
+  });
+});
+
+test('a record write whose outcome cannot be read keeps every backup and names the record', () => {
+  withCatchUp(({ b }) => {
+    const { r, earlier, state } = runClearWithRecordFault(b, 'garbled');
+    assert.equal(state.fired, true);
+    assert.equal(r.pre.reason, 'archive-write-failed');
+    assert.equal(r.pre.recordUncertain, true);
+    assert.equal(r.pre.recordWritten, false);
+    assert.equal(r.pre.archived.length, 1, 'there was a view for the undo to take back');
+    assert.equal(existsSync(r.pre.archived[0].backupPath), true, 'this run backup stays');
+    assert.equal(existsSync(earlier.backupPath), true, 'the earlier backup stays');
+    assert.equal(
+      readRel(b, RECORD_REL),
+      'not the intended bytes\n',
+      'the undo did not touch the record',
+    );
+    assert.equal(readRel(b, 'projects/p/hot.md'), W1, 'the undo put the bytes back');
+    assert.match(r.notice, /\.cache\/pull-archive\.json/);
+  });
+});
+
+test('a recovered record whose rewrite cannot be judged reaches undo and names the record', () => {
+  withCatchUp(({ b }) => {
+    // an earlier run stopped before its merge (target is not an ancestor of HEAD) with one view,
+    // and nothing blocks this run: the recovery alone carries the view into the lists
+    const earlier = earlierView(b);
+    seedRecord(b, {
+      stage: 'archived',
+      targetSha: cgitOk(b, ['rev-parse', '@{u}']).trim(),
+      views: [earlier],
+    });
+    const r = withRecordRenameFault(join(b, RECORD_REL), { when: 'garbled', nth: 1 }, () =>
+      fastForwardTo(b, '@{u}'),
+    );
+    assert.equal(r.pre.reason, 'archive-write-failed');
+    assert.equal(r.pre.archived.length, 1, 'the caller counts the carried view');
+    assert.equal(r.pre.recordUncertain, true);
+    assert.match(r.notice, /\.cache\/pull-archive\.json/);
+    assert.equal(existsSync(earlier.backupPath), true, 'the backup stays');
+  });
+});
+
 test('a user .gitignore rule that hides projects/*/sessions/ defers the move and touches nothing', () => {
   withOldGit(
     (dir) => {
