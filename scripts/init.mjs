@@ -62,6 +62,7 @@ import {
 } from './lib/pkg-json.mjs';
 import { syncExtensions } from './lib/extensions.mjs';
 import { writeProvenanceSidecar } from './lib/pkg-provenance.mjs';
+import { writeSettingsJson } from './lib/settings-write.mjs';
 import { templateSchemaVersion } from './lib/template-schema-version.mjs';
 import { classifyInstall, downgradeGuardMessage } from '../hooks/version-check.mjs';
 import { resolvePluginChannel, isHypomnemaInstallRoot } from './lib/plugin-detect.mjs';
@@ -502,8 +503,7 @@ function mergeSettingsJson(settingsPath, hooksDir, dryRun, hookMap) {
   }
 
   if (changed && !dryRun) {
-    mkdirSync(join(settingsPath, '..'), { recursive: true });
-    writeFileSync(settingsPath, JSON.stringify(settings, null, 2) + '\n');
+    writeSettingsJson(settingsPath, JSON.stringify(settings, null, 2) + '\n');
   }
 }
 

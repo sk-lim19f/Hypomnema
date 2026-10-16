@@ -46,6 +46,7 @@ import {
   readCoreHooksConfig,
   run,
   runWithHome,
+  settingsWriteFaultPreload,
   withTmpDir,
   withTmpHome,
 } from './helpers.mjs';
@@ -2925,5 +2926,96 @@ test('init adds the block after a .gitattributes the vault already has and keeps
       readFileSync(join(hypoDir, '.gitattributes'), 'utf-8'),
       `log.md merge=union\n${GITATTRIBUTES_BLOCK}`,
     );
+  });
+});
+
+// ── settings.json writes from init and uninstall go through writeSettingsJson ──
+//
+// settingsWriteFaultPreload tears the first fs.writeFileSync to a settings.json*
+// path whose stack holds HYPO_TEST_FAULT_CALLER, half the bytes and then EIO.
+// A direct write tears the target itself; the helper writes a temp file next to
+// it and renames, so the tear lands on the throwaway name and the target keeps
+// its starting bytes. The fault runs the real CLI, so the caller name is the
+// real function on the real stack.
+
+suite('init.mjs / uninstall.mjs: a failed settings.json write leaves the file whole');
+
+function runFaulted(script, args, home, hypoDir, caller) {
+  const { preloadPath, firedPath } = settingsWriteFaultPreload(home);
+  const env = { ...process.env, HOME: home, HYPO_DIR: hypoDir, HYPO_TEST_FAULT_CALLER: caller };
+  delete env.CLAUDE_CONFIG_DIR;
+  const r = spawnSync(process.execPath, ['-r', preloadPath, join(SCRIPTS, script), ...args], {
+    encoding: 'utf-8',
+    env,
+  });
+  return { r, firedPath };
+}
+
+function assertWholeAfterFault({ r, firedPath }, settingsPath, startBytes, scriptFile, caller) {
+  assert.ok(existsSync(firedPath), `the injected fault never fired: ${r.stderr}`);
+  const stack = readFileSync(firedPath, 'utf-8');
+  assert.ok(stack.includes(scriptFile), `fault did not come from ${scriptFile}: ${stack}`);
+  assert.ok(stack.includes(caller), `fault did not come from ${caller}: ${stack}`);
+  assert.notEqual(r.status, 0, 'a failed settings.json write must not exit 0');
+  assert.equal(
+    readFileSync(settingsPath, 'utf-8'),
+    startBytes,
+    'settings.json must keep its starting bytes',
+  );
+  JSON.parse(readFileSync(settingsPath, 'utf-8'));
+}
+
+test('init keeps settings.json whole when its write fails partway', () => {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      const settingsPath = join(home, '.claude', 'settings.json');
+      mkdirSync(join(home, '.claude'), { recursive: true });
+      const startBytes = JSON.stringify(
+        { model: 'opus', permissions: { allow: ['Bash'] } },
+        null,
+        2,
+      );
+      writeFileSync(settingsPath, startBytes + '\n');
+      const fault = runFaulted(
+        'init.mjs',
+        [`--hypo-dir=${hypoDir}`, '--no-git-init', '--no-commands', '--no-shell'],
+        home,
+        hypoDir,
+        'mergeSettingsJson',
+      );
+      assertWholeAfterFault(
+        fault,
+        settingsPath,
+        startBytes + '\n',
+        'init.mjs',
+        'mergeSettingsJson',
+      );
+    });
+  });
+});
+
+test('uninstall keeps settings.json whole when the core hook strip write fails partway', () => {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      const initR = runWithHome(
+        'init.mjs',
+        [`--hypo-dir=${hypoDir}`, '--no-git-init', '--no-commands', '--no-shell'],
+        home,
+      );
+      assert.equal(initR.status, 0, `init failed: ${initR.stderr}`);
+      const settingsPath = join(home, '.claude', 'settings.json');
+      const startBytes = readFileSync(settingsPath, 'utf-8');
+      assert.ok(startBytes.includes('$HOME/.claude/hooks/'), 'fixture: init must register hooks');
+      const fault = runFaulted(
+        'uninstall.mjs',
+        [`--hypo-dir=${hypoDir}`, '--apply', '--yes'],
+        home,
+        hypoDir,
+        'stripSettingsJson',
+      );
+      assertWholeAfterFault(fault, settingsPath, startBytes, 'uninstall.mjs', 'stripSettingsJson');
+    });
   });
 });
