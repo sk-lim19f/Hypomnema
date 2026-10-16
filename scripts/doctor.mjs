@@ -86,7 +86,12 @@ import {
   computeHooksDigest,
 } from './lib/pkg-provenance.mjs';
 import { resolveCliOnPath, classifyInstall, upgradeApplyHint } from '../hooks/version-check.mjs';
-import { closeCheckpointState, isCloseComplete } from '../hooks/close-receipt.mjs';
+import {
+  closeCheckpointState,
+  isCloseComplete,
+  readReceiptStrict,
+  verifyEntriesInCommit,
+} from '../hooks/close-receipt.mjs';
 import {
   enabledHypomnemaPluginKey,
   usablePkgRoot,
@@ -1255,6 +1260,18 @@ function checkSessionCloseArtifacts(hypoDir) {
         brokenMarkers.push({ sessionId, reason: checkpoint.reason });
         continue;
       }
+      // A closed checkpoint whose receipt names file versions its commit does
+      // not hold vouches for nothing, the same as a missing receipt.
+      if (checkpoint.receipt) {
+        const bad = receiptEvidenceMismatches(hypoDir, checkpoint.receipt);
+        if (bad.length > 0) {
+          brokenMarkers.push({
+            sessionId,
+            reason: `receipt evidence mismatch: ${describeMismatches(bad)}`,
+          });
+          continue;
+        }
+      }
       // ONLY the v4 `projects` array counts as project-scope evidence. A
       // legacy flat `project` field can be a recency-derived misattribution
       // (the P1 bug resolveCloseScope's own doc comment describes) — the
@@ -1313,6 +1330,68 @@ function checkSessionCloseArtifacts(hypoDir) {
     `${unmatched.length} close artifact(s) with no session-closed marker covering their ` +
       `date and project scope — may be an unapproved hand-made close, or an approved close ` +
       `whose marker doesn't attribute this project: ${sample}${extra}${brokenNote}`,
+  );
+}
+
+// The commit-based entries of a receipt (everything but local-create) against
+// the commit it names. A local-create entry is the bytes on disk, which a human
+// may legitimately edit after the close, so it is not compared here. Reads git
+// objects only, so doctor stays read-only.
+function receiptEvidenceMismatches(hypoDir, receipt) {
+  return verifyEntriesInCommit(
+    hypoDir,
+    receipt.commit,
+    receipt.entries.filter((e) => e.kind !== 'local-create'),
+  ).mismatches;
+}
+
+function describeMismatches(mismatches) {
+  return (
+    mismatches
+      .slice(0, 3)
+      .map((m) => `${m.path} (${m.reason})`)
+      .join(', ') + (mismatches.length > 3 ? ` (+${mismatches.length - 3} more)` : '')
+  );
+}
+
+// Warn when a valid receipt in the 7-day window names file versions its commit
+// does not hold (a forged or hand-edited receipt, an older writer's defect, a
+// damaged git object). Silent when every receipt checks out, like
+// checkHalfClosedReceipts.
+function checkReceiptEvidence(hypoDir) {
+  const sessionsDir = join(hypoDir, '.cache', 'sessions');
+  let dirs = [];
+  try {
+    dirs = readdirSync(sessionsDir);
+  } catch {
+    return; // no sessions directory, or unreadable: nothing to judge
+  }
+  const bad = [];
+  for (const name of dirs) {
+    const file = join(sessionsDir, name, 'close-receipt.json');
+    try {
+      if (Date.now() - statSync(file).mtimeMs > SESSION_CLOSED_MARKER_STALE_MS) continue;
+      // The directory name is the sanitized id; the receipt body carries the real one.
+      const body = JSON.parse(readFileSync(file, 'utf-8'));
+      const sessionId =
+        typeof body?.sessionId === 'string' && body.sessionId ? body.sessionId : name;
+      const read = readReceiptStrict(hypoDir, sessionId);
+      if (read.status !== 'valid') continue; // checkHalfClosedReceipts and the marker walk own these
+      const mismatches = receiptEvidenceMismatches(hypoDir, read.receipt);
+      if (mismatches.length > 0) bad.push({ sessionId, file, mismatches });
+    } catch {
+      // unreadable or corrupt receipt: not this check's job to diagnose
+    }
+  }
+  if (bad.length === 0) return;
+  warn(
+    'Session-close receipt evidence',
+    `${bad.length} close receipt(s) name file versions their commit does not hold: ` +
+      bad
+        .slice(0, 3)
+        .map((b) => `${b.sessionId} (${b.file}): ${describeMismatches(b.mismatches)}`)
+        .join('; ') +
+      (bad.length > 3 ? ` (+${bad.length - 3} more)` : ''),
   );
 }
 
@@ -3170,6 +3249,7 @@ if (rootOk && args.codex) checkExtensions(args.hypoDir, args.claudeHome, 'codex'
 if (rootOk) checkProjectIndexAnchors(args.hypoDir);
 if (rootOk) checkSessionCloseArtifacts(args.hypoDir);
 if (rootOk) checkHalfClosedReceipts(args.hypoDir);
+if (rootOk) checkReceiptEvidence(args.hypoDir);
 if (rootOk) checkBaselineIntegrity(args.hypoDir);
 if (rootOk) checkSessionEntries(args.hypoDir);
 if (rootOk) checkSyncState(args.hypoDir);
