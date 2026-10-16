@@ -44,6 +44,10 @@ import {
   writeReceiptAtomic,
 } from '../hooks/close-receipt.mjs';
 import {
+  parseWikiPreCommitRoot,
+  previousFormPreCommitContent,
+} from '../scripts/lib/git-hooks-dir.mjs';
+import {
   resolveEnabledPluginRoot,
   resolveEnabledPluginEntry,
   resolvePluginChannel,
@@ -171,6 +175,52 @@ test('a hook whose marker is present but whose body is unrecognizable warns inst
         /--force-commands/,
         `the warning must name the command that fixes it: ${rootCheck.detail}`,
       );
+    });
+  });
+});
+
+// The previous commit-time resolver also resolves at runtime, so a check that
+// only asks "is the root baked in?" passes it. It reads the sidecar before the
+// enabled plugin, which is the ordering that kept running a stale install, so
+// doctor must tell it apart from the current form and point at upgrade --apply.
+test('doctor warns that a previous-resolver hook needs upgrade --apply', () => {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      mkdirSync(hypoDir, { recursive: true });
+      gitRepo(hypoDir);
+      const initR = runWithHome(
+        'init.mjs',
+        [`--hypo-dir=${hypoDir}`, '--no-git-init', '--no-commands'],
+        home,
+      );
+      assert.equal(initR.status, 0, `init failed: ${initR.stderr}`);
+      const hookPath = join(hypoDir, '.git', 'hooks', 'pre-commit');
+      const current = readFileSync(hookPath, 'utf-8');
+      const rootCheckOf = () => {
+        const r = runWithHome('doctor.mjs', [`--hypo-dir=${hypoDir}`, '--json'], home);
+        const check = JSON.parse(r.stdout).find((c) => c.label === 'git hooks/pre-commit root');
+        assert.ok(check, `expected a pre-commit root check: ${r.stdout}`);
+        return check;
+      };
+
+      // Current form: the pass, no older-resolver warning.
+      const fine = rootCheckOf();
+      assert.equal(fine.status, 'pass', JSON.stringify(fine));
+      assert.match(fine.detail, /resolved at commit time/i);
+
+      // Previous form for the same vault and lint mode.
+      const parsed = parseWikiPreCommitRoot(current);
+      assert.equal(parsed.ok, true, `init hook must parse: ${current}`);
+      writeFileSync(hookPath, previousFormPreCommitContent(hypoDir, parsed.lintStrict), {
+        mode: 0o755,
+      });
+      const old = rootCheckOf();
+      assert.equal(old.status, 'warn', JSON.stringify(old));
+      assert.match(old.detail, /older commit-time resolver/i);
+      assert.match(old.detail, /sidecar before the enabled plugin/i);
+      assert.match(old.detail, /upgrade --apply|\/hypo:upgrade/);
+      assert.doesNotMatch(old.detail, /resolved at commit time/i);
     });
   });
 });
