@@ -461,7 +461,7 @@ process.stdin.on('end', () => {
       `  [ ] 13. git commit & push`,
       `  [ ] 14. verify: run /hypo:crystallize (--check-session-close --session-id=${sessionId ?? '<id>'});`,
       `           the close is recorded once it reports close_state: closed (or legacy-closed).`,
-      `           The Stop hook still checks this session's own project folder and has the final say.`,
+      `           The Stop hook runs the same check on this session's write record and has the final say.`,
     ].join('\n');
 
   const closeIntentNote = hasCloseIntent

@@ -32,7 +32,7 @@ node ${CLAUDE_PLUGIN_ROOT}/scripts/upgrade.mjs [--hypo-dir="<path>"]
 
 Show the output verbatim.
 
-> **Plugin installs**: if the output begins with `ℹ Plugin install detected`, the core hooks, slash commands, and `settings.json` wiring are managed by the Claude Code plugin loader — **not** by `/hypo:upgrade`. Do **not** run `--apply` expecting it to update them (it intentionally skips those to avoid double-registering every hook). To upgrade the plugin itself: `/plugin marketplace update hypomnema` then `/reload-plugins`. **Then run `--apply` anyway**: the vault's git pre-commit hook holds an absolute path baked in at init time, and reloading the plugin does not move it, so without that step every wiki commit keeps running the install you had when you first ran init. `--apply` in plugin mode applies vault-side migrations (SCHEMA, `.hypoignore`), refreshes package metadata, and still syncs any vault extensions — but does **not** install the core hooks/commands/settings (the plugin provides those).
+> **Plugin installs**: if the output begins with `ℹ Plugin install detected`, the core hooks, slash commands, and `settings.json` wiring are managed by the Claude Code plugin loader — **not** by `/hypo:upgrade`. Do **not** run `--apply` expecting it to update them (it intentionally skips those to avoid double-registering every hook). To upgrade the plugin itself: `/plugin marketplace update hypomnema`, then `/reload-plugins` in **every session that is already open**, not only the one where you ran the update. A session that has not reloaded keeps running the old hooks and commands. It can go on blocking close under the old project-folder rule, and when old hooks mix with new commands a failed write record leaves no trace. `--apply` alone never changes the plugin-managed hooks. **Then run `--apply` anyway**: the vault's git pre-commit hook holds an absolute path baked in at init time, and reloading the plugin does not move it, so without that step every wiki commit keeps running the install you had when you first ran init. `--apply` in plugin mode applies vault-side migrations (SCHEMA, `.hypoignore`), refreshes package metadata, and still syncs any vault extensions — but does **not** install the core hooks/commands/settings (the plugin provides those).
 
 > **Note**: A major SCHEMA bump is only **detected** in this step. The informational `MIGRATION-vX.Y.md` file is written later by `--apply` (Step 4) and only on a major bump. `SCHEMA.md` is never auto-overwritten.
 
@@ -91,7 +91,7 @@ This moves the vault from the tracked `hot.md` and `session-state.md` files to p
 
 1. loses the session view in what it injects at session start,
 2. stalls its whole sync if it holds an unpushed commit that edits `hot.md` or `session-state.md`, and
-3. if it uses the plugin channel, is not refreshed on its own (run `/plugin marketplace update hypomnema`, then `/reload-plugins`).
+3. if it uses the plugin channel, is not refreshed on its own (run `/plugin marketplace update hypomnema`, then `/reload-plugins` in every session that is already open).
 
 **When to ask.** If the user typed `/hypo:upgrade --migrate-sessions` directly, run it without asking again: typing the flag is their statement that all machines are upgraded. Only when you are the one proposing this flag, or about to run it during another flow, first ask the user whether every machine that uses the same vault has been upgraded, because the command pushes the migration commit at once.
 

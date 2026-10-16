@@ -672,6 +672,9 @@ export function gitDirtyFiles(dir = HYPO_DIR, opts = {}) {
 // former inline closure so hypo-compact-guard.mjs (spec §5) can call the
 // exact same predicate instead of duplicating it — a closure over the gate's
 // local variables cannot be called, or asserted against, from anywhere else.
+// The gate itself no longer calls it: its git axis judges by the session's
+// touched-paths record, so hypo-compact-guard.mjs is now the only caller (via
+// classifyForeignOnlyDirty).
 //
 // Lexical, on the RAW git-porcelain path `f`, BEFORE posixPath()'s
 // unconditional `\` -> `/` conversion: a file whose actual NAME contains a
@@ -681,7 +684,8 @@ export function gitDirtyFiles(dir = HYPO_DIR, opts = {}) {
 // string means it never matches the regex below and falls through to
 // "not foreign", the fail-closed default. `transcriptTouched` IS keyed by
 // posix paths (it comes from extractTouchedWikiFiles), so that one check
-// still normalizes `f` before the lookup.
+// still normalizes `f` before the lookup. No caller passes it any more (the
+// gate was the only one that did), so it always takes its empty default.
 //
 // @param {string} f - a raw dirty path from gitDirtyFiles/git porcelain
 // @param {{eligibleSlugs: Set<string>|null, effectiveOverride: string|null,
@@ -6155,11 +6159,13 @@ export function peekTouchedPaths(hypoDir, sessionId) {
 
 /**
  * Like `peekTouchedPaths`, but does not collapse "corrupt", "lock timeout"
- * and "empty" into the same silent `[]`. A `checkpointMode` gate treats
+ * and "empty" into the same silent `[]`. The close gate (every caller) treats
  * the three differently: a lock timeout is transient (another writer holds
  * the lock right now) and blocks so the retry reads the real set; a corrupt
- * file stays corrupt on every retry, so the gate reads it as "no record"
- * and says so in a notice instead of refusing forever. `peekTouchedPaths`
+ * file stays corrupt on every retry, so it is not a blocker of its own: it
+ * widens the project folder being closed to every uncommitted file in it
+ * (with the way out in the reason) instead of refusing every close for
+ * good. `peekTouchedPaths`
  * itself is unchanged: its callers already treat its `[]` as
  * fail-safe-to-no-scope for a best-effort commit attempt.
  *
@@ -8196,11 +8202,11 @@ function toHypoRel(absPath, hypoDir) {
  * occasionally truncate mid-write). `extractTouchedWikiFiles` collapses all of
  * that to an empty/partial Set, indistinguishable from "this session touched
  * nothing", which is fine for lint's existing debt-partition (a false notice is not a
- * false pass), but NOT fine for an attribution-sensitive caller like
- * precompactGateStatus's git-scope check: treating an untrustworthy empty Set
- * as "nothing to widen" would let a session's own dirty file, invisible only
- * because its transcript could not be read, pass as someone else's foreign
- * debt (codex pre-commit review BLOCKER 1).
+ * false pass), but NOT fine for a caller that must not guess from a partial
+ * walk, such as deriveTouchedProject: a truncated line could have named a
+ * second project the walk never saw. The gate's git check does not read the
+ * transcript at all (it uses the touched-paths record), so it is not such a
+ * caller any more.
  *
  * @returns {{files: Set<string>, trusted: boolean}}
  */

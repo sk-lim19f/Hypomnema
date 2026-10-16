@@ -16,12 +16,15 @@
  * This hook never calls precompactGateStatus: its own hooks.json timeout is
  * 10s and the gate's lint spawn alone budgets 30s, three times over. Instead
  * it re-checks only the cheap axes (session log, git, hot.md) directly, and
- * narrows the git axis with the SAME project-vs-foreign path rule the gate
- * uses (isForeignProjectFile / classifyForeignOnlyDirty in hypo-shared.mjs), so
- * a different project's dangling close file does not fire a false alarm here
- * either. Unlike the gate, this hook never passes transcriptTouched into that
- * rule: parsing the transcript is exactly the evidence spec §5 excludes to
- * stay inside the 10s budget, so only the cheap path-prefix axis runs here.
+ * narrows the git axis with a project-vs-foreign path rule
+ * (isForeignProjectFile / classifyForeignOnlyDirty in hypo-shared.mjs), so
+ * a different project's dangling close file does not fire a false alarm here.
+ * The gate no longer uses that rule: it judges the git axis by this session's
+ * touched-paths record, so the two now differ. The record is a per-session
+ * file under .cache/sessions, which this hook does not read, and it never
+ * parses the transcript either, to stay inside the 10s budget. Only the
+ * cheap path-prefix axis runs here. Moving this hook onto the record is a
+ * follow-up, not part of the gate change.
  */
 
 import {

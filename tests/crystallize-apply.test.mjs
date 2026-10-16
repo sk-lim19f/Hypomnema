@@ -2587,7 +2587,7 @@ test("apply: the same file in this session's touched-paths withholds it", () => 
     assert.equal(out.markerSkipReason, 'compact-gate-not-ok', `stage: ${r.stdout}\n${r.stderr}`);
     assert.equal(out.markerWritten, false);
     // The result names the checkpoint gate's own blocker, so a caller does not
-    // have to reach for --check-session-close, which judges a wider git axis.
+    // have to run --check-session-close again to see why the marker was held.
     assert.ok(
       (out.gateBlockers || []).some(
         (b) => b.type === 'known-session-write' && b.file === 'projects/test-project/scratch.txt',

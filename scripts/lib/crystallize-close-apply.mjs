@@ -1074,7 +1074,7 @@ function priorReceiptCommitRewritten(hypoDir, sessionId) {
 // between this CLI and the auto-write at the tail of applySessionClose.
 //
 // Contract: the marker is written only when precompactGateStatus, run in
-// checkpointMode (the git axis narrowed), is green. A failed gate exits 1 with no
+// checkpointMode (which only makes an invalid session id a blocker), is green. A failed gate exits 1 with no
 // marker — the next Stop hook re-blocks.
 
 // `testHooks` is test-only, see settleCloseResolution.
@@ -4920,7 +4920,8 @@ function buildCloseResult({
     gateNotices: gateNotices || [],
     // The checkpoint gate's own blockers when it refused the marker
     // (markerSkipReason compact-gate-not-ok); empty otherwise. --check-session-close
-    // judges the whole vault on a wider git axis, so it is not a substitute.
+    // runs the same git check but may lack this session's id, in which case it reads
+    // no record and blocks the whole project folder, so it is not a substitute.
     gateBlockers: gateBlockers || [],
     // Always present (possibly empty), same visibility contract as `notices`/
     // `otherDebtCount` above — a caller should not have to guess whether the
