@@ -476,7 +476,7 @@ export function lastSubstantialOpIsSession() {
 //   0         — budget exhausted, or the deadline itself was not a safe
 //               positive integer: do not spawn
 //   >0        — a whole positive integer number of ms safe to pass as `timeout`
-function remainingSpawnTimeoutMs(deadline) {
+export function remainingSpawnTimeoutMs(deadline) {
   if (!deadline) return undefined;
   const remaining = Math.floor(deadline.end - performance.now());
   return Number.isSafeInteger(remaining) && remaining > 0 ? remaining : 0;
@@ -6448,16 +6448,22 @@ function readCacheRecord(path) {
   }
 }
 
-function updateCacheRecord(path, mutate) {
-  withFileLock(path, () => {
-    // An unreadable record starts over: a lost entry only means one more backup later.
-    const record = readCacheRecord(path);
-    mutate(record);
-    // An empty record is no file, so a commit that leaves nothing to remember leaves no trace in a
-    // vault whose `.gitignore` has no `.cache/` line.
-    if (Object.keys(record).length === 0) rmSync(path, { force: true });
-    else atomicWrite(path, JSON.stringify(record));
-  });
+// `timeoutMs` caps the lock wait (a hook with a time budget passes what is left); without it the
+// wait is `withFileLock`'s default.
+function updateCacheRecord(path, mutate, { timeoutMs } = {}) {
+  withFileLock(
+    path,
+    () => {
+      // An unreadable record starts over: a lost entry only means one more backup later.
+      const record = readCacheRecord(path);
+      mutate(record);
+      // An empty record is no file, so a commit that leaves nothing to remember leaves no trace in a
+      // vault whose `.gitignore` has no `.cache/` line.
+      if (Object.keys(record).length === 0) rmSync(path, { force: true });
+      else atomicWrite(path, JSON.stringify(record));
+    },
+    timeoutMs === undefined ? {} : { timeoutMs },
+  );
 }
 
 /** The recorded auto-stage blobs. A missing or unreadable record is `{}`: nothing is skipped. */
@@ -6469,10 +6475,14 @@ export function readAutoStagedRecord(hypoDir) {
  * Remember that hypo-auto-stage staged `blob` for `relPath` while HEAD held `headBlob` for it, so a
  * commit does not back it up.
  */
-export function recordAutoStagedBlob(hypoDir, relPath, blob, headBlob) {
-  updateCacheRecord(autoStagedPath(hypoDir), (record) => {
-    record[relPath] = { blob, headBlob: headBlob ?? null };
-  });
+export function recordAutoStagedBlob(hypoDir, relPath, blob, headBlob, { timeoutMs } = {}) {
+  updateCacheRecord(
+    autoStagedPath(hypoDir),
+    (record) => {
+      record[relPath] = { blob, headBlob: headBlob ?? null };
+    },
+    { timeoutMs },
+  );
 }
 
 /**
@@ -6505,13 +6515,19 @@ export function isStagedDeletion(headBlob, indexed) {
 /**
  * The stage-0 index blob and HEAD's blob for one vault path (`null` when absent; an unborn HEAD has
  * no blobs), and whether the index has an entry for it at any stage. `null` for the whole result
- * when git cannot answer about the index.
+ * when git cannot answer about the index (or `deadline` has run out).
  * @returns {{index: string|null, head: string|null, indexed: boolean}|null}
  */
-export function indexAndHeadBlobs(hypoDir, relPath) {
-  const ls = vaultGit(hypoDir, ['ls-files', '-s', '--', relPath]);
+export function indexAndHeadBlobs(hypoDir, relPath, { deadline } = {}) {
+  // With a `deadline` each git call is cut to the time left, and no time left is `null` (git did
+  // not answer about the index), the answer callers already skip on.
+  const git = (args) => {
+    const timeout = remainingSpawnTimeoutMs(deadline);
+    return timeout === 0 ? { error: true } : vaultGit(hypoDir, args, timeout ? { timeout } : {});
+  };
+  const ls = git(['ls-files', '-s', '--', relPath]);
   if (ls.error || ls.status !== 0) return null;
-  const tree = vaultGit(hypoDir, ['ls-tree', 'HEAD', '--', relPath]);
+  const tree = git(['ls-tree', 'HEAD', '--', relPath]);
   return {
     index: /^\d+ ([0-9a-f]+) 0\t/m.exec(ls.stdout || '')?.[1] ?? null,
     head:

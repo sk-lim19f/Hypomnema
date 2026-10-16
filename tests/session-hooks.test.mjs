@@ -433,6 +433,86 @@ test('hypo-auto-stage.mjs does NOT accumulate a Read (non-mutating tool)', () =>
   });
 });
 
+// The hook as Claude Code runs it: the harness kills it at 10 seconds (hooks.json), so the spawn
+// carries the same `timeout`. HOME and HYPO_DIR are pinned to temp dirs.
+function runAutoStageWithHarnessTimeout(dir, sid, rel) {
+  const started = performance.now();
+  const r = spawnSync(process.execPath, [join(HOOKS, 'hypo-auto-stage.mjs')], {
+    input: JSON.stringify({
+      session_id: sid,
+      tool_name: 'Write',
+      tool_input: { file_path: join(dir, rel), content: 'z\n' },
+    }),
+    encoding: 'utf-8',
+    timeout: 10000,
+    env: { ...process.env, HOME: SESSION_TMP_HOME, HYPO_DIR: dir },
+  });
+  return { r, elapsedMs: performance.now() - started };
+}
+
+// Distinguishes: all four locks the hook waits on held by a live pid (the hook must give up on each
+// within one budget, finish before the harness kill, and leave the flag naming the path) from no
+// lock held (the write is recorded, nothing flagged). Before the shared budget the waits ran to
+// 5 seconds apiece and the harness killed the hook before it could write the flag.
+test('auto-stage: with both the vault lock and the session lock held, the hook still leaves a failure flag within its budget', () => {
+  withSyncedWiki((dir) => {
+    mkdirSync(join(dir, 'pages'), { recursive: true });
+    writeFileSync(join(dir, 'pages', 'busy.md'), 'z\n');
+    const sid = 'sess-budget';
+    const sessionDir = dirname(touchedPathsPath(dir, sid));
+    mkdirSync(sessionDir, { recursive: true });
+    // This process is alive, so withFileLock waits for these instead of stealing them.
+    for (const target of [
+      join(dir, '.cache', 'vault-commit'),
+      touchedPathsPath(dir, sid),
+      join(dir, '.cache', 'auto-staged.json'),
+      join(sessionDir, 'base.json'),
+    ]) {
+      mkdirSync(dirname(target), { recursive: true });
+      writeFileSync(`${target}.lock`, String(process.pid));
+    }
+    const { r, elapsedMs } = runAutoStageWithHarnessTimeout(dir, sid, 'pages/busy.md');
+    assert.equal(r.error, undefined, `the hook outlived the harness timeout: ${r.error}`);
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    assert.ok(elapsedMs < 9000, `finished in ${Math.round(elapsedMs)}ms, inside the 8000ms budget`);
+    assert.ok(
+      'pages/busy.md' in readFailedFlag(dir, sid).entries,
+      'the unrecorded path is flagged for the gate',
+    );
+    assert.ok(
+      !existsSync(join(dir, '.cache', 'auto-staged.json')),
+      'the cache record was given up, not written',
+    );
+    assert.equal(
+      spawnSync('git', ['-C', dir, 'ls-files', '--', 'pages/busy.md'], {
+        encoding: 'utf-8',
+      }).stdout.trim(),
+      '',
+      'the add was skipped (Stop stages it again)',
+    );
+  });
+});
+
+test('auto-stage: with no lock held, the write is recorded and no flag is left', () => {
+  withSyncedWiki((dir) => {
+    mkdirSync(join(dir, 'pages'), { recursive: true });
+    writeFileSync(join(dir, 'pages', 'free.md'), 'z\n');
+    const { r } = runAutoStageWithHarnessTimeout(dir, 'sess-free', 'pages/free.md');
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    const read = readTouchedPathsStrict(dir, 'sess-free');
+    assert.equal(read.state, 'ok');
+    assert.deepEqual(read.paths, ['pages/free.md']);
+    assert.ok(!existsSync(touchedPathsFailedPath(dir, 'sess-free')), 'no flag for a success');
+    assert.equal(
+      spawnSync('git', ['-C', dir, 'ls-files', '--', 'pages/free.md'], {
+        encoding: 'utf-8',
+      }).stdout.trim(),
+      'pages/free.md',
+      'the add ran',
+    );
+  });
+});
+
 test('hypo-auto-commit.mjs: missing session_id → scoped commit SKIPPED, no whole-tree fallback', () => {
   withGrowthWiki((dir) => {
     mkdirSync(join(dir, 'pages'), { recursive: true });
