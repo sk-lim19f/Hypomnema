@@ -8467,13 +8467,15 @@ export function resolveCloseScope(hypoDir, opts = {}, marker = null) {
  * spec §3). The writer is `scripts/lib/crystallize-close-apply.mjs`
  * (`runMarkSessionClosed` and `runMarkerPhase`); the reader is
  * `markerCoversArtifact` in `scripts/doctor.mjs`.
- * Either key ALSO feeds the git-dirty partition (spec §2b): with an untrusted
- * transcript (missing/corrupt), a dirty file structurally under a DIFFERENT
- * eligible project's own directory is demoted to a notice, because the path
- * alone proves it is not this session's; everything else keeps blocking.
- * When a log-only marker governs the session, log-only mode wins for the
- * close-status and lint scope (scope selection above); the git-dirty
- * partition in spec §2b still applies regardless of projectOverride.
+ * The git axis is the same for every caller, and does not read the
+ * transcript. A dirty file blocks when this session's touched-paths record says
+ * it wrote it, or a failure flag says a record of it was lost; the whole
+ * project folder being closed blocks only when the record lost paths it cannot
+ * name, or when the call has no session id to read a record of. Any other dirty
+ * file is a notice (`unresolved`, `foreign-entry`, `foreign-append`,
+ * `local-entry`). projectOverride and attributionScope only name the project
+ * folder being closed. When a log-only marker governs the session, log-only
+ * mode wins for the close-status and lint scope (scope selection above).
  *
  * @param {string} hypoDir
  * opts.sessionCwd (session-cwd close check): the authoritative cwd of the session being
@@ -8491,7 +8493,7 @@ export function resolveCloseScope(hypoDir, opts = {}, marker = null) {
  * way it injects `opts.closeMarker`: close-gate-store.mjs imports this module.
  * A call that reaches the check without them throws (sessionProofCloseId).
  *
- * @param {{lintScope?: Iterable<string>, transcriptPath?: string|null, claudeHome?: string, projectOverride?: string|null, attributionScope?: string|null, sessionCwd?: string|null, sessionId?: string|null, closeMarker?: object|null, logOnly?: boolean, closeScope?: string[], closeOpen?: boolean, resolvedAtIndex?: number|null}} [opts]
+ * @param {{lintScope?: Iterable<string>, transcriptPath?: string|null, claudeHome?: string, projectOverride?: string|null, attributionScope?: string|null, sessionCwd?: string|null, sessionId?: string|null, checkpointMode?: boolean, closeMarker?: object|null, logOnly?: boolean, closeScope?: string[], closeOpen?: boolean, resolvedAtIndex?: number|null}} [opts]
  * @returns {{ok: boolean, close: object, blockers: {type:string,reason:string}[], notices: {type:string,reason:string,file?:string}[], driftTargets: string[], skipped: {lint:boolean, feedback:boolean}}}
  */
 export function precompactGateStatus(hypoDir, opts = {}) {
@@ -8526,10 +8528,9 @@ export function precompactGateStatus(hypoDir, opts = {}) {
         : null;
   const logOnly = opts.logOnly === true || marker?.scope === 'log-only';
 
-  // Paths this session is accountable for at THIS close: the same signals the
-  // lint partition below already trusts for exactly this question ("is this
-  // file mine or pre-existing debt"), hoisted so the git check (step 1) can
-  // partition on it too. Base = the mandatory close-target files (opts.lintScope
+  // Paths this session is accountable for at THIS close: the signals the lint
+  // partition below trusts for the question "is this file mine or pre-existing
+  // debt". Base = the mandatory close-target files (opts.lintScope
   // override, else the log-only shared root files, else one project's close
   // files under projectOverride, else every today-active project's); widened by
   // every file this session's transcript shows it editing directly.
@@ -8541,59 +8542,25 @@ export function precompactGateStatus(hypoDir, opts = {}) {
           ? closeFileTargetsForProject(hypoDir, opts.projectOverride)
           : closeFileTargetsGlobal(hypoDir)),
   );
-  // Trust signal for the git-scope check below (codex pre-commit review
-  // BLOCKER 1): closeAccountableScope's mandatory-files base is always
-  // reliable, but the transcript widening that catches an ad hoc page this
-  // session edited is only as good as the transcript. No opts.transcriptPath
-  // at all, an unreadable file, or a line that fails to parse all mean the
-  // widened scope may be under-inclusive, NOT that this session touched
-  // nothing extra. Only a fully-read, fully-parsed transcript earns
-  // sessionTouchTrusted:true. A single tool_use with no file_path does NOT
-  // lower trust: most tool_use blocks (Read, Bash, Grep, ...) never carry one
-  // and that is expected, not corruption, so treating it as untrustworthy
-  // would make almost every real transcript untrusted and defeat the scoping
-  // this fix exists to add.
-  let sessionTouchTrusted = false;
-  // Transcript-derived files ONLY (not closeAccountableScope's mandatory-files
-  // base, which comes from closeFileTargetsGlobal and would fold every close
-  // file of every eligible project into "this session touched it"). §2b's
-  // isForeign below needs exactly this narrower set: a file this session's own
-  // Edit/Write proves it touched, even on a PARTIALLY-parsed transcript (the
-  // trailing line of an append-in-progress JSONL truncates in the ordinary
-  // course of a live session, not as an exceptional failure), must never be
-  // classified foreign by path prefix alone. Widening this to
-  // closeAccountableScope would re-open the exact foreign-close-file leak
-  // (b) fixed above (a genuinely different project's close file would count
-  // as "touched" just because it shares the mandatory-files base).
-  let transcriptTouched = new Set();
+  // The transcript widens the lint scope to the wiki files this session edited
+  // directly. It plays no part in the git axis below, which judges by the
+  // session's touched-paths record.
   if (opts.transcriptPath) {
-    const widened = extractTouchedWikiFilesWithTrust(opts.transcriptPath, hypoDir);
-    sessionTouchTrusted = widened.trusted;
-    for (const f of widened.files) {
+    for (const f of extractTouchedWikiFiles(opts.transcriptPath, hypoDir)) {
       closeAccountableScope.add(f);
-      transcriptTouched.add(f);
     }
   }
 
-  // 1. wiki git state. Uncommitted changes (real unsaved work) BLOCK, but a
-  //    file this session cannot be held to still demotes to a notice: a
-  //    session's own scoped auto-commit (commitWikiChanges, PR #222) can
-  //    leave the working tree non-empty when a DIFFERENT session sharing
-  //    this vault still has its own file dirty, the 2026-08-03 multi-session
-  //    block. That dirty file is human-fixable by whoever owns it, not by
-  //    this session, so it demotes to a notice (listed by path, never
-  //    silently dropped) instead of refusing this session's marker. Which
-  //    set decides "not mine" depends on what the caller told us: a
-  //    caller-provided project (--project, or the cwd-derived
-  //    attributionScope) demotes by PATH STRUCTURE alone
-  //    (isForeignProjectFile below), independent of transcript trust; with
-  //    no such scope, only a trusted transcript's closeAccountableScope can
-  //    tell mine from foreign, so an untrusted,
-  //    unscoped session falls back to the original unscoped blocker:
-  //    "cannot attribute" is not "clean". A dirty file THIS session owns
-  //    still blocks unconditionally either way, and so does the
-  //    enumeration-failed case below (dirty.length === 0 despite
-  //    git.uncommitted === true).
+  // 1. wiki git state. An uncommitted file blocks only when this session's
+  //    touched-paths record (or its failure flag) says the write is this
+  //    session's. A DIFFERENT session sharing this vault can leave the working
+  //    tree non-empty with its own dirty file (the 2026-08-03 multi-session
+  //    block). That file is human-fixable by whoever owns it, not by this
+  //    session, so it demotes to a notice (listed by path, never silently
+  //    dropped) instead of refusing this session. "Cannot attribute" is not
+  //    "clean" either: an enumeration failure (dirty.length === 0 despite
+  //    git.uncommitted === true) blocks, and so does every file of the project
+  //    folder being closed when the record lost paths it cannot name.
   //    Unpushed commits (ahead) DEMOTE to a notice regardless of scope: push is
   //    automatic (auto-commit Stop hook) and its failures are already non-fatal, so
   //    "ahead" is a transient sync state, not a human-fixable blocker. Demoting it
@@ -8601,315 +8568,186 @@ export function precompactGateStatus(hypoDir, opts = {}) {
   //    a committed-but-unpushed close marks AND compacts, instead of the close writer
   //    committing its own payload and then being blocked by its own (unpushed) commit.
   const git = hypoIsClean(hypoDir);
-  // checkpointMode: a marker-writing
-  // path's own gate call, replacing the whole git axis above with a narrower
-  // question: "is there an uncommitted write THIS session recorded (or failed
+  // One git axis for every caller (Stop, PreCompact, check, --mark, apply): the
+  // question is "is there an uncommitted write THIS session recorded (or failed
   // to record)". The project folder being closed blocks only what the record
   // says is this session's, and every file in it only when the record itself
-  // lost paths it cannot name.
-  // Everything else (close files, cwd, hot structure, lint, W8,
-  // feedback) is untouched below; Stop, PreCompact and check never set this.
-  if (opts.checkpointMode) {
-    if (!isValidSessionId(opts.sessionId)) {
-      blockers.push({
-        type: 'checkpoint-session',
-        reason: 'checkpointMode requires a validated sessionId',
-      });
-    } else if (git.uncommitted) {
-      const dirty = gitDirtyFiles(hypoDir);
-      if (dirty.length === 0) {
-        // Enumeration itself failed (or nothing is actually dirty despite the
-        // porcelain status): fail closed exactly like the unscoped path below.
-        blockers.push({ type: 'git', reason: git.reason });
-      } else {
-        const touched = readTouchedPathsStrict(hypoDir, opts.sessionId);
-        if (touched.state === 'locked') {
-          // Another writer holds this session's touched-paths lock right now
-          // (usually this session's own Stop auto-commit). Transient, so
-          // block: the retry reads the real set instead of guessing.
-          blockers.push({
-            type: 'known-session-write',
-            reason: 'touched-paths lock timed out (다른 쓰기가 끝난 뒤 다시 시도하면 된다)',
-          });
-        } else {
-          // An unreadable set reads as "no record" and would read the same on
-          // every retry, so it is not a blocker of its own (that refused every
-          // close for good). It widens the project folder rule instead
-          // (folderWide below): the record can no longer say which files in the
-          // folder are this session's, so all of them block, with the way out
-          // in the reason.
-          if (touched.state === 'unreadable') {
-            notices.push({
-              type: 'touched-paths-unreadable',
-              reason:
-                'touched-paths unreadable: ownership of dirty files outside the project folder being closed was not judged (touched-paths 기록을 읽지 못해 프로젝트 폴더 밖 파일의 소유를 판정하지 못했다)',
-            });
-          }
-          // A record that failed to land leaves a failure flag
-          // (touched-paths-failed.json, see markTouchedPathsFailed). A flagged
-          // path blocks wherever it sits until its record lands, HEAD moves
-          // past it, or the flag is removed. A flag that lost paths it cannot
-          // name (pathsUnknown), or an unreadable record, makes the whole
-          // project folder being closed block (folderWide): another session's
-          // dirty file there stays a notice only while the record is complete.
-          // With no project named (a --mark without --project), whose folder
-          // it is cannot be told, so every projects/ file counts. A log-only
-          // close names no project by design, so none does.
-          const failed = readTouchedPathsFailed(hypoDir, opts.sessionId);
-          const flagged = (pf) =>
-            Object.hasOwn(failed.entries, pf) &&
-            flaggedPathStillPending(hypoDir, pf, failed.entries[pf]);
-          const folderWide = failed.pathsUnknown || touched.state === 'unreadable';
-          const cacheDir = `.cache/sessions/${sanitizeSessionId(opts.sessionId)}`;
-          const folderWideExit = [
-            failed.pathsUnknown
-              ? `${cacheDir}/touched-paths-failed.json 을 지우면 이 세션의 표시가 풀린다. 지우기 전에 잃은 경로가 이미 커밋됐는지 git status 로 확인한다`
-              : null,
-            touched.state === 'unreadable' && touched.cause === 'corrupt'
-              ? `손상된 ${cacheDir}/touched-paths.json 을 살펴보고 지우면 풀린다. 지우기 전에 이 세션이 쓴 파일이 이미 커밋됐는지 git status 로 확인한다`
-              : null,
-            touched.state === 'unreadable' && touched.cause === 'lock-failed'
-              ? `${cacheDir}/ 디렉터리의 권한과 디스크 공간을 점검한다 (파일을 지워도 고쳐지지 않는다)`
-              : null,
-          ]
-            .filter(Boolean)
-            .join('. ');
-          const closeSlug = opts.projectOverride || opts.attributionScope || null;
-          const inClosedProject = (f) =>
-            closeSlug
-              ? f.startsWith(`projects/${closeSlug}/`)
-              : !logOnly && f.startsWith('projects/');
-          const touchedSet = new Set((touched.paths || []).map(posixPath));
-          const driftedSet = new Set(
-            readTouchedPathsDrifted(hypoDir, opts.sessionId).map(posixPath),
-          );
-          const ignorePatterns = loadHypoIgnore(hypoDir);
-          // A session entry of a `.hypoignore` project is never committed by
-          // anything, so it is dirty for good and would refuse every close of
-          // that project. This session's own one is proven by its close pin's
-          // local proof instead (the receipt checks the same bytes); another
-          // session's is that session's to prove. Only an own entry whose bytes
-          // no longer match its proof still blocks, below.
-          const provenLocal = new Set(
-            Object.values(readClosePin(hypoDir, opts.sessionId).localProofs)
-              .filter((p) => fileSha256(join(hypoDir, p.entryRelPath)) === p.entrySha256)
-              .map((p) => posixPath(p.entryRelPath)),
-          );
-          for (const f of dirty) {
-            const pf = posixPath(f);
-            // First, ahead of the local-entry and foreign-append exceptions:
-            // an active flag means a record of this path was lost, so who owns
-            // the bytes is not left to those exceptions.
-            if (flagged(pf)) {
-              blockers.push({
-                type: 'known-session-write',
-                file: f,
-                reason: `이 세션의 쓰기 기록이 실패한 파일이 아직 미커밋이다: ${f} (기록 실패 표시 ${cacheDir}/touched-paths-failed.json 이 이 경로를 가리킨다. 커밋하거나 되돌리면 풀린다)`,
-              });
-              continue;
-            }
-            if (
-              ignorePatterns.length > 0 &&
-              isSessionEntryPath(pf) &&
-              isIgnored(join(hypoDir, f), hypoDir, ignorePatterns) &&
-              (provenLocal.has(pf) || !touchedSet.has(pf))
-            ) {
-              notices.push({
-                type: 'local-entry',
-                file: f,
-                reason: provenLocal.has(pf)
-                  ? `${f} stays out of git (.hypoignore); this session's close pin proves its bytes`
-                  : `${f} stays out of git (.hypoignore) and belongs to another session's close`,
-              });
-              continue;
-            }
-            if (isForeignAppendOnlyShard(hypoDir, pf, opts.sessionId)) {
-              // Ahead of the touched-set check: the shard this session's close
-              // committed stays in its set until Stop, and the later close of the
-              // same project appends to it before this marker gate is done.
-              notices.push({ type: 'foreign-append', file: f, reason: FOREIGN_APPEND_NOTICE(f) });
-              continue;
-            }
-            if (touchedSet.has(posixPath(f))) {
-              // A touched file .hypoignore keeps out of every commit stays
-              // dirty forever on its own: say how to get out. A file whose
-              // bytes changed after this session recorded it is kept out of
-              // the auto-commit (commitTouchedPaths), so say that too.
-              const pathHint = emptyNewIndexHint(hypoDir, pf)
-                ? ' (빈 파일이다. 이 세션의 close 가 만들다 멈춘 것이니 지우고 close 를 다시 하면 된다)'
-                : ignorePatterns.length > 0 && isIgnored(join(hypoDir, f), hypoDir, ignorePatterns)
-                  ? ' (.hypoignore 대상이라 자동 커밋되지 않는다. 손으로 커밋하거나 .hypoignore 에서 빼야 close 가 된다)'
-                  : driftedSet.has(posixPath(f))
-                    ? ' (이 세션이 기록한 뒤 다른 쓰기가 이 파일을 바꿔서 자동 커밋에서 빠진다. 지금 내용이 맞는지 확인하고 손으로 커밋해야 close 가 된다)'
-                    : '';
-              blockers.push({
-                type: 'known-session-write',
-                file: f,
-                reason: `this session's own write is still uncommitted: ${f}${pathHint}`,
-              });
-            } else if (isForeignUncommittedEntry(hypoDir, pf, opts.sessionId)) {
-              // Two sessions closing one project at once: the other one's entry
-              // is published and its commit has not landed yet.
-              notices.push({ type: 'foreign-entry', file: f, reason: FOREIGN_ENTRY_NOTICE(f) });
-            } else if (folderWide && inClosedProject(posixPath(f))) {
-              blockers.push({
-                type: 'git',
-                file: f,
-                reason: `${
-                  closeSlug
-                    ? `uncommitted file in the project folder being closed: ${f}`
-                    : `uncommitted file under projects/ and this close names no project: ${f}`
-                } (이 세션의 쓰기 기록이 불완전해서(잃은 경로를 모름) close 하는 프로젝트 폴더의 미커밋 파일을 모두 막는다. ${folderWideExit}. 커밋하거나 되돌려도 풀린다)`,
-              });
-            } else {
-              notices.push({
-                type: 'unresolved',
-                file: f,
-                reason: `uncommitted changes, ownership unknown: ${f}`,
-              });
-            }
-          }
-        }
-      }
-    } else if (git.ahead) {
-      notices.push({
-        type: 'git-sync',
-        reason: `unpushed commits in ${hypoDir} (push deferred to Stop hook)`,
-      });
-    }
+  // lost paths it cannot name (or there is no session to read a record of).
+  // Everything else is another session's or nobody's, and is listed as a
+  // notice. The other axes (close files, cwd, hot structure, lint, W8,
+  // feedback) are untouched below. checkpointMode, set by the two marker
+  // writers, adds one thing: a session id that fails validation is a blocker of
+  // its own instead of reading as "no session".
+  if (opts.checkpointMode && !isValidSessionId(opts.sessionId)) {
+    blockers.push({
+      type: 'checkpoint-session',
+      reason: 'checkpointMode requires a validated sessionId',
+    });
   } else if (git.uncommitted) {
     const dirty = gitDirtyFiles(hypoDir);
     if (dirty.length === 0) {
       // Enumeration itself failed (or nothing is actually dirty despite the
-      // porcelain status): "cannot attribute" is not "clean", block exactly
-      // as before, override or not.
-      blockers.push({ type: 'git', reason: git.reason });
-    } else if (opts.projectOverride || opts.attributionScope) {
-      // session-close-scope-boundary spec §2b, revised 2026-09-11: a
-      // caller-provided scope (an explicit --project, or the cwd-derived
-      // attributionScope) proves which project is ours PATH-STRUCTURALLY,
-      // regardless of transcript trust. This used to run only when
-      // !sessionTouchTrusted, on the theory that a trusted transcript could
-      // fall back to closeAccountableScope instead. But closeAccountableScope
-      // is `closeFileTargetsGlobal` whenever opts.projectOverride is unset
-      // (every caller here passes attributionScope, never projectOverride;
-      // see crystallize-close-apply.mjs), which unions in every OTHER
-      // today-active project's own mandatory close files too. That let a
-      // different session's still-dirty close files (session-state.md,
-      // project hot.md, today's session-log shard) block THIS session's
-      // marker even with --project set. A dirty file that lives structurally
-      // under a DIFFERENT eligible project's own
-      // directory needs no attribution inference at all: the path alone
-      // proves it is not this session's file. Everything else (this
-      // session's own project, pages/, an unregistered or _template project
-      // dir) keeps the pre-existing fail-closed behavior; only a
-      // provably-foreign path is demoted.
-      const effectiveOverride = opts.projectOverride || opts.attributionScope;
-      // Computed once per gate call, never per file (collectProjectWorkingDirs
-      // walks the projects/ dir and reads every index.md). A throw here (a
-      // readdirSync failure it does not catch itself) must not escape as an
-      // exception, the PreCompact hook's outermost catch would turn that
-      // into a silent, fully-suppressed gate result, the opposite of "fail
-      // closed". Treat any failure as "no eligible projects known", which
-      // makes isForeignProjectFile() below always false and every dirty file
-      // falls through to the unconditional blocker.
-      let eligibleSlugs = null;
-      try {
-        eligibleSlugs = new Set(collectProjectWorkingDirs(hypoDir).map((p) => p.slug));
-      } catch {
-        eligibleSlugs = null;
-      }
-      // isForeignProjectFile is the extracted, exported predicate (spec §5):
-      // hypo-compact-guard.mjs calls the exact same function on its own git
-      // axis, instead of a second, silently-diverging copy of this rule.
-      const isForeign = (f) =>
-        isForeignProjectFile(f, { eligibleSlugs, effectiveOverride, transcriptTouched });
-      const foreign = dirty.filter(isForeign);
-      // A dirty file inside the scoped project's OWN directory blocks, even one
-      // this close does not write. An earlier revision demoted those to notices
-      // to escape a deadlock: a close whose commit fails leaves
-      // `projects/<p>/index.md` (seeded by ensureProjectIndex) uncommitted, the
-      // retry skips every payload field as already-current without re-staging
-      // it, and the marker can then never land again no matter how often the
-      // user retries.
-      //
-      // That demotion was far wider than the deadlock it answered. It waved
-      // through every unsaved file in the project, which is exactly the work a
-      // close is supposed to refuse to walk away from. The deadlock is fixed at
-      // its source instead: applyOverwrites re-stages index.md on the retry
-      // path (crystallize-close-apply.mjs), so the file this branch used to
-      // demote is now in the close's own commit scope and never reaches here.
-      // Another session's entry still waiting for its own commit, or its
-      // append to a shared session-log shard, is not this session's to commit,
-      // inside the scoped project or not (the checkpoint branch above demotes
-      // both the same way).
-      const foreignEntries = dirty.filter(
-        (f) => !isForeign(f) && isForeignUncommittedEntry(hypoDir, posixPath(f), opts.sessionId),
-      );
-      const foreignAppends = dirty.filter(
-        (f) =>
-          !isForeign(f) &&
-          !foreignEntries.includes(f) &&
-          isForeignAppendOnlyShard(hypoDir, posixPath(f), opts.sessionId),
-      );
-      const rest = dirty.filter(
-        (f) => !isForeign(f) && !foreignEntries.includes(f) && !foreignAppends.includes(f),
-      );
-      if (rest.length > 0) {
-        blockers.push({
-          type: 'git',
-          reason: `uncommitted changes in ${hypoDir}: ${rest.join(', ')}`,
-        });
-      }
-      for (const f of foreign) {
-        notices.push({
-          type: 'git',
-          file: f,
-          reason: `uncommitted changes outside this session's scope: ${f}`,
-        });
-      }
-      for (const f of foreignEntries) {
-        notices.push({ type: 'foreign-entry', file: f, reason: FOREIGN_ENTRY_NOTICE(f) });
-      }
-      for (const f of foreignAppends) {
-        notices.push({ type: 'foreign-append', file: f, reason: FOREIGN_APPEND_NOTICE(f) });
-      }
-    } else if (!sessionTouchTrusted) {
+      // porcelain status): "cannot attribute" is not "clean", so fail closed.
       blockers.push({ type: 'git', reason: git.reason });
     } else {
-      // closeAccountableScope holds every entry of today in the project, the
-      // other sessions' too, and the day's session-log shard they all append
-      // to, so a foreign entry still waiting for its commit and a foreign
-      // append are taken out here like in the scoped branch above.
-      const foreignEntries = dirty.filter((f) =>
-        isForeignUncommittedEntry(hypoDir, posixPath(f), opts.sessionId),
-      );
-      const foreignAppends = dirty.filter(
-        (f) =>
-          !foreignEntries.includes(f) &&
-          isForeignAppendOnlyShard(hypoDir, posixPath(f), opts.sessionId),
-      );
-      for (const f of foreignEntries) {
-        notices.push({ type: 'foreign-entry', file: f, reason: FOREIGN_ENTRY_NOTICE(f) });
-      }
-      for (const f of foreignAppends) {
-        notices.push({ type: 'foreign-append', file: f, reason: FOREIGN_APPEND_NOTICE(f) });
-      }
-      const demoted = (f) => foreignEntries.includes(f) || foreignAppends.includes(f);
-      const mine = dirty.filter((f) => closeAccountableScope.has(posixPath(f)) && !demoted(f));
-      const foreign = dirty.filter((f) => !closeAccountableScope.has(posixPath(f)) && !demoted(f));
-      if (mine.length > 0) {
+      // No valid session id (a check run without --session-id): there is no
+      // record to read, so nothing can be told apart as this session's and
+      // the project folder rule below applies to every file in it.
+      const hasSession = isValidSessionId(opts.sessionId);
+      const touched = hasSession
+        ? readTouchedPathsStrict(hypoDir, opts.sessionId)
+        : { state: 'empty', paths: [] };
+      if (touched.state === 'locked') {
+        // Another writer holds this session's touched-paths lock right now
+        // (usually this session's own Stop auto-commit). Transient, so
+        // block: the retry reads the real set instead of guessing.
         blockers.push({
-          type: 'git',
-          reason: `uncommitted changes in ${hypoDir}: ${mine.join(', ')}`,
+          type: 'known-session-write',
+          reason: 'touched-paths lock timed out (다른 쓰기가 끝난 뒤 다시 시도하면 된다)',
         });
-      }
-      for (const f of foreign) {
-        notices.push({
-          type: 'git',
-          file: f,
-          reason: `uncommitted changes outside this session's scope: ${f}`,
-        });
+      } else {
+        // An unreadable set reads as "no record" and would read the same on
+        // every retry, so it is not a blocker of its own (that refused every
+        // close for good). It widens the project folder rule instead
+        // (folderWide below): the record can no longer say which files in the
+        // folder are this session's, so all of them block, with the way out
+        // in the reason.
+        if (touched.state === 'unreadable') {
+          notices.push({
+            type: 'touched-paths-unreadable',
+            reason:
+              'touched-paths unreadable: ownership of dirty files outside the project folder being closed was not judged (touched-paths 기록을 읽지 못해 프로젝트 폴더 밖 파일의 소유를 판정하지 못했다)',
+          });
+        }
+        // A record that failed to land leaves a failure flag
+        // (touched-paths-failed.json, see markTouchedPathsFailed). A flagged
+        // path blocks wherever it sits until its record lands, HEAD moves
+        // past it, or the flag is removed. A flag that lost paths it cannot
+        // name (pathsUnknown), or an unreadable record, makes the whole
+        // project folder being closed block (folderWide): another session's
+        // dirty file there stays a notice only while the record is complete.
+        // With no project named (a --mark without --project), whose folder
+        // it is cannot be told, so every projects/ file counts. A log-only
+        // close names no project by design, so none does.
+        const failed = hasSession
+          ? readTouchedPathsFailed(hypoDir, opts.sessionId)
+          : { failed: false, entries: {}, pathsUnknown: false, reasons: [] };
+        const flagged = (pf) =>
+          Object.hasOwn(failed.entries, pf) &&
+          flaggedPathStillPending(hypoDir, pf, failed.entries[pf]);
+        const folderWide = !hasSession || failed.pathsUnknown || touched.state === 'unreadable';
+        const cacheDir = hasSession ? `.cache/sessions/${sanitizeSessionId(opts.sessionId)}` : '';
+        const folderWideExit = [
+          !hasSession
+            ? '이 호출에는 세션 id 가 없어 쓰기 기록을 읽지 못했다. 세션 id 를 알려 주면(--session-id) 이 세션이 쓴 파일만 막는다'
+            : null,
+          failed.pathsUnknown
+            ? `${cacheDir}/touched-paths-failed.json 을 지우면 이 세션의 표시가 풀린다. 지우기 전에 잃은 경로가 이미 커밋됐는지 git status 로 확인한다`
+            : null,
+          touched.state === 'unreadable' && touched.cause === 'corrupt'
+            ? `손상된 ${cacheDir}/touched-paths.json 을 살펴보고 지우면 풀린다. 지우기 전에 이 세션이 쓴 파일이 이미 커밋됐는지 git status 로 확인한다`
+            : null,
+          touched.state === 'unreadable' && touched.cause === 'lock-failed'
+            ? `${cacheDir}/ 디렉터리의 권한과 디스크 공간을 점검한다 (파일을 지워도 고쳐지지 않는다)`
+            : null,
+        ]
+          .filter(Boolean)
+          .join('. ');
+        const closeSlug = opts.projectOverride || opts.attributionScope || null;
+        const inClosedProject = (f) =>
+          closeSlug
+            ? f.startsWith(`projects/${closeSlug}/`)
+            : !logOnly && f.startsWith('projects/');
+        const touchedSet = new Set((touched.paths || []).map(posixPath));
+        const driftedSet = new Set(
+          hasSession ? readTouchedPathsDrifted(hypoDir, opts.sessionId).map(posixPath) : [],
+        );
+        const ignorePatterns = loadHypoIgnore(hypoDir);
+        // A session entry of a `.hypoignore` project is never committed by
+        // anything, so it is dirty for good and would refuse every close of
+        // that project. This session's own one is proven by its close pin's
+        // local proof instead (the receipt checks the same bytes); another
+        // session's is that session's to prove. Only an own entry whose bytes
+        // no longer match its proof still blocks, below.
+        const provenLocal = new Set(
+          Object.values(hasSession ? readClosePin(hypoDir, opts.sessionId).localProofs : {})
+            .filter((p) => fileSha256(join(hypoDir, p.entryRelPath)) === p.entrySha256)
+            .map((p) => posixPath(p.entryRelPath)),
+        );
+        for (const f of dirty) {
+          const pf = posixPath(f);
+          // First, ahead of the local-entry and foreign-append exceptions:
+          // an active flag means a record of this path was lost, so who owns
+          // the bytes is not left to those exceptions.
+          if (flagged(pf)) {
+            blockers.push({
+              type: 'known-session-write',
+              file: f,
+              reason: `이 세션의 쓰기 기록이 실패한 파일이 아직 미커밋이다: ${f} (기록 실패 표시 ${cacheDir}/touched-paths-failed.json 이 이 경로를 가리킨다. 커밋하거나 되돌리면 풀린다)`,
+            });
+            continue;
+          }
+          if (
+            ignorePatterns.length > 0 &&
+            isSessionEntryPath(pf) &&
+            isIgnored(join(hypoDir, f), hypoDir, ignorePatterns) &&
+            (provenLocal.has(pf) || !touchedSet.has(pf))
+          ) {
+            notices.push({
+              type: 'local-entry',
+              file: f,
+              reason: provenLocal.has(pf)
+                ? `${f} stays out of git (.hypoignore); this session's close pin proves its bytes`
+                : `${f} stays out of git (.hypoignore) and belongs to another session's close`,
+            });
+            continue;
+          }
+          if (isForeignAppendOnlyShard(hypoDir, pf, opts.sessionId)) {
+            // Ahead of the touched-set check: the shard this session's close
+            // committed stays in its set until Stop, and the later close of the
+            // same project appends to it before this marker gate is done.
+            notices.push({ type: 'foreign-append', file: f, reason: FOREIGN_APPEND_NOTICE(f) });
+            continue;
+          }
+          if (touchedSet.has(posixPath(f))) {
+            // A touched file .hypoignore keeps out of every commit stays
+            // dirty forever on its own: say how to get out. A file whose
+            // bytes changed after this session recorded it is kept out of
+            // the auto-commit (commitTouchedPaths), so say that too.
+            const pathHint = emptyNewIndexHint(hypoDir, pf)
+              ? ' (빈 파일이다. 이 세션의 close 가 만들다 멈춘 것이니 지우고 close 를 다시 하면 된다)'
+              : ignorePatterns.length > 0 && isIgnored(join(hypoDir, f), hypoDir, ignorePatterns)
+                ? ' (.hypoignore 대상이라 자동 커밋되지 않는다. 손으로 커밋하거나 .hypoignore 에서 빼야 close 가 된다)'
+                : driftedSet.has(posixPath(f))
+                  ? ' (이 세션이 기록한 뒤 다른 쓰기가 이 파일을 바꿔서 자동 커밋에서 빠진다. 지금 내용이 맞는지 확인하고 손으로 커밋해야 close 가 된다)'
+                  : '';
+            blockers.push({
+              type: 'known-session-write',
+              file: f,
+              reason: `this session's own write is still uncommitted: ${f}${pathHint}`,
+            });
+          } else if (isForeignUncommittedEntry(hypoDir, pf, opts.sessionId)) {
+            // Two sessions closing one project at once: the other one's entry
+            // is published and its commit has not landed yet.
+            notices.push({ type: 'foreign-entry', file: f, reason: FOREIGN_ENTRY_NOTICE(f) });
+          } else if (folderWide && inClosedProject(posixPath(f))) {
+            blockers.push({
+              type: 'git',
+              file: f,
+              reason: `${
+                closeSlug
+                  ? `uncommitted file in the project folder being closed: ${f}`
+                  : `uncommitted file under projects/ and this close names no project: ${f}`
+              } (이 세션의 쓰기 기록이 불완전해서(잃은 경로를 모름) close 하는 프로젝트 폴더의 미커밋 파일을 모두 막는다. ${folderWideExit}. 커밋하거나 되돌려도 풀린다)`,
+            });
+          } else {
+            notices.push({
+              type: 'unresolved',
+              file: f,
+              reason: `uncommitted changes, ownership unknown: ${f}`,
+            });
+          }
+        }
       }
     }
   } else if (git.ahead) {

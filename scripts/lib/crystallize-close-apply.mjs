@@ -1098,10 +1098,10 @@ export function runMarkSessionClosed(args, testHooks = null) {
   // The per-session marker is the THIRD session-close completion
   // signal (after the PreCompact gate and `--check-session-close`). It uses
   // precompactGateStatus, the gate the PreCompact notice reads, with one deliberate
-  // difference: `checkpointMode` (set below) replaces the git axis. The gate
-  // flags any uncommitted vault change, while the checkpoint blocks only
-  // on an uncommitted write THIS session still owns, so another session's
-  // dirty file can keep the gate red while this checkpoint still lands.
+  // difference: `checkpointMode` (set below) only makes an invalid session id a
+  // blocker of its own. The git axis is the same for every caller: it blocks
+  // only on an uncommitted write THIS session still owns (or failed to record),
+  // so another session's dirty file stays a notice for this checkpoint too.
   // Neither one stops /compact: PreCompact only shows a notice.
   // Every other axis is the same, so the marker still enforces feedback
   // projection (over-cap/conflict), W8 design-history staleness, and root
@@ -1121,11 +1121,10 @@ export function runMarkSessionClosed(args, testHooks = null) {
   // resolveGateProjectOverride (session-close-scope-boundary spec §2/§3): closeScope
   // above only widens THIS session's accountability set (evidence union for the
   // marker's attribution) -- it does not narrow closeAccountableScope's base, so a
-  // DIFFERENT project's dangling close files still land in the git-dirty check and
-  // block a `--project=<mine>` mark. Passed below as `attributionScope`: this is
-  // the value that feeds the mine/foreign partition in precompactGateStatus and
-  // demotes the foreign project's own close-file debt to a notice instead of
-  // block, and it also decides which projects the marker this call may go on to
+  // DIFFERENT project's dangling close files still land in the lint scope. Passed
+  // below as `attributionScope`: this is the value that feeds the mine/foreign
+  // partition in precompactGateStatus and demotes the foreign project's own
+  // close-file debt to a notice instead of block, and it also decides which projects the marker this call may go on to
   // write ends up attesting -- so passing `projectOverride` instead would narrow
   // sessionCloseGlobalStatus to args.project alone and turn the partition off,
   // which is the bug this key split fixes (a marker then claimed the demoted
@@ -4466,10 +4465,9 @@ function runMarkerPhase(args, project, appliedPaths, ok, hostTagWarning, receipt
         ...(closeTranscript ? { transcriptPath: closeTranscript } : {}),
         ...(autoMarkerOverride ? { attributionScope: autoMarkerOverride } : {}),
         // This is one of the two marker-writing paths that must share ONE
-        // `ok` invariant with `--mark-session-closed`. checkpointMode narrows the git axis to "is
-        // there an uncommitted write THIS session still owns" instead of
-        // refusing on any unattributed dirty root file; every other axis
-        // (close files, cwd, hot, lint, W8, feedback) is unchanged.
+        // `ok` invariant with `--mark-session-closed`. The git axis asks "is
+        // there an uncommitted write THIS session still owns" for every caller;
+        // checkpointMode only makes an invalid session id a blocker of its own.
         checkpointMode: true,
         sessionId: args.sessionId,
         closeOpen,

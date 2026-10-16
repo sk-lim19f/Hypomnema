@@ -420,15 +420,23 @@ process.stdin.on('end', () => {
     // "work-incomplete" together are exactly the case where the transcript's
     // NL close phrase can't tell "close now" from "close once X is done" —
     // regex can't disambiguate this (see spec background). Narrowed to the
-    // work-incomplete signals only: an uncommitted wiki (`git` blocker; real
-    // unsaved work) OR pending background work — a non-terminal background task
+    // work-incomplete signals only: an uncommitted file this session wrote (a
+    // `known-session-write` blocker that names a file, or a `git` blocker for a
+    // project folder the write record lost track of; real unsaved work) OR
+    // pending background work — a non-terminal background task
     // (delegated subagent OR shell, e.g. a deferred push/CI wait) or a
     // scheduled cron wake (hasPendingBackgroundWork). `hot` / `lint` / `close`
     // / `design-history` / `feedback` blockers are real close blockers but not
     // evidence of "later" intent, so they keep the existing wording (unchanged
-    // from before this feature).
+    // from before this feature). The touched-paths lock timeout is a
+    // `known-session-write` blocker with no `file`: it says the record could not
+    // be read right now, not that work is unfinished.
     const workIncomplete =
-      (gate && gate.blockers && gate.blockers.some((b) => b.type === 'git')) ||
+      (gate &&
+        gate.blockers &&
+        gate.blockers.some(
+          (b) => b.type === 'git' || (b.type === 'known-session-write' && b.file),
+        )) ||
       hasPendingBackgroundWork(payload);
     if (workIncomplete && isCloseReconfirmDeclined(transcriptPath)) {
       // The user already answered "아직" to the ambiguous close signal that

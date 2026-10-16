@@ -250,13 +250,14 @@ process.stdin.on('end', () => {
   }
 
   // Non-blocking heads-up, one line per notice TYPE (session-close-scope-boundary
-  // spec §4). gate.notices can carry any of seven types: git, git-sync,
+  // spec §4). gate.notices can carry these types: unresolved, foreign-entry,
+  // foreign-append, local-entry, touched-paths-unreadable, git-sync,
   // close-debt, close-cwd-unresolved, lint, design-history, feedback. Folding
   // them all into one "pre-existing lint issue(s)" sentence (the old
   // renderer) mislabeled git/git-sync/close-cwd-unresolved as lint debt and
   // dropped close-cwd-unresolved plus most feedback notices outright: visible
   // but lying about what kind of issue it was and what fixes it. A count that
-  // can grow unbounded (foreign git paths, close-debt projects) is capped and
+  // can grow unbounded (unresolved paths, close-debt projects) is capped and
   // the rest folds into "+N more", mirroring the existing lint/design-history
   // fold (a vault-wide lint sweep once produced 125 lines here).
   const NOTICE_LIST_CAP = 5;
@@ -267,12 +268,31 @@ process.stdin.on('end', () => {
   const byType = (t) => gate.notices.filter((n) => n.type === t);
   const noticeLines = [];
 
-  // git: a dirty file outside this session's scope (§2b's structural demotion,
-  // or the trusted-transcript foreign-file demotion above it).
-  const foreignGit = byType('git');
-  if (foreignGit.length > 0) {
+  // unresolved: a dirty file this session has no record of writing, so it is
+  // not blocking and its owner is unknown (the gate's git axis, which is the
+  // same for every caller).
+  const unresolvedGit = byType('unresolved');
+  if (unresolvedGit.length > 0) {
     noticeLines.push(
-      `[WIKI CHECK] ${foreignGit.length} uncommitted file(s) outside this session's scope (not blocking): ${foldNames(foreignGit.map((n) => n.file || n.reason))}.`,
+      `[WIKI CHECK] ${unresolvedGit.length} uncommitted file(s) this session has no record of writing (not blocking): ${foldNames(unresolvedGit.map((n) => n.file || n.reason))}.`,
+    );
+  }
+  // foreign-entry, foreign-append, local-entry, touched-paths-unreadable: each
+  // carries its own full sentence in `reason` (what the file is and what to do
+  // or not do about it), so it is one line apiece. Past the cap the rest fold
+  // into a count with their names.
+  const reasonNotices = [
+    'foreign-entry',
+    'foreign-append',
+    'local-entry',
+    'touched-paths-unreadable',
+  ].flatMap(byType);
+  for (const n of reasonNotices.slice(0, NOTICE_LIST_CAP))
+    noticeLines.push(`[WIKI CHECK] ${n.reason}.`);
+  if (reasonNotices.length > NOTICE_LIST_CAP) {
+    const rest = reasonNotices.slice(NOTICE_LIST_CAP);
+    noticeLines.push(
+      `[WIKI CHECK] +${rest.length} more ownership notice(s) (not blocking): ${foldNames(rest.map((n) => n.file || n.type))}.`,
     );
   }
   // git-sync / close-cwd-unresolved: single-fact notices, their own `reason`

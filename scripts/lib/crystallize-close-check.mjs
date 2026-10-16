@@ -41,7 +41,7 @@ export function runSessionCloseCheck(args) {
   // --project=<slug> narrows BOTH the close status and the lint scope to that one
   // project: a project-scoped DIAGNOSTIC, NOT the global close verdict.
   // It is check-only: the marker writers stay global (the marker gate is the
-  // global gate with only the git axis narrowed by checkpointMode). When narrowed, the
+  // same global gate, and its git axis is the same one this check uses). When narrowed, the
   // transcript widening is suppressed: a transcript touch in some OTHER project
   // would re-add that project's files to the lint scope and re-block the scoped
   // check, defeating the point. The global (no --project) check keeps widening.
