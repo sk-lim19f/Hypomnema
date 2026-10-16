@@ -2803,10 +2803,10 @@ test('--mark-session-closed: a dirty (uncommitted) append target withholds the c
   withWiki(null, (dir) => {
     const cleanup = seedCloseTranscript('s-mark-dirty-append');
     // The append target is the vault-root log.md (one of the proof's four files),
-    // not the session-log shard. The checkpoint gate now refuses any dirty file in
-    // the project folder being closed before this proof runs, so the shard fixture
-    // moved to the test below. A root file with no touched-paths record only
-    // demotes to a notice, which is what lets the proof still reach `incomplete`.
+    // not the session-log shard. A project-folder file this session recorded is
+    // refused by the checkpoint gate before this proof runs (the test below pins
+    // that). A root file with no touched-paths record only demotes to a notice,
+    // which is what lets the proof still reach `incomplete`.
     appendFileSync(join(dir, 'log.md'), '\nappended by Bash, never committed\n');
     const r = run('crystallize.mjs', [
       `--hypo-dir=${dir}`,
@@ -2830,15 +2830,18 @@ test('--mark-session-closed: a dirty (uncommitted) append target withholds the c
 
 // The original fixture of the test above (design.md test 28): a session-log shard
 // modified on disk with no commit. It sits inside the project folder being
-// closed, so the gate refuses it before the proof runs: exit 1, ok:false, the
-// file named in blockers[], no marker, no receipt.
-test('--mark-session-closed: a dirty session-log shard in the project folder is refused by the gate', () => {
+// closed and this session recorded writing it, so the gate refuses it before the
+// proof runs: exit 1, ok:false, the file named in blockers[], no marker, no
+// receipt. (An unrecorded shard no longer reaches the gate as a blocker: the
+// proof above catches it as `incomplete`.)
+test("--mark-session-closed: this session's dirty session-log shard in the project folder is refused by the gate", () => {
   withWiki(null, (dir, today) => {
     const sessionId = 's-mark-dirty-shard';
     const cleanup = seedCloseTranscript(sessionId);
     // buildCleanWikiTree seeds the LEGACY MONTHLY shard, not the daily one.
     const shardRel = join('projects', 'test-project', 'session-log', `${today.slice(0, 7)}.md`);
     appendFileSync(join(dir, shardRel), '\nappended by Bash, never committed\n');
+    assert.equal(recordTouchedPaths(dir, sessionId, [shardRel]), true, 'precondition: recorded');
     const r = run('crystallize.mjs', [
       `--hypo-dir=${dir}`,
       '--mark-session-closed',
@@ -2876,8 +2879,8 @@ test('--mark-session-closed: a close file staged but not committed withholds the
   withWiki(null, (dir) => {
     const cleanup = seedCloseTranscript('s-mark-staged-only');
     // The staged file is the vault-root log.md, not session-state.md: the gate
-    // refuses a dirty file in the project folder being closed before the proof
-    // runs (the test below keeps that fixture), and only a root file still
+    // refuses a project-folder file this session recorded before the proof runs
+    // (the test below keeps that fixture), and a root file with no record still
     // reaches the `incomplete` proof.
     const logRel = 'log.md';
     const logPath = join(dir, logRel);
@@ -2908,8 +2911,9 @@ test('--mark-session-closed: a close file staged but not committed withholds the
 });
 
 // The original fixture of the test above: session-state.md, inside the project
-// folder being closed, staged but not committed. The gate refuses it first.
-test('--mark-session-closed: a staged-only session-state.md in the project folder is refused by the gate', () => {
+// folder being closed, staged but not committed, and recorded as this session's
+// write. The gate refuses it first.
+test("--mark-session-closed: this session's staged-only session-state.md in the project folder is refused by the gate", () => {
   withWiki(null, (dir) => {
     const sessionId = 's-mark-staged-project-file';
     const cleanup = seedCloseTranscript(sessionId);
@@ -2917,6 +2921,7 @@ test('--mark-session-closed: a staged-only session-state.md in the project folde
     const ssPath = join(dir, ssRel);
     writeFileSync(ssPath, readFileSync(ssPath, 'utf-8') + '\nstaged only, never committed\n');
     spawnSync('git', ['-C', dir, 'add', '--', ssRel]);
+    assert.equal(recordTouchedPaths(dir, sessionId, [ssRel]), true, 'precondition: recorded');
     const r = run('crystallize.mjs', [
       `--hypo-dir=${dir}`,
       '--mark-session-closed',
@@ -3485,7 +3490,7 @@ test('--apply-session-close: a refused commit takes the shard append back, and t
 test('--apply-session-close: a retry leaves an unjournaled payload file uncommitted, receipt withheld', () => {
   withWiki(null, (dir, today) => {
     // The unjournaled file is the vault-root log.md, not session-state.md. The
-    // checkpoint gate refuses any dirty file in the project folder being closed
+    // checkpoint gate refuses a project-folder file this session recorded
     // before the receipt proof runs (the test below keeps that fixture), and a
     // root file with no touched-paths record only demotes to a notice, so this
     // is the fixture that still reaches receipt-proof-mismatch.
@@ -3544,14 +3549,17 @@ test('--apply-session-close: a retry leaves an unjournaled payload file uncommit
 });
 
 // The original fixture of the test above: session-state.md, inside the project
-// folder being closed, holds unjournaled bytes. The gate now refuses it before
-// the receipt proof: the marker is skipped as compact-gate-not-ok, no receipt is
-// filed, and the file still stays out of the commit.
-test('--apply-session-close: an unjournaled session-state.md in the project folder is refused by the gate', () => {
+// folder being closed, holds unjournaled bytes that this session recorded as its
+// write. The gate refuses it before the receipt proof: the marker is skipped as
+// compact-gate-not-ok, no receipt is filed, and the file still stays out of the
+// commit.
+test("--apply-session-close: this session's unjournaled session-state.md in the project folder is refused by the gate", () => {
   withWiki(null, (dir, today) => {
     const stateRel = join('projects', 'test-project', 'session-state.md');
     const stateContent = `${readFileSync(join(dir, stateRel), 'utf-8')}\n<!-- someone else -->\n`;
     writeFileSync(join(dir, stateRel), stateContent);
+    const sessionId = 's-apply-unjournaled-gate';
+    assert.equal(recordTouchedPaths(dir, sessionId, [stateRel]), true, 'precondition: recorded');
     const payload = {
       project: 'test-project',
       date: today,
@@ -3567,7 +3575,6 @@ test('--apply-session-close: an unjournaled session-state.md in the project fold
       `hypo-payload-${process.pid}-${Math.random().toString(36).slice(2, 10)}.json`,
     );
     writeFileSync(payloadPath, JSON.stringify(payload));
-    const sessionId = 's-apply-unjournaled-gate';
     const cleanup = seedCloseTranscript(sessionId);
     const r = run('crystallize.mjs', [
       `--hypo-dir=${dir}`,

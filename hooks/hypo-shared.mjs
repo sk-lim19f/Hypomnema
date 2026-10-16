@@ -5807,6 +5807,19 @@ function dropTouchedPathsFailedEntries(hypoDir, sessionId, paths) {
 }
 
 /**
+ * Whether a failure-flag entry still points at this session's uncommitted write. The entry holds
+ * HEAD's blob hash at flag time; HEAD still at that value means the flagged write was never
+ * committed, HEAD moved means it was (what is dirty now may be another writer's). A flag entry
+ * with no hash, or a HEAD lookup that fails now, is no evidence of a move, so it stays pending.
+ */
+function flaggedPathStillPending(hypoDir, relPath, entry) {
+  if (!entry || !Object.hasOwn(entry, 'headSha256')) return true;
+  const now = headBlobState(hypoDir, relPath);
+  if (now.state === 'error') return true;
+  return (now.state === 'present' ? now.sha256 : null) === entry.headSha256;
+}
+
+/**
  * Read the raw touched-paths JSON array off disk. Caller's responsibility to
  * hold the per-session lock first — this has no locking of its own.
  *
@@ -8575,8 +8588,10 @@ export function precompactGateStatus(hypoDir, opts = {}) {
   const git = hypoIsClean(hypoDir);
   // checkpointMode: a marker-writing
   // path's own gate call, replacing the whole git axis above with a narrower
-  // question: "is there an uncommitted write THIS session is known to still
-  // own, or any uncommitted file in the project folder being closed".
+  // question: "is there an uncommitted write THIS session recorded (or failed
+  // to record)". The project folder being closed blocks only what the record
+  // says is this session's, and every file in it only when the record itself
+  // lost paths it cannot name.
   // Everything else (close files, cwd, hot structure, lint, W8,
   // feedback) is untouched below; Stop, PreCompact and check never set this.
   if (opts.checkpointMode) {
@@ -8602,12 +8617,12 @@ export function precompactGateStatus(hypoDir, opts = {}) {
             reason: 'touched-paths lock timed out (다른 쓰기가 끝난 뒤 다시 시도하면 된다)',
           });
         } else {
-          // A corrupt set reads as "no record". It would read the same on
-          // every retry, and nothing clears it, so blocking on it refused
-          // every close for good. The project folder rule below does not
-          // depend on the record, so that folder stays protected; only the
-          // ownership of files outside it goes unjudged, and the notice
-          // says so.
+          // An unreadable set reads as "no record" and would read the same on
+          // every retry, so it is not a blocker of its own (that refused every
+          // close for good). It widens the project folder rule instead
+          // (folderWide below): the record can no longer say which files in the
+          // folder are this session's, so all of them block, with the way out
+          // in the reason.
           if (touched.state === 'unreadable') {
             notices.push({
               type: 'touched-paths-unreadable',
@@ -8615,18 +8630,35 @@ export function precompactGateStatus(hypoDir, opts = {}) {
                 'touched-paths unreadable: ownership of dirty files outside the project folder being closed was not judged (touched-paths 기록을 읽지 못해 프로젝트 폴더 밖 파일의 소유를 판정하지 못했다)',
             });
           }
-          // The project folder this close is closing blocks on any dirty
-          // file, recorded or not, as the gate did before checkpointMode.
-          // The record is not complete enough to be the only guard there: a
-          // failed record (a hash sidecar or list write that did not land)
-          // leaves this session's own write unlisted, and a close that died
-          // between creating a new project's index.md and writing it leaves
-          // an empty file no session ever recorded. Root files and other
-          // projects' folders keep the record-only rule, since those are
-          // where another session's dirty file stopped a close for good.
+          // A record that failed to land leaves a failure flag
+          // (touched-paths-failed.json, see markTouchedPathsFailed). A flagged
+          // path blocks wherever it sits until its record lands, HEAD moves
+          // past it, or the flag is removed. A flag that lost paths it cannot
+          // name (pathsUnknown), or an unreadable record, makes the whole
+          // project folder being closed block (folderWide): another session's
+          // dirty file there stays a notice only while the record is complete.
           // With no project named (a --mark without --project), whose folder
-          // it is cannot be told, so every projects/ file blocks. A log-only
+          // it is cannot be told, so every projects/ file counts. A log-only
           // close names no project by design, so none does.
+          const failed = readTouchedPathsFailed(hypoDir, opts.sessionId);
+          const flagged = (pf) =>
+            Object.hasOwn(failed.entries, pf) &&
+            flaggedPathStillPending(hypoDir, pf, failed.entries[pf]);
+          const folderWide = failed.pathsUnknown || touched.state === 'unreadable';
+          const cacheDir = `.cache/sessions/${sanitizeSessionId(opts.sessionId)}`;
+          const folderWideExit = [
+            failed.pathsUnknown
+              ? `${cacheDir}/touched-paths-failed.json 을 지우면 이 세션의 표시가 풀린다. 지우기 전에 잃은 경로가 이미 커밋됐는지 git status 로 확인한다`
+              : null,
+            touched.state === 'unreadable' && touched.cause === 'corrupt'
+              ? `손상된 ${cacheDir}/touched-paths.json 을 살펴보고 지우면 풀린다. 지우기 전에 이 세션이 쓴 파일이 이미 커밋됐는지 git status 로 확인한다`
+              : null,
+            touched.state === 'unreadable' && touched.cause === 'lock-failed'
+              ? `${cacheDir}/ 디렉터리의 권한과 디스크 공간을 점검한다 (파일을 지워도 고쳐지지 않는다)`
+              : null,
+          ]
+            .filter(Boolean)
+            .join('. ');
           const closeSlug = opts.projectOverride || opts.attributionScope || null;
           const inClosedProject = (f) =>
             closeSlug
@@ -8650,6 +8682,17 @@ export function precompactGateStatus(hypoDir, opts = {}) {
           );
           for (const f of dirty) {
             const pf = posixPath(f);
+            // First, ahead of the local-entry and foreign-append exceptions:
+            // an active flag means a record of this path was lost, so who owns
+            // the bytes is not left to those exceptions.
+            if (flagged(pf)) {
+              blockers.push({
+                type: 'known-session-write',
+                file: f,
+                reason: `이 세션의 쓰기 기록이 실패한 파일이 아직 미커밋이다: ${f} (기록 실패 표시 ${cacheDir}/touched-paths-failed.json 이 이 경로를 가리킨다. 커밋하거나 되돌리면 풀린다)`,
+              });
+              continue;
+            }
             if (
               ignorePatterns.length > 0 &&
               isSessionEntryPath(pf) &&
@@ -8692,13 +8735,15 @@ export function precompactGateStatus(hypoDir, opts = {}) {
               // Two sessions closing one project at once: the other one's entry
               // is published and its commit has not landed yet.
               notices.push({ type: 'foreign-entry', file: f, reason: FOREIGN_ENTRY_NOTICE(f) });
-            } else if (inClosedProject(posixPath(f))) {
+            } else if (folderWide && inClosedProject(posixPath(f))) {
               blockers.push({
                 type: 'git',
                 file: f,
-                reason: closeSlug
-                  ? `uncommitted file in the project folder being closed: ${f} (close 하는 프로젝트 폴더 안의 미커밋 파일은 이 세션의 쓰기 기록에 없어도 막는다. 커밋하거나 되돌려야 close 가 된다)`
-                  : `uncommitted file under projects/ and this close names no project: ${f} (close 하는 프로젝트를 알 수 없어 projects/ 아래 미커밋 파일은 쓰기 기록에 없어도 막는다. --project 로 프로젝트를 지정하거나, 커밋하거나 되돌려야 close 가 된다)`,
+                reason: `${
+                  closeSlug
+                    ? `uncommitted file in the project folder being closed: ${f}`
+                    : `uncommitted file under projects/ and this close names no project: ${f}`
+                } (이 세션의 쓰기 기록이 불완전해서(잃은 경로를 모름) close 하는 프로젝트 폴더의 미커밋 파일을 모두 막는다. ${folderWideExit}. 커밋하거나 되돌려도 풀린다)`,
               });
             } else {
               notices.push({

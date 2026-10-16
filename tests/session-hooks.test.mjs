@@ -48,6 +48,8 @@ import {
   readTouchedPathsStrict,
   readTouchedPathsDrifted,
   touchedPathsFailedPath,
+  gitDirtyFiles,
+  recordShardAppend,
   writeClosePin,
   migrationState,
 } from '../hooks/hypo-shared.mjs';
@@ -4125,10 +4127,11 @@ test('checkpointMode: an invalid sessionId (not isValidSessionId shape) → chec
 
 // A corrupt touched-paths set used to block every checkpoint outright, and
 // nothing clears it, so the retry the blocker pointed at was refused the same
-// way forever. It now reads as "no record": the project folder being closed
-// still blocks (that rule never needed the record), a root file demotes to a
-// notice like any unrecorded one, and a separate notice says ownership outside
-// the folder went unjudged.
+// way forever. It now reads as "no record" that cannot say which files are this
+// session's: every dirty file in the project folder being closed blocks (with
+// the way out in the reason), a root file demotes to a notice like any
+// unrecorded one, and a separate notice says ownership outside the folder went
+// unjudged.
 test('checkpointMode: a corrupt touched-paths file → the closed project folder still blocks, a root file demotes, and an unjudged-ownership notice is added', () => {
   withSyncedWiki((dir) => {
     writeFileSync(join(dir, 'unrelated-session.md'), '# dirty\n');
@@ -4146,11 +4149,24 @@ test('checkpointMode: a corrupt touched-paths file → the closed project folder
       (gate.blockers || []).some((b) => b.type === 'git' && b.file === 'projects/demo/note.md'),
       `the closed project folder must still block on a corrupt record: ${JSON.stringify(gate.blockers)}`,
     );
+    // The recovery text names touched-paths.json, so "no blocker mentions it" no longer holds.
+    // What stays true: the root file has no blocker, and the corrupt record is not a blocker of
+    // its own (every blocker that mentions it is the folder's per-file `git` blocker).
+    assert.ok(
+      !(gate.blockers || []).some((b) => b.file === 'unrelated-session.md'),
+      `a corrupt record must not block a root file: ${JSON.stringify(gate.blockers)}`,
+    );
     assert.ok(
       !(gate.blockers || []).some(
-        (b) => b.file === 'unrelated-session.md' || /touched-paths/.test(b.reason),
+        (b) => /touched-paths/.test(b.reason) && !(b.type === 'git' && b.file),
       ),
-      `a corrupt record must not block by itself or on a root file: ${JSON.stringify(gate.blockers)}`,
+      `a corrupt record must not block by itself: ${JSON.stringify(gate.blockers)}`,
+    );
+    const corruptBlocker = (gate.blockers || []).find((b) => b.file === 'projects/demo/note.md');
+    assert.ok(
+      corruptBlocker.reason.includes('.cache/sessions/sess-checkpoint-c/touched-paths.json') &&
+        !corruptBlocker.reason.includes('touched-paths-failed.json'),
+      `the reason must carry the corrupt-record exit, not the flag one: ${corruptBlocker.reason}`,
     );
     assert.ok(
       (gate.notices || []).some(
@@ -4193,34 +4209,283 @@ test('checkpointMode: a touched-paths lock timeout blocks (transient, unlike a c
   });
 });
 
-// The touched-paths record is not complete enough to be the only guard on the
-// project folder being closed: a record write that failed, or a close that
-// died between creating a new project's index.md and writing it, leaves a
-// dirty file there that no session recorded. That folder blocks on any dirty
-// file; root files and other projects' folders keep the record-only rule.
-test('checkpointMode: an unrecorded dirty file in the closed project folder blocks, under either scope key', () => {
+// ── the project folder is judged by the record ──────────────────────────────────────────────
+// The project folder being closed blocks only what this session recorded, or failed to record
+// (a path on its failure flag, see touched-paths-failed.json). Every dirty file in it blocks only
+// when the record lost paths it cannot name (a paths-unknown flag) or cannot be read at all.
+
+// Fails this session's record of `paths` the way a busy session lock does (a live holder, a short
+// deadline), so the failure flag names them with HEAD's hash at flag time. Drops the holder after,
+// so the gate under test reads the set instead of timing out on the lock.
+function failRecordByLock(dir, sid, paths) {
+  const tp = touchedPathsPath(dir, sid);
+  mkdirSync(dirname(tp), { recursive: true });
+  writeFileSync(`${tp}.lock`, String(process.pid));
+  const ok = recordTouchedPaths(dir, sid, paths, { deadline: { end: performance.now() + 1200 } });
+  rmSync(`${tp}.lock`, { force: true });
+  assert.equal(ok, false, 'precondition: the record lost its lock');
+}
+// The flag an overwrite of an unreadable set leaves: paths were lost that nobody can name.
+function pathsUnknownFlag(dir, sid) {
+  recordTouchedPaths(dir, sid, ['pages/seed.md']);
+  writeFileSync(touchedPathsPath(dir, sid), '{ not json');
+  assert.equal(recordTouchedPaths(dir, sid, ['pages/seed.md']), true);
+  assert.equal(readFailedFlag(dir, sid).pathsUnknown, true, 'precondition: paths-unknown flag');
+}
+const cpGate = (dir, sid, extra = {}) =>
+  precompactGateStatus(dir, {
+    claudeHome: join(dir, '.claude-none'),
+    checkpointMode: true,
+    sessionId: sid,
+    ...extra,
+  });
+const blockerOn = (gate, file) => (gate.blockers || []).find((b) => b.file === file);
+const noticeOn = (gate, type, file) =>
+  (gate.notices || []).some((n) => n.type === type && n.file === file);
+
+// Distinguishes (with the paths-unknown test below): no failure flag, where another session's
+// unrecorded file (or the empty index.md a close that died after openSync('wx') leaves) in the
+// project folder is a notice, from a paths-unknown flag, where it blocks.
+test("checkpointMode: another session's unrecorded file in the closed project folder is a notice, under either scope key", () => {
   for (const key of ['attributionScope', 'projectOverride']) {
     withSyncedWiki((dir) => {
       mkdirSync(join(dir, 'projects', 'demo'), { recursive: true });
-      // The shape a close leaves when it dies right after openSync('wx').
       writeFileSync(join(dir, 'projects', 'demo', 'index.md'), '');
-      const gate = precompactGateStatus(dir, {
-        claudeHome: join(dir, '.claude-none'),
-        checkpointMode: true,
-        sessionId: 'sess-checkpoint-proj',
-        [key]: 'demo',
-      });
-      const b = (gate.blockers || []).find((x) => x.file === 'projects/demo/index.md');
-      assert.ok(
-        b && b.type === 'git' && /project folder being closed/.test(b.reason),
-        `${key}: an unrecorded dirty file in the closed project must block: ${JSON.stringify(gate.blockers)}`,
+      const gate = cpGate(dir, 'sess-checkpoint-proj', { [key]: 'demo' });
+      assert.equal(
+        blockerOn(gate, 'projects/demo/index.md'),
+        undefined,
+        `${key}: an unrecorded file must not block without a flag: ${JSON.stringify(gate.blockers)}`,
       );
       assert.ok(
-        !(gate.notices || []).some((n) => n.file === 'projects/demo/index.md'),
-        `${key}: it must not also demote to a notice: ${JSON.stringify(gate.notices)}`,
+        noticeOn(gate, 'unresolved', 'projects/demo/index.md'),
+        `${key}: it must surface as an unresolved notice: ${JSON.stringify(gate.notices)}`,
       );
     });
   }
+});
+
+test('checkpointMode: a paths-unknown failure flag makes the closed project folder block', () => {
+  for (const key of ['attributionScope', 'projectOverride']) {
+    withSyncedWiki((dir) => {
+      pathsUnknownFlag(dir, 'sess-checkpoint-proj');
+      mkdirSync(join(dir, 'projects', 'demo'), { recursive: true });
+      writeFileSync(join(dir, 'projects', 'demo', 'index.md'), '');
+      writeFileSync(join(dir, 'pages-note.md'), '# root file\n');
+      const gate = cpGate(dir, 'sess-checkpoint-proj', { [key]: 'demo' });
+      const b = blockerOn(gate, 'projects/demo/index.md');
+      assert.ok(
+        b && b.type === 'git' && /project folder being closed/.test(b.reason),
+        `${key}: a paths-unknown flag must block the folder: ${JSON.stringify(gate.blockers)}`,
+      );
+      assert.ok(
+        b.reason.includes('.cache/sessions/sess-checkpoint-proj/touched-paths-failed.json') &&
+          b.reason.includes('git status'),
+        `${key}: the reason must carry the flag's way out: ${b.reason}`,
+      );
+      assert.ok(
+        !noticeOn(gate, 'unresolved', 'projects/demo/index.md'),
+        `${key}: it must not also demote to a notice: ${JSON.stringify(gate.notices)}`,
+      );
+      assert.equal(
+        blockerOn(gate, 'pages-note.md'),
+        undefined,
+        `${key}: the flag widens the project folder only, not the vault: ${JSON.stringify(gate.blockers)}`,
+      );
+      assert.ok(noticeOn(gate, 'unresolved', 'pages-note.md'));
+    });
+  }
+});
+
+// Distinguishes: this session's recorded file in its own project folder (known-session-write)
+// from the same kind of file unrecorded (the notice above). Success criterion 1: the record alone
+// decides.
+test("checkpointMode: this session's recorded dirty file in its own project folder blocks (known-session-write)", () => {
+  withSyncedWiki((dir) => {
+    mkdirSync(join(dir, 'projects', 'demo'), { recursive: true });
+    writeFileSync(join(dir, 'projects', 'demo', 'note.md'), '# mine\n');
+    writeFileSync(join(dir, 'projects', 'demo', 'other.md'), '# nobody recorded this\n');
+    assert.equal(recordTouchedPaths(dir, 'sess-checkpoint-own', ['projects/demo/note.md']), true);
+    const gate = cpGate(dir, 'sess-checkpoint-own', { attributionScope: 'demo' });
+    assert.equal(blockerOn(gate, 'projects/demo/note.md')?.type, 'known-session-write');
+    assert.equal(blockerOn(gate, 'projects/demo/other.md'), undefined);
+    assert.ok(noticeOn(gate, 'unresolved', 'projects/demo/other.md'));
+  });
+});
+
+// Distinguishes: a failure flag that names the path (the flagged root log.md blocks a log-only
+// close, wherever the file sits) from the same dirty file with no flag (a notice).
+test('checkpointMode: a flagged root log.md blocks a log-only close', () => {
+  withSyncedWiki((dir) => {
+    commitVaultFile(dir, 'log.md', '# log\n');
+    appendFileSync(join(dir, 'log.md'), '- this session wrote this\n');
+    failRecordByLock(dir, 'sess-flag-log', ['log.md']);
+    const gate = cpGate(dir, 'sess-flag-log', { logOnly: true });
+    const b = blockerOn(gate, 'log.md');
+    assert.equal(b?.type, 'known-session-write', JSON.stringify(gate.blockers));
+    assert.ok(b.reason.includes('touched-paths-failed.json'), b.reason);
+  });
+});
+
+test('checkpointMode: the same unrecorded root log.md is a notice without a flag', () => {
+  withSyncedWiki((dir) => {
+    commitVaultFile(dir, 'log.md', '# log\n');
+    appendFileSync(join(dir, 'log.md'), "- another session's line\n");
+    const gate = cpGate(dir, 'sess-flag-log', { logOnly: true });
+    assert.equal(blockerOn(gate, 'log.md'), undefined, JSON.stringify(gate.blockers));
+    assert.ok(noticeOn(gate, 'unresolved', 'log.md'), JSON.stringify(gate.notices));
+  });
+});
+
+// Distinguishes: HEAD still at the flagged value (the flagged write was never committed, it
+// blocks) from HEAD moved since the flag (the flagged write landed in a commit, so what is dirty
+// now is a later edit, possibly another session's: a notice).
+test('checkpointMode: a flagged write still uncommitted blocks', () => {
+  withSyncedWiki((dir) => {
+    commitVaultFile(dir, 'pages/a.md', 'v0\n');
+    failRecordByLock(dir, 'sess-flag-pending', ['pages/a.md']);
+    writeFileSync(join(dir, 'pages/a.md'), 'v1, this session\n');
+    const gate = cpGate(dir, 'sess-flag-pending');
+    assert.equal(blockerOn(gate, 'pages/a.md')?.type, 'known-session-write', JSON.stringify(gate));
+  });
+});
+
+test("checkpointMode: a flagged path committed since the flag does not block another session's later edit", () => {
+  withSyncedWiki((dir) => {
+    commitVaultFile(dir, 'pages/a.md', 'v0\n');
+    failRecordByLock(dir, 'sess-flag-moved', ['pages/a.md']);
+    commitVaultFile(dir, 'pages/a.md', 'v1, committed since the flag\n');
+    writeFileSync(join(dir, 'pages/a.md'), "v2, another session's edit\n");
+    const gate = cpGate(dir, 'sess-flag-moved');
+    assert.equal(blockerOn(gate, 'pages/a.md'), undefined, JSON.stringify(gate.blockers));
+    assert.ok(noticeOn(gate, 'unresolved', 'pages/a.md'), JSON.stringify(gate.notices));
+  });
+});
+
+// Distinguishes: a HEAD lookup that fails now (no evidence HEAD moved, so the flag holds) from a
+// confirmed HEAD move. The second side flags a path HEAD did not have yet (null), so it covers the
+// absent-to-present move the test above does not.
+test('checkpointMode: a flagged path whose HEAD lookup fails still blocks', () => {
+  withSyncedWiki((dir) => {
+    commitVaultFile(dir, 'pages/a.md', 'v0\n');
+    failRecordByLock(dir, 'sess-flag-lookup', ['pages/a.md']);
+    assert.equal(
+      readFailedFlag(dir, 'sess-flag-lookup').entries['pages/a.md'].headSha256,
+      sha256('v0\n'),
+    );
+    const blob = spawnSync('git', ['-C', dir, 'rev-parse', 'HEAD:pages/a.md'], {
+      encoding: 'utf-8',
+    }).stdout.trim();
+    rmSync(join(dir, '.git', 'objects', blob.slice(0, 2), blob.slice(2)), { force: true });
+    writeFileSync(join(dir, 'pages/a.md'), 'v1\n');
+    assert.ok(
+      gitDirtyFiles(dir).includes('pages/a.md'),
+      'precondition: the dirty file is still listed with its HEAD blob gone',
+    );
+    const gate = cpGate(dir, 'sess-flag-lookup');
+    assert.equal(blockerOn(gate, 'pages/a.md')?.type, 'known-session-write', JSON.stringify(gate));
+  });
+});
+
+test('checkpointMode: a flagged path whose HEAD blob changed does not', () => {
+  withSyncedWiki((dir) => {
+    failRecordByLock(dir, 'sess-flag-changed', ['pages/new.md']);
+    assert.equal(readFailedFlag(dir, 'sess-flag-changed').entries['pages/new.md'].headSha256, null);
+    commitVaultFile(dir, 'pages/new.md', 'committed by someone\n');
+    writeFileSync(join(dir, 'pages/new.md'), 'edited again\n');
+    const gate = cpGate(dir, 'sess-flag-changed');
+    assert.equal(blockerOn(gate, 'pages/new.md'), undefined, JSON.stringify(gate.blockers));
+    assert.ok(noticeOn(gate, 'unresolved', 'pages/new.md'), JSON.stringify(gate.notices));
+  });
+});
+
+// Distinguishes: an active flag on a .hypoignore session entry (it sits ahead of the local-entry
+// exception, so it blocks even a log-only close) from the same entry with no flag (a local-entry
+// notice).
+function withIgnoredEntry(fn) {
+  withSyncedWiki((dir) => {
+    commitVaultFile(dir, '.hypoignore', 'projects/demo/sessions/*.md\n');
+    const rel = 'projects/demo/sessions/2026-10-16-aaaa.md';
+    mkdirSync(join(dir, 'projects', 'demo', 'sessions'), { recursive: true });
+    writeFileSync(join(dir, rel), '# local session entry\n');
+    fn(dir, rel);
+  });
+}
+test('checkpointMode: a flagged .hypoignore session entry blocks even a log-only close', () => {
+  withIgnoredEntry((dir, rel) => {
+    failRecordByLock(dir, 'sess-flag-entry', [rel]);
+    const gate = cpGate(dir, 'sess-flag-entry', { logOnly: true });
+    assert.equal(blockerOn(gate, rel)?.type, 'known-session-write', JSON.stringify(gate));
+    assert.ok(!noticeOn(gate, 'local-entry', rel), JSON.stringify(gate.notices));
+  });
+});
+
+test('checkpointMode: the same ignored session entry with no flag is a local-entry notice', () => {
+  withIgnoredEntry((dir, rel) => {
+    const gate = cpGate(dir, 'sess-flag-entry', { logOnly: true });
+    assert.ok(noticeOn(gate, 'local-entry', rel), JSON.stringify(gate.notices));
+    assert.equal(blockerOn(gate, rel), undefined, JSON.stringify(gate.blockers));
+  });
+});
+
+// Distinguishes: a flagged shard another close appended to (the flag sits ahead of the
+// foreign-append exception, so it blocks) from the same shard with no flag (a foreign-append
+// notice).
+function withAppendedShard(fn) {
+  withSyncedWiki((dir) => {
+    const rel = 'projects/demo/session-log/2026-10-16.md';
+    commitVaultFile(dir, rel, '# Session Log\n\n## [2026-10-16] earlier close\n');
+    const added = "\n## [2026-10-16] another session's close\n";
+    const before = readFileSync(join(dir, rel), 'utf-8');
+    assert.ok(recordShardAppend(dir, 'sess-other-close', rel, before, added));
+    appendFileSync(join(dir, rel), added);
+    fn(dir, rel);
+  });
+}
+test('checkpointMode: a flagged shard blocks even where another close appended to it', () => {
+  withAppendedShard((dir, rel) => {
+    failRecordByLock(dir, 'sess-flag-shard', [rel]);
+    const gate = cpGate(dir, 'sess-flag-shard', { attributionScope: 'demo' });
+    assert.equal(blockerOn(gate, rel)?.type, 'known-session-write', JSON.stringify(gate));
+    assert.ok(!noticeOn(gate, 'foreign-append', rel), JSON.stringify(gate.notices));
+  });
+});
+
+test('checkpointMode: the same appended shard with no flag is a foreign-append notice', () => {
+  withAppendedShard((dir, rel) => {
+    const gate = cpGate(dir, 'sess-flag-shard', { attributionScope: 'demo' });
+    assert.ok(noticeOn(gate, 'foreign-append', rel), JSON.stringify(gate.notices));
+    assert.equal(blockerOn(gate, rel), undefined, JSON.stringify(gate.blockers));
+  });
+});
+
+// Distinguishes: a lock that cannot be created (the cause is the directory, so the reason sends
+// the user to its permissions and disk space and never tells them to delete a file) from a corrupt
+// record (delete it) and a paths-unknown flag (delete the flag).
+test('checkpointMode: a session cache directory that cannot take a lock blocks the closed project folder with a permissions exit', () => {
+  if (process.platform === 'win32' || process.getuid?.() === 0) {
+    console.log('  (lock-failed half skipped: a read-only directory is writable here)');
+    return;
+  }
+  withSyncedWiki((dir) => {
+    recordTouchedPaths(dir, 'sess-cp-lockfail', 'pages/a.md');
+    mkdirSync(join(dir, 'projects', 'demo'), { recursive: true });
+    writeFileSync(join(dir, 'projects', 'demo', 'note.md'), '# unrecorded\n');
+    const cacheDir = dirname(touchedPathsPath(dir, 'sess-cp-lockfail'));
+    chmodSync(cacheDir, 0o500);
+    try {
+      const gate = cpGate(dir, 'sess-cp-lockfail', { attributionScope: 'demo' });
+      const b = blockerOn(gate, 'projects/demo/note.md');
+      assert.equal(b?.type, 'git', JSON.stringify(gate.blockers));
+      assert.ok(
+        b.reason.includes('.cache/sessions/sess-cp-lockfail/ 디렉터리의 권한과 디스크 공간') &&
+          !b.reason.includes('지우면'),
+        b.reason,
+      );
+    } finally {
+      chmodSync(cacheDir, 0o700);
+    }
+  });
 });
 
 test('checkpointMode: the same unrecorded file in a DIFFERENT project folder, or at the root, is a notice', () => {
@@ -4251,43 +4516,50 @@ test('checkpointMode: the same unrecorded file in a DIFFERENT project folder, or
 });
 
 // No project named (a --mark-session-closed without --project): whose folder a
-// projects/ file is cannot be told, so every unrecorded one blocks rather than
-// the gate failing open. A log-only close names no project by design, so none
-// does. Root files are a notice either way.
-test('checkpointMode: with no project scope every unrecorded projects/ file blocks, and a log-only close blocks none', () => {
+// projects/ file is cannot be told, so under a paths-unknown flag every
+// projects/ file blocks rather than the gate failing open. Without a flag an
+// unrecorded one is a notice. A log-only close names no project by design, so
+// the flag blocks no folder there; only the paths the flag names block. Root
+// files are a notice either way.
+test('checkpointMode: with no project scope an unrecorded projects/ file is a notice, a paths-unknown flag blocks every projects/ file, and a log-only close blocks only the flagged path', () => {
   withSyncedWiki((dir) => {
     mkdirSync(join(dir, 'projects', 'any'), { recursive: true });
     writeFileSync(join(dir, 'projects', 'any', 'note.md'), '# unrecorded\n');
+    writeFileSync(join(dir, 'projects', 'any', 'flagged.md'), '# this session, record lost\n');
     writeFileSync(join(dir, 'root-note.md'), '# unrecorded\n');
-    const unscoped = precompactGateStatus(dir, {
-      claudeHome: join(dir, '.claude-none'),
-      checkpointMode: true,
-      sessionId: 'sess-checkpoint-noscope',
-    });
-    const b = (unscoped.blockers || []).find((x) => x.file === 'projects/any/note.md');
+    // No flag yet: a notice, not a blocker.
+    const clean = cpGate(dir, 'sess-checkpoint-noscope');
+    assert.equal(
+      blockerOn(clean, 'projects/any/note.md'),
+      undefined,
+      JSON.stringify(clean.blockers),
+    );
+    assert.ok(noticeOn(clean, 'unresolved', 'projects/any/note.md'), JSON.stringify(clean.notices));
+    // The flag, on a session that also lost one named path.
+    const sid = 'sess-checkpoint-flagged';
+    pathsUnknownFlag(dir, sid);
+    failRecordByLock(dir, sid, ['projects/any/flagged.md']);
+    const unscoped = cpGate(dir, sid);
+    const b = blockerOn(unscoped, 'projects/any/note.md');
     assert.ok(
       b && b.type === 'git' && /names no project/.test(b.reason),
-      `an unscoped checkpoint must block an unrecorded projects/ file: ${JSON.stringify(unscoped.blockers)}`,
+      `an unscoped checkpoint under a paths-unknown flag must block every projects/ file: ${JSON.stringify(unscoped.blockers)}`,
+    );
+    assert.ok(noticeOn(unscoped, 'unresolved', 'root-note.md'), JSON.stringify(unscoped.notices));
+    const logOnly = cpGate(dir, sid, { logOnly: true });
+    assert.equal(
+      blockerOn(logOnly, 'projects/any/note.md'),
+      undefined,
+      `a log-only checkpoint blocks no folder, flag or not: ${JSON.stringify(logOnly.blockers)}`,
     );
     assert.ok(
-      (unscoped.notices || []).some((n) => n.type === 'unresolved' && n.file === 'root-note.md'),
-      `a root file stays a notice without a scope: ${JSON.stringify(unscoped.notices)}`,
+      noticeOn(logOnly, 'unresolved', 'projects/any/note.md'),
+      JSON.stringify(logOnly.notices),
     );
-    const logOnly = precompactGateStatus(dir, {
-      claudeHome: join(dir, '.claude-none'),
-      checkpointMode: true,
-      sessionId: 'sess-checkpoint-logonly',
-      logOnly: true,
-    });
-    assert.ok(
-      !(logOnly.blockers || []).some((x) => x.type === 'git' || x.type === 'known-session-write'),
-      `a log-only checkpoint must not block on projects/ files: ${JSON.stringify(logOnly.blockers)}`,
-    );
-    assert.ok(
-      (logOnly.notices || []).some(
-        (n) => n.type === 'unresolved' && n.file === 'projects/any/note.md',
-      ),
-      `the projects/ file is a notice under log-only: ${JSON.stringify(logOnly.notices)}`,
+    assert.equal(
+      blockerOn(logOnly, 'projects/any/flagged.md')?.type,
+      'known-session-write',
+      `the flagged path itself still blocks a log-only close: ${JSON.stringify(logOnly.blockers)}`,
     );
   });
 });

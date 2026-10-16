@@ -49,6 +49,7 @@ import {
   recordShardAppend,
   readClosePin,
   readTouchedPathsStrict,
+  recordTouchedPaths,
   writeClosePin,
   sessionProofCloseId,
   rootLogEntry,
@@ -2441,11 +2442,12 @@ test('the console report for marker-did-not-land names the marker, not the recei
 test('a .hypoignore-excluded target commits the OLD bytes, and the receipt is withheld (receipt-proof-mismatch)', () => {
   withWiki(null, (dir, today) => {
     // The ignored target is the vault-root log.md, not a file under
-    // projects/test-project/. The checkpoint gate blocks any dirty file in the
-    // project folder being closed before the receipt proof runs, so a hot.md
-    // fixture no longer reaches receipt-proof-mismatch (the next test pins that
-    // refusal). A root file with no touched-paths record only demotes to a
-    // notice, which is what lets this proof still see the divergence.
+    // projects/test-project/. A project-folder file this session recorded is
+    // refused at the checkpoint gate before the receipt proof runs, so a hot.md
+    // fixture would not reach receipt-proof-mismatch (the second test below
+    // pins that refusal). A root file with no touched-paths record only
+    // demotes to a notice, which is what lets this proof still see the
+    // divergence.
     writeFileSync(join(dir, '.hypoignore'), 'log.md\n');
     const payload = payloadForCleanWiki(dir, today);
     const sessionId = 's-hypoignore-mismatch';
@@ -2469,17 +2471,42 @@ test('a .hypoignore-excluded target commits the OLD bytes, and the receipt is wi
   });
 });
 
-// The test above with a file inside the project folder being closed instead:
-// the gate blocks any dirty file there, so the close is refused one step
-// earlier, as compact-gate-not-ok, with no marker and no receipt. (Its original
-// fixture, an ignored project's entry, now passes the gate on its local proof:
-// see the .hypoignore suite below.)
-test('a dirty file in the project folder being closed refuses the gate (compact-gate-not-ok), no marker, no receipt', () => {
+// The test above with a file inside the project folder being closed instead. The record decides,
+// not the folder: another session's dirty file there is a notice and the close lands its marker
+// and receipt, while the same file in THIS session's touched-paths refuses the gate one step
+// earlier, as compact-gate-not-ok, with no marker and no receipt. Distinguishes: not recorded by
+// this session (markerWritten, receipt on disk) from recorded (gate withheld, known-session-write
+// naming the file). (The original fixture, an ignored project's entry, passes the gate on its
+// local proof: see the .hypoignore suite below.)
+test("apply: another session's dirty file in the project folder being closed does not withhold the marker", () => {
   withWiki(null, (dir, today) => {
     // Not a .md page, so preflight lint has nothing to say about it.
     writeFileSync(join(dir, 'projects', 'test-project', 'scratch.txt'), 'unsaved work\n');
     const payload = payloadForCleanWiki(dir, today);
-    const sessionId = 's-hypoignore-gate-refusal';
+    const sessionId = 's-folder-other-session';
+    const r = runApply(dir, payload, { sessionId });
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.committed, true, `the close itself committed: ${r.stdout}`);
+    assert.equal(out.markerWritten, true, `stage: ${r.stdout}\n${r.stderr}`);
+    assert.equal(out.markerSkipReason ?? null, null, r.stdout);
+    assert.ok(existsSync(receiptPath(dir, sessionId)), 'the receipt is filed behind an open gate');
+    assert.ok(
+      existsSync(join(dir, 'projects', 'test-project', 'scratch.txt')),
+      "another session's file is left where it is",
+    );
+  });
+});
+
+test("apply: the same file in this session's touched-paths withholds it", () => {
+  withWiki(null, (dir, today) => {
+    writeFileSync(join(dir, 'projects', 'test-project', 'scratch.txt'), 'unsaved work\n');
+    const sessionId = 's-folder-own-session';
+    assert.equal(
+      recordTouchedPaths(dir, sessionId, ['projects/test-project/scratch.txt']),
+      true,
+      'precondition: this session recorded the file',
+    );
+    const payload = payloadForCleanWiki(dir, today);
     const r = runApply(dir, payload, { sessionId });
     const out = JSON.parse(r.stdout);
     assert.equal(out.committed, true, `the close itself committed: ${r.stdout}`);
@@ -2488,12 +2515,14 @@ test('a dirty file in the project folder being closed refuses the gate (compact-
     // The result names the checkpoint gate's own blocker, so a caller does not
     // have to reach for --check-session-close, which judges a wider git axis.
     assert.ok(
-      (out.gateBlockers || []).some((b) => b.file === 'projects/test-project/scratch.txt'),
+      (out.gateBlockers || []).some(
+        (b) => b.type === 'known-session-write' && b.file === 'projects/test-project/scratch.txt',
+      ),
       `gateBlockers must name the refused file: ${JSON.stringify(out.gateBlockers)}`,
     );
     assert.ok(
       !existsSync(join(dir, '.cache', `session-closed-${sessionId}.marker`)),
-      'no marker may land while the project folder has an uncommitted file',
+      'no marker may land while this session has an uncommitted write of its own',
     );
     assert.equal(
       existsSync(receiptPath(dir, sessionId)),
@@ -2508,7 +2537,8 @@ test('a dirty file in the project folder being closed refuses the gate (compact-
 test('the console report for receipt-proof-mismatch says ok:false and points at the commit, not at --session-id', () => {
   withWiki(null, (dir, today) => {
     // Root log.md ignored, for the reason given in the receipt-proof-mismatch
-    // JSON test above: a project-folder file is refused at the gate instead.
+    // JSON test above: a project-folder file this session recorded is refused
+    // at the gate instead.
     writeFileSync(join(dir, '.hypoignore'), 'log.md\n');
     const payload = payloadForCleanWiki(dir, today);
     const sessionId = `s-hypoignore-mismatch-console-${process.pid}`;
@@ -2540,6 +2570,8 @@ test('the console report for compact-gate-not-ok names the gate blocker, not --s
     writeFileSync(join(dir, 'projects', 'test-project', 'scratch.txt'), 'unsaved work\n');
     const payload = payloadForCleanWiki(dir, today);
     const sessionId = `s-hypoignore-gate-console-${process.pid}`;
+    // The gate refuses what this session recorded writing, so record the file.
+    recordTouchedPaths(dir, sessionId, ['projects/test-project/scratch.txt']);
     const cleanup = seedCloseTranscript(sessionId);
     let r;
     try {
@@ -7299,7 +7331,10 @@ test("another session's seeded index.md, not committed yet, is committed with th
   });
 });
 
-test("an uncommitted index.md that is not this close's seed stays out of its commit and still blocks the marker (pair)", () => {
+// Pair of the seeded-index test above: a seed is adopted into this close's commit, anything else
+// stays out of it. The project folder blocks only what this session recorded, so a hand-made
+// index.md nobody here recorded is an unresolved notice and the marker lands.
+test("an uncommitted index.md that is not this close's seed stays out of its commit and is an unresolved notice, not a blocker (pair)", () => {
   withWiki(null, (dir, today) => {
     const rel = join('projects', 'test-project', 'index.md');
     writeFileSync(
@@ -7307,18 +7342,25 @@ test("an uncommitted index.md that is not this close's seed stays out of its com
       `---\ntitle: test-project\ntype: project-index\n---\n# hand made\n`,
     );
     const { out } = applyJson(dir, v2Payload(today), newPinSession('index-hand'));
-    assert.equal(out.markerWritten, false, JSON.stringify(out));
+    assert.equal(out.markerWritten, true, JSON.stringify(out));
     assert.ok(
-      (out.gateBlockers || []).some((b) => b.file === rel),
+      (out.gateNotices || []).some((n) => n.type === 'unresolved' && n.file === rel),
+      JSON.stringify(out.gateNotices),
+    );
+    assert.ok(
+      !(out.gateBlockers || []).some((b) => b.file === rel),
       JSON.stringify(out.gateBlockers),
     );
+    const tracked = spawnSync('git', ['ls-files', '--', rel], { cwd: dir, encoding: 'utf-8' });
+    assert.equal(tracked.stdout, '', 'not committed by this close');
   });
 });
 
 // Disabling the check (F1, checkpoint half): in precompactGateStatus's
 // checkpointMode loop delete the `isForeignUncommittedEntry` branch. The other
-// session's entry then blocks as a dirty file of the project folder:
-// markerWritten goes red. The modified-entry pair below stays green.
+// session's entry then reads as an unrecorded dirty file of the project folder,
+// an `unresolved` notice: the foreign-entry notice assertion goes red. The
+// modified-entry pair below stays green.
 test("another session's new entry, published and not committed yet, does not keep this close from its marker, and is left alone", () => {
   withWiki(null, (dir, today) => {
     const otherId = closeIdFor(newPinSession('other-close'), 0);
@@ -7346,7 +7388,10 @@ test("another session's new entry, published and not committed yet, does not kee
   });
 });
 
-test("another session's committed entry edited since its commit still keeps this close from its marker (pair)", () => {
+// Pair of the test above: an entry that still matches its own path is a foreign-entry notice,
+// one edited since its commit no longer does and falls to the unresolved notice. Neither blocks,
+// since the project folder blocks only what this session recorded.
+test("another session's committed entry edited since its commit is an unresolved notice, not a foreign-entry one (pair)", () => {
   withWiki(null, (dir, today) => {
     const otherId = closeIdFor(newPinSession('other-close-m'), 0);
     const file = writeEntryFile(dir, {
@@ -7356,9 +7401,17 @@ test("another session's committed entry edited since its commit still keeps this
     });
     appendFileSync(join(dir, file), '\nedited after its commit\n');
     const { out } = applyJson(dir, v2Payload(today), newPinSession('mine-m'));
-    assert.equal(out.markerWritten, false, JSON.stringify(out));
+    assert.equal(out.markerWritten, true, JSON.stringify(out));
     assert.ok(
-      (out.gateBlockers || []).some((b) => b.file === file),
+      (out.gateNotices || []).some((n) => n.type === 'unresolved' && n.file === file),
+      JSON.stringify(out.gateNotices),
+    );
+    assert.ok(
+      !(out.gateNotices || []).some((n) => n.type === 'foreign-entry' && n.file === file),
+      JSON.stringify(out.gateNotices),
+    );
+    assert.ok(
+      !(out.gateBlockers || []).some((b) => b.file === file),
       JSON.stringify(out.gateBlockers),
     );
   });
