@@ -72,7 +72,7 @@ import {
   uniqueBakPath,
 } from './lib/git-hooks-dir.mjs';
 import { classifyInstall, downgradeGuardMessage } from '../hooks/version-check.mjs';
-import { atomicWrite } from '../hooks/atomic-write.mjs';
+import { writeSettingsJson } from './lib/settings-write.mjs';
 import {
   GITATTRIBUTES_BLOCK,
   GITIGNORE_BLOCK,
@@ -507,7 +507,7 @@ function removeRetiredRegistrations(settings, hooksDir) {
 
 // The one place settings.json is mutated by --apply: rename, add, and retire
 // merged into a single in-memory transform, committed with exactly one
-// atomicWrite (temp file plus rename, see hooks/atomic-write.mjs). So there is
+// writeSettingsJson (temp file plus rename, see lib/settings-write.mjs). So there is
 // no window where the file on disk reflects only some of the three, and a
 // crash mid-write lands on a throwaway temp name instead of a torn
 // settings.json. Known gap this does not close: no lock guards settingsPath,
@@ -531,7 +531,7 @@ function applySettingsJsonTransform(settingsPath, hooksDir) {
   const retired = removeRetiredRegistrations(settings, hooksDir);
 
   if (renamed.length > 0 || added.length > 0 || retired.length > 0) {
-    atomicWrite(settingsPath, JSON.stringify(settings, null, 2) + '\n');
+    writeSettingsJson(settingsPath, JSON.stringify(settings, null, 2) + '\n');
   }
   if (renamed.length > 0) copyRenamedHookFiles(hooksDir);
   return { renamed, added, retired };
@@ -1726,7 +1726,7 @@ if (args.apply) {
     });
   }
   if (managesClaudeCore) {
-    // Rename, add, and retire all commit through one atomicWrite inside this
+    // Rename, add, and retire all commit through one writeSettingsJson inside this
     // call. See applySettingsJsonTransform's own comment for why they are no
     // longer three separate writeFileSync calls.
     const claudeSettingsResult = applySettingsJsonTransform(claudeSettingsPath, claudeHooksDir);

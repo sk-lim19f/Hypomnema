@@ -41,6 +41,7 @@ import {
 import { join, dirname, relative, resolve, posix, sep } from 'path';
 import { homedir } from 'os';
 import { sha256, isRegularFile, readFileIfRegular, writePkgJsonAtomic } from './pkg-json.mjs';
+import { writeSettingsJson } from './settings-write.mjs';
 import { loadHypoIgnore, isIgnored } from './hypo-ignore.mjs';
 
 const HOME = homedir();
@@ -1914,8 +1915,7 @@ function registerSettings(settingsPath, expectedEntries, apply) {
   const next = JSON.stringify(settings, null, 2) + '\n';
   const changed = next !== original;
   if (changed && apply) {
-    mkdirSync(join(settingsPath, '..'), { recursive: true });
-    writeFileSync(settingsPath, next);
+    writeSettingsJson(settingsPath, next);
   }
   return { registered, changed, invalidJson: false };
 }

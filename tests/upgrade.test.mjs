@@ -145,6 +145,39 @@ test('--apply on tmp wiki exits 0 after applying available changes', () => {
   });
 });
 
+// A profile whose settings.json is a link into a dotfiles checkout. The core
+// registrations are missing from the target, so upgrade has a transform to write.
+// A write that replaces the path itself turns the link into a regular file.
+test('upgrade --apply keeps a symlinked settings.json a link', () => {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      const initR = runWithHome('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-git-init'], home);
+      assert.equal(initR.status, 0, `init failed: ${initR.stderr}`);
+      const settingsPath = join(home, '.claude', 'settings.json');
+      const targetDir = join(dir, 'dotfiles');
+      const targetPath = join(targetDir, 'settings.json');
+      mkdirSync(targetDir, { recursive: true });
+      writeFileSync(targetPath, JSON.stringify({ model: 'opus' }, null, 2) + '\n');
+      unlinkSync(settingsPath);
+      symlinkSync(targetPath, settingsPath);
+
+      const r = runWithHome('upgrade.mjs', [`--hypo-dir=${hypoDir}`, '--json', '--apply'], home);
+      assert.equal(r.status, 0, `--apply failed: ${r.stderr}`);
+      const out = JSON.parse(r.stdout);
+      assert.ok(out.applied.settings.length > 0, 'upgrade must have registered the core hooks');
+
+      assert.ok(lstatSync(settingsPath).isSymbolicLink(), 'settings.json must stay a symlink');
+      const written = JSON.parse(readFileSync(targetPath, 'utf-8'));
+      assert.equal(written.model, 'opus', 'the existing keys survive');
+      assert.ok(
+        JSON.stringify(written.hooks).includes('hypo-session-start.mjs'),
+        'the new registrations land in the link target',
+      );
+    });
+  });
+});
+
 test('--apply .hypoignore migration appends .cache/ and is idempotent', () => {
   withTmpHome((home) => {
     withTmpDir((dir) => {
@@ -2907,17 +2940,13 @@ test('--apply removes Stop registrations the orchestrator replaced, and nothing 
 // a legacy Stop entry renamed to its new basename with nothing left to retire
 // it, so the orchestrator and the step it replaced both fired on every Stop.
 //
-// This is proven by swapping settingsPath for a symlink before --apply runs.
-// A plain writeFileSync opens through a symlink (follows it, like any other
-// open()) and rewrites the TARGET file, leaving the symlink itself in place.
-// A rename-based atomic write (temp file plus renameSync, see
-// hooks/atomic-write.mjs) replaces whatever directory entry sits at that
-// path, symlink or not, so the symlink is gone afterward. Reverting the
-// merged apply path back to three separate writeFileSync calls turns this
-// red: the symlink would survive.
+// This is proven by counting renames onto settings.json while --apply runs. One
+// writeSettingsJson call is one temp-file rename; reverting the merged apply
+// path back to three separate writes turns the count into three. The path is a
+// symlink so the same run also shows the link survives the writes.
 suite('upgrade.mjs: settings.json is committed with one atomic write');
 
-test('--apply replaces a symlinked settings.json with a real file, not a truncate-in-place write', () => {
+test('--apply commits rename, add and retire in one settings.json write and keeps the link', () => {
   withTmpHome((home) => {
     withTmpDir((dir) => {
       const hypoDir = join(dir, 'wiki');
@@ -2948,10 +2977,36 @@ test('--apply replaces a symlinked settings.json with a real file, not a truncat
         'fixture setup: settingsPath must start as a symlink',
       );
 
-      const applyR = runWithHome(
-        'upgrade.mjs',
-        [`--hypo-dir=${hypoDir}`, '--apply', '--json'],
-        home,
+      const renamesPath = join(dir, 'settings-renames.log');
+      const preloadPath = join(dir, 'count-settings-renames.cjs');
+      writeFileSync(
+        preloadPath,
+        `'use strict';
+const fs = require('node:fs');
+const path = require('node:path');
+const realRename = fs.renameSync;
+fs.renameSync = function (from, to) {
+  if (typeof to === 'string' && path.basename(to).startsWith('settings.')) {
+    fs.appendFileSync(${JSON.stringify(renamesPath)}, to + '\\n');
+  }
+  return realRename.apply(this, arguments);
+};
+require('node:module').syncBuiltinESMExports();
+`,
+      );
+      const env = { ...process.env, HOME: home, HYPO_DIR: hypoDir };
+      delete env.CLAUDE_CONFIG_DIR;
+      const applyR = spawnSync(
+        process.execPath,
+        [
+          '-r',
+          preloadPath,
+          join(SCRIPTS, 'upgrade.mjs'),
+          `--hypo-dir=${hypoDir}`,
+          '--apply',
+          '--json',
+        ],
+        { encoding: 'utf-8', env },
       );
       assert.equal(applyR.status, 0, `--apply failed: ${applyR.stderr}`);
       const applied = JSON.parse(applyR.stdout).applied;
@@ -2960,12 +3015,16 @@ test('--apply replaces a symlinked settings.json with a real file, not a truncat
         `fixture must exercise both rename and retire in the same pass: ${applyR.stdout}`,
       );
 
+      const renames = readFileSync(renamesPath, 'utf-8').trim().split('\n');
       assert.equal(
+        renames.length,
+        1,
+        `rename, add and retire must commit through one write, saw: ${renames}`,
+      );
+      assert.equal(renames[0], realpathSync(realPath), 'the one write lands on the link target');
+      assert.ok(
         lstatSync(settingsPath).isSymbolicLink(),
-        false,
-        'settings.json must be a plain file after --apply: a rename-based atomic write replaces ' +
-          'whatever sits at that path, while three separate writeFileSync calls would write through ' +
-          'the symlink and leave it in place',
+        'settings.json must stay a symlink after --apply',
       );
 
       // Functional correctness survives the atomicity fix: both outcomes are

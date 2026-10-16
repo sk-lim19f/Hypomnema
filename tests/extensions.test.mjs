@@ -3658,6 +3658,54 @@ test('doctor-extensions: matcher:"" + wrong timeout falls back to generic differ
   });
 });
 
+// Extension sync registers a hook through registerSettings, which writes
+// settings.json through writeSettingsJson. The preload tears the first
+// settings.json* write whose stack holds registerSettings: a direct write tears
+// the target, the helper's temp file takes the tear and the target keeps its
+// starting bytes.
+test('extension sync keeps settings.json whole when its write fails partway', () => {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      const initR = runWithHome('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-git-init'], home);
+      assert.equal(initR.status, 0, `init failed: ${initR.stderr}`);
+      writeExt(hypoDir, 'hooks', 'hypo-ext-mywatcher.mjs', '#!/usr/bin/env node\n', {
+        type: 'hook',
+        event: 'PostToolUse',
+        matcher: 'Write|Edit',
+        timeout: 10000,
+      });
+      const settingsPath = join(home, '.claude', 'settings.json');
+      const startBytes = readFileSync(settingsPath, 'utf-8');
+
+      const { preloadPath, firedPath } = settingsWriteFaultPreload(home);
+      const env = {
+        ...process.env,
+        HOME: home,
+        HYPO_DIR: hypoDir,
+        HYPO_TEST_FAULT_CALLER: 'registerSettings',
+      };
+      delete env.CLAUDE_CONFIG_DIR;
+      const r = spawnSync(
+        process.execPath,
+        ['-r', preloadPath, join(SCRIPTS, 'upgrade.mjs'), `--hypo-dir=${hypoDir}`, '--apply'],
+        { encoding: 'utf-8', env },
+      );
+
+      assert.ok(existsSync(firedPath), `the injected fault never fired: ${r.stderr}`);
+      const stack = readFileSync(firedPath, 'utf-8');
+      assert.ok(
+        stack.includes('extensions.mjs'),
+        `fault did not come from extensions.mjs: ${stack}`,
+      );
+      assert.ok(stack.includes('registerSettings'), stack);
+      assert.notEqual(r.status, 0, 'a failed settings.json write must not exit 0');
+      assert.equal(readFileSync(settingsPath, 'utf-8'), startBytes);
+      JSON.parse(readFileSync(settingsPath, 'utf-8'));
+    });
+  });
+});
+
 // ── extensions companion uninstall (ADR 0024) ───────────────────────
 
 suite('extensions companion uninstall (uninstall.mjs, ADR 0024)');
