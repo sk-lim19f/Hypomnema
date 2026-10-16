@@ -23,13 +23,19 @@ import {
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { snapshotBase, overwriteTargets, advanceBaseForWrite } from '../hooks/base-store.mjs';
+import {
+  snapshotBase,
+  overwriteTargets,
+  advanceBaseForWrite,
+  hashContent,
+} from '../hooks/base-store.mjs';
 import { closeGatePath, closeGateStatus } from '../hooks/close-gate-store.mjs';
 import { readJournal } from '../hooks/close-journal.mjs';
 import {
   GITATTRIBUTES_BLOCK,
   closeIdFor,
   formatSessionEntry,
+  isBaselineId,
   parseSessionEntry,
   renderViews,
   trackHeads,
@@ -6354,6 +6360,104 @@ test('legacy payload: a payload mixing either old field with summary or tracks f
     const status = spawnSync('git', ['status', '--porcelain'], { cwd: dir, encoding: 'utf-8' });
     assert.equal(status.stdout, '', 'the vault is untouched');
   });
+});
+
+suite('close entries: a close after a mid-session move');
+
+// The flat session-state.md a session was shown before the vault moved to entries. The move splits it
+// into a `legacy` head and one head per `###` section, all in one baseline entry.
+const FLAT_STATE = (today) =>
+  `---\ntitle: session-state\ntype: session-state\nupdated: ${today}\n---\n\n## 다음 작업\n\n` +
+  `### Alpha\n\nALPHA-BODY\n\n### Beta\n\nBETA-BODY\n`;
+
+// Moves a vault whose session-state.md is FLAT_STATE and closes `legacy` plus `done` of the Alpha
+// track, both without `supersedes`. `baseBytes(flat)` gives the bytes the session's base record
+// holds a hash of (`null`: the session has no base record). Calls `check` with what the close wrote.
+function closeAfterMove(label, baseBytes, check) {
+  withWiki(
+    (dir, today) =>
+      writeFileSync(join(dir, 'projects', 'test-project', 'session-state.md'), FLAT_STATE(today)),
+    (dir, today) => {
+      const rel = join('projects', 'test-project', 'session-state.md');
+      const flat = readFileSync(join(dir, rel), 'utf-8');
+      const sid = newPinSession(label);
+      if (baseBytes) snapshotBase(dir, sid, [rel], { [rel]: hashContent(baseBytes(flat)) });
+      const moved = migrateVaultToSessionEntries(dir);
+      assert.equal(moved.migrated, true, JSON.stringify(moved));
+      const baseline = loadSessionModel(dir, 'test-project').entries.find(
+        (e) => isBaselineId(e.closeId) && e.tracks.length > 0,
+      );
+      assert.ok(baseline, 'the move made a baseline of the flat session-state.md');
+      const alpha = baseline.tracks.find((t) => t.id.startsWith('legacy-alpha')).id;
+      const { out } = applyJson(
+        dir,
+        v2Payload(today, {
+          tracks: [
+            { id: 'legacy', next: '- NEW-LEGACY' },
+            { id: alpha, done: true },
+          ],
+        }),
+        sid,
+      );
+      assert.equal(out.ok, true, JSON.stringify(out));
+      const mine = closeIdFor(sid, 0);
+      const entry = entryAt(
+        dir,
+        sessionFilesOf(dir).find((f) => f.includes(mine)),
+      );
+      check({ dir, baseline, alpha, mine, entry });
+    },
+  );
+}
+
+// Disabling the check: in flatReadBaselineHeads make `const match` false.
+test('a close after a mid-session move supersedes the baseline heads made from the session-state.md this session was shown', () => {
+  closeAfterMove(
+    'mid-move',
+    (flat) => flat,
+    ({ dir, baseline, alpha, mine, entry }) => {
+      for (const t of entry.tracks) {
+        assert.deepEqual(t.supersedes, [baseline.closeId], JSON.stringify(entry.tracks));
+      }
+      const tracks = trackHeads(loadSessionModel(dir, 'test-project').entries);
+      const heads = (id) => tracks.find((t) => t.trackId === id).heads.map((h) => h.closeId);
+      assert.deepEqual(heads('legacy'), [mine]);
+      assert.deepEqual(heads(alpha), [mine]);
+      assert.equal(tracks.find((t) => t.trackId === alpha).done, true);
+      const view = readFileSync(join(dir, 'projects', 'test-project', 'session-state.md'), 'utf-8');
+      assert.ok(view.includes('NEW-LEGACY'), view);
+      assert.ok(!view.includes('ALPHA-BODY'), 'the baseline head of Alpha is not live');
+    },
+  );
+});
+
+test('a close from a session that never read the old session-state.md supersedes nothing after the move', () => {
+  closeAfterMove('mid-move-none', null, ({ entry }) => {
+    for (const t of entry.tracks) assert.equal(t.supersedes, undefined, JSON.stringify(t));
+  });
+});
+
+test('a close whose session read other bytes than the baseline was made from supersedes nothing', () => {
+  closeAfterMove(
+    'mid-move-other',
+    (flat) => `${flat}\nedited after the session read it\n`,
+    ({ entry }) => {
+      for (const t of entry.tracks) assert.equal(t.supersedes, undefined, JSON.stringify(t));
+    },
+  );
+});
+
+// Disabling the check: in flatReadBaselineHeads make the CRLF term of `const match` false.
+test("a close whose session read the CRLF checkout of the baseline's source supersedes its heads", () => {
+  closeAfterMove(
+    'mid-move-crlf',
+    (flat) => flat.replace(/\n/g, '\r\n'),
+    ({ baseline, entry }) => {
+      for (const t of entry.tracks) {
+        assert.deepEqual(t.supersedes, [baseline.closeId], JSON.stringify(entry.tracks));
+      }
+    },
+  );
 });
 
 suite('close entries: publishing and retrying one close');
