@@ -43,6 +43,7 @@ import {
   isForeignUncommittedEntry,
   recordShardAppend,
   recordTouchedPaths,
+  touchedPathsPath,
   rootLogHeadingKey,
   sessionClosedMarkerPath,
   vaultCommitLockTarget,
@@ -8260,4 +8261,252 @@ test("a retry of a close committed on an earlier day is verified by that day's l
       }
     },
   );
+});
+
+// ── the five close-gate callers on one vault state (T6a, T6b) ────────────────
+// check, --mark-session-closed, --apply-session-close, PreCompact and Stop all
+// run precompactGateStatus's one git axis. A close or a Stop changes the state
+// it reads (marker, receipt, commit), so each caller gets its own vault built by
+// the same lines instead of sharing one. session-hooks.test.mjs holds the gate
+// level pair and the no-session-id test, and the Stop pair on the hook alone.
+const FIVE_OWN = 'projects/test-project/own.md';
+const FIVE_FOREIGN = 'projects/test-project/foreign.md';
+const FIVE_OTHER = 'projects/other/foreign.md';
+
+// The flag an overwrite of an unreadable record leaves: paths were lost that
+// nobody can name.
+function fivePathsUnknownFlag(dir, sid) {
+  recordTouchedPaths(dir, sid, ['pages/seed.md']);
+  writeFileSync(touchedPathsPath(dir, sid), '{ not json');
+  assert.equal(recordTouchedPaths(dir, sid, ['pages/seed.md']), true);
+}
+
+// `recorded`: this session recorded writing own.md. `pathsUnknown`: its record lost
+// paths it cannot name. `foreign`: the file no record names.
+function withFiveCallerVault(sid, { recorded, pathsUnknown, foreign, pinned }, fn) {
+  withWiki(
+    (dir, today) => {
+      anchorTestProject(dir, today);
+      if (foreign === FIVE_OTHER) {
+        mkdirSync(join(dir, 'projects', 'other'), { recursive: true });
+        writeFileSync(join(dir, 'projects', 'other', 'index.md'), OTHER_INDEX(today));
+      }
+    },
+    (dir, today) => {
+      // The pin feeds --mark's proof of this close, not the git axis. apply opens its
+      // own close, so it runs without one.
+      if (pinned) pinCommittedClose(dir, sid);
+      writeFileSync(join(dir, foreign), '# another session wrote this\n');
+      if (pathsUnknown) fivePathsUnknownFlag(dir, sid);
+      if (recorded) {
+        writeFileSync(join(dir, FIVE_OWN), '# this session wrote this\n');
+        assert.equal(recordTouchedPaths(dir, sid, [FIVE_OWN]), true, 'precondition: recorded');
+      }
+      const cleanup = seedCloseTranscript(sid, { toolUseLines: [T10_EDIT_LINE] });
+      try {
+        fn(dir, today);
+      } finally {
+        cleanup();
+      }
+    },
+  );
+}
+
+// What each caller says about the files, in one shape: `blocked` is the files its git
+// axis blocks on, `unresolved` the ones it lists as an unresolved notice, `signal` what
+// proves the call ran to its own verdict (a refused run passes "nothing blocked").
+const gitBlockers = (blockers) =>
+  (blockers || []).filter((b) => b.type === 'known-session-write' || b.type === 'git');
+const unresolvedFiles = (notices) =>
+  (notices || [])
+    .filter((n) => n.type === 'unresolved')
+    .map((n) => n.file)
+    .sort();
+const FIVE_CALLERS = {
+  check: (dir, sid) => {
+    const out = JSON.parse(
+      run('crystallize.mjs', [
+        `--hypo-dir=${dir}`,
+        '--check-session-close',
+        `--session-id=${sid}`,
+        '--json',
+      ]).stdout,
+    );
+    return { blockers: gitBlockers(out.blockers), unresolved: unresolvedFiles(out.notices), out };
+  },
+  mark: (dir, sid) => {
+    const { r, out } = markJson(dir, sid);
+    assert.ok(out, `JSON expected: ${r.stdout}\n${r.stderr}`);
+    return { blockers: gitBlockers(out.blockers), unresolved: unresolvedFiles(out.notices), out };
+  },
+  apply: (dir, sid, today) => {
+    const out = JSON.parse(
+      runApply(
+        dir,
+        {
+          project: 'test-project',
+          date: today,
+          summary: 'five callers\n',
+          tracks: [{ id: 'main', new: true, next: '- next\n' }],
+          sessionLog: { entry: `## [${today}] five callers\n` },
+        },
+        { sessionId: sid },
+      ).stdout,
+    );
+    return {
+      blockers: gitBlockers(out.gateBlockers),
+      unresolved: unresolvedFiles(out.gateNotices),
+      out,
+    };
+  },
+  // The hook prints the blockers as one sentence and the unresolved files as one line.
+  precompact: (dir, sid) => {
+    const hook = runHook(
+      'hypo-personal-check.mjs',
+      { session_id: sid, transcript_path: t10Transcript(sid), cwd: T10_CWD },
+      { HYPO_DIR: dir },
+    );
+    const msg = JSON.parse(hook.stdout).systemMessage || '';
+    const unresolvedLine = msg.split('\n').find((l) => l.includes('no record of writing')) || '';
+    const files = [FIVE_OWN, FIVE_FOREIGN, FIVE_OTHER];
+    return {
+      blockers: files.filter(
+        (f) =>
+          msg.includes(`own write is still uncommitted: ${f}`) ||
+          msg.includes(`in the project folder being closed: ${f}`),
+      ),
+      unresolved: files.filter((f) => unresolvedLine.includes(f)).sort(),
+      out: msg,
+    };
+  },
+  // Stop names no file: a blocker that names one (or a `git` blocker) is a reconfirm.
+  stop: (dir, sid) => {
+    const r = runStop('hypo-auto-minimal-crystallize.mjs', dir, {
+      session_id: sid,
+      transcript_path: t10Transcript(sid),
+      cwd: T10_CWD,
+    });
+    const reason = JSON.parse(r.stdout).reason || '';
+    return {
+      reconfirm: reason.includes('AskUserQuestion'),
+      gateGreen: reason.includes('close gate green'),
+      out: r.stdout,
+    };
+  },
+};
+
+function runFiveCallers(label, opts) {
+  const seen = {};
+  for (const name of Object.keys(FIVE_CALLERS)) {
+    const sid = `s-five-${label}-${name}`;
+    const vault = { recorded: false, pathsUnknown: false, foreign: FIVE_FOREIGN, ...opts };
+    withFiveCallerVault(sid, { ...vault, pinned: name !== 'apply' }, (dir, today) => {
+      seen[name] = FIVE_CALLERS[name](dir, sid, today);
+    });
+  }
+  return seen;
+}
+const fiveJson = (v) => JSON.stringify(v.out);
+const blockedFiles = (v) => v.blockers.map((b) => b.file ?? b).sort();
+
+// Distinguishes: a file this session recorded blocks every caller, a file in the same
+// folder that no record names blocks none (the record decides, not the folder).
+// Disabling the check: in precompactGateStatus's dirty-file loop make
+// `touchedSet.has(posixPath(f))` false. The four callers that name the file and Stop
+// (no reconfirm) go red. Stop names no file, so its X half is the reconfirm itself.
+test("five callers: this session's recorded file blocks and another session's file does not, in the same project folder", () => {
+  const seen = runFiveCallers('x', { recorded: true });
+  for (const name of ['check', 'mark', 'apply', 'precompact']) {
+    assert.deepEqual(blockedFiles(seen[name]), [FIVE_OWN], `${name}: ${fiveJson(seen[name])}`);
+  }
+  for (const name of ['check', 'apply', 'precompact']) {
+    assert.deepEqual(seen[name].unresolved, [FIVE_FOREIGN], `${name}: ${fiveJson(seen[name])}`);
+  }
+  assert.equal(seen.check.out.ok, false, fiveJson(seen.check));
+  assert.equal(seen.mark.out.ok, false, fiveJson(seen.mark));
+  assert.equal(seen.apply.out.markerWritten, false, fiveJson(seen.apply));
+  assert.equal(seen.apply.out.markerSkipReason, 'compact-gate-not-ok', fiveJson(seen.apply));
+  assert.ok(seen.precompact.out.includes('Session close incomplete'), seen.precompact.out);
+  assert.equal(seen.stop.reconfirm, true, seen.stop.out);
+});
+
+// Distinguishes: the same folder with only another session's file, so all five judge
+// the git axis clear (each ran to its own success signal, not a refusal).
+// Disabling the check: in precompactGateStatus set `const folderWide = true;`. Every
+// caller then blocks foreign.md and this test goes red (so do the no-record pairs in
+// session-hooks.test.mjs, which pin the same value).
+test("five callers: another session's file alone blocks none of them", () => {
+  const seen = runFiveCallers('y', { recorded: false });
+  for (const name of ['check', 'mark', 'apply', 'precompact']) {
+    assert.deepEqual(seen[name].blockers, [], `${name}: ${fiveJson(seen[name])}`);
+    assert.deepEqual(seen[name].unresolved, [FIVE_FOREIGN], `${name}: ${fiveJson(seen[name])}`);
+  }
+  assert.equal(seen.check.out.ok, true, fiveJson(seen.check));
+  assert.equal(seen.mark.out.ok, true, fiveJson(seen.mark));
+  assert.equal(seen.apply.out.markerWritten, true, fiveJson(seen.apply));
+  assert.ok(!seen.precompact.out.includes('Session close incomplete'), seen.precompact.out);
+  assert.equal(seen.stop.reconfirm, false, seen.stop.out);
+  assert.equal(seen.stop.gateGreen, true, seen.stop.out);
+});
+
+// Where the callers differ, on purpose: a record that lost paths it cannot name blocks
+// every file of the project folder being closed, and only the check run with no
+// project knows no folder, so it reads every projects/ file as that folder. The other
+// four know test-project (--project, the cwd, the payload) and leave another
+// project's file a notice. Distinguishes: a caller that names no project from four
+// that do. Disabling the check: in precompactGateStatus make `closeSlug` null. The four
+// then block projects/other/foreign.md too, and the "blocks none" half goes red.
+test("with a paths-unknown record, only the check that names no project blocks another project's folder", () => {
+  const seen = runFiveCallers('lost', { pathsUnknown: true, foreign: FIVE_OTHER });
+  // The check ran its first call only: a re-run scoped to an inferred project would
+  // judge by that project's folder and say so with this key.
+  assert.ok(!('project_inferred_from_transcript' in seen.check.out), fiveJson(seen.check));
+  assert.equal(seen.check.out.scope, 'global', fiveJson(seen.check));
+  assert.deepEqual(blockedFiles(seen.check), [FIVE_OTHER], fiveJson(seen.check));
+  assert.equal(seen.check.blockers[0].type, 'git', fiveJson(seen.check));
+  assert.equal(seen.check.out.ok, false, fiveJson(seen.check));
+  for (const name of ['mark', 'apply', 'precompact']) {
+    assert.deepEqual(seen[name].blockers, [], `${name}: ${fiveJson(seen[name])}`);
+    assert.deepEqual(seen[name].unresolved, [FIVE_OTHER], `${name}: ${fiveJson(seen[name])}`);
+  }
+  assert.equal(seen.mark.out.ok, true, fiveJson(seen.mark));
+  assert.equal(seen.apply.out.markerWritten, true, fiveJson(seen.apply));
+  assert.ok(!seen.precompact.out.includes('Session close incomplete'), seen.precompact.out);
+  assert.equal(seen.stop.reconfirm, false, seen.stop.out);
+  assert.equal(seen.stop.gateGreen, true, seen.stop.out);
+});
+
+// The check that names no project, in a vault where discovery finds none: it infers
+// the one project this session's transcript touched and judges again. Distinguishes:
+// a re-run that carries the session id (this session's recorded file is a
+// known-session-write, the file nobody recorded blocks folder-wide as `git`) from one
+// that lost it (both files would read as `git`). The test above covers the check's
+// first call, where discovery found the project. Disabling the check: delete the
+// `sessionId` spread in the second precompactGateStatus call of
+// scripts/lib/crystallize-close-check.mjs (line 133). own.md turns `git`.
+test('with a paths-unknown record, the inferred-project check re-run judges the same way', () => {
+  withSyncedWiki((dir) => {
+    seedUndiscoverableProject(dir, 'hook-qa');
+    const sid = 's-five-inferred';
+    const own = 'projects/hook-qa/own.md';
+    const note = 'projects/hook-qa/note.md';
+    writeFileSync(join(dir, own), '# this session wrote this\n');
+    writeFileSync(join(dir, note), '# no record names this\n');
+    fivePathsUnknownFlag(dir, sid);
+    assert.equal(recordTouchedPaths(dir, sid, [own]), true, 'precondition: recorded');
+    const transcript = toolUseTranscript(dir, ['projects/hook-qa/index.md']);
+    const r = run('crystallize.mjs', [
+      `--hypo-dir=${dir}`,
+      '--check-session-close',
+      `--session-id=${sid}`,
+      `--transcript-path=${transcript}`,
+      '--json',
+    ]);
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.project_inferred_from_transcript, true, r.stdout);
+    assert.equal(out.scoped_project, 'hook-qa', r.stdout);
+    const typeOf = (file) => out.blockers.find((b) => b.file === file)?.type;
+    assert.equal(typeOf(own), 'known-session-write', r.stdout);
+    assert.equal(typeOf(note), 'git', r.stdout);
+  });
 });
