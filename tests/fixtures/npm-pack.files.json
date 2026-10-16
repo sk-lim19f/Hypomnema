@@ -408,6 +408,10 @@
     "exec": false
   },
   {
+    "path": "scripts/lib/settings-write.mjs",
+    "exec": false
+  },
+  {
     "path": "scripts/lib/slug-resolver.mjs",
     "exec": false
   },

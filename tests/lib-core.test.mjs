@@ -8,16 +8,21 @@ import { spawnSync } from 'node:child_process';
 import {
   chmodSync,
   existsSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
   readdirSync,
   readFileSync,
+  readlinkSync,
+  realpathSync,
   rmSync,
   statSync,
+  symlinkSync,
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { test, suite } from './harness.mjs';
 import {
   HOME,
@@ -29,9 +34,11 @@ import {
   resolveHypoRoot,
   resolveHypoRootInfo,
   run,
+  settingsWriteFaultPreload,
   withTmpDir,
 } from './helpers.mjs';
 import { atomicWrite } from '../hooks/atomic-write.mjs';
+import { writeSettingsJson } from '../scripts/lib/settings-write.mjs';
 import { formatSessionEntry, renderViews } from '../hooks/session-entries.mjs';
 
 suite('expandHome()');
@@ -1026,6 +1033,276 @@ test('a write that cannot open its tmp file throws and creates nothing', () => {
     } finally {
       chmodSync(sub, 0o700); // restore so withTmpDir's cleanup can remove the tree
     }
+  });
+});
+
+// ── writeSettingsJson (scripts/lib/settings-write.mjs) ───────────────────────
+
+suite('writeSettingsJson() (the settings.json writer)');
+
+const SETTINGS_WRITE_URL = pathToFileURL(join(SCRIPTS, 'lib', 'settings-write.mjs')).href;
+const IS_ROOT = process.getuid?.() === 0;
+
+// Runs writeSettingsJson(path, text) in a child with umask pinned to 0o022 (a runner umask of
+// 0o077 would make the default mode 0o600 and hide a missing mode restore), HOME and HYPO_DIR
+// pinned, CLAUDE_CONFIG_DIR unset. A thrown error comes back as `CAUGHT <code>|<written>|<message>`
+// on stderr with exit 3; success prints the result as JSON on stdout.
+function runSettingsWriter(dir, path, text, { preload, env = {} } = {}) {
+  const script = join(dir, 'settings-writer-child.mjs');
+  writeFileSync(
+    script,
+    `process.umask(0o022);
+const { writeSettingsJson } = await import(${JSON.stringify(SETTINGS_WRITE_URL)});
+try {
+  console.log(JSON.stringify(writeSettingsJson(process.argv[2], process.argv[3])));
+} catch (err) {
+  console.error(\`CAUGHT \${err.code}|\${err.written}|\${err.message}\`);
+  process.exit(3);
+}
+`,
+  );
+  const childEnv = { ...process.env, HOME: SESSION_TMP_HOME, HYPO_DIR: dir, ...env };
+  delete childEnv.CLAUDE_CONFIG_DIR;
+  const res = spawnSync(
+    process.execPath,
+    [...(preload ? ['-r', preload] : []), script, path, text],
+    { encoding: 'utf8', timeout: 5000, env: childEnv },
+  );
+  return { ...res, json: res.status === 0 ? JSON.parse(res.stdout) : null };
+}
+
+// Makes chmodSync fail with EPERM, so the mode restore after the rename cannot happen.
+function chmodFaultPreload(dir) {
+  const preloadPath = join(dir, 'chmod-fault.cjs');
+  writeFileSync(
+    preloadPath,
+    `const fs = require('node:fs');
+fs.chmodSync = function () {
+  const err = new Error('injected chmod failure');
+  err.code = 'EPERM';
+  throw err;
+};
+require('node:module').syncBuiltinESMExports();
+`,
+  );
+  return preloadPath;
+}
+
+function skipAsRoot(name) {
+  console.log(`  skipped (running as root, permissions are not enforced): ${name}`);
+}
+
+test('writeSettingsJson keeps a symlinked settings.json a link and updates its target', () => {
+  withTmpDir((dir) => {
+    const store = join(dir, 'store');
+    mkdirSync(store);
+    const real = join(store, 'settings.json');
+    writeFileSync(real, 'old\n');
+    const b = join(dir, 'b');
+    const a = join(dir, 'a');
+    symlinkSync(real, b);
+    symlinkSync('b', a);
+    const res = writeSettingsJson(a, 'new\n');
+    assert.ok(lstatSync(a).isSymbolicLink());
+    assert.ok(lstatSync(b).isSymbolicLink());
+    assert.equal(readlinkSync(a), 'b');
+    assert.equal(readlinkSync(b), real);
+    assert.equal(readFileSync(real, 'utf8'), 'new\n');
+    assert.deepEqual(readdirSync(store), ['settings.json']);
+    assert.equal(res.viaLink, true);
+    assert.equal(res.target, realpathSync(real));
+  });
+});
+
+test('a relative .. link under a directory link writes the intended target and leaves the decoy', () => {
+  withTmpDir((dir) => {
+    const base = realpathSync(dir);
+    const team = join(base, 'store', 'team');
+    mkdirSync(team, { recursive: true });
+    mkdirSync(join(base, 'cfg'));
+    const real = join(base, 'store', 'settings.json');
+    const decoy = join(base, 'cfg', 'settings.json');
+    writeFileSync(real, 'old\n');
+    writeFileSync(decoy, 'decoy-bytes\n');
+    symlinkSync(team, join(base, 'cfg', 'alias'));
+    symlinkSync('../settings.json', join(team, 'settings.json'));
+    const res = writeSettingsJson(join(base, 'cfg', 'alias', 'settings.json'), 'new\n');
+    assert.equal(readFileSync(real, 'utf8'), 'new\n');
+    assert.equal(readFileSync(decoy, 'utf8'), 'decoy-bytes\n');
+    assert.ok(lstatSync(join(base, 'cfg', 'alias')).isSymbolicLink());
+    assert.equal(readlinkSync(join(team, 'settings.json')), '../settings.json');
+    assert.equal(res.target, real);
+    assert.equal(res.viaLink, true);
+  });
+});
+
+test('dangling link into an existing directory is created through the link', () => {
+  withTmpDir((dir) => {
+    const claude = join(dir, 'claude');
+    mkdirSync(claude);
+    mkdirSync(join(dir, 'claude-work'));
+    const link = join(dir, 'claude-work', 'settings.json');
+    const real = join(claude, 'settings.json');
+    symlinkSync(real, link);
+    const res = writeSettingsJson(link, 'new\n');
+    assert.ok(lstatSync(link).isSymbolicLink());
+    assert.equal(readlinkSync(link), real);
+    assert.equal(readFileSync(real, 'utf8'), 'new\n');
+    assert.equal(res.viaLink, true);
+  });
+});
+
+test('a dangling link into a missing directory is refused and creates nothing', () => {
+  withTmpDir((dir) => {
+    const link = join(dir, 'settings.json');
+    const missing = join(dir, 'nodir');
+    symlinkSync(join(missing, 'settings.json'), link);
+    assert.throws(
+      () => writeSettingsJson(link, 'new\n'),
+      (err) => err.code === 'ENOENT' && err.message.includes(link),
+    );
+    assert.ok(lstatSync(link).isSymbolicLink());
+    assert.equal(existsSync(link), false);
+    assert.equal(existsSync(missing), false);
+  });
+});
+
+test('a settings.json link loop is refused with ELOOP', () => {
+  withTmpDir((dir) => {
+    const a = join(dir, 'a');
+    const b = join(dir, 'b');
+    symlinkSync('b', a);
+    symlinkSync('a', b);
+    const res = runSettingsWriter(dir, a, 'new\n');
+    assert.equal(res.error, undefined); // finished inside the 5s timeout
+    assert.equal(res.status, 3);
+    assert.ok(res.stderr.includes('CAUGHT ELOOP'), res.stderr);
+    assert.ok(res.stderr.includes(a), res.stderr);
+    assert.equal(readlinkSync(a), 'b');
+    assert.equal(readlinkSync(b), 'a');
+  });
+});
+
+test('writeSettingsJson falls back to an in-place write with a notice when atomicWrite is refused', () => {
+  if (IS_ROOT) return skipAsRoot('in-place fallback');
+  withTmpDir((dir) => {
+    const ro = join(dir, 'ro');
+    mkdirSync(ro);
+    const file = join(ro, 'settings.json');
+    writeFileSync(file, 'old\n');
+    chmodSync(ro, 0o555);
+    try {
+      const res = runSettingsWriter(dir, file, 'new\n');
+      assert.equal(res.status, 0, res.stderr);
+      assert.equal(res.json.atomic, false);
+      assert.equal(readFileSync(file, 'utf8'), 'new\n');
+      assert.match(res.stderr, /not writable for an atomic replace, wrote in place/);
+      assert.equal(res.stderr.trim().split('\n').length, 1);
+    } finally {
+      chmodSync(ro, 0o700);
+    }
+  });
+});
+
+test('a symlinked settings.json whose target directory is read-only keeps the link and gets the bytes in place', () => {
+  if (IS_ROOT) return skipAsRoot('symlink into a read-only directory');
+  withTmpDir((dir) => {
+    const ro = join(dir, 'ro');
+    mkdirSync(ro);
+    const real = join(ro, 'settings.json');
+    writeFileSync(real, 'old\n');
+    const link = join(dir, 'settings.json');
+    symlinkSync(real, link);
+    chmodSync(ro, 0o555);
+    try {
+      const res = runSettingsWriter(dir, link, 'new\n');
+      assert.equal(res.status, 0, res.stderr);
+      assert.equal(res.json.atomic, false);
+      assert.equal(res.json.viaLink, true);
+      assert.ok(lstatSync(link).isSymbolicLink());
+      assert.equal(readFileSync(real, 'utf8'), 'new\n');
+      assert.match(res.stderr, /wrote in place/);
+      assert.equal(res.stderr.trim().split('\n').length, 1);
+    } finally {
+      chmodSync(ro, 0o700);
+    }
+  });
+});
+
+test('writeSettingsJson keeps the file mode', () => {
+  withTmpDir((dir) => {
+    const file = join(dir, 'settings.json');
+    writeFileSync(file, 'old\n');
+    chmodSync(file, 0o600);
+    const res = runSettingsWriter(dir, file, 'new\n');
+    assert.equal(res.status, 0, res.stderr);
+    assert.equal(readFileSync(file, 'utf8'), 'new\n');
+    assert.equal(statSync(file).mode & 0o777, 0o600);
+    assert.equal(res.json.atomic, true);
+    assert.equal(res.json.modeRestored, true);
+  });
+});
+
+test('writeSettingsJson replaces a read-only settings.json and keeps it read-only', () => {
+  withTmpDir((dir) => {
+    const file = join(dir, 'settings.json');
+    writeFileSync(file, 'old\n');
+    chmodSync(file, 0o444);
+    const res = runSettingsWriter(dir, file, 'new\n');
+    assert.equal(res.status, 0, res.stderr);
+    assert.equal(readFileSync(file, 'utf8'), 'new\n');
+    assert.equal(statSync(file).mode & 0o777, 0o444);
+    assert.equal(res.json.atomic, true);
+  });
+});
+
+test('writeSettingsJson reports a mode it could not narrow back as an error that says the write happened', () => {
+  withTmpDir((dir) => {
+    const file = join(dir, 'settings.json');
+    writeFileSync(file, 'old\n');
+    chmodSync(file, 0o600);
+    const res = runSettingsWriter(dir, file, 'new\n', { preload: chmodFaultPreload(dir) });
+    assert.equal(res.status, 3, res.stderr);
+    assert.match(
+      res.stderr,
+      /^CAUGHT SETTINGS_MODE_NOT_RESTORED\|true\|settings\.json was written, but/m,
+    );
+    assert.equal(readFileSync(file, 'utf8'), 'new\n');
+  });
+});
+
+test('writeSettingsJson keeps the write and only notes a mode it could not restore when the new mode is not wider', () => {
+  withTmpDir((dir) => {
+    const file = join(dir, 'settings.json');
+    writeFileSync(file, 'old\n');
+    chmodSync(file, 0o666);
+    const res = runSettingsWriter(dir, file, 'new\n', { preload: chmodFaultPreload(dir) });
+    assert.equal(res.status, 0, res.stderr);
+    assert.equal(res.json.modeRestored, false);
+    assert.match(res.stderr, /written, mode not restored/);
+    assert.equal(readFileSync(file, 'utf8'), 'new\n');
+  });
+});
+
+test('writeSettingsJson leaves settings.json whole when its write fails partway', () => {
+  withTmpDir((dir) => {
+    const file = join(dir, 'settings.json');
+    const start = '{"hooks":{"a":[1,2,3]},"keep":"these bytes"}\n';
+    writeFileSync(file, start);
+    const { preloadPath, firedPath } = settingsWriteFaultPreload(dir);
+    const res = runSettingsWriter(dir, file, '{"hooks":{"a":[4,5,6]},"new":"payload bytes"}\n', {
+      preload: preloadPath,
+      env: { HYPO_TEST_FAULT_CALLER: 'writeSettingsJson' },
+    });
+    assert.equal(res.status, 3, res.stderr);
+    assert.match(res.stderr, /CAUGHT EIO/);
+    assert.ok(existsSync(firedPath), 'the injected failure never fired');
+    assert.ok(readFileSync(firedPath, 'utf8').includes('settings-write.mjs'));
+    assert.equal(readFileSync(file, 'utf8'), start);
+    assert.deepEqual(
+      readdirSync(dir).filter((n) => n.endsWith('.tmp')),
+      [],
+    );
   });
 });
 
