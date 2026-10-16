@@ -3845,128 +3845,184 @@ test('precompactGateStatus: ahead-only → NO git blocker, has git-sync notice',
   });
 });
 
-// BASE-SCOPE test: hot.md is in closeFileTargetsGlobal unconditionally, with
-// or without a transcript, so this proves only that a dirty file INSIDE the
-// deterministic base scope always blocks. It does NOT exercise the
-// transcript-trust gate below (a broken trust check cannot turn this test
-// red, because hot.md never depends on it) -- that is what the two
-// attribution-unknown tests further down are for, using pages/mine.md, a
-// file that enters scope ONLY via a trusted transcript.
-test('precompactGateStatus: uncommitted change in the base scope (hot.md) → git blocker', () => {
+// ── The git axis is judged by the record, for every caller ───────────────────
+// A dirty file blocks (known-session-write) only when THIS session recorded it in
+// touched-paths. Any other dirty file is an `unresolved` notice. Scope, transcript
+// and path shape no longer decide, so each fixture below runs twice on the same
+// bytes: once with the path recorded, once with no record.
+//
+// Function declarations on purpose: tests in other suites below use them too.
+const GIT_AXIS_SID = 'sess-gitaxis';
+function gitAxisGate(dir, { record = [], sid = GIT_AXIS_SID, ...extra } = {}) {
+  if (record.length > 0) assert.equal(recordTouchedPaths(dir, sid, record), true);
+  return precompactGateStatus(dir, {
+    claudeHome: join(dir, '.claude-none'),
+    sessionId: sid,
+    ...extra,
+  });
+}
+function gitAxisBlocker(gate, file) {
+  return (gate.blockers || []).find((b) => b.file === file);
+}
+function gitAxisNotice(gate, type, file) {
+  return (gate.notices || []).some((n) => n.type === type && n.file === file);
+}
+// Asserts the whole "this file is only a notice" verdict: no blocker of either git-axis type
+// names it, and no git-axis blocker without a file (an enumeration failure or a lock timeout)
+// is hiding behind that.
+function assertOnlyUnresolved(gate, file, label) {
+  assert.equal(
+    gitAxisBlocker(gate, file),
+    undefined,
+    `${label}: an unrecorded file must not block: ${JSON.stringify(gate.blockers)}`,
+  );
+  assert.ok(
+    !(gate.blockers || []).some((b) => b.type === 'git' || b.type === 'known-session-write'),
+    `${label}: no git-axis blocker of any kind: ${JSON.stringify(gate.blockers)}`,
+  );
+  assert.ok(
+    gitAxisNotice(gate, 'unresolved', file),
+    `${label}: it must be listed by name as an unresolved notice: ${JSON.stringify(gate.notices)}`,
+  );
+}
+function assertRecordedBlocks(gate, file, label) {
+  const b = gitAxisBlocker(gate, file);
+  assert.equal(
+    b?.type,
+    'known-session-write',
+    `${label}: this session's recorded write must block as known-session-write: ${JSON.stringify(gate.blockers)}`,
+  );
+  assert.ok(
+    !gitAxisNotice(gate, 'unresolved', file),
+    `${label}: a blocked file is not also an unresolved notice: ${JSON.stringify(gate.notices)}`,
+  );
+}
+
+// hot.md is a mandatory close file (base scope). Scope no longer matters to the git axis:
+// distinguishes "this session recorded the write" from "no record", on the same dirty hot.md.
+test('precompactGateStatus: uncommitted base-scope file (hot.md) this session recorded → known-session-write blocker', () => {
   withSyncedWiki((dir) => {
     appendFileSync(join(dir, 'hot.md'), '\ndirty\n');
-    const gate = precompactGateStatus(dir, { claudeHome: join(dir, '.claude-none') });
-    assert.ok(
-      (gate.blockers || []).some((b) => b.type === 'git'),
-      `uncommitted work in the base scope must still be a git blocker: ${JSON.stringify(gate.blockers)}`,
+    assertRecordedBlocks(gitAxisGate(dir, { record: ['hot.md'] }), 'hot.md', 'hot.md');
+  });
+});
+
+test('precompactGateStatus: uncommitted base-scope file (hot.md) with no record of this session writing it → unresolved notice, not a blocker', () => {
+  withSyncedWiki((dir) => {
+    appendFileSync(join(dir, 'hot.md'), '\ndirty\n');
+    assertOnlyUnresolved(gitAxisGate(dir), 'hot.md', 'hot.md');
+  });
+});
+
+// 2026-08-03 multi-session incident: a DIFFERENT session sharing the vault leaves its own file
+// dirty. That file is human-fixable by whoever owns it, so it must not refuse THIS session's
+// close. The transcript below used to be what earned the demotion (a trusted one that never
+// lists the file); now it only widens the lint scope, so the pair varies the record alone.
+function transcriptEditingHotMd(dir) {
+  const transcript = join(transcriptTmpDir(), 't.jsonl');
+  writeFileSync(
+    transcript,
+    JSON.stringify({
+      type: 'assistant',
+      message: {
+        content: [{ type: 'tool_use', name: 'Edit', input: { file_path: join(dir, 'hot.md') } }],
+      },
+    }) + '\n',
+  );
+  return transcript;
+}
+
+test("precompactGateStatus: another session's uncommitted file, transcript never lists it → unresolved notice, not a blocker", () => {
+  withSyncedWiki((dir) => {
+    writeFileSync(join(dir, 'unrelated-session.md'), "# another session's own edit\n");
+    const gate = gitAxisGate(dir, { transcriptPath: transcriptEditingHotMd(dir) });
+    assertOnlyUnresolved(gate, 'unrelated-session.md', 'foreign file');
+  });
+});
+
+test('precompactGateStatus: this session recorded the uncommitted file although its transcript never lists it → known-session-write blocker', () => {
+  withSyncedWiki((dir) => {
+    writeFileSync(
+      join(dir, 'unrelated-session.md'),
+      '# written through a path the transcript misses\n',
+    );
+    const gate = gitAxisGate(dir, {
+      record: ['unrelated-session.md'],
+      transcriptPath: transcriptEditingHotMd(dir),
+    });
+    assertRecordedBlocks(gate, 'unrelated-session.md', 'recorded, unlisted by transcript');
+  });
+});
+
+// pages/mine.md is outside the base scope: the old rule saw it only through a trusted
+// transcript, and blocked it fail-closed when the transcript was missing or corrupt. The
+// record decides now, so a missing or corrupt transcript changes nothing: recorded blocks,
+// unrecorded is a notice.
+test('precompactGateStatus: no transcript at all, this session recorded pages/mine.md → known-session-write blocker', () => {
+  withSyncedWiki((dir) => {
+    mkdirSync(join(dir, 'pages'), { recursive: true });
+    writeFileSync(join(dir, 'pages', 'mine.md'), '# wip\n');
+    assertRecordedBlocks(
+      gitAxisGate(dir, { record: ['pages/mine.md'] }),
+      'pages/mine.md',
+      'no transcript',
     );
   });
 });
 
-// 2026-08-03 multi-session incident: this session's own scoped commit
-// (commitWikiChanges, PR #222) can leave the working tree non-empty when a
-// DIFFERENT session sharing the same vault still has its own file dirty. That
-// file is human-fixable by whoever owns it, not by this session, so it must
-// not refuse THIS session's close.
-test("precompactGateStatus: uncommitted change OUTSIDE this session's scope → notice, not a git blocker", () => {
+test('precompactGateStatus: no transcript at all, pages/mine.md unrecorded → unresolved notice, not a blocker', () => {
   withSyncedWiki((dir) => {
-    writeFileSync(join(dir, 'unrelated-session.md'), "# another session's own edit\n");
-    // The partition only fires with a TRUSTED transcript (codex pre-commit
-    // review BLOCKER 1): a readable, fully-parseable transcript that shows
-    // this session editing hot.md only, never unrelated-session.md, is what
-    // earns the demotion below. Without a transcript the gate must fall back
-    // to the unscoped blocker instead (see the two attribution-unknown tests
-    // further down).
-    const tdir = transcriptTmpDir();
-    const transcript = join(tdir, 't.jsonl');
-    writeFileSync(
-      transcript,
+    mkdirSync(join(dir, 'pages'), { recursive: true });
+    writeFileSync(join(dir, 'pages', 'mine.md'), '# wip\n');
+    assertOnlyUnresolved(gitAxisGate(dir), 'pages/mine.md', 'no transcript');
+  });
+});
+
+// One well-formed line plus one truncated (mid-write) line: the walk still returns SOME files.
+function corruptTranscript(dir) {
+  const transcript = join(transcriptTmpDir(), 't.jsonl');
+  writeFileSync(
+    transcript,
+    [
       JSON.stringify({
         type: 'assistant',
         message: {
-          content: [{ type: 'tool_use', name: 'Edit', input: { file_path: join(dir, 'hot.md') } }],
+          content: [{ type: 'tool_use', name: 'Edit', input: { file_path: join(dir, 'log.md') } }],
         },
-      }) + '\n',
-    );
-    const gate = precompactGateStatus(dir, {
-      claudeHome: join(dir, '.claude-none'),
-      transcriptPath: transcript,
-    });
-    assert.ok(
-      !(gate.blockers || []).some((b) => b.type === 'git'),
-      `a foreign session's dirty file must NOT be a git blocker: ${JSON.stringify(gate.blockers)}`,
-    );
-    assert.ok(
-      (gate.notices || []).some((n) => n.type === 'git' && n.file === 'unrelated-session.md'),
-      `the foreign dirty file must still be listed by name in notices: ${JSON.stringify(gate.notices)}`,
-    );
-  });
-});
+      }),
+      '{"type": "assistant", "message": {"content": [{"trunc',
+    ].join('\n') + '\n',
+  );
+  return transcript;
+}
 
-// ATTRIBUTION-UNKNOWN tests (codex pre-commit review BLOCKER 1):
-// extractTouchedWikiFiles collapses "no transcript" and "genuinely touched
-// nothing" into the same empty Set, so a naive partition would let this
-// session's OWN dirty file get demoted to a notice just because there was
-// nothing to widen the scope with. pages/mine.md is deliberately OUTSIDE the
-// base scope (unlike hot.md above) -- it can only ever enter
-// closeAccountableScope via a trusted transcript widening, so it is the one
-// file that actually exercises the `sessionTouchTrusted` gate: deleting
-// `|| !sessionTouchTrusted` from the git check turns THESE two tests red
-// without touching the base-scope test above.
-test('precompactGateStatus: no transcript at all → a transcript-only-scope file still blocks (not demoted)', () => {
+test('precompactGateStatus: transcript with a corrupt line, this session recorded pages/mine.md → known-session-write blocker', () => {
   withSyncedWiki((dir) => {
     mkdirSync(join(dir, 'pages'), { recursive: true });
     writeFileSync(join(dir, 'pages', 'mine.md'), '# wip\n');
-    const gate = precompactGateStatus(dir, { claudeHome: join(dir, '.claude-none') });
-    assert.ok(
-      (gate.blockers || []).some((b) => b.type === 'git'),
-      `no transcript means unattributable, which must still block: ${JSON.stringify(gate.blockers)}`,
-    );
+    const gate = gitAxisGate(dir, {
+      record: ['pages/mine.md'],
+      transcriptPath: corruptTranscript(dir),
+    });
+    assertRecordedBlocks(gate, 'pages/mine.md', 'corrupt transcript');
   });
 });
 
-test('precompactGateStatus: transcript with a corrupt line → a transcript-only-scope file still blocks', () => {
+test('precompactGateStatus: transcript with a corrupt line, pages/mine.md unrecorded → unresolved notice, not a blocker', () => {
   withSyncedWiki((dir) => {
     mkdirSync(join(dir, 'pages'), { recursive: true });
     writeFileSync(join(dir, 'pages', 'mine.md'), '# wip\n');
-    const tdir = transcriptTmpDir();
-    const transcript = join(tdir, 't.jsonl');
-    // One well-formed line plus one truncated (mid-write) line: the walk
-    // still returns SOME files, but must not be trusted as complete.
-    writeFileSync(
-      transcript,
-      [
-        JSON.stringify({
-          type: 'assistant',
-          message: {
-            content: [
-              { type: 'tool_use', name: 'Edit', input: { file_path: join(dir, 'log.md') } },
-            ],
-          },
-        }),
-        '{"type": "assistant", "message": {"content": [{"trunc',
-      ].join('\n') + '\n',
-    );
-    const gate = precompactGateStatus(dir, {
-      claudeHome: join(dir, '.claude-none'),
-      transcriptPath: transcript,
-    });
-    assert.ok(
-      (gate.blockers || []).some((b) => b.type === 'git'),
-      `a corrupt transcript line means the scope cannot be trusted, which must still block: ${JSON.stringify(gate.blockers)}`,
-    );
+    const gate = gitAxisGate(dir, { transcriptPath: corruptTranscript(dir) });
+    assertOnlyUnresolved(gate, 'pages/mine.md', 'corrupt transcript');
   });
 });
 
-// codex pre-commit review BLOCKER 2: `git -C <dir> status --porcelain` prints
-// paths relative to the repo TOP LEVEL, not to `dir`, even under `-C`. A
-// vault living under a bigger host repo (`<repo>/vault/`) would report its
-// own `hot.md` as `vault/hot.md`, which never matches the vault-relative
-// `hot.md` in closeAccountableScope, so the session's OWN dirty file would
-// look foreign and pass. A trusted (parseable) transcript is required here so
-// the partition actually runs instead of falling back to the unscoped
-// blocker on attribution-unknown grounds.
-test('precompactGateStatus: vault nested under a bigger git repo, my hot.md dirty → still a git blocker', () => {
+// `git -C <dir> status --porcelain` prints paths relative to the repo TOP LEVEL, not to `dir`
+// (`vault/hot.md` for a vault living under a bigger host repo). Without stripping that prefix
+// the dirty path never equals the vault-relative `hot.md` the record holds, so the session's
+// OWN write would read as unrecorded and pass. The pair: recorded `hot.md` must block by its
+// vault-relative name, and the same file unrecorded stays a notice under the same name.
+function withNestedVault(fn) {
   const base = mkdtempSync(join(tmpdir(), 'hypo-nested-'));
   try {
     const vault = join(base, 'vault');
@@ -3979,6 +4035,7 @@ test('precompactGateStatus: vault nested under a bigger git repo, my hot.md dirt
       '---\ntitle: Hot\nupdated: today\n---\n## Active Projects\n\n| Project | Last Session | Hot Cache |\n|---|---|---|\n',
     );
     writeFileSync(join(vault, 'log.md'), '# Log\n');
+    writeFileSync(join(vault, '.gitignore'), '.cache/\n');
     writeFileSync(
       join(base, 'host-repo-file.md'),
       '# unrelated content living outside the vault\n',
@@ -3986,8 +4043,7 @@ test('precompactGateStatus: vault nested under a bigger git repo, my hot.md dirt
     spawnSync('git', ['add', '-A'], { cwd: base });
     spawnSync('git', ['commit', '-q', '-m', 'init'], { cwd: base });
     appendFileSync(join(vault, 'hot.md'), '\ndirty\n');
-    const tdir = transcriptTmpDir();
-    const transcript = join(tdir, 't.jsonl');
+    const transcript = join(transcriptTmpDir(), 't.jsonl');
     writeFileSync(
       transcript,
       JSON.stringify({
@@ -3999,17 +4055,24 @@ test('precompactGateStatus: vault nested under a bigger git repo, my hot.md dirt
         },
       }) + '\n',
     );
-    const gate = precompactGateStatus(vault, {
-      claudeHome: join(vault, '.claude-none'),
-      transcriptPath: transcript,
-    });
-    assert.ok(
-      (gate.blockers || []).some((b) => b.type === 'git'),
-      `hot.md dirty in a nested vault must still block (top-level path prefix bug): ${JSON.stringify(gate.blockers)}`,
-    );
+    fn(vault, transcript);
   } finally {
     rmSync(base, { recursive: true, force: true });
   }
+}
+
+test('precompactGateStatus: vault nested under a bigger git repo, my recorded hot.md dirty → known-session-write blocker by its vault-relative name', () => {
+  withNestedVault((vault, transcriptPath) => {
+    const gate = gitAxisGate(vault, { record: ['hot.md'], transcriptPath });
+    assertRecordedBlocks(gate, 'hot.md', 'nested vault');
+  });
+});
+
+test('precompactGateStatus: vault nested under a bigger git repo, hot.md unrecorded → unresolved notice by its vault-relative name', () => {
+  withNestedVault((vault, transcriptPath) => {
+    const gate = gitAxisGate(vault, { transcriptPath });
+    assertOnlyUnresolved(gate, 'hot.md', 'nested vault');
+  });
 });
 
 // A rename touches TWO porcelain records (`to\0from`, see gitDirtyFiles); the
@@ -4636,20 +4699,72 @@ test('checkpointMode: sessionId is required even when the tree is otherwise clea
   });
 });
 
-test('checkpointMode omitted (Stop/PreCompact/check): the existing unscoped git blocker wording is unchanged', () => {
+// Without checkpointMode (Stop, PreCompact, check) the old unscoped `git` blocker
+// ("uncommitted changes in <dir>", one for any dirty file) is gone: it is the same record-based
+// axis the marker writers run. A dirty root file with no record is an `unresolved` notice whose
+// reason no longer carries that sentence, with or without a session id.
+test('no checkpointMode (Stop/PreCompact/check): an unrecorded root file is an unresolved notice, the old unscoped git blocker is gone', () => {
   withSyncedWiki((dir) => {
     writeFileSync(join(dir, 'unrelated-session.md'), '# dirty\n');
-    const gate = precompactGateStatus(dir, { claudeHome: join(dir, '.claude-none') });
-    assert.ok(
-      (gate.blockers || []).some(
-        (b) => b.type === 'git' && b.reason === `uncommitted changes in ${dir}`,
-      ),
-      `without checkpointMode the old unscoped blocker text must survive byte for byte: ${JSON.stringify(gate.blockers)}`,
+    for (const [label, gate] of [
+      ['with a session id', gitAxisGate(dir)],
+      [
+        'without a session id',
+        precompactGateStatus(dir, { claudeHome: join(dir, '.claude-none') }),
+      ],
+    ]) {
+      assertOnlyUnresolved(gate, 'unrelated-session.md', label);
+      assert.ok(
+        !(gate.blockers || []).some((b) => b.reason === `uncommitted changes in ${dir}`),
+        `${label}: the unscoped blocker wording must not come back: ${JSON.stringify(gate.blockers)}`,
+      );
+      assert.ok(
+        !(gate.notices || []).some((n) => n.type === 'git'),
+        `${label}: no notice may keep the old 'git' type: ${JSON.stringify(gate.notices)}`,
+      );
+    }
+  });
+});
+
+// A check run without --session-id (the CLI passes no sessionId then) has no record to read, so
+// the file cannot be told apart as this session's or not: the project folder being closed
+// blocks folder-wide, as `git`, with the way out (pass --session-id) in the reason. A file
+// outside that folder is still only a notice. The same file under a valid session id with no
+// record is a notice, so this pair tells "no session" from "session with an empty record".
+// (The CLI-level paths-unknown case belongs to close-global; this is the gate-level pair.)
+test('precompactGateStatus: no session id (a check without --session-id) -> the closed project folder blocks folder-wide, a root file stays a notice', () => {
+  withSyncedWiki((dir) => {
+    registerEligibleProject(dir, 'mine');
+    writeFileSync(join(dir, 'projects', 'mine', 'note.md'), '# unrecorded\n');
+    writeFileSync(join(dir, 'root-note.md'), '# root\n');
+    const gate = precompactGateStatus(dir, {
+      claudeHome: join(dir, '.claude-none'),
+      projectOverride: 'mine',
+    });
+    const b = gitAxisBlocker(gate, 'projects/mine/note.md');
+    assert.equal(
+      b?.type,
+      'git',
+      `the closed folder must block with no session id: ${JSON.stringify(gate.blockers)}`,
     );
     assert.ok(
-      !(gate.notices || []).some((n) => n.type === 'unresolved'),
-      `an 'unresolved' notice type must never appear outside checkpointMode: ${JSON.stringify(gate.notices)}`,
+      b.reason.includes('--session-id'),
+      `the reason must name the way out (--session-id): ${b.reason}`,
     );
+    assert.equal(gitAxisBlocker(gate, 'root-note.md'), undefined, JSON.stringify(gate.blockers));
+    assert.ok(
+      gitAxisNotice(gate, 'unresolved', 'root-note.md'),
+      `a file outside the closed folder stays an unresolved notice: ${JSON.stringify(gate.notices)}`,
+    );
+  });
+});
+
+test('precompactGateStatus: a valid session id with an empty record -> the same closed-folder file is only an unresolved notice', () => {
+  withSyncedWiki((dir) => {
+    registerEligibleProject(dir, 'mine');
+    writeFileSync(join(dir, 'projects', 'mine', 'note.md'), '# unrecorded\n');
+    const gate = gitAxisGate(dir, { projectOverride: 'mine' });
+    assertOnlyUnresolved(gate, 'projects/mine/note.md', 'valid session id, empty record');
   });
 });
 
@@ -6303,21 +6418,14 @@ test('hypo-auto-commit: an indexWarning from the commit reaches the next Session
 // ── session-close-scope-boundary spec §2b: structural git demotion under
 //    projectOverride / attributionScope ──────────────────────────────────
 //
-// All six fixtures below require `sessionTouchTrusted === false` (no
-// transcript is passed): with a trusted transcript AND no OTHER today-active
-// project sharing the file's mandatory-scope membership, the EXISTING
-// partition a few tests up already demotes a foreign dirty file, so a
-// fixture that keeps transcript trust in that shape would pass before this
-// change too and pin nothing. That "AND" used to matter (ISSUE-130): when
-// the foreign file was also a DIFFERENT today-active project's own
-// mandatory close file (session-state.md, project hot.md, its session-log
-// shard), the trusted-transcript branch used to fall back to
-// closeAccountableScope alone — which is `closeFileTargetsGlobal`'s union
-// over EVERY today-active project whenever `projectOverride` is unset — and
-// wrongly counted that file as "mine". See the ISSUE-130 regression test
-// right after the TODAY-active fixture below, which pins the trusted case.
-// The gate here is called directly (not through a hook), same style as
-// every other precompactGateStatus test in this suite.
+// These fixtures used to pin a structural partition: a dirty file under a DIFFERENT eligible
+// project's folder was demoted, anything else under the closed project's scope blocked, and a
+// trusted transcript changed the answer. That partition is gone. The git axis now asks only
+// whether THIS session recorded the file (touched-paths), so each fixture asserts the same
+// shape under the new rule: the foreign-project file is an `unresolved` notice, and a file
+// that used to block by path shape blocks only when it is recorded.
+// The gate is called directly (not through a hook), same style as every other
+// precompactGateStatus test in this suite.
 
 // `slug` becomes an ELIGIBLE project for collectProjectWorkingDirs: index.md
 // present, not `_template`. Committed so it does not itself count as dirty.
@@ -6333,39 +6441,28 @@ function registerEligibleProject(dir, slug) {
 
 suite('session-close-scope-boundary spec §2b: structural git demotion');
 
-test('precompactGateStatus: projectOverride + no transcript + foreign ELIGIBLE project dirty -> notice, not a git blocker', () => {
+test('precompactGateStatus: projectOverride + no transcript + foreign ELIGIBLE project dirty -> unresolved notice, not a git blocker', () => {
   withSyncedWiki((dir) => {
     registerEligibleProject(dir, 'other');
     writeFileSync(join(dir, 'projects', 'other', 'scratch.md'), '# other session work\n');
     // 'mine' needs no registered project dir here: the gate never validates
     // projectOverride against an actual project, that validation belongs to
-    // resolveGateProjectOverride, upstream of this call.
+    // resolveGateProjectOverride, upstream of this call. No session id: even with the
+    // folder-wide rule on, only projects/mine/ is the closed folder.
     const gate = precompactGateStatus(dir, {
       claudeHome: join(dir, '.claude-none'),
       projectOverride: 'mine',
     });
-    assert.ok(
-      !(gate.blockers || []).some((b) => b.type === 'git'),
-      `a dirty file structurally under a DIFFERENT eligible project must be demoted even without a transcript: ${JSON.stringify(gate.blockers)}`,
-    );
-    assert.ok(
-      (gate.notices || []).some((n) => n.type === 'git' && n.file === 'projects/other/scratch.md'),
-      `the foreign file must still be listed by name in notices: ${JSON.stringify(gate.notices)}`,
-    );
+    assertOnlyUnresolved(gate, 'projects/other/scratch.md', 'projectOverride');
   });
 });
 
 // The four marker-writing paths never pass projectOverride; they pass
 // attributionScope instead (hypo-personal-check.mjs's resolveGateProjectOverride
-// result). §2b's six fixtures above all key off `opts.projectOverride`, which
-// only the check-only `--project` diagnostic ever sets in production. Every
-// caller that actually WRITES a marker routes through attributionScope, so a
-// suite that never tries that key is pinning behavior no production path can
-// reach. Duplicate the first fixture with attributionScope in place of
-// projectOverride, and assert on the ABSENCE of a git blocker (not just the
-// notice string), since a passing notice assertion alone would not catch a
-// regression that also left the blocker in place.
-test('precompactGateStatus: attributionScope + no transcript + foreign ELIGIBLE project dirty -> notice, not a git blocker', () => {
+// result), and only the check-only `--project` diagnostic sets projectOverride. Same fixture
+// as above under the key production writers use, asserting the ABSENCE of a git-axis blocker
+// and the typed notice.
+test('precompactGateStatus: attributionScope + no transcript + foreign ELIGIBLE project dirty -> unresolved notice, not a git blocker', () => {
   withSyncedWiki((dir) => {
     registerEligibleProject(dir, 'other');
     writeFileSync(join(dir, 'projects', 'other', 'scratch.md'), '# other session work\n');
@@ -6373,30 +6470,16 @@ test('precompactGateStatus: attributionScope + no transcript + foreign ELIGIBLE 
       claudeHome: join(dir, '.claude-none'),
       attributionScope: 'mine',
     });
-    assert.ok(
-      !(gate.blockers || []).some((b) => b.type === 'git'),
-      `attributionScope must demote a structurally-foreign dirty file exactly like projectOverride: ${JSON.stringify(gate.blockers)}`,
-    );
-    assert.ok(
-      (gate.notices || []).some((n) => n.type === 'git' && n.file === 'projects/other/scratch.md'),
-      `the foreign file must still be listed by name in notices: ${JSON.stringify(gate.notices)}`,
-    );
+    assertOnlyUnresolved(gate, 'projects/other/scratch.md', 'attributionScope');
   });
 });
 
-// Regression pin for the "which set does isForeign consult" question. This
-// file must land in closeAccountableScope for the fixture to mean anything:
-// registering 'other' as TODAY-active (a log.md entry dated today) puts
-// 'projects/other/hot.md' into closeFileTargetsGlobal (hypo-shared.mjs
-// ~3520-3552), which is closeAccountableScope's base whenever attributionScope
-// (not projectOverride) is the operative key (hypo-shared.mjs ~3757-3761). So
-// this file sits in BOTH candidate sets: closeAccountableScope (via the global
-// base) and, if isForeign wrongly checked that set instead of the narrower
-// transcriptTouched, it would read as "mine" purely because another project
-// closed today, not because THIS session's transcript proved it. The correct
-// guard (transcriptTouched, empty here: no transcript was ever passed) still
-// classifies the file as foreign by path, so it must demote to a notice.
-test('precompactGateStatus: attributionScope + no transcript + a foreign project active TODAY -> its close file still demotes to a notice, not a git blocker', () => {
+// A different project that closed today puts its own mandatory close files (hot.md here) into
+// closeFileTargetsGlobal, which is the lint scope's base whenever attributionScope (not
+// projectOverride) is the operative key. The git axis must not read that scope as "mine": the
+// file is another project's, unrecorded by this session, so it is a notice. The pair below
+// records the same file and it blocks, which is what tells "in scope" from "mine".
+test('precompactGateStatus: attributionScope + no transcript + a foreign project active TODAY -> its close file is an unresolved notice, not a git blocker', () => {
   withSyncedWiki((dir) => {
     registerEligibleProject(dir, 'other');
     const today = freshDates()[0];
@@ -6409,30 +6492,33 @@ test('precompactGateStatus: attributionScope + no transcript + a foreign project
       claudeHome: join(dir, '.claude-none'),
       attributionScope: 'mine',
     });
-    assert.ok(
-      !(gate.blockers || []).some((b) => b.type === 'git'),
-      `a file that is in closeAccountableScope ONLY because a different project closed today must still demote by path, not become a git blocker: ${JSON.stringify(gate.blockers)}`,
-    );
-    assert.ok(
-      (gate.notices || []).some((n) => n.type === 'git' && n.file === 'projects/other/hot.md'),
-      `the foreign close file must still be listed by name in notices: ${JSON.stringify(gate.notices)}`,
-    );
+    assertOnlyUnresolved(gate, 'projects/other/hot.md', 'foreign close file');
   });
 });
 
-// ISSUE-130 regression: the sibling of the fixture above, but with
-// `sessionTouchTrusted === true` (a fully-parseable transcript). Before the
-// fix, a trusted transcript skipped the isForeignProjectFile check entirely
-// and fell back to closeAccountableScope alone, which is
-// `closeFileTargetsGlobal`'s union over every today-active project whenever
-// `projectOverride` is unset (every marker-writing caller passes
-// attributionScope, never projectOverride). `other`'s own mandatory close
-// files landed in that union purely because it was active today, so they
-// read as "mine" and blocked this session's marker even though
-// attributionScope named `mine`. The real-world incident: four unrelated
-// files from a different session (`security-backoffice`) blocked a
-// `--project=hypomnema` close with `markerWritten: false`.
-test('precompactGateStatus: attributionScope + TRUSTED transcript + a foreign project active TODAY -> its close file still demotes to a notice, not a git blocker (ISSUE-130)', () => {
+test("precompactGateStatus: attributionScope + a foreign project active TODAY, this session recorded that project's close file -> known-session-write blocker", () => {
+  withSyncedWiki((dir) => {
+    registerEligibleProject(dir, 'other');
+    const today = freshDates()[0];
+    writeFileSync(join(dir, 'log.md'), `## [${today}] session | other\n`);
+    spawnSync('git', ['-C', dir, 'add', '-A']);
+    spawnSync('git', ['-C', dir, 'commit', '-q', '-m', 'other closed today']);
+    writeFileSync(join(dir, 'projects', 'other', 'hot.md'), '# this session wrote it\n');
+    const gate = gitAxisGate(dir, {
+      record: ['projects/other/hot.md'],
+      attributionScope: 'mine',
+    });
+    assertRecordedBlocks(gate, 'projects/other/hot.md', 'recorded foreign-project close file');
+  });
+});
+
+// Regression: with a fully-parseable transcript, the old trusted branch skipped the foreign
+// check and fell back to the lint scope, which is the union of every today-active project's
+// close files. `other`'s own close files read as "mine" and blocked this session's marker even
+// though attributionScope named `mine` (the real incident: four files from a different session
+// blocked a `--project=hypomnema` close with `markerWritten: false`). The transcript plays no
+// part in the git axis now; this keeps the trusted-transcript shape and asserts the same notices.
+test('precompactGateStatus: attributionScope + TRUSTED transcript + a foreign project active TODAY -> its close files are unresolved notices, not git blockers (ISSUE-130)', () => {
   withSyncedWiki((dir) => {
     registerEligibleProject(dir, 'other');
     const today = freshDates()[0];
@@ -6445,37 +6531,18 @@ test('precompactGateStatus: attributionScope + TRUSTED transcript + a foreign pr
     writeFileSync(join(dir, 'projects', 'other', 'hot.md'), '# other session work\n');
     writeFileSync(join(dir, 'projects', 'other', 'session-state.md'), '# other session state\n');
     writeFileSync(join(dir, 'projects', 'other', 'session-log', `${today}.md`), '# other log\n');
-    // A fully valid transcript (every line parses) proving THIS session only
-    // ever touched its own hot.md -> sessionTouchTrusted becomes true.
-    const tdir = transcriptTmpDir();
-    const transcript = join(tdir, 't.jsonl');
-    writeFileSync(
-      transcript,
-      JSON.stringify({
-        type: 'assistant',
-        message: {
-          content: [{ type: 'tool_use', name: 'Edit', input: { file_path: join(dir, 'hot.md') } }],
-        },
-      }) + '\n',
-    );
+    // A fully valid transcript (every line parses) proving THIS session only touched its own hot.md.
     const gate = precompactGateStatus(dir, {
       claudeHome: join(dir, '.claude-none'),
       attributionScope: 'mine',
-      transcriptPath: transcript,
+      transcriptPath: transcriptEditingHotMd(dir),
     });
-    assert.ok(
-      !(gate.blockers || []).some((b) => b.type === 'git'),
-      `a different today-active project's own dirty close files must demote by path even with a trusted transcript: ${JSON.stringify(gate.blockers)}`,
-    );
     for (const f of [
       'projects/other/hot.md',
       'projects/other/session-state.md',
       `projects/other/session-log/${today}.md`,
     ]) {
-      assert.ok(
-        (gate.notices || []).some((n) => n.type === 'git' && n.file === f),
-        `${f} must still be listed by name in notices: ${JSON.stringify(gate.notices)}`,
-      );
+      assertOnlyUnresolved(gate, f, f);
     }
   });
 });
@@ -6526,52 +6593,66 @@ test('precompactGateStatus: projectOverride + no transcript + own index.md dirty
   });
 });
 
-test('precompactGateStatus: projectOverride + no transcript + pages/mine.md dirty -> still a git blocker', () => {
+// The next three used to be fail-closed by path shape: a file with no structural "not mine"
+// proof (outside projects/, under the excluded _template, or in an unregistered project dir)
+// blocked. Path shape is not evidence any more. Each fixture runs recorded (blocks) and
+// unrecorded (notice) under projectOverride with no transcript.
+test('precompactGateStatus: projectOverride + no transcript + pages/mine.md recorded -> known-session-write blocker', () => {
   withSyncedWiki((dir) => {
     mkdirSync(join(dir, 'pages'), { recursive: true });
     writeFileSync(join(dir, 'pages', 'mine.md'), '# wip\n');
-    // Again, 'mine' needs no registered project dir: see the comment on the
-    // first fixture above.
-    const gate = precompactGateStatus(dir, {
-      claudeHome: join(dir, '.claude-none'),
-      projectOverride: 'mine',
-    });
-    assert.ok(
-      (gate.blockers || []).some((b) => b.type === 'git'),
-      `a path outside projects/ has no structural "not mine" proof and must stay fail-closed: ${JSON.stringify(gate.blockers)}`,
-    );
+    // 'mine' needs no registered project dir: see the comment on the first fixture above.
+    const gate = gitAxisGate(dir, { record: ['pages/mine.md'], projectOverride: 'mine' });
+    assertRecordedBlocks(gate, 'pages/mine.md', 'pages/mine.md');
   });
 });
 
-test('precompactGateStatus: projectOverride + no transcript + projects/_template/x.md dirty -> still a git blocker', () => {
+test('precompactGateStatus: projectOverride + no transcript + pages/mine.md unrecorded -> unresolved notice, not a git blocker', () => {
+  withSyncedWiki((dir) => {
+    mkdirSync(join(dir, 'pages'), { recursive: true });
+    writeFileSync(join(dir, 'pages', 'mine.md'), '# wip\n');
+    const gate = gitAxisGate(dir, { projectOverride: 'mine' });
+    assertOnlyUnresolved(gate, 'pages/mine.md', 'pages/mine.md');
+  });
+});
+
+test('precompactGateStatus: projectOverride + no transcript + projects/_template/x.md recorded -> known-session-write blocker', () => {
   withSyncedWiki((dir) => {
     mkdirSync(join(dir, 'projects', '_template'), { recursive: true });
     writeFileSync(join(dir, 'projects', '_template', 'x.md'), '# template scratch\n');
-    const gate = precompactGateStatus(dir, {
-      claudeHome: join(dir, '.claude-none'),
+    const gate = gitAxisGate(dir, {
+      record: ['projects/_template/x.md'],
       projectOverride: 'mine',
     });
-    assert.ok(
-      (gate.blockers || []).some((b) => b.type === 'git'),
-      `_template is excluded from collectProjectWorkingDirs, so it cannot be structurally confirmed as someone else's project: ${JSON.stringify(gate.blockers)}`,
-    );
+    assertRecordedBlocks(gate, 'projects/_template/x.md', '_template');
   });
 });
 
-test('precompactGateStatus: projectOverride + no transcript + an unregistered projects/new/x.md dirty -> still a git blocker', () => {
+test('precompactGateStatus: projectOverride + no transcript + projects/_template/x.md unrecorded -> unresolved notice, not a git blocker', () => {
   withSyncedWiki((dir) => {
-    // No index.md under `new`: it is not yet a real project, so it cannot be
-    // structurally confirmed as someone else's either.
+    mkdirSync(join(dir, 'projects', '_template'), { recursive: true });
+    writeFileSync(join(dir, 'projects', '_template', 'x.md'), '# template scratch\n');
+    const gate = gitAxisGate(dir, { projectOverride: 'mine' });
+    assertOnlyUnresolved(gate, 'projects/_template/x.md', '_template');
+  });
+});
+
+// No index.md under `new`: it is not yet a registered project.
+test('precompactGateStatus: projectOverride + no transcript + an unregistered projects/new/x.md recorded -> known-session-write blocker', () => {
+  withSyncedWiki((dir) => {
     mkdirSync(join(dir, 'projects', 'new'), { recursive: true });
     writeFileSync(join(dir, 'projects', 'new', 'x.md'), '# not a registered project yet\n');
-    const gate = precompactGateStatus(dir, {
-      claudeHome: join(dir, '.claude-none'),
-      projectOverride: 'mine',
-    });
-    assert.ok(
-      (gate.blockers || []).some((b) => b.type === 'git'),
-      `an unregistered project dir must stay fail-closed: ${JSON.stringify(gate.blockers)}`,
-    );
+    const gate = gitAxisGate(dir, { record: ['projects/new/x.md'], projectOverride: 'mine' });
+    assertRecordedBlocks(gate, 'projects/new/x.md', 'unregistered project dir');
+  });
+});
+
+test('precompactGateStatus: projectOverride + no transcript + an unregistered projects/new/x.md unrecorded -> unresolved notice, not a git blocker', () => {
+  withSyncedWiki((dir) => {
+    mkdirSync(join(dir, 'projects', 'new'), { recursive: true });
+    writeFileSync(join(dir, 'projects', 'new', 'x.md'), '# not a registered project yet\n');
+    const gate = gitAxisGate(dir, { projectOverride: 'mine' });
+    assertOnlyUnresolved(gate, 'projects/new/x.md', 'unregistered project dir');
   });
 });
 
@@ -6603,67 +6684,74 @@ test('precompactGateStatus: projectOverride + a literal-backslash filename match
   });
 });
 
-test('precompactGateStatus: projectOverride + no transcript + a literal-backslash filename dirty -> still a git blocker (regression)', () => {
+// ONE file whose NAME contains literal backslashes, not a real nested projects/other/x.md
+// path. It sits at the vault root, so it is nobody's project file: with the closed project
+// `mine` it must stay an `unresolved` notice under its RAW name, and it must not be
+// reinterpreted as a path under `other` (or anywhere else) on the way. The own-slug direction
+// of the same spoof is the test above.
+test('precompactGateStatus: projectOverride + no transcript + a literal-backslash filename dirty -> unresolved notice under its raw name (regression)', () => {
   withSyncedWiki((dir) => {
     registerEligibleProject(dir, 'other');
-    // ONE file whose NAME contains literal backslashes, not a real nested
-    // projects/other/x.md path. posixPath()'s unconditional `\` -> `/`
-    // conversion would misread this as living under projects/other/ and
-    // wrongly demote it; the classifier must run on the RAW porcelain path
-    // instead, where this string never matches the projects/<slug>/ prefix.
-    writeFileSync(join(dir, 'projects\\other\\x.md'), '# literal backslash name\n');
+    const raw = 'projects\\other\\x.md';
+    writeFileSync(join(dir, raw), '# literal backslash name\n');
     const gate = precompactGateStatus(dir, {
       claudeHome: join(dir, '.claude-none'),
       projectOverride: 'mine',
     });
+    assertOnlyUnresolved(gate, raw, 'literal backslash');
     assert.ok(
-      (gate.blockers || []).some((b) => b.type === 'git'),
-      `a literal-backslash filename must not be reinterpreted as a projects/other/ path: ${JSON.stringify(gate.blockers)}`,
+      !(gate.notices || []).some((n) => n.file === 'projects/other/x.md'),
+      `the raw name must not be reported as a normalized projects/other/ path: ${JSON.stringify(gate.notices)}`,
     );
   });
 });
 
-// A PARTIALLY-parsed transcript (a well-formed line proving this session
-// edited a file structurally under a DIFFERENT project's dir, followed by a
-// truncated trailing line, the ordinary state of an append-in-progress
-// JSONL, not corruption) must still count that file as THIS session's, not
-// foreign-by-path. sessionTouchTrusted is false here (the trailing line fails
-// to parse), so before the fix this fell straight into the path-prefix
-// heuristic and demoted the very file the transcript proves this session
-// touched.
-test('precompactGateStatus: projectOverride + a partially-parsed transcript proving THIS session edited a foreign-path file -> still a git blocker', () => {
+// A PARTIALLY-parsed transcript (a well-formed line naming a file under a DIFFERENT project's
+// dir, then a truncated trailing line: the ordinary state of an append-in-progress JSONL) used
+// to be the evidence that this session edited that file. It is no evidence now, for the git
+// axis: the transcript only widens the lint scope. The pair varies the record on the same
+// bytes, with the same transcript.
+function partialTranscriptNaming(dir, rel) {
+  const transcript = join(transcriptTmpDir(), 't.jsonl');
+  writeFileSync(
+    transcript,
+    [
+      JSON.stringify({
+        type: 'assistant',
+        message: {
+          content: [{ type: 'tool_use', name: 'Edit', input: { file_path: join(dir, rel) } }],
+        },
+      }),
+      '{"type": "assistant", "message": {"content": [{"trunc',
+    ].join('\n') + '\n',
+  );
+  return transcript;
+}
+
+test('precompactGateStatus: projectOverride + a partially-parsed transcript naming a foreign-path file, this session recorded it -> known-session-write blocker', () => {
   withSyncedWiki((dir) => {
     registerEligibleProject(dir, 'other');
-    writeFileSync(join(dir, 'projects', 'other', 'hot.md'), '# edited by this session\n');
-    const tdir = transcriptTmpDir();
-    const transcript = join(tdir, 't.jsonl');
-    writeFileSync(
-      transcript,
-      [
-        JSON.stringify({
-          type: 'assistant',
-          message: {
-            content: [
-              {
-                type: 'tool_use',
-                name: 'Edit',
-                input: { file_path: join(dir, 'projects', 'other', 'hot.md') },
-              },
-            ],
-          },
-        }),
-        '{"type": "assistant", "message": {"content": [{"trunc',
-      ].join('\n') + '\n',
-    );
-    const gate = precompactGateStatus(dir, {
-      claudeHome: join(dir, '.claude-none'),
+    const rel = 'projects/other/hot.md';
+    writeFileSync(join(dir, rel), '# edited by this session\n');
+    const gate = gitAxisGate(dir, {
+      record: [rel],
       projectOverride: 'mine',
-      transcriptPath: transcript,
+      transcriptPath: partialTranscriptNaming(dir, rel),
     });
-    assert.ok(
-      (gate.blockers || []).some((b) => b.type === 'git'),
-      `transcript evidence of THIS session's own edit must outrank the foreign-path heuristic: ${JSON.stringify(gate.blockers)}`,
-    );
+    assertRecordedBlocks(gate, rel, 'recorded, partial transcript');
+  });
+});
+
+test('precompactGateStatus: projectOverride + a partially-parsed transcript naming a foreign-path file, no record -> unresolved notice, the transcript is no evidence', () => {
+  withSyncedWiki((dir) => {
+    registerEligibleProject(dir, 'other');
+    const rel = 'projects/other/hot.md';
+    writeFileSync(join(dir, rel), '# edited by this session\n');
+    const gate = gitAxisGate(dir, {
+      projectOverride: 'mine',
+      transcriptPath: partialTranscriptNaming(dir, rel),
+    });
+    assertOnlyUnresolved(gate, rel, 'unrecorded, partial transcript');
   });
 });
 
@@ -6768,7 +6856,9 @@ test('classifyForeignOnlyDirty: two distinct registered projects, dirty mixes ow
 
 suite('session-close-scope-boundary spec §4: notice rendered by its own TYPE');
 
-test('hypo-personal-check.mjs: a foreign uncommitted file renders its own "outside this session\'s scope" line, not a folded lint line', () => {
+// The line names what the gate knows: this session has no record of writing the file. It used to
+// say "outside this session's scope", a claim the gate can no longer make.
+test('hypo-personal-check.mjs: an unrecorded uncommitted file renders its own "no record of writing" line, not a folded lint line', () => {
   const CWD = join(tmpdir(), 'hypo-spec4-workdir-test-project');
   withWiki(
     (dir) => {
@@ -6792,13 +6882,75 @@ test('hypo-personal-check.mjs: a foreign uncommitted file renders its own "outsi
       assert.equal(out.continue, true, `PreCompact never blocks (spec §1): ${r.stdout}`);
       assert.ok(
         out.systemMessage &&
-          /\[WIKI CHECK\] \d+ uncommitted file\(s\) outside this session's scope \(not blocking\): projects\/other\/scratch\.md/.test(
+          /\[WIKI CHECK\] \d+ uncommitted file\(s\) this session has no record of writing \(not blocking\): projects\/other\/scratch\.md/.test(
             out.systemMessage,
           ),
-        `the foreign git file must render its own typed line, not fold into a lint sentence: ${r.stdout}`,
+        `the unrecorded git file must render its own typed line, not fold into a lint sentence: ${r.stdout}`,
+      );
+      assert.ok(
+        !/outside this session's scope/.test(out.systemMessage),
+        `the old scope wording must be gone: ${r.stdout}`,
       );
     },
   );
+});
+
+// PreCompact pair through the real hook, spec criterion "the record, not the transcript". The
+// transcript is fully parseable and never lists pages/x.md, and the cwd matches no project (no
+// attribution, no scope). The old trusted-transcript branch demoted this file to an "outside
+// this session's scope" notice. Same dirty bytes, only the record differs: recorded blocks (the
+// advisory message carries the blocker's reason), unrecorded is the ownership-unknown notice line.
+function preCompactOnDirtyPage(dir, { recorded }) {
+  const sid = 'sess-precompact-record';
+  mkdirSync(join(dir, 'pages'), { recursive: true });
+  writeFileSync(join(dir, 'pages', 'x.md'), '# wip\n');
+  if (recorded) assert.equal(recordTouchedPaths(dir, sid, ['pages/x.md']), true);
+  const r = runHook(
+    'hypo-personal-check.mjs',
+    {
+      session_id: sid,
+      transcript_path: transcriptEditingHotMd(dir),
+      cwd: join(tmpdir(), 'hypo-precompact-no-project-cwd'),
+    },
+    { HYPO_DIR: dir },
+  );
+  const out = JSON.parse(r.stdout);
+  assert.equal(out.continue, true, `PreCompact never blocks (spec §1): ${r.stdout}`);
+  return out.systemMessage || '';
+}
+
+test("PreCompact: this session's recorded write to a shared page blocks even when the transcript does not list it", () => {
+  withCleanWiki((dir) => {
+    const msg = preCompactOnDirtyPage(dir, { recorded: true });
+    assert.match(
+      msg,
+      /this session's own write is still uncommitted: pages\/x\.md/,
+      `the recorded write must be a blocker reason in the message: ${msg}`,
+    );
+    assert.ok(
+      !/no record of writing/.test(msg),
+      `a recorded file is not an ownership-unknown notice: ${msg}`,
+    );
+  });
+});
+
+test("PreCompact: another session's unrecorded write to a shared page is an ownership-unknown notice", () => {
+  withCleanWiki((dir) => {
+    const msg = preCompactOnDirtyPage(dir, { recorded: false });
+    assert.match(
+      msg,
+      /\[WIKI CHECK\] 1 uncommitted file\(s\) this session has no record of writing \(not blocking\): pages\/x\.md/,
+      `the unrecorded file must render as the ownership-unknown line: ${msg}`,
+    );
+    assert.ok(
+      !/own write is still uncommitted/.test(msg),
+      `an unrecorded file must not be a blocker reason: ${msg}`,
+    );
+    assert.ok(
+      !/outside this session's scope/.test(msg),
+      `the old scope wording must be gone: ${msg}`,
+    );
+  });
 });
 
 test('hypo-personal-check.mjs: unpushed commits render their own git-sync line, not a folded lint line', () => {
@@ -6841,6 +6993,100 @@ test('hypo-personal-check.mjs: an unresolved session cwd renders its own close-c
       !/pre-existing lint issue/.test(out.systemMessage || ''),
       `a close-cwd-unresolved notice must not be folded into the lint sentence: ${r.stdout}`,
     );
+  });
+});
+
+// ── Stop reconfirm follows the record (git axis) ────────────────────────────────────────────────
+
+suite("hypo-auto-minimal-crystallize.mjs: reconfirm follows this session's write record");
+
+// Runs Stop with a close signal ("마무리하자") and one dirty pages/x.md. A `known-session-write`
+// blocker that names a file (or a `git` one) is work-incomplete evidence, so Stop asks to
+// reconfirm instead of nudging crystallize. Everything else about the fixture is held fixed.
+function stopWithDirtyPage(dir, sid, { recorded, lockRecord = false }) {
+  mkdirSync(join(dir, 'pages'), { recursive: true });
+  writeFileSync(join(dir, 'pages', 'x.md'), '# wip\n');
+  if (recorded) assert.equal(recordTouchedPaths(dir, sid, ['pages/x.md']), true);
+  if (lockRecord) {
+    // A live holder (this very process), so the hook's read waits and times out instead of stealing it.
+    const tp = touchedPathsPath(dir, sid);
+    mkdirSync(dirname(tp), { recursive: true });
+    writeFileSync(`${tp}.lock`, String(process.pid));
+  }
+  const transcript = join(dir, '.cache', 'transcript-stop.jsonl');
+  mkdirSync(dirname(transcript), { recursive: true });
+  writeFileSync(
+    transcript,
+    [
+      {
+        type: 'assistant',
+        message: {
+          content: [{ type: 'tool_use', name: 'Edit', input: { file_path: join(dir, 'hot.md') } }],
+        },
+      },
+      { type: 'user', message: { role: 'user', content: '오늘은 이만 마무리하자' } },
+    ]
+      .map((l) => JSON.stringify(l))
+      .join('\n') + '\n',
+  );
+  const r = runStop('hypo-auto-minimal-crystallize.mjs', dir, {
+    session_id: sid,
+    transcript_path: transcript,
+    stop_hook_active: false,
+  });
+  assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+  return JSON.parse(r.stdout);
+}
+const STOP_RECONFIRM = 'session-close incomplete (Layer 3, reconfirm)';
+
+test("Stop: this session's recorded dirty write asks to reconfirm", () => {
+  withGrowthWiki((dir) => {
+    const out = stopWithDirtyPage(dir, 's-stop-recorded', { recorded: true });
+    assert.equal(out.decision, 'block', JSON.stringify(out));
+    assert.equal(
+      out.stopReason,
+      STOP_RECONFIRM,
+      `a recorded write is work-incomplete: ${JSON.stringify(out)}`,
+    );
+    assert.match(out.reason, /AskUserQuestion/);
+  });
+});
+
+test("Stop: another session's dirty file alone does not ask to reconfirm", () => {
+  withGrowthWiki((dir) => {
+    const out = stopWithDirtyPage(dir, 's-stop-unrecorded', { recorded: false });
+    assert.equal(
+      out.decision,
+      'block',
+      `the close itself is still incomplete: ${JSON.stringify(out)}`,
+    );
+    assert.notEqual(out.stopReason, STOP_RECONFIRM, JSON.stringify(out));
+    assert.ok(!/AskUserQuestion/.test(out.reason), out.reason);
+    assert.match(
+      out.reason,
+      /crystallize/,
+      `the existing crystallize wording stays: ${out.reason}`,
+    );
+    assert.ok(
+      !out.reason.includes('pages/x.md'),
+      `an unrecorded file is not a blocker reason: ${out.reason}`,
+    );
+  });
+});
+
+// A lock timeout is a `known-session-write` blocker with no `file`: the record cannot be read
+// right now, which says nothing about unfinished work. Against the recorded test above (a
+// `known-session-write` that names its file) it tells "names a file" from "does not".
+test('Stop: a touched-paths lock timeout alone does not ask to reconfirm', () => {
+  withGrowthWiki((dir) => {
+    const out = stopWithDirtyPage(dir, 's-stop-locked', { recorded: false, lockRecord: true });
+    assert.equal(out.decision, 'block', JSON.stringify(out));
+    assert.ok(
+      out.reason.includes('touched-paths lock timed out'),
+      `precondition: the lock timeout is the blocker: ${out.reason}`,
+    );
+    assert.notEqual(out.stopReason, STOP_RECONFIRM, JSON.stringify(out));
+    assert.ok(!/AskUserQuestion/.test(out.reason), out.reason);
   });
 });
 

@@ -40,6 +40,7 @@ import {
   CLOSE_LOGS_MISSING_NOTICE_TYPE,
   freshDates,
   currentDevice,
+  isForeignUncommittedEntry,
   recordShardAppend,
   recordTouchedPaths,
   rootLogHeadingKey,
@@ -2016,10 +2017,13 @@ suite('hypo-auto-minimal-crystallize.mjs — conditional close reconfirm');
 
 test('uncommitted wiki + conditional close phrase, no decline → reconfirm block (not a silent nag)', () => {
   withGrowthWiki((dir) => {
-    // Leave a real uncommitted change so the `git` blocker fires (not the
-    // .cache phantom the fixture no longer produces).
+    // Leave a real uncommitted change this session recorded as its own write, so
+    // the `known-session-write` blocker fires (not the .cache phantom the fixture
+    // no longer produces). Stop reconfirms only for a blocker that names a file
+    // this session wrote (or a `git` one); the unrecorded twin is the next test.
     mkdirSync(join(dir, 'pages'), { recursive: true });
     writeFileSync(join(dir, 'pages', 'x.md'), '# wip\n');
+    recordTouchedPaths(dir, 's-reconfirm', ['pages/x.md']);
     const transcript = writeTranscript(dir, [
       {
         type: 'assistant',
@@ -2065,10 +2069,49 @@ test('uncommitted wiki + conditional close phrase, no decline → reconfirm bloc
   });
 });
 
+// Pair with the test above: the same dirty file and close phrase, but this session
+// never recorded the write. The file is an `unresolved` notice, not a blocker, so
+// there is nothing of this session's work to reconfirm: only the close blocker is
+// left and the plain crystallize wording stays.
+test('uncommitted wiki this session has no record of writing + conditional close phrase → no reconfirm', () => {
+  withGrowthWiki((dir) => {
+    mkdirSync(join(dir, 'pages'), { recursive: true });
+    writeFileSync(join(dir, 'pages', 'x.md'), '# wip\n');
+    const transcript = writeTranscript(dir, [
+      {
+        type: 'assistant',
+        message: {
+          content: [
+            { type: 'tool_use', name: 'Edit', input: { file_path: join(dir, 'pages', 'x.md') } },
+          ],
+        },
+      },
+      { type: 'user', message: { role: 'user', content: '구현 완료하면 세션 마무리하자' } },
+    ]);
+    const r = runAutoMinimal(dir, {
+      session_id: 's-reconfirm-unrecorded',
+      transcript_path: transcript,
+      stop_hook_active: false,
+    });
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.decision, 'block', `the close blocker still blocks: ${JSON.stringify(out)}`);
+    assert.ok(
+      /crystallize/.test(out.reason),
+      `an unrecorded dirty file keeps the crystallize wording: ${out.reason}`,
+    );
+    assert.ok(
+      !/AskUserQuestion/.test(out.reason),
+      `an unrecorded dirty file must NOT trigger the reconfirm: ${out.reason}`,
+    );
+  });
+});
+
 test('a correlated "아직, 계속" decline suppresses the reconfirm → continue', () => {
   withGrowthWiki((dir) => {
     mkdirSync(join(dir, 'pages'), { recursive: true });
     writeFileSync(join(dir, 'pages', 'x.md'), '# wip\n');
+    recordTouchedPaths(dir, 's-declined', ['pages/x.md']);
     const transcript = writeTranscript(dir, [
       {
         type: 'assistant',
@@ -2111,6 +2154,7 @@ test('a NEW user close signal after a decline re-arms the reconfirm → block ag
   withGrowthWiki((dir) => {
     mkdirSync(join(dir, 'pages'), { recursive: true });
     writeFileSync(join(dir, 'pages', 'x.md'), '# wip\n');
+    recordTouchedPaths(dir, 's-rearm', ['pages/x.md']);
     const transcript = writeTranscript(dir, [
       { type: 'assistant', message: { content: [{ type: 'tool_use', name: 'Edit', input: {} }] } },
       { type: 'user', message: { role: 'user', content: '구현 완료하면 세션 마무리하자' } },
@@ -2144,6 +2188,10 @@ test('a NEW user close signal after a decline re-arms the reconfirm → block ag
       'block',
       `a new close signal after the decline must re-arm reconfirm: ${JSON.stringify(out)}`,
     );
+    assert.ok(
+      /AskUserQuestion/.test(out.reason),
+      `the re-armed block must be the reconfirm, not the plain crystallize wording: ${out.reason}`,
+    );
   });
 });
 
@@ -2151,6 +2199,7 @@ test('decline label variants ("나중에" / "later") also suppress (label-drift 
   withGrowthWiki((dir) => {
     mkdirSync(join(dir, 'pages'), { recursive: true });
     writeFileSync(join(dir, 'pages', 'x.md'), '# wip\n');
+    recordTouchedPaths(dir, 's-label-drift', ['pages/x.md']);
     const transcript = writeTranscript(dir, [
       {
         type: 'assistant',
@@ -2196,6 +2245,7 @@ test('genuine close-now + uncommitted, no decline → still reconfirm block (no 
   withGrowthWiki((dir) => {
     mkdirSync(join(dir, 'pages'), { recursive: true });
     writeFileSync(join(dir, 'pages', 'x.md'), '# wip\n');
+    recordTouchedPaths(dir, 's-close-now', ['pages/x.md']);
     const transcript = writeTranscript(dir, [
       {
         type: 'assistant',
@@ -2370,6 +2420,7 @@ test('absent background_tasks + uncommitted → in-flight fails open, git alone 
   withGrowthWiki((dir) => {
     mkdirSync(join(dir, 'pages'), { recursive: true });
     writeFileSync(join(dir, 'pages', 'x.md'), '# wip\n');
+    recordTouchedPaths(dir, 's-no-bg-tasks', ['pages/x.md']);
     const transcript = writeTranscript(dir, [
       {
         type: 'assistant',
@@ -7672,12 +7723,13 @@ test('after the two closes, a new close request makes the cwd project open again
   });
 });
 
-// Another session's entry that is published and waiting for its own commit, on the
-// two git partitions outside checkpointMode (Stop, PreCompact, --check).
-// Disabling the check (F1, scoped half): in precompactGateStatus's scoped branch
-// set `foreignEntries` to `[]`. The first gate's assertions go red. (F1, unscoped
-// half): same in the trusted unscoped branch: the second gate's go red.
-test("another session's new uncommitted entry is a foreign-entry notice, not a git blocker, on the scoped and the trusted unscoped git partitions", () => {
+// Another session's entry that is published and waiting for its own commit, seen by
+// a session with no record of writing it, with and without an attribution scope
+// (the scope no longer picks a different rule). Pair with the recorded-path test
+// below. Disabling the check: in precompactGateStatus's dirty-file loop replace
+// `isForeignUncommittedEntry(hypoDir, pf, opts.sessionId)` with `false`. The entry
+// is then an unresolved notice and both gates' foreign-entry assertions go red.
+test('an unrecorded valid foreign entry is a foreign-entry notice, not a git blocker, with and without an attribution scope', () => {
   withWiki(anchorTestProject, (dir, today) => {
     const sid = 's-t10-foreign-entry';
     const rel = writeDatedEntry(dir, 'test-project', today, closeIdFor('s-t10-someone-else', 0));
@@ -7706,127 +7758,48 @@ test("another session's new uncommitted entry is a foreign-entry notice, not a g
   });
 });
 
-test("this session's own uncommitted entry, and another session's committed entry edited since, still block on the scoped partition (pair)", () => {
+// The same two files seen by a session that recorded them and by one that did not.
+// This session's own uncommitted entry, and another session's committed entry edited
+// since, block as known-session-write when this session recorded the write. A session
+// with no record of them gets an unresolved notice and no blocker: neither is a new
+// entry of another session, so neither is a foreign-entry notice either. Disabling
+// the check: in precompactGateStatus's dirty-file loop make `touchedSet.has(...)`
+// false (the recorded half goes red).
+test("this session's recorded uncommitted entry, and another session's committed entry edited since, block as known-session-write, and are unresolved notices when unrecorded (pair)", () => {
   withWiki(anchorTestProject, (dir, today) => {
     const sid = 's-t10-own-entry';
-    const own = writeDatedEntry(dir, 'test-project', today, closeIdFor(sid, 0));
-    const gate = precompactGateStatus(dir, {
-      claudeHome: join(dir, '.claude-none'),
-      attributionScope: 'test-project',
-      sessionId: sid,
-    });
-    assert.ok(
-      gate.blockers.some((b) => b.type === 'git' && b.reason.includes(own)),
-      JSON.stringify(gate.blockers),
-    );
-    rmSync(join(dir, own));
-    const theirs = commitEntry(dir, today, closeIdFor('s-t10-someone-else', 0));
-    appendFileSync(join(dir, theirs), '\nedited\n');
-    const edited = precompactGateStatus(dir, {
-      claudeHome: join(dir, '.claude-none'),
-      attributionScope: 'test-project',
-      sessionId: sid,
-    });
-    assert.ok(
-      edited.blockers.some((b) => b.type === 'git' && b.reason.includes(theirs)),
-      JSON.stringify(edited.blockers),
-    );
-  });
-});
-
-// S2: the name alone does not make a file another session's entry. Disabling the check:
-// in isForeignUncommittedEntry drop the `!parsed.ok || parsed.entry.closeId !== m[1]`
-// test (return before parsing). The no-frontmatter and mismatched-id files then turn
-// into foreign-entry notices and both assertions go red.
-test("a file named like another session's entry but not that entry still blocks on the scoped partition (S2)", () => {
-  withWiki(anchorTestProject, (dir, today) => {
-    const sid = 's-t10-s2-mine';
-    const otherId = closeIdFor('s-t10-s2-other', 0);
-    const relOf = (id) => `projects/test-project/sessions/${today}-${id}.md`;
-    mkdirSync(join(dir, 'projects', 'test-project', 'sessions'), { recursive: true });
-    const blocksOn = (rel) => {
-      const gate = precompactGateStatus(dir, {
-        claudeHome: join(dir, '.claude-none'),
-        attributionScope: 'test-project',
-        sessionId: sid,
-      });
-      assert.ok(
-        gate.blockers.some((b) => b.type === 'git' && b.reason.includes(rel)),
-        `${rel}: ${JSON.stringify(gate.blockers)}`,
-      );
-      assert.ok(
-        !gate.notices.some((n) => n.type === 'foreign-entry'),
-        JSON.stringify(gate.notices),
-      );
-      rmSync(join(dir, rel));
-    };
-    // No frontmatter at all: a hand-written note under an entry-shaped name.
-    writeFileSync(join(dir, relOf(otherId)), '# hand written\n');
-    blocksOn(relOf(otherId));
-    // A real entry, but of another close id than its name carries.
-    writeFileSync(
-      join(dir, relOf(otherId)),
-      formatSessionEntry({
-        project: 'test-project',
-        closeId: closeIdFor('s-t10-s2-third', 0),
-        date: today,
-        tracks: [],
-        summary: 'moved',
-        bodies: {},
-      }),
-    );
-    blocksOn(relOf(otherId));
-  });
-});
-
-// X4 (wave B, third review): the entry must also be the one its path names by project,
-// by date, and by the session its close id belongs to. Disabling the check (X4,
-// project and date): in isForeignUncommittedEntry drop `|| e.project !== project ||
-// e.date !== date`. (X4, session): drop the `e.sessionId` line. Either goes red.
-test("a file named like another session's entry whose project, date or session differ from its path still blocks on the scoped partition (X4)", () => {
-  withWiki(anchorTestProject, (dir, today) => {
-    const sid = 's-t10-x4-mine';
-    const otherId = closeIdFor('s-t10-x4-other', 0);
-    const rel = `projects/test-project/sessions/${today}-${otherId}.md`;
-    mkdirSync(join(dir, 'projects', 'test-project', 'sessions'), { recursive: true });
-    const entryOf = (over) =>
-      formatSessionEntry({
-        project: 'test-project',
-        closeId: otherId,
-        date: today,
-        tracks: [],
-        summary: 'x4',
-        bodies: {},
-        ...over,
-      });
-    const gate = () =>
+    const gate = (sessionId) =>
       precompactGateStatus(dir, {
         claudeHome: join(dir, '.claude-none'),
         attributionScope: 'test-project',
-        sessionId: sid,
+        sessionId,
       });
-    // Pair: the entry its path names is a notice.
-    writeFileSync(join(dir, rel), entryOf({ sessionId: 's-t10-x4-other' }));
-    assert.ok(
-      gate().notices.some((n) => n.type === 'foreign-entry' && n.file === rel),
-      'precondition: the matching entry is foreign',
-    );
-    for (const over of [
-      { project: 'another-project' },
-      { date: '2001-01-01' },
-      { sessionId: 's-t10-x4-third' },
-    ]) {
-      writeFileSync(join(dir, rel), entryOf(over));
-      const g = gate();
-      assert.ok(
-        g.blockers.some((b) => b.type === 'git' && b.reason.includes(rel)),
-        `${JSON.stringify(over)}: ${JSON.stringify(g.blockers)}`,
+    const writeBlockerOn = (g, rel) =>
+      g.blockers.some((b) => b.type === 'known-session-write' && b.file === rel);
+    const noticeOn = (g, type, rel) => g.notices.some((n) => n.type === type && n.file === rel);
+    const assertUnrecorded = (g, rel) => {
+      assert.deepEqual(
+        g.blockers.filter((b) => b.file === rel || (b.reason || '').includes(rel)),
+        [],
+        JSON.stringify(g.blockers),
       );
-      assert.ok(
-        !g.notices.some((n) => n.type === 'foreign-entry'),
-        `${JSON.stringify(over)}: ${JSON.stringify(g.notices)}`,
-      );
-    }
+      assert.ok(noticeOn(g, 'unresolved', rel), JSON.stringify(g.notices));
+      assert.ok(!noticeOn(g, 'foreign-entry', rel), JSON.stringify(g.notices));
+    };
+    const own = writeDatedEntry(dir, 'test-project', today, closeIdFor(sid, 0));
+    assertUnrecorded(gate(sid), own);
+    assert.equal(recordTouchedPaths(dir, sid, [own]), true, 'precondition: recorded');
+    const ownGate = gate(sid);
+    assert.ok(writeBlockerOn(ownGate, own), JSON.stringify(ownGate.blockers));
+    assert.ok(!noticeOn(ownGate, 'foreign-entry', own), JSON.stringify(ownGate.notices));
+    rmSync(join(dir, own));
+    const theirs = commitEntry(dir, today, closeIdFor('s-t10-someone-else', 0));
+    appendFileSync(join(dir, theirs), '\nedited\n');
+    assertUnrecorded(gate(sid), theirs);
+    assert.equal(recordTouchedPaths(dir, sid, [theirs]), true, 'precondition: recorded');
+    const edited = gate(sid);
+    assert.ok(writeBlockerOn(edited, theirs), JSON.stringify(edited.blockers));
+    assert.ok(!noticeOn(edited, 'foreign-entry', theirs), JSON.stringify(edited.notices));
   });
 });
 
@@ -8044,31 +8017,170 @@ test('a staged edit or staged deletion of a shard whose work tree is HEAD still 
   });
 });
 
-// Disabling the check (S1, scoped half): in precompactGateStatus's scoped branch set
-// `foreignAppends` to `[]`. The first gate goes red. (S1, unscoped half): same in the
-// trusted unscoped branch. The second gate goes red.
-test("another session's append to the committed shard is a foreign-append notice on the scoped and the trusted unscoped git partitions (S1)", () => {
+// The marker-gate pair above, on the gate Stop, PreCompact and --check run: a session
+// that recorded the shard (S1_SID, as a close leaves it) and one that never did both
+// read another session's append as a foreign-append notice. Disabling the check: in
+// precompactGateStatus's dirty-file loop delete the `isForeignAppendOnlyShard` branch.
+// The recorded session then blocks as a known-session-write and the fresh one gets an
+// unresolved notice: both gates go red.
+test("another session's append to the committed shard is a foreign-append notice for a session that recorded the shard and one that did not (S1)", () => {
   withCommittedShard((dir, today, { rel }) => {
     appendAsOther(dir, rel, OTHER_HEADING(today));
-    const cleanup = seedCloseTranscript(S1_SID);
-    try {
-      const scoped = precompactGateStatus(dir, {
+    for (const sessionId of [S1_SID, 's-t10-s1-fresh']) {
+      const gate = precompactGateStatus(dir, {
         claudeHome: join(dir, '.claude-none'),
         attributionScope: 'test-project',
-        sessionId: S1_SID,
+        sessionId,
       });
-      assert.deepEqual(blockersOn(scoped, rel), [], JSON.stringify(scoped.blockers));
-      assert.ok(appendNotice(scoped, rel), JSON.stringify(scoped.notices));
-      const unscoped = precompactGateStatus(dir, {
-        claudeHome: join(dir, '.claude-none'),
-        transcriptPath: t10Transcript(S1_SID),
-        sessionId: S1_SID,
-      });
-      assert.deepEqual(blockersOn(unscoped, rel), [], JSON.stringify(unscoped.blockers));
-      assert.ok(appendNotice(unscoped, rel), JSON.stringify(unscoped.notices));
-    } finally {
-      cleanup();
+      assert.deepEqual(blockersOn(gate, rel), [], `${sessionId}: ${JSON.stringify(gate.blockers)}`);
+      assert.ok(appendNotice(gate, rel), `${sessionId}: ${JSON.stringify(gate.notices)}`);
     }
+  });
+});
+
+// isForeignUncommittedEntry is what tells another session's new entry from every
+// other dirty file, and a gate test cannot reach it for a recorded path (the record
+// blocks first). So each boundary is probed on the function: the matching entry is
+// foreign (precondition in the fixture), and one changed fact is not.
+const FE_MINE = 's-t5-fe-mine';
+const FE_OTHER = 's-t5-fe-other';
+function withForeignEntry(fn) {
+  withWiki(anchorTestProject, (dir, today) => {
+    const closeId = closeIdFor(FE_OTHER, 0);
+    const rel = `projects/test-project/sessions/${today}-${closeId}.md`;
+    mkdirSync(join(dir, 'projects', 'test-project', 'sessions'), { recursive: true });
+    const write = (over = {}) =>
+      writeFileSync(
+        join(dir, rel),
+        formatSessionEntry({
+          project: 'test-project',
+          closeId,
+          date: today,
+          sessionId: FE_OTHER,
+          tracks: [],
+          summary: 'fe',
+          bodies: {},
+          ...over,
+        }),
+      );
+    const probe = () => isForeignUncommittedEntry(dir, rel, FE_MINE);
+    write();
+    assert.equal(probe(), true, 'precondition: the entry its path names is foreign');
+    fn({ dir, today, rel, write, probe });
+  });
+}
+
+// Disabling the check: in entryMatchesPath return true before `parseSessionEntry`
+// (or drop the `!parsed.ok` test). The hand-written note turns foreign: red.
+test("isForeignUncommittedEntry: a name-only file with no entry frontmatter is not another session's entry", () => {
+  withForeignEntry(({ dir, rel, probe }) => {
+    writeFileSync(join(dir, rel), '# hand written\n');
+    assert.equal(probe(), false);
+  });
+});
+
+// Disabling the check: in entryMatchesPath drop `e.closeId !== closeId`. Red.
+test("isForeignUncommittedEntry: a close id that differs from the path's is not another session's entry", () => {
+  withForeignEntry(({ write, probe }) => {
+    write({ closeId: closeIdFor('s-t5-fe-third', 0) });
+    assert.equal(probe(), false);
+  });
+});
+
+// Disabling the check: in entryMatchesPath drop `e.project !== project`. Red.
+test("isForeignUncommittedEntry: a project that differs from the path's is not another session's entry", () => {
+  withForeignEntry(({ write, probe }) => {
+    write({ project: 'another-project' });
+    assert.equal(probe(), false);
+  });
+});
+
+// Disabling the check: in entryMatchesPath drop `e.date !== date`. Red.
+test("isForeignUncommittedEntry: a date that differs from the path's is not another session's entry", () => {
+  withForeignEntry(({ write, probe }) => {
+    write({ date: '2001-01-01' });
+    assert.equal(probe(), false);
+  });
+});
+
+// Disabling the check: in entryMatchesPath replace the last line's session test with
+// `return true`. Red.
+test("isForeignUncommittedEntry: a session that differs from the one the close id belongs to is not another session's entry", () => {
+  withForeignEntry(({ write, probe }) => {
+    write({ sessionId: 's-t5-fe-third' });
+    assert.equal(probe(), false);
+  });
+});
+
+// Disabling the check: in isForeignUncommittedEntry replace the final
+// `headPathState(...) === 'absent'` with `true`. The committed entry turns foreign: red.
+test("isForeignUncommittedEntry: an entry HEAD already holds is not another session's entry", () => {
+  withForeignEntry(({ dir, rel, probe }) => {
+    const git = (...a) =>
+      spawnSync('git', ['-C', dir, ...a], {
+        encoding: 'utf-8',
+        env: { ...process.env, HOME: SESSION_TMP_HOME },
+      });
+    git('add', '--', rel);
+    git('commit', '-q', '-m', 'other entry', '--', rel);
+    assert.equal(probe(), false, 'committed');
+    appendFileSync(join(dir, rel), '\nedited\n');
+    assert.equal(probe(), false, 'committed and edited since');
+  });
+});
+
+// The gate order: a recorded path is a known-session-write blocker before the
+// foreign-entry check ever runs, even for the entry its path names. Pair with the
+// unrecorded test earlier in this file (a foreign-entry notice, no blocker).
+// Disabling the check: in precompactGateStatus's dirty-file loop move the
+// `isForeignUncommittedEntry` branch ahead of `touchedSet.has(...)`. Red.
+test('a recorded entry-shaped path blocks as known-session-write before the foreign-entry check', () => {
+  withForeignEntry(({ dir, rel }) => {
+    assert.equal(recordTouchedPaths(dir, FE_MINE, [rel]), true, 'precondition: recorded');
+    const gate = precompactGateStatus(dir, {
+      claudeHome: join(dir, '.claude-none'),
+      attributionScope: 'test-project',
+      sessionId: FE_MINE,
+    });
+    assert.ok(writeBlocker(gate, rel), JSON.stringify(gate.blockers));
+    assert.ok(!gate.notices.some((n) => n.type === 'foreign-entry'), JSON.stringify(gate.notices));
+  });
+});
+
+// A name alone makes no entry: an unrecorded file under an entry-shaped name that is
+// not that entry is an unresolved notice, never a foreign-entry notice and no blocker.
+// Disabling the check: as in the boundary tests above, any one of the entryMatchesPath
+// tests. The file then reads as foreign and the unresolved assertion goes red.
+test("an unrecorded file named like another session's entry but not that entry is an unresolved notice, not a foreign-entry notice", () => {
+  withForeignEntry(({ dir, rel, write }) => {
+    const gate = () =>
+      precompactGateStatus(dir, {
+        claudeHome: join(dir, '.claude-none'),
+        attributionScope: 'test-project',
+        sessionId: FE_MINE,
+      });
+    const assertUnresolvedOnly = (label) => {
+      const g = gate();
+      // The lint axis may still name a malformed file; only the git axis is judged here.
+      assert.deepEqual(
+        blockersOn(g, rel).filter((b) => b.type === 'git' || b.type === 'known-session-write'),
+        [],
+        `${label}: ${JSON.stringify(g.blockers)}`,
+      );
+      assert.ok(unresolvedNotice(g, rel), `${label}: ${JSON.stringify(g.notices)}`);
+      assert.ok(
+        !g.notices.some((n) => n.type === 'foreign-entry'),
+        `${label}: ${JSON.stringify(g.notices)}`,
+      );
+    };
+    writeFileSync(join(dir, rel), '# hand written\n');
+    assertUnresolvedOnly('no frontmatter');
+    write({ project: 'another-project' });
+    assertUnresolvedOnly('project differs');
+    write({ date: '2001-01-01' });
+    assertUnresolvedOnly('date differs');
+    write({ sessionId: 's-t5-fe-third' });
+    assertUnresolvedOnly('session differs');
   });
 });
 
