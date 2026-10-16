@@ -10,6 +10,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  readdirSync,
   realpathSync,
   rmSync,
   statSync,
@@ -28,6 +29,7 @@ import {
   parseWikiPreCommitRoot,
   wikiPreCommitContent,
   previousFormPreCommitContent,
+  publishHookFile,
   WIKI_PRE_COMMIT_MARKER_START,
   WIKI_PRE_COMMIT_MARKER_END,
   PRE_COMMIT_RESOLVER_LINE,
@@ -37,7 +39,13 @@ import {
 } from '../scripts/lib/git-hooks-dir.mjs';
 import { resolveCommitTimeRoot } from '../scripts/lib/plugin-detect.mjs';
 import { compareSemver } from '../hooks/version-check.mjs';
-import { runWithHome, withTmpHome, legacyWikiPreCommitContent } from './helpers.mjs';
+import {
+  hookWriteFaultPreload,
+  legacyWikiPreCommitContent,
+  runWithHome,
+  withTmpDir,
+  withTmpHome,
+} from './helpers.mjs';
 
 const git = (cwd, args) => execFileSync('git', args, { cwd, encoding: 'utf-8' }).trim();
 
@@ -684,6 +692,55 @@ test('a hook on the previous resolver is owned and parsed with previousResolver:
     assert.equal(parseWikiPreCommitRoot(body).ok, false, name);
     assert.equal(isOwnedWikiPreCommitBody(body, span), false, `${name} (strict path)`);
   }
+});
+
+suite('git-hooks-dir.mjs: publishHookFile');
+
+test('publishHookFile leaves the live hook whole and no candidate when the rename fails', () => {
+  withTmpDir((dir) => {
+    const { preloadPath, firedPath } = hookWriteFaultPreload(dir);
+    const hook = join(dir, 'pre-commit');
+    const OLD = '#!/bin/sh\necho old\n';
+    const NEW = '#!/bin/sh\necho new\n';
+    writeFileSync(hook, OLD, { mode: 0o644 });
+    const script = join(dir, 'publish.mjs');
+    writeFileSync(
+      script,
+      `import { publishHookFile } from ${JSON.stringify(new URL('../scripts/lib/git-hooks-dir.mjs', import.meta.url).href)};
+const r = publishHookFile(process.argv[2], ${JSON.stringify(NEW)});
+console.log(JSON.stringify({ ok: r.ok, cleaned: r.cleaned, candidate: r.candidatePath, code: r.error?.code }));
+`,
+    );
+    const run = (fault) =>
+      spawnSync(process.execPath, ['-r', preloadPath, script, hook], {
+        encoding: 'utf-8',
+        env: { ...process.env, HOME: dir, ...(fault ? { HYPO_TEST_HOOK_FAULT: fault } : {}) },
+      });
+
+    const failed = run('rename');
+    assert.equal(failed.status, 0, failed.stderr);
+    const out = JSON.parse(failed.stdout);
+    assert.equal(out.ok, false);
+    assert.equal(out.cleaned, true);
+    assert.equal(out.code, 'EIO');
+    assert.equal(readFileSync(firedPath, 'utf-8'), hook, 'the rename onto the hook failed');
+    assert.equal(readFileSync(hook, 'utf-8'), OLD, 'live hook untouched');
+    assert.equal(existsSync(out.candidate), false, 'candidate removed');
+    assert.deepEqual(
+      readdirSync(dir).filter((f) => f.endsWith('.tmp')),
+      [],
+    );
+
+    const done = run(undefined);
+    assert.equal(done.status, 0, done.stderr);
+    assert.equal(JSON.parse(done.stdout).ok, true);
+    assert.equal(readFileSync(hook, 'utf-8'), NEW);
+    assert.equal(statSync(hook).mode & 0o777, 0o755, 'published hook is executable');
+    assert.deepEqual(
+      readdirSync(dir).filter((f) => f.endsWith('.tmp')),
+      [],
+    );
+  });
 });
 
 suite('git-hooks-dir.mjs — runtime install-root resolver (no baked root)');

@@ -35,7 +35,18 @@
  */
 
 import { execFileSync } from 'child_process';
-import { existsSync, lstatSync, readFileSync, realpathSync, statSync } from 'fs';
+import { randomBytes } from 'crypto';
+import {
+  chmodSync,
+  existsSync,
+  lstatSync,
+  readFileSync,
+  realpathSync,
+  renameSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from 'fs';
 import { basename, dirname, isAbsolute, join, resolve, sep } from 'path';
 
 // ── shared install/uninstall markers ────────────────────────────────────────
@@ -634,6 +645,40 @@ export function wikiPreCommitContent(hypoDir, lintStrict, build = buildPreCommit
 // exists: the marker span says nothing about what sits around it.
 export function previousFormPreCommitContent(hypoDir, lintStrict) {
   return wikiPreCommitContent(hypoDir, lintStrict, buildPreviousPreCommitResolverJs);
+}
+
+// Publishes `content` as the executable hook at `hookPath` through a complete
+// candidate file: write the candidate beside the hook, mark it executable, then
+// rename it over the hook. Git runs the hook at every commit, so a write torn
+// halfway through the live file would leave a hook that fails or half-runs
+// until someone repairs it by hand. With the rename as the only step that
+// touches the live path, a failure anywhere leaves the previous hook whole.
+// Ownership checks and the .bak copy are the caller's job.
+//
+// Returns `{ ok: true }`, or `{ ok: false, error, candidatePath, cleaned }`.
+// `cleaned` is false when the candidate could not be removed after a failure; a
+// leftover `pre-commit.<pid>.<rand>.tmp` is never run by git, so the caller
+// reports its path rather than treating it as a second failure.
+export function publishHookFile(hookPath, content) {
+  const candidatePath = `${hookPath}.${process.pid}.${randomBytes(4).toString('hex')}.tmp`;
+  try {
+    writeFileSync(candidatePath, content, { flag: 'wx' });
+    chmodSync(candidatePath, 0o755);
+    renameSync(candidatePath, hookPath);
+    return { ok: true };
+  } catch (error) {
+    let cleaned = false;
+    const cleanup = true;
+    if (cleanup) {
+      try {
+        rmSync(candidatePath, { force: true });
+        cleaned = true;
+      } catch {
+        // Reported through `cleaned: false`, not thrown over the original error.
+      }
+    }
+    return { ok: false, error, candidatePath, cleaned };
+  }
 }
 
 // Rebuilds the exact bytes an OLD-form (version-pinned) pre-commit hook holds

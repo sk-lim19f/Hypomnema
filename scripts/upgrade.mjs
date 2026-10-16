@@ -67,6 +67,8 @@ import {
   parseWikiPreCommitRoot,
   wikiPreCommitContent,
   oldFormPreCommitContent,
+  previousFormPreCommitContent,
+  publishHookFile,
   uniqueBakPath,
 } from './lib/git-hooks-dir.mjs';
 import { classifyInstall, downgradeGuardMessage } from '../hooks/version-check.mjs';
@@ -693,6 +695,11 @@ function applyGitignoreMigration(result) {
 // a shape isOwnedWikiPreCommitBody() recognizes (old OR new — see
 // lib/git-hooks-dir.mjs), what parseWikiPreCommitRoot() read back from it.
 //
+// A hook on the previous commit-time resolver (v1.8.4 through v1.10.0) comes
+// back with `previousResolver: true` and `root: null`. It bakes no root, but it
+// reads hypo-pkg.json before the enabled plugin, so upgrade rewrites it onto the
+// current resolver like an old-form one.
+//
 // Returns `null` when there is nothing of ours to report (no hook, or a hook
 // with no Hypomnema marker at all: some other tool's or the user's own).
 // Returns `{ hookPath, unrecognized: true, root: null }` when our marker IS
@@ -720,10 +727,17 @@ function checkWikiPreCommitRoot(hypoDir) {
   if (!parsed.ok) {
     return parsed.hasMarker ? { hookPath, unrecognized: true, root: null } : null;
   }
-  return { hookPath, root: parsed.root, lintStrict: parsed.lintStrict, hypoDir: parsed.hypoDir };
+  return {
+    hookPath,
+    root: parsed.root,
+    previousResolver: parsed.previousResolver === true,
+    lintStrict: parsed.lintStrict,
+    hypoDir: parsed.hypoDir,
+  };
 }
 
-// Rewrites an OLD-form hook onto the runtime-resolving form, reusing the exact
+// Rewrites an OLD-form hook (or one on the previous commit-time resolver) onto
+// the current runtime-resolving form, reusing the exact
 // writer init.mjs itself uses so the regenerated hook is byte-identical to
 // what a fresh init would produce today — the --lint-strict step count
 // (info.lintStrict) is preserved exactly, never collapsed to one step, or the
@@ -746,7 +760,9 @@ function checkWikiPreCommitRoot(hypoDir) {
 //
 // Returns `{ ok: true }` on a successful rewrite, or `{ ok: false, reason }`
 // naming why the write was refused or failed, so the caller can surface that
-// reason instead of silently reporting "unchanged".
+// reason instead of silently reporting "unchanged". The final swap goes through
+// publishHookFile, so a failed write or rename leaves the live hook untouched
+// and the reason names the .bak path.
 function applyWikiPreCommitRoot(info) {
   const unsafe = unsafeHookTargetReason(info.hookPath);
   if (unsafe) return { ok: false, reason: unsafe };
@@ -781,7 +797,9 @@ function applyWikiPreCommitRoot(info) {
       reason: `cannot read hook to verify before migrating (${e.code || e.message})`,
     };
   }
-  const expectedOld = oldFormPreCommitContent(info.root, hypoDir, info.lintStrict);
+  const expectedOld = info.previousResolver
+    ? previousFormPreCommitContent(hypoDir, info.lintStrict)
+    : oldFormPreCommitContent(info.root, hypoDir, info.lintStrict);
   if (currentContent !== expectedOld) {
     return {
       ok: false,
@@ -810,14 +828,22 @@ function applyWikiPreCommitRoot(info) {
   writeFileSync(bakPath, currentContent);
 
   // A REFUSAL (above) is a soft skip, matching init's contract that an unsafe
-  // or unresolvable target is logged and stepped over. A real I/O failure is
-  // not that: every other apply write in this file lets the exception through,
-  // and init does the same, so swallowing EACCES here would make this one
-  // migration quieter than the rest of --apply for no reason. It also reported
-  // the wrong thing: a chmod that fails AFTER the write says "still on the old
-  // form" while the file already holds the new one.
-  writeFileSync(info.hookPath, newContent);
-  chmodSync(info.hookPath, 0o755);
+  // or unresolvable target is logged and stepped over. A failed write is
+  // reported the same way, because publishHookFile keeps it from touching the
+  // live hook: the old bytes are still in place, so "still on the older form" is
+  // true and the .bak path in the reason is a second copy, not the only one.
+  const published = publishHookFile(info.hookPath, newContent);
+  if (!published.ok) {
+    const leftover = published.cleaned
+      ? ''
+      : `; the unused candidate file ${published.candidatePath} could not be removed`;
+    return {
+      ok: false,
+      reason:
+        `writing the new hook failed (${published.error.code || published.error.message}); ` +
+        `the existing hook is unchanged and its bytes are also saved at ${bakPath}${leftover}`,
+    };
+  }
   return { ok: true };
 }
 
@@ -1469,8 +1495,10 @@ const wikiHookWantRoot = hypomnemaPluginEnabled ? pluginRegistryRoot : PKG_ROOT;
 const wikiPreCommitInfo = checkWikiPreCommitRoot(args.hypoDir);
 // `wikiPreCommitInfo.root` is non-null only for a hook still on the
 // OLD, version-pinned form (see parseWikiPreCommitRoot in
-// lib/git-hooks-dir.mjs) — the NEW, runtime-resolving form never bakes one in,
-// so `root === null` there means "nothing to migrate", not "unresolved".
+// lib/git-hooks-dir.mjs). A runtime-resolving hook never bakes one in, so
+// `root === null` alone does not say whether there is anything to migrate: a
+// hook on the previous resolver (`previousResolver === true`) also has no root
+// and still needs rewriting; only the current form is "nothing to migrate".
 // Migrating does not need wikiHookWantRoot at all: unlike the old repoint
 // (which had to pick the CORRECT root to bake in, and had to stay silent when
 // it could not positively resolve one — see the dual-install preserve case
@@ -1478,7 +1506,9 @@ const wikiPreCommitInfo = checkWikiPreCommitRoot(args.hypoDir);
 // even when this run cannot resolve the active install itself, because the
 // rewritten hook resolves it fresh at every future commit instead of baking
 // in a guess now.
-const wikiPreCommitDrift = wikiPreCommitInfo !== null && wikiPreCommitInfo.root !== null;
+const wikiPreCommitDrift =
+  wikiPreCommitInfo !== null &&
+  (wikiPreCommitInfo.root !== null || wikiPreCommitInfo.previousResolver === true);
 const commands = checkCommands();
 const oldHookRefs = checkOldHookNames(claudeSettingsPath);
 const retiredSettings = checkRetiredRegistrations(claudeSettingsPath, claudeHooksDir);
@@ -1913,6 +1943,9 @@ if (args.json) {
               // active install to, kept as diagnostic output.
               wantRoot: wikiHookWantRoot,
               drift: wikiPreCommitDrift,
+              // true for a hook on the previous commit-time resolver (no baked
+              // root, but upgrade --apply rewrites it onto the current one).
+              previousResolver: wikiPreCommitInfo.previousResolver === true,
               // true only for "marker present, body unreadable" (see
               // checkWikiPreCommitRoot above). Absent/false for both a clean
               // new-form hook and an old-form one this run can still parse.
@@ -2226,7 +2259,24 @@ if (dualSkip && dualSkipCorrected) {
 }
 
 // Vault pre-commit hook install root
-if (wikiPreCommitInfo && wikiPreCommitDrift) {
+if (wikiPreCommitInfo && wikiPreCommitDrift && wikiPreCommitInfo.previousResolver) {
+  if (appliedWikiPreCommitRoot) {
+    lines.push(
+      `✓ Wiki pre-commit   hook moved to the current commit-time resolver, which checks the` +
+        ` enabled plugin before hypo-pkg.json`,
+    );
+  } else if (args.apply) {
+    lines.push(
+      `⚠ Wiki pre-commit   could not update hook (${wikiPreCommitApplyFailReason}) —` +
+        ` it is still on the older resolver`,
+    );
+  } else {
+    lines.push(
+      `⚠ Wiki pre-commit   hook uses an older resolver that reads hypo-pkg.json before the` +
+        ` enabled plugin — run --apply to update it`,
+    );
+  }
+} else if (wikiPreCommitInfo && wikiPreCommitDrift) {
   if (appliedWikiPreCommitRoot) {
     lines.push(
       `✓ Wiki pre-commit   hook migrated off the baked-in root ${wikiPreCommitInfo.root}` +

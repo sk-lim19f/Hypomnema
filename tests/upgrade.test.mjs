@@ -19,6 +19,9 @@ import {
   symlinkSync,
   unlinkSync,
   chmodSync,
+  readdirSync,
+  statSync,
+  utimesSync,
 } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -28,7 +31,10 @@ import {
   SCHEMA_VERSION_DELTAS,
 } from '../scripts/lib/template-schema-version.mjs';
 import { isHypomnemaPluginEnabled } from '../scripts/lib/plugin-detect.mjs';
-import { wikiPreCommitContent } from '../scripts/lib/git-hooks-dir.mjs';
+import {
+  previousFormPreCommitContent,
+  wikiPreCommitContent,
+} from '../scripts/lib/git-hooks-dir.mjs';
 import { writeDualSkipProvenance } from '../scripts/lib/pkg-json.mjs';
 import { PROVENANCE_FILENAME } from '../scripts/lib/pkg-provenance.mjs';
 import {
@@ -46,6 +52,7 @@ import {
   REPO,
   SCRIPTS,
   SESSION_TMP_HOME,
+  hookWriteFaultPreload,
   legacyWikiPreCommitContent,
   run,
   runWithHome,
@@ -2473,6 +2480,140 @@ test('doctor reports an unreadable-but-marked pre-commit hook, not a silent pass
       'pass',
       'the marker-substring check stays a pass, the root check next to it is what must now catch this',
     );
+  });
+});
+
+// ── a hook on the previous commit-time resolver is rewritten onto the current one ──
+//
+// v1.8.4 through v1.10.0 wrote a resolver that reads hypo-pkg.json before the
+// enabled plugin's registry entry. It bakes no root, so the old-form check
+// (root !== null) never saw it as drift and --apply left it in place.
+
+suite('upgrade.mjs: hooks on the previous resolver');
+
+// A vault hook holding the exact bytes v1.10.0 wrote.
+function seedPreviousResolverHook(wiki, lintStrict) {
+  const hookPath = seedWikiPreCommitHook(wiki, join(wiki, 'unused-root'), lintStrict, wiki, false);
+  writeFileSync(hookPath, previousFormPreCommitContent(wiki, lintStrict), { mode: 0o755 });
+  return hookPath;
+}
+
+test('upgrade --apply rewrites a previous-resolver hook onto the current resolver and keeps a .bak', () => {
+  for (const lintStrict of [false, true]) {
+    withFakeUpgradeInstall(true, ({ upgrade, home, wiki }) => {
+      const hookPath = seedPreviousResolverHook(wiki, lintStrict);
+      const previous = previousFormPreCommitContent(wiki, lintStrict);
+      const r = runUpgrade(upgrade, [`--hypo-dir=${wiki}`, '--apply'], home);
+      const label = `lint-strict ${lintStrict}`;
+      assert.equal(r.status, 0, `${label}: ${r.stderr}\n${r.stdout}`);
+      assert.equal(readFileSync(hookPath, 'utf-8'), wikiPreCommitContent(wiki, lintStrict), label);
+      assert.equal(readFileSync(`${hookPath}.bak`, 'utf-8'), previous, `${label}: .bak bytes`);
+      assert.equal(statSync(hookPath).mode & 0o777, 0o755, `${label}: hook stays executable`);
+      assert.match(r.stdout, /Wiki pre-commit.*moved to the current commit-time resolver/, label);
+      assert.doesNotMatch(r.stdout, /baked-in root null/, label);
+    });
+  }
+});
+
+test('upgrade without --apply reports a previous-resolver hook in words, not as a null root', () => {
+  withFakeUpgradeInstall(true, ({ upgrade, home, wiki }) => {
+    const hookPath = seedPreviousResolverHook(wiki, false);
+    const before = readFileSync(hookPath, 'utf-8');
+    const r = runUpgrade(upgrade, [`--hypo-dir=${wiki}`], home);
+    // A dry run exits 1 whenever something needs updating.
+    assert.equal(r.status, 1, `${r.stderr}\n${r.stdout}`);
+    assert.match(r.stdout, /Wiki pre-commit.*older resolver.*run --apply to update it/);
+    assert.doesNotMatch(r.stdout, /Wiki pre-commit[^\n]*null/);
+    assert.doesNotMatch(r.stdout, /baked in, so it goes stale/);
+    assert.equal(readFileSync(hookPath, 'utf-8'), before, 'a dry run must not touch the hook');
+  });
+});
+
+test('upgrade leaves a current-resolver hook as it is', () => {
+  withFakeUpgradeInstall(true, ({ upgrade, home, wiki }) => {
+    const hookPath = seedPreviousResolverHook(wiki, false);
+    writeFileSync(hookPath, wikiPreCommitContent(wiki, false), { mode: 0o755 });
+    const past = new Date(Date.now() - 3600_000);
+    utimesSync(hookPath, past, past);
+    const before = statSync(hookPath);
+    const r = runUpgrade(upgrade, [`--hypo-dir=${wiki}`, '--apply', '--json'], home);
+    assert.equal(r.status, 0, `${r.stderr}\n${r.stdout}`);
+    const info = JSON.parse(r.stdout).wikiPreCommitRoot;
+    assert.equal(info.drift, false);
+    assert.equal(info.previousResolver, false);
+    assert.equal(readFileSync(hookPath, 'utf-8'), wikiPreCommitContent(wiki, false));
+    assert.equal(statSync(hookPath).mtimeMs, before.mtimeMs, 'the current form is not rewritten');
+    assert.equal(existsSync(`${hookPath}.bak`), false, 'no backup for a hook that was not touched');
+  });
+});
+
+// Runs `upgrade --apply` with the hook-write fault preload armed. NODE_OPTIONS
+// reaches only node children, and upgrade's git probe is not one.
+function runUpgradeWithHookFault(upgrade, wiki, home, mode, dir) {
+  const { preloadPath, firedPath } = hookWriteFaultPreload(dir);
+  const r = spawnSync(process.execPath, [upgrade, `--hypo-dir=${wiki}`, '--apply'], {
+    encoding: 'utf-8',
+    env: {
+      ...process.env,
+      HYPO_DIR: '',
+      HOME: home,
+      NODE_OPTIONS: `--require=${preloadPath}`,
+      HYPO_TEST_HOOK_FAULT: mode,
+    },
+  });
+  return { r, firedPath };
+}
+
+test('a hook write that fails partway leaves the live previous-resolver hook whole', () => {
+  withFakeUpgradeInstall(true, ({ upgrade, home, wiki }) => {
+    withTmpDir((dir) => {
+      const hookPath = seedPreviousResolverHook(wiki, false);
+      const previous = previousFormPreCommitContent(wiki, false);
+      const { r, firedPath } = runUpgradeWithHookFault(upgrade, wiki, home, 'write', dir);
+      assert.equal(r.status, 0, `${r.stderr}\n${r.stdout}`);
+      assert.ok(existsSync(firedPath), 'the injected write fault must have fired');
+      assert.match(
+        readFileSync(firedPath, 'utf-8'),
+        /pre-commit\.[^/]*\.tmp$/,
+        'the fault must have torn the candidate file, not the live hook',
+      );
+      assert.equal(readFileSync(hookPath, 'utf-8'), previous, 'live hook is the previous bytes');
+      assert.equal(readFileSync(`${hookPath}.bak`, 'utf-8'), previous, '.bak holds the same bytes');
+      assert.deepEqual(
+        readdirSync(dirname(hookPath)).filter((f) => /^pre-commit\..*\.tmp$/.test(f)),
+        [],
+        'no candidate file may be left behind',
+      );
+      assert.match(r.stdout, /could not update hook.*pre-commit\.bak.*still on the older resolver/);
+    });
+  });
+});
+
+test('a failed final rename leaves the live hook and removes the candidate', () => {
+  withFakeUpgradeInstall(true, ({ upgrade, home, wiki }) => {
+    withTmpDir((dir) => {
+      const hookPath = seedPreviousResolverHook(wiki, false);
+      const previous = previousFormPreCommitContent(wiki, false);
+      const { r, firedPath } = runUpgradeWithHookFault(upgrade, wiki, home, 'rename', dir);
+      assert.equal(r.status, 0, `${r.stderr}\n${r.stdout}`);
+      assert.equal(
+        readFileSync(firedPath, 'utf-8'),
+        join(realpathSync(dirname(hookPath)), 'pre-commit'),
+        'the rename onto the hook failed',
+      );
+      assert.equal(readFileSync(hookPath, 'utf-8'), previous);
+      assert.deepEqual(
+        readdirSync(dirname(hookPath)).filter((f) => /^pre-commit\..*\.tmp$/.test(f)),
+        [],
+        'the complete candidate must be removed when the rename fails',
+      );
+      assert.match(r.stdout, /could not update hook.*pre-commit\.bak/);
+
+      const again = runUpgrade(upgrade, [`--hypo-dir=${wiki}`, '--apply'], home);
+      assert.equal(again.status, 0, `${again.stderr}\n${again.stdout}`);
+      assert.equal(readFileSync(hookPath, 'utf-8'), wikiPreCommitContent(wiki, false));
+      assert.match(again.stdout, /moved to the current commit-time resolver/);
+    });
   });
 });
 
