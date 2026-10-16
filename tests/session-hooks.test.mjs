@@ -46,6 +46,8 @@ import {
   resolveActiveProject,
   sessionCloseFileStatus,
   readTouchedPathsStrict,
+  readTouchedPathsDrifted,
+  touchedPathsFailedPath,
   writeClosePin,
   migrationState,
 } from '../hooks/hypo-shared.mjs';
@@ -1014,7 +1016,7 @@ test('readTouchedPathsStrict: ok (non-empty) vs. empty (absent/no-session) vs. u
     writeFileSync(touchedPathsPath(dir, 'sess-strict-corrupt'), '{ not valid json');
     assert.deepEqual(
       readTouchedPathsStrict(dir, 'sess-strict-corrupt'),
-      { state: 'unreadable', paths: [] },
+      { state: 'unreadable', paths: [], cause: 'corrupt' },
       'a corrupt file must read as unreadable, never silently as empty',
     );
     // peekTouchedPaths keeps its own contract: fail-safe to [] regardless of
@@ -1108,6 +1110,252 @@ test('commitTouchedPaths: a committed result retires every path it does not repo
     recordTouchedPaths(dir, 'sess-ct-legacy', ['a.md', 'b.md']);
     commitTouchedPaths(dir, 'sess-ct-legacy', () => ({ committed: true }));
     assert.ok(!existsSync(touchedPathsPath(dir, 'sess-ct-legacy')));
+  });
+});
+
+// ── touched-paths failure flag (touched-paths-failed.json) ──────────────────────────────────
+// A record that does not land used to leave nothing: the caller got `false` (or ignored it) and a
+// gate that read the set later saw "not this session's". The flag is what a later gate reads.
+const sha256 = (bytes) => createHash('sha256').update(bytes).digest('hex');
+function commitVaultFile(dir, rel, text) {
+  mkdirSync(dirname(join(dir, rel)), { recursive: true });
+  writeFileSync(join(dir, rel), text);
+  spawnSync('git', ['-C', dir, 'add', '--', rel]);
+  spawnSync('git', ['-C', dir, 'commit', '-q', '-m', `add ${rel}`]);
+}
+function readFailedFlag(dir, sid) {
+  return JSON.parse(readFileSync(touchedPathsFailedPath(dir, sid), 'utf-8'));
+}
+// A directory where touched-hashes.json belongs makes the record's atomic write throw (the rename
+// onto a directory fails for any user), with no lock wait. Removing it lets the next record land.
+function breakHashWrite(dir, sid) {
+  const p = join(dirname(touchedPathsPath(dir, sid)), 'touched-hashes.json');
+  mkdirSync(p, { recursive: true });
+  return () => rmSync(p, { recursive: true, force: true });
+}
+
+// Distinguishes: a record that lost its lock to a live holder (returns false, flag names the path
+// with HEAD's blob hash) from a record that lands (returns true, set holds the path, no flag).
+test('recordTouchedPaths: a lock timeout leaves a failure flag naming the path', () => {
+  withSyncedWiki((dir) => {
+    commitVaultFile(dir, 'pages/a.md', 'in head\n');
+    const tp = touchedPathsPath(dir, 'sess-flag-lock');
+    mkdirSync(dirname(tp), { recursive: true });
+    // A live holder (this process), so withFileLock waits and times out instead of stealing.
+    writeFileSync(`${tp}.lock`, String(process.pid));
+    // The deadline leaves 2000ms of lock wait (3000 less the 1000 kept for the flag).
+    const ok = recordTouchedPaths(dir, 'sess-flag-lock', 'pages/a.md', {
+      deadline: { end: performance.now() + 3000 },
+    });
+    assert.equal(ok, false, 'a record that lost its lock reports false');
+    const flag = readFailedFlag(dir, 'sess-flag-lock');
+    assert.deepEqual(flag.entries, { 'pages/a.md': { headSha256: sha256('in head\n') } });
+    assert.equal(flag.pathsUnknown, false);
+    assert.deepEqual(flag.reasons, ['ELOCKTIMEOUT']);
+  });
+});
+
+test('recordTouchedPaths: a record that lands leaves no failure flag', () => {
+  withSyncedWiki((dir) => {
+    commitVaultFile(dir, 'pages/a.md', 'in head\n');
+    assert.equal(recordTouchedPaths(dir, 'sess-flag-none', 'pages/a.md'), true);
+    const read = readTouchedPathsStrict(dir, 'sess-flag-none');
+    assert.equal(read.state, 'ok');
+    assert.deepEqual(read.paths, ['pages/a.md']);
+    assert.ok(!existsSync(touchedPathsFailedPath(dir, 'sess-flag-none')), 'no flag for a success');
+  });
+});
+
+// Distinguishes: a spent budget (no time to ask git, so no hash is written and the gate always
+// blocks on the path) from a flag written with time left (the hash above).
+test('recordTouchedPaths: an exhausted deadline still flags the path, with no hash', () => {
+  withSyncedWiki((dir) => {
+    commitVaultFile(dir, 'pages/a.md', 'in head\n');
+    const tp = touchedPathsPath(dir, 'sess-flag-spent');
+    mkdirSync(dirname(tp), { recursive: true });
+    writeFileSync(`${tp}.lock`, String(process.pid));
+    const ok = recordTouchedPaths(dir, 'sess-flag-spent', 'pages/a.md', {
+      deadline: { end: performance.now() - 1 },
+    });
+    assert.equal(ok, false);
+    assert.deepEqual(readFailedFlag(dir, 'sess-flag-spent').entries, { 'pages/a.md': {} });
+  });
+});
+
+// Distinguishes: a later successful record of the SAME path (its entry goes, and with no entry left
+// the file goes) from a successful record of ANOTHER path (the entry stays).
+test('recordTouchedPaths: a later successful record of a flagged path drops its flag entry', () => {
+  withSyncedWiki((dir) => {
+    const heal = breakHashWrite(dir, 'sess-flag-drop');
+    assert.equal(recordTouchedPaths(dir, 'sess-flag-drop', 'pages/a.md'), false);
+    assert.ok('pages/a.md' in readFailedFlag(dir, 'sess-flag-drop').entries);
+    heal();
+    assert.equal(recordTouchedPaths(dir, 'sess-flag-drop', 'pages/a.md'), true);
+    assert.ok(
+      !existsSync(touchedPathsFailedPath(dir, 'sess-flag-drop')),
+      'the only entry went with its record, so the flag file is gone',
+    );
+
+    // A pathsUnknown flag keeps pathsUnknown when a path inside it records fine.
+    const sid = 'sess-flag-unknown';
+    recordTouchedPaths(dir, sid, 'pages/a.md');
+    writeFileSync(touchedPathsPath(dir, sid), '{ not json');
+    assert.equal(recordTouchedPaths(dir, sid, 'pages/a.md'), true);
+    assert.equal(readFailedFlag(dir, sid).pathsUnknown, true);
+    assert.equal(recordTouchedPaths(dir, sid, 'pages/a.md'), true);
+    assert.equal(
+      readFailedFlag(dir, sid).pathsUnknown,
+      true,
+      'a path recording fine does not account for the paths the flag could not name',
+    );
+  });
+});
+
+test('recordTouchedPaths: a successful record of another path leaves a flag entry', () => {
+  withSyncedWiki((dir) => {
+    const sid = 'sess-flag-other';
+    const heal = breakHashWrite(dir, sid);
+    assert.equal(recordTouchedPaths(dir, sid, 'pages/a.md'), false);
+    heal();
+    assert.equal(recordTouchedPaths(dir, sid, 'pages/b.md'), true);
+    assert.deepEqual(Object.keys(readFailedFlag(dir, sid).entries), ['pages/a.md']);
+    assert.deepEqual(readFailedFlag(dir, sid).reasons.length, 1);
+  });
+});
+
+// Distinguishes: a record set that was corrupt and got overwritten (paths lost, so the flag says
+// pathsUnknown) from a readable set that merges (nothing lost, no flag).
+test('recordTouchedPaths over a corrupt set leaves a paths-unknown failure flag', () => {
+  withSyncedWiki((dir) => {
+    const sid = 'sess-flag-corrupt';
+    recordTouchedPaths(dir, sid, 'pages/a.md');
+    writeFileSync(touchedPathsPath(dir, sid), '{ not json');
+    assert.equal(recordTouchedPaths(dir, sid, 'pages/b.md'), true, 'the new path itself records');
+    assert.deepEqual(readTouchedPathsStrict(dir, sid), { state: 'ok', paths: ['pages/b.md'] });
+    const flag = readFailedFlag(dir, sid);
+    assert.equal(flag.pathsUnknown, true);
+    assert.deepEqual(flag.reasons, ['prior-record-unreadable']);
+  });
+});
+
+test('recordTouchedPaths over a readable set merges without a flag', () => {
+  withSyncedWiki((dir) => {
+    const sid = 'sess-flag-merge';
+    recordTouchedPaths(dir, sid, 'pages/a.md');
+    assert.equal(recordTouchedPaths(dir, sid, 'pages/b.md'), true);
+    assert.deepEqual(readTouchedPathsStrict(dir, sid), {
+      state: 'ok',
+      paths: ['pages/a.md', 'pages/b.md'],
+    });
+    assert.ok(!existsSync(touchedPathsFailedPath(dir, sid)));
+  });
+});
+
+// Distinguishes: a recorded hash given by the caller (the disk bytes differ from it, so the path
+// reads as drifted) from the default (the disk bytes are the hash, nothing drifted).
+test('recordTouchedPaths with expectedHashes records the given hash', () => {
+  withSyncedWiki((dir) => {
+    writeFileSync(join(dir, 'a.md'), 'on disk\n');
+    assert.equal(
+      recordTouchedPaths(dir, 'sess-exp', 'a.md', { expectedHashes: { 'a.md': sha256('seed\n') } }),
+      true,
+    );
+    assert.deepEqual(readTouchedPathsDrifted(dir, 'sess-exp'), ['a.md']);
+    assert.equal(recordTouchedPaths(dir, 'sess-exp-default', 'a.md'), true);
+    assert.deepEqual(readTouchedPathsDrifted(dir, 'sess-exp-default'), []);
+  });
+});
+
+// Distinguishes: a HEAD lookup that failed (the tree names the path, its blob object is gone, so
+// the entry has no headSha256 key) from a path HEAD does not have (headSha256: null, a confirmed
+// absence). A gate treats the first as always-pending and the second as "HEAD has nothing yet".
+test('markTouchedPathsFailed: a failed HEAD lookup records the path with no hash, an absent path records null', () => {
+  withSyncedWiki((dir) => {
+    commitVaultFile(dir, 'pages/a.md', 'in head\n');
+    const blob = spawnSync('git', ['-C', dir, 'rev-parse', 'HEAD:pages/a.md'], {
+      encoding: 'utf-8',
+    }).stdout.trim();
+    rmSync(join(dir, '.git', 'objects', blob.slice(0, 2), blob.slice(2)), { force: true });
+    breakHashWrite(dir, 'sess-flag-head');
+    assert.equal(recordTouchedPaths(dir, 'sess-flag-head', ['pages/a.md', 'pages/new.md']), false);
+    const { entries } = readFailedFlag(dir, 'sess-flag-head');
+    assert.deepEqual(entries['pages/a.md'], {}, 'lookup failed: no headSha256 key');
+    assert.ok(!('headSha256' in entries['pages/a.md']));
+    assert.deepEqual(entries['pages/new.md'], { headSha256: null }, 'confirmed absent: null');
+  });
+});
+
+// Distinguishes: a corrupt set (deleting the file mends it) from a lock that cannot be created
+// (the directory is the problem, deleting the file does not mend it).
+test('readTouchedPathsStrict: a corrupt set reads unreadable with cause corrupt', () => {
+  withSyncedWiki((dir) => {
+    recordTouchedPaths(dir, 'sess-cause-corrupt', 'pages/a.md');
+    writeFileSync(touchedPathsPath(dir, 'sess-cause-corrupt'), '{ not json');
+    assert.deepEqual(readTouchedPathsStrict(dir, 'sess-cause-corrupt'), {
+      state: 'unreadable',
+      paths: [],
+      cause: 'corrupt',
+    });
+  });
+});
+
+test('readTouchedPathsStrict: a lock that cannot be created reads unreadable with cause lock-failed', () => {
+  if (process.platform === 'win32' || process.getuid?.() === 0) {
+    console.log('  (lock-failed half skipped: a read-only directory is writable here)');
+    return;
+  }
+  withSyncedWiki((dir) => {
+    recordTouchedPaths(dir, 'sess-cause-lock', 'pages/a.md');
+    const cacheDir = dirname(touchedPathsPath(dir, 'sess-cause-lock'));
+    chmodSync(cacheDir, 0o500);
+    try {
+      assert.deepEqual(readTouchedPathsStrict(dir, 'sess-cause-lock'), {
+        state: 'unreadable',
+        paths: [],
+        cause: 'lock-failed',
+      });
+    } finally {
+      chmodSync(cacheDir, 0o700);
+    }
+  });
+});
+
+// Distinguishes: worktree back at HEAD while the index still holds this session's bytes (the claim
+// stays, so the staged bytes are not committed under no claim) from index and worktree both at
+// HEAD (nothing is dirty, the claim is retired).
+test("commitTouchedPaths: a drifted claim stays while this session's bytes are still staged", () => {
+  withSyncedWiki((dir) => {
+    commitVaultFile(dir, 'pages/a.md', 'head bytes\n');
+    writeFileSync(join(dir, 'pages/a.md'), 'session bytes\n');
+    recordTouchedPaths(dir, 'sess-staged', 'pages/a.md');
+    spawnSync('git', ['-C', dir, 'add', '--', 'pages/a.md']);
+    const headBytes = spawnSync('git', ['-C', dir, 'show', 'HEAD:./pages/a.md'], {
+      encoding: 'utf-8',
+    }).stdout;
+    writeFileSync(join(dir, 'pages/a.md'), headBytes);
+    let scope = 'unset';
+    const res = commitTouchedPaths(dir, 'sess-staged', (paths) => {
+      scope = paths;
+      return { committed: true };
+    });
+    assert.equal(res.committed, true);
+    assert.deepEqual(scope, [], 'the drifted path is not in the commit scope');
+    assert.deepEqual(readTouchedPathsStrict(dir, 'sess-staged'), {
+      state: 'ok',
+      paths: ['pages/a.md'],
+    });
+  });
+});
+
+test('commitTouchedPaths: a drifted claim whose index and worktree are both HEAD is retired', () => {
+  withSyncedWiki((dir) => {
+    commitVaultFile(dir, 'pages/a.md', 'head bytes\n');
+    writeFileSync(join(dir, 'pages/a.md'), 'session bytes\n');
+    recordTouchedPaths(dir, 'sess-unstaged', 'pages/a.md');
+    spawnSync('git', ['-C', dir, 'checkout', '-q', 'HEAD', '--', 'pages/a.md']);
+    const res = commitTouchedPaths(dir, 'sess-unstaged', () => ({ committed: true }));
+    assert.equal(res.committed, true);
+    assert.deepEqual(readTouchedPathsStrict(dir, 'sess-unstaged'), { state: 'empty', paths: [] });
   });
 });
 
