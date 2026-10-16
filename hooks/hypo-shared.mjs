@@ -5714,6 +5714,21 @@ function headBlobState(hypoDir, relPath, { deadline } = {}) {
 }
 
 /**
+ * True for a zero-byte `projects/<slug>/index.md` that HEAD does not have: the shape a close leaves
+ * when it dies between creating the project index and writing its seed. `headBlobState` answering
+ * `error` gives no hint, since "not in HEAD" is then unknown.
+ */
+function emptyNewIndexHint(hypoDir, relPath) {
+  if (!/^projects\/[^/]+\/index\.md$/.test(relPath)) return false;
+  try {
+    if (statSync(join(hypoDir, relPath)).size !== 0) return false;
+  } catch {
+    return false;
+  }
+  return headBlobState(hypoDir, relPath).state === 'absent';
+}
+
+/**
  * Read a session's failure flag (`touched-paths-failed.json`):
  * `{v: 1, entries: {<path>: {headSha256?: string|null}}, pathsUnknown, reasons}`.
  * `failed` is false only when there is no flag. A flag that exists but cannot be read is a failure
@@ -8720,8 +8735,9 @@ export function precompactGateStatus(hypoDir, opts = {}) {
               // dirty forever on its own: say how to get out. A file whose
               // bytes changed after this session recorded it is kept out of
               // the auto-commit (commitTouchedPaths), so say that too.
-              const ignoredHint =
-                ignorePatterns.length > 0 && isIgnored(join(hypoDir, f), hypoDir, ignorePatterns)
+              const pathHint = emptyNewIndexHint(hypoDir, pf)
+                ? ' (빈 파일이다. 이 세션의 close 가 만들다 멈춘 것이니 지우고 close 를 다시 하면 된다)'
+                : ignorePatterns.length > 0 && isIgnored(join(hypoDir, f), hypoDir, ignorePatterns)
                   ? ' (.hypoignore 대상이라 자동 커밋되지 않는다. 손으로 커밋하거나 .hypoignore 에서 빼야 close 가 된다)'
                   : driftedSet.has(posixPath(f))
                     ? ' (이 세션이 기록한 뒤 다른 쓰기가 이 파일을 바꿔서 자동 커밋에서 빠진다. 지금 내용이 맞는지 확인하고 손으로 커밋해야 close 가 된다)'
@@ -8729,7 +8745,7 @@ export function precompactGateStatus(hypoDir, opts = {}) {
               blockers.push({
                 type: 'known-session-write',
                 file: f,
-                reason: `this session's own write is still uncommitted: ${f}${ignoredHint}`,
+                reason: `this session's own write is still uncommitted: ${f}${pathHint}`,
               });
             } else if (isForeignUncommittedEntry(hypoDir, pf, opts.sessionId)) {
               // Two sessions closing one project at once: the other one's entry

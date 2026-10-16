@@ -49,6 +49,9 @@ import {
   recordShardAppend,
   readClosePin,
   readTouchedPathsStrict,
+  commitTouchedPaths,
+  touchedHashesPath,
+  touchedPathsFailedPath,
   recordTouchedPaths,
   writeClosePin,
   sessionProofCloseId,
@@ -1550,6 +1553,77 @@ test("ensureProjectIndex: a file created after the caller's missing-check surviv
       winnerContent,
       "the winner's bytes must survive byte-for-byte, never clobbered by the losing create",
     );
+  });
+});
+
+// Pair of the next test: a session id makes the create this session's write, none records nothing.
+// The recorded hash is the sha256 of the bytes the create put on disk, which is also what
+// vaultFileHash would read, so the bytesSha256 the record is made from is the same value.
+test("ensureProjectIndex: records the index path in this session's touched-paths with the seed hash once it owns the create", () => {
+  withTmpDir((dir) => {
+    const rel = join('projects', 'rec-project', 'index.md');
+    const sid = newPinSession('idx-record');
+    assert.equal(ensureProjectIndex(dir, 'rec-project', rel, '2026-06-01', sid), rel);
+    const touched = readTouchedPathsStrict(dir, sid);
+    assert.equal(touched.state, 'ok', JSON.stringify(touched));
+    assert.deepEqual(touched.paths, [rel]);
+    const hashes = JSON.parse(readFileSync(touchedHashesPath(dir, sid), 'utf-8'));
+    assert.equal(
+      hashes[rel],
+      createHash('sha256')
+        .update(readFileSync(join(dir, rel)))
+        .digest('hex'),
+    );
+    assert.ok(readFileSync(join(dir, rel), 'utf-8').length > 0, 'the seed landed');
+  });
+});
+
+test('ensureProjectIndex: without a session id records nothing', () => {
+  withTmpDir((dir) => {
+    const rel = join('projects', 'rec-project', 'index.md');
+    assert.equal(ensureProjectIndex(dir, 'rec-project', rel, '2026-06-01'), rel);
+    assert.equal(existsSync(join(dir, '.cache', 'sessions')), false, 'no session dir was made');
+  });
+});
+
+// Pair of the one above: a file this session created is recorded, a file another session got to
+// first (EEXIST) is not, and it leaves no failure flag either.
+test("ensureProjectIndex: another session's index.md (EEXIST) is not recorded in this session's touched-paths", () => {
+  withTmpDir((dir) => {
+    const rel = join('projects', 'rec-project', 'index.md');
+    ensureProjectIndex(dir, 'rec-project', rel, '2026-06-01', newPinSession('idx-first'));
+    const sid = newPinSession('idx-second');
+    assert.equal(ensureProjectIndex(dir, 'rec-project', rel, '2026-06-01', sid), null);
+    assert.equal(readTouchedPathsStrict(dir, sid).state, 'empty');
+    assert.equal(existsSync(touchedPathsFailedPath(dir, sid)), false, 'no failure flag');
+  });
+});
+
+// Pair of the next test: the create died between the empty create and the write, so the record
+// holds the seed hash and the disk holds nothing. Stop's retirement keeps it. A create that
+// finished and was committed matches HEAD and is retired.
+test("an interrupted index.md create survives the Stop auto-commit's retirement", () => {
+  withWiki(null, (dir, today) => {
+    const rel = join('projects', 'test-project', 'index.md');
+    const sid = newPinSession('idx-interrupted');
+    ensureProjectIndex(dir, 'test-project', rel, today, sid);
+    writeFileSync(join(dir, rel), '');
+    const r = commitTouchedPaths(dir, sid, () => ({ committed: true }));
+    assert.equal(r.committed, true, JSON.stringify(r));
+    assert.deepEqual(readTouchedPathsStrict(dir, sid).paths, [rel]);
+  });
+});
+
+test('a completed and committed index.md create is retired by the Stop auto-commit', () => {
+  withWiki(null, (dir, today) => {
+    const rel = join('projects', 'test-project', 'index.md');
+    const sid = newPinSession('idx-completed');
+    ensureProjectIndex(dir, 'test-project', rel, today, sid);
+    spawnSync('git', ['-C', dir, 'add', '--', rel]);
+    spawnSync('git', ['-C', dir, 'commit', '-q', '-m', 'index']);
+    const r = commitTouchedPaths(dir, sid, () => ({ committed: true }));
+    assert.equal(r.committed, true, JSON.stringify(r));
+    assert.equal(readTouchedPathsStrict(dir, sid).state, 'empty');
   });
 });
 

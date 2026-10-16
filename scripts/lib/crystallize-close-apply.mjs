@@ -1917,6 +1917,17 @@ export function ensureProjectIndex(hypoDir, project, relPath, today, sessionId) 
     if (e && e.code === 'EEXIST') return null; // another writer already created it
     throw e;
   }
+  // The create is ours from here, so the close gate has to know the file is this
+  // session's before the bytes land: a death between the empty create and the
+  // write leaves a zero-byte index.md that nothing else would claim. The record
+  // carries the seed's hash, not the empty file's, so the Stop auto-commit does
+  // not retire it. A `false` return is not fatal: the failure flag recordTouchedPaths
+  // leaves on its own blocks this path. EEXIST above never reaches this record.
+  if (sessionId) {
+    recordTouchedPaths(hypoDir, sessionId, [relPath], {
+      expectedHashes: { [relPath]: bytesSha256(content) },
+    });
+  }
   try {
     writeSync(fd, content);
   } finally {

@@ -22,6 +22,7 @@ import {
 import { join, dirname, basename } from 'node:path';
 import { tmpdir } from 'node:os';
 import { createProject, substituteTokens } from '../scripts/lib/project-create.mjs';
+import { ensureProjectIndex } from '../scripts/crystallize.mjs';
 import { writeProvenanceSidecar, provenancePath } from '../scripts/lib/pkg-provenance.mjs';
 import {
   buildProjectSuggestionLine,
@@ -4092,6 +4093,60 @@ test("checkpointMode: a dirty file still in THIS session's touched-paths → kno
       (gate.blockers || []).some((b) => b.type === 'known-session-write' && b.file === 'mine.md'),
       `a dirty file still claimed in touched-paths must block: ${JSON.stringify(gate.blockers)}`,
     );
+  });
+});
+
+// Pair of the next test: an empty index.md this close started (recorded with the seed hash, then
+// cut to zero bytes as if the process died before the write) against one another session left.
+// This session's blocks and says how to get out, the other session's is only a notice.
+test("checkpointMode: an empty index.md this session's close started blocks with the delete-and-retry hint", () => {
+  withSyncedWiki((dir) => {
+    const rel = 'projects/demo/index.md';
+    ensureProjectIndex(dir, 'demo', rel, '2026-06-01', 'sess-empty-mine');
+    writeFileSync(join(dir, rel), '');
+    const gate = precompactGateStatus(dir, {
+      claudeHome: join(dir, '.claude-none'),
+      checkpointMode: true,
+      sessionId: 'sess-empty-mine',
+    });
+    const b = (gate.blockers || []).find((x) => x.file === rel);
+    assert.ok(b && b.type === 'known-session-write', JSON.stringify(gate));
+    assert.match(b.reason, /빈 파일이다.*지우고 close 를 다시 하면 된다/);
+  });
+});
+
+test('checkpointMode: an empty index.md another session left is a notice', () => {
+  withSyncedWiki((dir) => {
+    const rel = 'projects/demo/index.md';
+    ensureProjectIndex(dir, 'demo', rel, '2026-06-01', 'sess-empty-theirs');
+    writeFileSync(join(dir, rel), '');
+    const gate = precompactGateStatus(dir, {
+      claudeHome: join(dir, '.claude-none'),
+      checkpointMode: true,
+      sessionId: 'sess-empty-me',
+    });
+    assert.ok(!(gate.blockers || []).some((x) => x.file === rel), JSON.stringify(gate.blockers));
+    assert.ok(
+      (gate.notices || []).some((n) => n.type === 'unresolved' && n.file === rel),
+      JSON.stringify(gate.notices),
+    );
+  });
+});
+
+// Pair of the first: the hint is for a zero-byte file only. The same recorded index.md with its
+// seed on disk still blocks, with no delete advice.
+test("checkpointMode: this session's non-empty recorded index.md gets no delete-and-retry hint", () => {
+  withSyncedWiki((dir) => {
+    const rel = 'projects/demo/index.md';
+    ensureProjectIndex(dir, 'demo', rel, '2026-06-01', 'sess-full-mine');
+    const gate = precompactGateStatus(dir, {
+      claudeHome: join(dir, '.claude-none'),
+      checkpointMode: true,
+      sessionId: 'sess-full-mine',
+    });
+    const b = (gate.blockers || []).find((x) => x.file === rel);
+    assert.ok(b && b.type === 'known-session-write', JSON.stringify(gate));
+    assert.ok(!/지우고 close 를 다시/.test(b.reason), b.reason);
   });
 });
 
