@@ -1165,7 +1165,6 @@ if (args.fromRemote) {
   copyTemplate('Overview.md', join(args.hypoDir, 'Overview.md'), args.dryRun);
   copyTemplate('hypo-help.md', join(args.hypoDir, 'hypo-help.md'), args.dryRun);
   copyTemplate('hypo-automation.md', join(args.hypoDir, 'hypo-automation.md'), args.dryRun);
-  copyTemplate('session-state.md', join(args.hypoDir, 'session-state.md'), args.dryRun);
   copyTemplate(join('pages', '_index.md'), join(args.hypoDir, 'pages', '_index.md'), args.dryRun);
   copyTemplate(
     join('pages', 'observability', '_index.md'),

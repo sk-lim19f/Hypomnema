@@ -578,9 +578,5 @@
   {
     "path": "templates/projects/_template/prd.md",
     "exec": false
-  },
-  {
-    "path": "templates/session-state.md",
-    "exec": false
   }
 ]

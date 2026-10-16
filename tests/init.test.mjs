@@ -33,6 +33,7 @@ import {
   SHELL_MARKER_START,
   SHELL_MARKER_END,
   SHELL_FUNCTION_BODY,
+  wikiPreCommitContent,
 } from '../scripts/lib/git-hooks-dir.mjs';
 import {
   HOME,
@@ -42,6 +43,7 @@ import {
   SESSION_TMP_HOME,
   deriveCoreHookBasenames,
   gitRepo,
+  hookWriteFaultPreload,
   legacyWikiPreCommitContent,
   readCoreHooksConfig,
   run,
@@ -3017,5 +3019,100 @@ test('uninstall keeps settings.json whole when the core hook strip write fails p
       );
       assertWholeAfterFault(fault, settingsPath, startBytes, 'uninstall.mjs', 'stripSettingsJson');
     });
+  });
+});
+
+// ── root session-state.md and the pre-commit hook publish ──
+
+suite('init.mjs: no root session-state.md, hook replaced through a candidate file');
+
+test('init does not create a root session-state.md', () => {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      const r = runWithHome('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-git-init'], home);
+      assert.equal(r.status, 0, `init failed: ${r.stderr}${r.stdout}`);
+      assert.ok(existsSync(join(hypoDir, 'hypo-config.md')), 'pre-state: init must have run');
+      assert.equal(
+        existsSync(join(hypoDir, 'session-state.md')),
+        false,
+        'the root session-state.md is a generated view per project, not a vault-root template',
+      );
+      assert.ok(
+        existsSync(join(hypoDir, 'projects', '_template', 'index.md')),
+        'projects/_template is still copied',
+      );
+    });
+  });
+});
+
+test('init re-run leaves an existing root session-state.md untouched', () => {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      mkdirSync(hypoDir, { recursive: true });
+      const own = '# my own root state\nkeep-me-7f3a\n';
+      writeFileSync(join(hypoDir, 'session-state.md'), own);
+      for (let i = 0; i < 2; i++) {
+        const r = runWithHome('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-git-init'], home);
+        assert.equal(r.status, 0, `init run ${i} failed: ${r.stderr}${r.stdout}`);
+      }
+      assert.equal(readFileSync(join(hypoDir, 'session-state.md'), 'utf-8'), own);
+    });
+  });
+});
+
+// A vault whose pre-commit hook is still the v1.10.0 form (previous resolver).
+function withPreviousResolverVault(fn) {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      mkdirSync(hypoDir, { recursive: true });
+      writeFileSync(join(hypoDir, 'hypo-config.md'), '# config');
+      gitRepo(hypoDir);
+      const { dir: hooksDir } = hooksDirForInstall(hypoDir);
+      mkdirSync(hooksDir, { recursive: true });
+      const hookPath = join(hooksDir, 'pre-commit');
+      writeFileSync(hookPath, V1_10_0_WORKER_HOOK, { mode: 0o755 });
+      fn({ home, dir, hypoDir, hookPath });
+    });
+  });
+}
+
+test('init re-run over a previous-resolver hook leaves the live hook whole when the write fails partway', () => {
+  withPreviousResolverVault(({ home, dir, hypoDir, hookPath }) => {
+    const { preloadPath, firedPath } = hookWriteFaultPreload(dir);
+    const env = { ...process.env, HOME: home, HYPO_DIR: hypoDir, HYPO_TEST_HOOK_FAULT: 'write' };
+    delete env.CLAUDE_CONFIG_DIR;
+    const r = spawnSync(
+      process.execPath,
+      ['-r', preloadPath, join(SCRIPTS, 'init.mjs'), `--hypo-dir=${hypoDir}`, '--no-git-init'],
+      { encoding: 'utf-8', env },
+    );
+    assert.ok(existsSync(firedPath), `the injected write fault never fired: ${r.stderr}`);
+    assert.match(
+      readFileSync(firedPath, 'utf-8'),
+      /pre-commit\.[^/]*\.tmp$/,
+      'the fault must tear the candidate file, not the live hook',
+    );
+    assert.notEqual(r.status, 0, 'a failed hook write must not exit 0');
+    assert.equal(readFileSync(hookPath, 'utf-8'), V1_10_0_WORKER_HOOK, 'live hook keeps its bytes');
+    assert.equal(readFileSync(`${hookPath}.bak`, 'utf-8'), V1_10_0_WORKER_HOOK, '.bak is a copy');
+    assert.deepEqual(
+      readdirSync(join(hookPath, '..')).filter((f) => /^pre-commit\..*\.tmp$/.test(f)),
+      [],
+      'no candidate file may be left behind',
+    );
+    assert.match(r.stdout, /pre-commit\.bak/, `the error line must name the .bak: ${r.stdout}`);
+  });
+});
+
+test('init re-run over a previous-resolver hook replaces it with the current resolver', () => {
+  withPreviousResolverVault(({ home, hypoDir, hookPath }) => {
+    const r = runWithHome('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-git-init'], home);
+    assert.equal(r.status, 0, `init failed: ${r.stderr}${r.stdout}`);
+    assert.equal(readFileSync(hookPath, 'utf-8'), wikiPreCommitContent(hypoDir, false));
+    assert.equal(statSync(hookPath).mode & 0o777, 0o755);
+    assert.equal(readFileSync(`${hookPath}.bak`, 'utf-8'), V1_10_0_WORKER_HOOK);
   });
 });
