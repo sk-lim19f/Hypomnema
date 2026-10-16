@@ -17,6 +17,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { join } from 'node:path';
+import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { test, suite } from './harness.mjs';
@@ -26,6 +27,7 @@ import {
   unsafeHookTargetReason,
   parseWikiPreCommitRoot,
   wikiPreCommitContent,
+  previousFormPreCommitContent,
   WIKI_PRE_COMMIT_MARKER_START,
   WIKI_PRE_COMMIT_MARKER_END,
   PRE_COMMIT_RESOLVER_LINE,
@@ -620,6 +622,69 @@ test('isOwnedWikiPreCommitBody (strict/delete path, default predicate): still re
 // body must never contain an install root string, and the resolver embedded
 // in it must actually find and run an install described only by
 // ~/.claude/hypo-pkg.json or ~/.claude/plugins/installed_plugins.json.
+
+// ── the previous commit-time resolver ───────────────────────────────────────
+// Hooks written before the enabled plugin root was consulted ahead of the
+// sidecar embed an older resolver script. The live builder no longer produces
+// it, so ownership recognition rebuilds it from a frozen copy.
+
+suite('git-hooks-dir.mjs: hooks on the previous resolver');
+
+// sha256 of the hook files v1.10.0 wrote for hypoDir "/v", measured from the
+// shipped module (every release that has the two-argument writer produced the
+// same bytes). A frozen copy that drifts from them recognizes nothing.
+const SHIPPED_PREVIOUS_SHA256 = {
+  worker: 'a363c220b5399e80eca2f501365a08ea0db974162e0b66a8204d27cd32a1674b',
+  lint: 'fc72b7830082816590dbb6379c0b7b1156b9b0aac16373fdbacb39ab3a72b115',
+};
+const sha256 = (s) => createHash('sha256').update(s).digest('hex');
+
+test('the frozen previous resolver reproduces the shipped v1.10.0 bytes', () => {
+  assert.equal(sha256(previousFormPreCommitContent('/v', false)), SHIPPED_PREVIOUS_SHA256.worker);
+  assert.equal(sha256(previousFormPreCommitContent('/v', true)), SHIPPED_PREVIOUS_SHA256.lint);
+  assert.notEqual(
+    sha256(wikiPreCommitContent('/v', false)),
+    SHIPPED_PREVIOUS_SHA256.worker,
+    'the live resolver must differ from the shipped one, or this pin separates nothing',
+  );
+});
+
+test('a hook on the previous resolver is owned and parsed with previousResolver: true, a mixed previous and current body is not', () => {
+  for (const lintStrict of [false, true]) {
+    const content = previousFormPreCommitContent('/v', lintStrict);
+    const span = findMarkerSpan(content, WIKI_PRE_COMMIT_MARKER_START, WIKI_PRE_COMMIT_MARKER_END);
+    assert.equal(
+      isOwnedWikiPreCommitBody(content, span),
+      true,
+      `strict (delete) path, lint ${lintStrict}`,
+    );
+    const parsed = parseWikiPreCommitRoot(content);
+    assert.equal(parsed.ok, true, `lint ${lintStrict}`);
+    assert.equal(parsed.previousResolver, true, `lint ${lintStrict}`);
+    assert.equal(parsed.root, null);
+    assert.equal(parsed.lintStrict, lintStrict);
+    assert.equal(parsed.hypoDir, lintStrict ? '/v' : null);
+    assert.notEqual(
+      parseWikiPreCommitRoot(wikiPreCommitContent('/v', lintStrict)).previousResolver,
+      true,
+      'the live form must not read as the previous one',
+    );
+  }
+
+  const stepsOf = (c) => c.split('\n').filter((l) => l.startsWith('node '));
+  const join2 = (a, b) =>
+    `#!/bin/sh\n${WIKI_PRE_COMMIT_MARKER_START}\n${a}\n${b}\nexit 0\n${WIKI_PRE_COMMIT_MARKER_END}\n`;
+  const prev = stepsOf(previousFormPreCommitContent('/v', true));
+  const cur = stepsOf(wikiPreCommitContent('/v', true));
+  for (const [name, body] of [
+    ['previous worker, current lint', join2(prev[0], cur[1])],
+    ['current worker, previous lint', join2(cur[0], prev[1])],
+  ]) {
+    const span = findMarkerSpan(body, WIKI_PRE_COMMIT_MARKER_START, WIKI_PRE_COMMIT_MARKER_END);
+    assert.equal(parseWikiPreCommitRoot(body).ok, false, name);
+    assert.equal(isOwnedWikiPreCommitBody(body, span), false, `${name} (strict path)`);
+  }
+});
 
 suite('git-hooks-dir.mjs — runtime install-root resolver (no baked root)');
 

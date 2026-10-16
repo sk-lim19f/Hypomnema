@@ -412,11 +412,12 @@ function extractLintHypoDir(js) {
 // (not a substring/suffix check) because the worker step has no dynamic
 // input at all — anything less than byte-identical is not a script this
 // writer could have produced, and per the module comment above an
-// unrecognized shape must never be treated as "close enough".
-function isNewFormWorkerStep(step) {
+// unrecognized shape must never be treated as "close enough". `build` picks the
+// resolver shape: the live one, or the frozen one an earlier release shipped.
+function isNewFormWorkerStep(step, build = buildPreCommitResolverJs) {
   const m = PRE_COMMIT_RESOLVER_LINE.exec(step);
   if (!m) return false;
-  return unescapeShellSingleQuoted(m[1]) === buildPreCommitResolverJs(WORKER_SUFFIX);
+  return unescapeShellSingleQuoted(m[1]) === build(WORKER_SUFFIX);
 }
 
 // Is `root` a real, on-disk Hypomnema install that could actually have
@@ -496,13 +497,13 @@ export function isRewritableOldFormInstallRoot(root) {
 // Extracts the embedded --hypo-dir, rebuilds the expected script around it,
 // and compares byte-for-byte — the only way to validate a script with one
 // dynamic input without loosening the check into a substring match.
-function isNewFormLintStep(step) {
+function isNewFormLintStep(step, build = buildPreCommitResolverJs) {
   const m = PRE_COMMIT_RESOLVER_LINE.exec(step);
   if (!m) return false;
   const js = unescapeShellSingleQuoted(m[1]);
   const hypoDir = extractLintHypoDir(js);
   if (hypoDir === null) return false;
-  return js === buildPreCommitResolverJs(LINT_SUFFIX, lintExtraArgvJs(hypoDir));
+  return js === build(LINT_SUFFIX, lintExtraArgvJs(hypoDir));
 }
 
 /**
@@ -522,7 +523,8 @@ function isNewFormLintStep(step) {
  *   or COULD HAVE WRITTEN in an older release (the version-pinned form) — see
  *   the module comment above PRE_COMMIT_WORKER_LINE for both shapes. A body
  *   that mixes the two (one step old-form, the other new-form) is never
- *   ours: no writer this codebase has ever shipped produces that.
+ *   ours: no writer this codebase has ever shipped produces that. The same
+ *   goes for one step on the previous resolver and the other on the current.
  */
 export function isOwnedWikiPreCommitBody(
   content,
@@ -548,7 +550,8 @@ export function isOwnedWikiPreCommitBody(
       : null;
   const workerIsOld = oldWorkerRoot !== null && isValidOldFormRoot(oldWorkerRoot);
   const workerIsNew = isNewFormWorkerStep(steps[0]);
-  if (!workerIsOld && !workerIsNew) return false;
+  const workerIsPrevious = isNewFormWorkerStep(steps[0], buildPreviousPreCommitResolverJs);
+  if (!workerIsOld && !workerIsNew && !workerIsPrevious) return false;
 
   if (steps.length === 2) {
     if (workerIsOld) {
@@ -566,7 +569,12 @@ export function isOwnedWikiPreCommitBody(
       if (!lint || unescapeShellSingleQuoted(lint[1]) !== oldWorkerRoot + LINT_SUFFIX) {
         return false;
       }
-    } else if (!isNewFormLintStep(steps[1])) {
+    } else if (
+      !isNewFormLintStep(
+        steps[1],
+        workerIsPrevious ? buildPreviousPreCommitResolverJs : buildPreCommitResolverJs,
+      )
+    ) {
       return false;
     }
   }
@@ -610,14 +618,22 @@ export function shellSingleQuote(p) {
 // hypo-config.md scan) and may silently lint an unrelated vault. That is a
 // vault path, not an install path, so unlike the root above it never goes
 // stale across a release — it only needs resolving once, here.
-export function wikiPreCommitContent(hypoDir, lintStrict) {
+export function wikiPreCommitContent(hypoDir, lintStrict, build = buildPreCommitResolverJs) {
   const absHypoDir = resolve(hypoDir);
-  const steps = [`node -e ${shellSingleQuote(buildPreCommitResolverJs(WORKER_SUFFIX))} || exit 1`];
+  const steps = [`node -e ${shellSingleQuote(build(WORKER_SUFFIX))} || exit 1`];
   if (lintStrict) {
-    const lintJs = buildPreCommitResolverJs(LINT_SUFFIX, lintExtraArgvJs(absHypoDir));
+    const lintJs = build(LINT_SUFFIX, lintExtraArgvJs(absHypoDir));
     steps.push(`node -e ${shellSingleQuote(lintJs)} || exit 1`);
   }
   return `#!/bin/sh\n${WIKI_PRE_COMMIT_MARKER_START}\n${steps.join('\n')}\nexit 0\n${WIKI_PRE_COMMIT_MARKER_END}\n`;
+}
+
+// The exact bytes a hook written with the previous commit-time resolver holds
+// (what v1.10.0 shipped). upgrade compares a file on disk against this before
+// it rewrites the whole file, for the same reason oldFormPreCommitContent
+// exists: the marker span says nothing about what sits around it.
+export function previousFormPreCommitContent(hypoDir, lintStrict) {
+  return wikiPreCommitContent(hypoDir, lintStrict, buildPreviousPreCommitResolverJs);
 }
 
 // Rebuilds the exact bytes an OLD-form (version-pinned) pre-commit hook holds
@@ -718,6 +734,11 @@ export function parseWikiPreCommitRoot(content) {
   if (lintStrict) {
     const js = unescapeShellSingleQuoted(PRE_COMMIT_RESOLVER_LINE.exec(steps[1])[1]);
     hypoDir = extractLintHypoDir(js);
+  }
+  // A body on the previous resolver also has no baked root, but it still needs
+  // upgrade to rewrite it, so it says so instead of looking like the live form.
+  if (isNewFormWorkerStep(steps[0], buildPreviousPreCommitResolverJs)) {
+    return { ok: true, hasMarker: true, root: null, previousResolver: true, lintStrict, hypoDir };
   }
   return { ok: true, hasMarker: true, root: null, lintStrict, hypoDir };
 }

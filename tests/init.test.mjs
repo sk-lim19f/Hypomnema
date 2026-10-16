@@ -2079,6 +2079,44 @@ test('dry-run leaves the wiki pre-commit hook in place; --apply removes it', () 
   });
 });
 
+// The bytes `init` wrote into a vault's pre-commit hook in v1.10.0 (worker step
+// only, resolver script as shipped). Kept as a literal on purpose: building it
+// from previousFormPreCommitContent would make the fixture and the recognizer
+// move together, and this test exists to catch exactly that.
+const V1_10_0_WORKER_HOOK =
+  '#!/bin/sh\n# hypo-managed:pre-commit:start\nnode -e \'var fs=require("fs"),os=require("os"),cp=require("child_process"),path=require("path");function usable(r){if(typeof r!=="string"||!r||!path.isAbsolute(r))return false;try{var p=JSON.parse(fs.readFileSync(r+"/package.json","utf-8"));if(p.name!=="hypomnema")return false;if(typeof p.version!=="string"||!p.version)return false}catch(e){return false}try{return fs.existsSync(r+"/hooks/hypo-pre-commit.mjs")}catch(e){return false}}function readJson(p){try{return JSON.parse(fs.readFileSync(p,"utf-8"))}catch(e){return null}}var home=os.homedir();var root=null;var pkg=readJson(home+"/.claude/hypo-pkg.json");if(pkg&&usable(pkg.pkgRoot)){root=pkg.pkgRoot}if(!root){var reg=readJson(home+"/.claude/plugins/installed_plugins.json");var plugins=reg&&reg.plugins;var arr=[];if(plugins&&Array.isArray(plugins["hypo@hypomnema"]))arr=arr.concat(plugins["hypo@hypomnema"]);if(plugins&&Array.isArray(plugins["hypomnema@hypomnema"]))arr=arr.concat(plugins["hypomnema@hypomnema"]);var entry=arr.find(function(e){return e&&e.scope==="user"&&usable(e.installPath)})||arr.find(function(e){return e&&usable(e.installPath)});if(entry){root=entry.installPath}}if(!root){console.error("hypomnema: could not resolve the install root for /hooks/hypo-pre-commit.mjs.");console.error("Checked ~/.claude/hypo-pkg.json (pkgRoot) and ~/.claude/plugins/installed_plugins.json (hypo@hypomnema installPath, legacy hypomnema@hypomnema).");console.error("Fix: run `hypomnema upgrade --apply` (or `/hypo:upgrade` on a plugin install), or reinstall Hypomnema.");process.exit(1)}var r=cp.spawnSync(process.execPath,[root+"/hooks/hypo-pre-commit.mjs"],{stdio:"inherit"});if(r.error){console.error(String(r.error.message||r.error))}process.exit(r.status===null?1:r.status)\' || exit 1\nexit 0\n# hypo-managed:pre-commit:end\n';
+const V1_10_0_WORKER_HOOK_SHA256 =
+  'a363c220b5399e80eca2f501365a08ea0db974162e0b66a8204d27cd32a1674b';
+
+test('uninstall --apply removes a hook on the previous resolver', () => {
+  assert.equal(
+    createHash('sha256').update(V1_10_0_WORKER_HOOK).digest('hex'),
+    V1_10_0_WORKER_HOOK_SHA256,
+    'fixture: the literal must stay byte-identical to what v1.10.0 shipped',
+  );
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      mkdirSync(hypoDir, { recursive: true });
+      writeFileSync(join(hypoDir, 'hypo-config.md'), '# config');
+      gitRepo(hypoDir);
+      const { dir: hooksDir } = hooksDirForInstall(hypoDir);
+      mkdirSync(hooksDir, { recursive: true });
+      const hookPath = join(hooksDir, 'pre-commit');
+      writeFileSync(hookPath, V1_10_0_WORKER_HOOK, { mode: 0o755 });
+
+      const applyR = runWithHome('uninstall.mjs', [`--hypo-dir=${hypoDir}`, '--apply'], home);
+      assert.equal(applyR.status, 0, `stderr: ${applyR.stderr}`);
+      assert.ok(!existsSync(hookPath), 'a hook on the previous resolver is ours and must go');
+      assert.match(
+        applyR.stdout,
+        /Wiki pre-commit hook removed \(1\)/,
+        `the report must carry the removal line: ${applyR.stdout}`,
+      );
+    });
+  });
+});
+
 test('preserves a user pre-commit hook that carries no Hypomnema marker', () => {
   withTmpHome((home) => {
     withTmpDir((dir) => {
