@@ -7874,6 +7874,24 @@ const blockersOn = (gate, rel) =>
   gate.blockers.filter((b) => b.file === rel || (b.reason || '').includes(rel));
 const appendNotice = (gate, rel) =>
   gate.notices.some((n) => n.type === 'foreign-append' && n.file === rel);
+const unresolvedNotice = (gate, rel) =>
+  gate.notices.some((n) => n.type === 'unresolved' && n.file === rel);
+const writeBlocker = (gate, rel) =>
+  blockersOn(gate, rel).some((b) => b.type === 'known-session-write');
+// A session that never recorded the shard, with the shard changed some way that is
+// not a recorded append: it is no blocker (only a recorded write or a lost record is),
+// no foreign-append notice (nobody recorded those bytes), but an unresolved notice.
+const assertUnresolvedNotice = (gate, rel) => {
+  assert.deepEqual(blockersOn(gate, rel), [], JSON.stringify(gate.blockers));
+  assert.ok(unresolvedNotice(gate, rel), JSON.stringify(gate.notices));
+  assert.ok(!appendNotice(gate, rel), JSON.stringify(gate.notices));
+};
+// This session recorded the shard and its bytes changed some way that is not a
+// recorded append: its own unresolved write, never a foreign append.
+const assertOwnWriteBlocks = (gate, rel) => {
+  assert.ok(writeBlocker(gate, rel), JSON.stringify(gate.blockers));
+  assert.ok(!appendNotice(gate, rel), JSON.stringify(gate.notices));
+};
 
 // Disabling the check (S1, checkpoint half): in precompactGateStatus's checkpointMode
 // loop delete the `isForeignAppendOnlyShard` branch. The shard then blocks as this
@@ -7919,89 +7937,76 @@ test('a shard committed with the other close heading while the real index kept o
   });
 });
 
-// The pairs: what is not a pure append by someone else keeps blocking. Disabling the
-// check (S1, prefix): drop the `!disk.subarray(0, head.length).equals(head)` test.
-// The edited-prefix assertions go red. (S1, recorded tail): make the tail walk accept
-// a missing record. The undated assertions go red. (S1, own write): in
-// isForeignAppendOnlyShard replace `if (!committed) return false;` with
-// `if (!committed) own = null;`. The reverted-write assertion goes red.
+// The pairs: what is not a pure append by someone else is not a foreign-append
+// notice. It blocks when this session recorded the shard (S1_SID, the write is its
+// own), and it is an unresolved notice when this session never did (the project
+// folder is blocked only for a lost record, not for an unrecorded file). Disabling
+// the check (S1, prefix): drop the `!disk.subarray(0, head.length).equals(head)` test.
+// The same-length prefix assertions go red (the fixture below is built so that only
+// this test blocks it). (S1, recorded tail): make the tail walk accept a missing
+// record. The undated assertions go red. (S1, own write): in isForeignAppendOnlyShard
+// replace `if (!committed) return false;` with `if (!committed) own = null;`. The
+// reverted-write assertion goes red.
 test('a shard whose committed part changed, an undated append, a deleted shard, and this session own uncommitted append still block the marker gate (S1 pair)', () => {
   withCommittedShard((dir, today, { rel, own }) => {
     writeFileSync(join(dir, rel), own.replace('own close', 'rewritten') + OTHER_HEADING(today));
-    const edited = checkpointGate(dir, S1_SID);
-    assert.ok(
-      blockersOn(edited, rel).some((b) => b.type === 'known-session-write'),
-      JSON.stringify(edited.blockers),
-    );
-    assert.ok(!appendNotice(edited, rel), JSON.stringify(edited.notices));
-    const editedFresh = checkpointGate(dir, 's-t10-s1-fresh');
-    assert.ok(
-      blockersOn(editedFresh, rel).some((b) => b.type === 'git'),
-      JSON.stringify(editedFresh.blockers),
-    );
+    assertOwnWriteBlocks(checkpointGate(dir, S1_SID), rel);
+    assertUnresolvedNotice(checkpointGate(dir, 's-t10-s1-fresh'), rel);
 
     // Lines with no dated heading are not what a close appends (a Bash append).
     writeFileSync(join(dir, rel), own + '\nappended by Bash, never committed\n');
-    const undated = checkpointGate(dir, 's-t10-s1-fresh');
-    assert.ok(
-      blockersOn(undated, rel).some((b) => b.type === 'git'),
-      JSON.stringify(undated.blockers),
-    );
-    assert.ok(!appendNotice(undated, rel), JSON.stringify(undated.notices));
+    assertOwnWriteBlocks(checkpointGate(dir, S1_SID), rel);
+    assertUnresolvedNotice(checkpointGate(dir, 's-t10-s1-fresh'), rel);
 
     rmSync(join(dir, rel));
-    const deleted = checkpointGate(dir, 's-t10-s1-fresh');
-    assert.ok(
-      blockersOn(deleted, rel).some((b) => b.type === 'git'),
-      JSON.stringify(deleted.blockers),
-    );
+    assertOwnWriteBlocks(checkpointGate(dir, S1_SID), rel);
+    assertUnresolvedNotice(checkpointGate(dir, 's-t10-s1-fresh'), rel);
 
     writeFileSync(join(dir, rel), own + `\n## [${today}] own second heading\n`);
     recordTouchedPaths(dir, S1_SID, [rel]);
-    const ownAppend = checkpointGate(dir, S1_SID);
-    assert.ok(
-      blockersOn(ownAppend, rel).some((b) => b.type === 'known-session-write'),
-      JSON.stringify(ownAppend.blockers),
-    );
-    assert.ok(!appendNotice(ownAppend, rel), JSON.stringify(ownAppend.notices));
+    assertOwnWriteBlocks(checkpointGate(dir, S1_SID), rel);
 
     // This session's recorded write never reached HEAD and is gone from disk (put
     // back by hand), and another close appended since: still this session's
     // unresolved write, not a clean foreign append.
     writeFileSync(join(dir, rel), own);
     appendAsOther(dir, rel, OTHER_HEADING(today));
-    const reverted = checkpointGate(dir, S1_SID);
-    assert.ok(
-      blockersOn(reverted, rel).some((b) => b.type === 'known-session-write'),
-      JSON.stringify(reverted.blockers),
-    );
-    assert.ok(!appendNotice(reverted, rel), JSON.stringify(reverted.notices));
+    assertOwnWriteBlocks(checkpointGate(dir, S1_SID), rel);
+  });
+});
+
+// The committed part rewritten with bytes of the same length, then another close's
+// recorded append on top of those bytes (its record's beforeSha256 names the rewritten
+// prefix). Every other check accepts this: the tail walk finds the record, this
+// session's recorded hash is HEAD's and the index equals HEAD. Only the prefix test
+// (disk starts with HEAD's bytes) tells it from a pure append. Disabling the check
+// (S1, prefix): see above. Red here only.
+test('a shard whose committed part was rewritten in place under another close recorded append stays this session own write (S1 prefix)', () => {
+  withCommittedShard((dir, today, { rel, own }) => {
+    const rewritten = own.replace('own close', 'xxx xxxxx');
+    assert.equal(rewritten.length, own.length, 'precondition: same length');
+    writeFileSync(join(dir, rel), rewritten);
+    appendAsOther(dir, rel, OTHER_HEADING(today));
+    assertOwnWriteBlocks(checkpointGate(dir, S1_SID), rel);
   });
 });
 
 // X3 (wave B, third review): only bytes another close recorded count as its append.
 // (a) A dated heading typed by hand, with no record anywhere, is not another close's.
 // (c) A hand note sitting in front of a recorded append makes the whole tail unowned.
-// Disabling the check (X3, tail walk): in isForeignAppendOnlyShard replace
-// `if (!r) return false;` with `if (!r) break;`. Both gates go red.
+// Both stay this session's write when it recorded the shard, and an unresolved notice
+// when it did not. Disabling the check (X3, tail walk): in isForeignAppendOnlyShard
+// replace `if (!r) return false;` with `if (!r) break;`. Both gates go red.
 test('a hand-typed dated heading, and a hand note ahead of another close recorded append, still block the marker gate (X3 a, c)', () => {
   withCommittedShard((dir, today, { rel, own }) => {
     appendFileSync(join(dir, rel), `\n## [${today}] typed by hand\n`);
-    const typed = checkpointGate(dir, 's-t10-s1-fresh');
-    assert.ok(
-      blockersOn(typed, rel).some((b) => b.type === 'git'),
-      JSON.stringify(typed.blockers),
-    );
-    assert.ok(!appendNotice(typed, rel), JSON.stringify(typed.notices));
+    assertOwnWriteBlocks(checkpointGate(dir, S1_SID), rel);
+    assertUnresolvedNotice(checkpointGate(dir, 's-t10-s1-fresh'), rel);
 
     writeFileSync(join(dir, rel), own + '\na note by hand\n');
     appendAsOther(dir, rel, OTHER_HEADING(today));
-    const noted = checkpointGate(dir, 's-t10-s1-fresh');
-    assert.ok(
-      blockersOn(noted, rel).some((b) => b.type === 'git'),
-      JSON.stringify(noted.blockers),
-    );
-    assert.ok(!appendNotice(noted, rel), JSON.stringify(noted.notices));
+    assertOwnWriteBlocks(checkpointGate(dir, S1_SID), rel);
+    assertUnresolvedNotice(checkpointGate(dir, 's-t10-s1-fresh'), rel);
   });
 });
 
@@ -8021,22 +8026,14 @@ test('a staged edit or staged deletion of a shard whose work tree is HEAD still 
     // work tree to that index).
     assert.equal(git('status', '--porcelain', '--', rel).stdout.slice(0, 2), 'MM');
     assert.equal(readFileSync(join(dir, rel), 'utf-8'), own);
-    const staged = checkpointGate(dir, 's-t10-s1-fresh');
-    assert.ok(
-      blockersOn(staged, rel).some((b) => b.type === 'git'),
-      JSON.stringify(staged.blockers),
-    );
-    assert.ok(!appendNotice(staged, rel), JSON.stringify(staged.notices));
+    assertOwnWriteBlocks(checkpointGate(dir, S1_SID), rel);
+    assertUnresolvedNotice(checkpointGate(dir, 's-t10-s1-fresh'), rel);
 
     git('reset', '-q', 'HEAD', '--', rel);
     git('rm', '-q', '--cached', '--', rel);
     assert.equal(git('status', '--porcelain', '--', rel).stdout.slice(0, 2), 'D ');
-    const removed = checkpointGate(dir, 's-t10-s1-fresh');
-    assert.ok(
-      blockersOn(removed, rel).some((b) => b.type === 'git'),
-      JSON.stringify(removed.blockers),
-    );
-    assert.ok(!appendNotice(removed, rel), JSON.stringify(removed.notices));
+    assertOwnWriteBlocks(checkpointGate(dir, S1_SID), rel);
+    assertUnresolvedNotice(checkpointGate(dir, 's-t10-s1-fresh'), rel);
 
     git('reset', '-q', 'HEAD', '--', rel);
     appendAsOther(dir, rel, OTHER_HEADING(today));
