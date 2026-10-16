@@ -175,20 +175,36 @@ const LINT_SUFFIX = '/scripts/lint.mjs';
 // applied to the finished script as a whole, so any single quote inside such a
 // value is escaped once, at the one place that can actually do it safely.
 //
-// Resolution order (must match the resolution chain commands/*.md already
-// documents for resolving CLAUDE_PLUGIN_ROOT by hand):
-//   1. ~/.claude/hypo-pkg.json's `pkgRoot`, but only when it is usable (see
-//      below). A stale/wrong/relative pkgRoot must not be trusted just
-//      because the file parses.
-//   2. ~/.claude/plugins/installed_plugins.json's `hypo@hypomnema` AND the
-//      legacy pre-rename `hypomnema@hypomnema` entries, searched TOGETHER as
-//      one combined list: every user-scope row first, then any usable row.
-//      A prior version searched `hypo@hypomnema` alone and only fell back to
-//      the legacy key when that key was entirely absent, so a `hypo@hypomnema`
-//      array present but full of unusable rows (a half-migrated registry)
-//      hid a perfectly good `hypomnema@hypomnema` row forever (codex
-//      reproduction, 2026-09-11: exit 1 with a real legacy row on disk).
-//   3. Neither resolves: print what was checked and how to fix it, then exit 1.
+// Resolution order. commands/*.md read ${CLAUDE_PLUGIN_ROOT} first and the
+// sidecar second, but CLAUDE_PLUGIN_ROOT does not exist at commit time, so this
+// script asks the settings and the plugin registry for the enabled plugin
+// instead (the same choice resolveCommitTimeRoot in plugin-detect.mjs makes):
+//   1. The enabled plugin's root: the first `enabledPlugins` key in
+//      ~/.claude/settings.json that is exactly `true`, shaped `name@marketplace`
+//      and named `hypo` or `hypomnema`; then that key's row in
+//      ~/.claude/plugins/installed_plugins.json (a user-scope row first, then
+//      any usable row).
+//   2. ~/.claude/hypo-pkg.json's `pkgRoot` (the sidecar), but only when it is
+//      usable (see below). A stale/wrong/relative pkgRoot must not be trusted
+//      just because the file parses.
+//   When both 1 and 2 resolve, the higher package.json version wins and the
+//   plugin root wins a tie. The sidecar can be the newer one: SessionStart
+//   rewrites it to the running install, and a second profile that shares the
+//   settings but not the registry may sit on a newer release than the default
+//   profile's registry row. The comparison is the one hooks/version-check.mjs
+//   compareSemver makes (leading `v` allowed, `+build` ignored, prerelease
+//   ordered per SemVer section 11), copied below because this script runs
+//   standalone. A root whose version does not parse is not a candidate.
+//   3. Neither resolved: ~/.claude/plugins/installed_plugins.json's
+//      `hypo@hypomnema` AND the legacy pre-rename `hypomnema@hypomnema`
+//      entries, searched TOGETHER as one combined list: every user-scope row
+//      first, then any usable row. A prior version searched `hypo@hypomnema`
+//      alone and only fell back to the legacy key when that key was entirely
+//      absent, so a `hypo@hypomnema` array present but full of unusable rows (a
+//      half-migrated registry) hid a perfectly good `hypomnema@hypomnema` row
+//      forever (codex reproduction, 2026-09-11: exit 1 with a real legacy row
+//      on disk).
+//   4. Nothing resolves: print what was checked and how to fix it, then exit 1.
 //      A commit that silently skips the .hypoignore guard is worse than one
 //      that refuses outright.
 //
@@ -207,6 +223,101 @@ const LINT_SUFFIX = '/scripts/lint.mjs';
 // is skipped in favor of the registry, and if nothing else resolves the
 // commit is refused (exit 1) rather than silently let through.
 function buildPreCommitResolverJs(targetSuffix, extraArgvJs = '') {
+  return (
+    'var fs=require("fs"),os=require("os"),cp=require("child_process"),path=require("path");' +
+    'function usable(r){' +
+    'if(typeof r!=="string"||!r||!path.isAbsolute(r))return false;' +
+    // name AND version. This one runs at commit time in the user's vault and
+    // EXECUTES whatever it adopts, so version alone was not enough: any
+    // absolute directory carrying a package.json and the target path was
+    // accepted, and its script ran. The name check closes that.
+    //
+    // Not every root judgment here checks the name, and the difference is
+    // what each one licenses. isRealOldFormInstallRoot and
+    // isRewritableOldFormInstallRoot (below) and hypo-shared.mjs's sidecar
+    // proof do check it — they gate deleting, rewriting, executing.
+    // plugin-detect.mjs's usablePkgRoot does NOT (it answers the narrower
+    // "can scripts be resolved through this pointer at all"), which is why
+    // that file now also exports isHypomnemaInstallRoot, the strong form that
+    // DOES check the name. Its callers split accordingly: init.mjs's
+    // resolveDurableRoot and selectEntry (the registry-row picker behind
+    // resolveEnabledPluginEntry) RECORD what they accept, so both moved onto
+    // the strong predicate; doctor.mjs's per-row leaf-drift scan only reads
+    // for display and deliberately stays on the weak one (narrowing it would
+    // silence a foreign registry row doctor exists to surface). Do not cite
+    // this comment as proof the name is checked everywhere; check the
+    // specific predicate.
+    'try{var p=JSON.parse(fs.readFileSync(r+"/package.json","utf-8"));' +
+    'if(p.name!=="hypomnema")return false;' +
+    'if(typeof p.version!=="string"||!p.version)return false}catch(e){return false}' +
+    'try{return fs.existsSync(r+"' +
+    targetSuffix +
+    '")}catch(e){return false}' +
+    '}' +
+    'function readJson(p){try{return JSON.parse(fs.readFileSync(p,"utf-8"))}catch(e){return null}}' +
+    // Version helpers: a copy of hooks/version-check.mjs parseSemver and
+    // compareSemver (see the resolution order above). Only the regex and the
+    // comparison are copied, no comments, because a comment here could carry a
+    // single quote.
+    'function sv(v){var m=typeof v==="string"?v.trim().replace(/^v/,"").match(/^(\\d+)\\.(\\d+)\\.(\\d+)(?:-([0-9A-Za-z.-]+))?(?:\\+[0-9A-Za-z.-]+)?$/):null;return m?{c:[m[1],m[2],m[3]],pre:m[4]||""}:null}' +
+    'function nid(x,y){if(x.length!==y.length)return x.length<y.length?-1:1;return x===y?0:(x<y?-1:1)}' +
+    'function cpre(a,b){var ai=a.split("."),bi=b.split(".");var n=Math.max(ai.length,bi.length);' +
+    'for(var i=0;i<n;i++){if(i>=ai.length)return -1;if(i>=bi.length)return 1;' +
+    'var x=ai[i],y=bi[i],xn=/^\\d+$/.test(x),yn=/^\\d+$/.test(y);' +
+    'if(xn&&yn){var c=nid(x,y);if(c!==0)return c}' +
+    'else if(xn!==yn){return xn?-1:1}' +
+    'else if(x!==y){return x<y?-1:1}}return 0}' +
+    'function cmp(a,b){var pa=sv(a),pb=sv(b);if(!pa||!pb)return null;' +
+    'for(var k=0;k<3;k++){var c=nid(pa.c[k],pb.c[k]);if(c!==0)return c}' +
+    'if(pa.pre===pb.pre)return 0;if(!pa.pre)return 1;if(!pb.pre)return -1;return cpre(pa.pre,pb.pre)}' +
+    'function ver(r){return readJson(r+"/package.json").version}' +
+    'var home=os.homedir();var root=null;' +
+    'var reg=readJson(home+"/.claude/plugins/installed_plugins.json");' +
+    'var plugins=reg&&reg.plugins;' +
+    'var set=readJson(home+"/.claude/settings.json");var ep=set&&set.enabledPlugins;var key=null;' +
+    'if(ep&&typeof ep==="object"&&!Array.isArray(ep)){var ks=Object.keys(ep);' +
+    'for(var i=0;i<ks.length;i++){var k=ks[i],at=k.indexOf("@");' +
+    'if(ep[k]!==true||at<=0||at===k.length-1)continue;' +
+    'var nm=k.slice(0,at);if(nm==="hypo"||nm==="hypomnema"){key=k;break}}}' +
+    'var pr=null;' +
+    'if(key&&plugins&&Array.isArray(plugins[key])){var rows=plugins[key];' +
+    'var row=rows.find(function(e){return e&&e.scope==="user"&&usable(e.installPath)})||' +
+    'rows.find(function(e){return e&&usable(e.installPath)});' +
+    'if(row&&sv(ver(row.installPath)))pr=row.installPath}' +
+    'var pkg=readJson(home+"/.claude/hypo-pkg.json");' +
+    'var sc=pkg&&usable(pkg.pkgRoot)&&sv(ver(pkg.pkgRoot))?pkg.pkgRoot:null;' +
+    'if(pr&&sc){var sidecarNewer=cmp(ver(pr),ver(sc))<0;root=sidecarNewer?sc:pr}else{root=pr||sc}' +
+    'if(!root){' +
+    'var arr=[];' +
+    'if(plugins&&Array.isArray(plugins["hypo@hypomnema"]))arr=arr.concat(plugins["hypo@hypomnema"]);' +
+    'if(plugins&&Array.isArray(plugins["hypomnema@hypomnema"]))arr=arr.concat(plugins["hypomnema@hypomnema"]);' +
+    'var entry=arr.find(function(e){return e&&e.scope==="user"&&usable(e.installPath)})||' +
+    'arr.find(function(e){return e&&usable(e.installPath)});' +
+    'if(entry){root=entry.installPath}' +
+    '}' +
+    'if(!root){' +
+    'console.error("hypomnema: could not resolve the install root for ' +
+    targetSuffix +
+    '.");' +
+    'console.error("Checked ~/.claude/settings.json (enabledPlugins), ~/.claude/hypo-pkg.json (pkgRoot) and ~/.claude/plugins/installed_plugins.json (hypo@hypomnema installPath, legacy hypomnema@hypomnema).");' +
+    'console.error("Fix: run `hypomnema upgrade --apply` (or `/hypo:upgrade` on a plugin install), or reinstall Hypomnema.");' +
+    'process.exit(1)' +
+    '}' +
+    'var r=cp.spawnSync(process.execPath,[root+"' +
+    targetSuffix +
+    '"' +
+    extraArgvJs +
+    '],{stdio:"inherit"});' +
+    'if(r.error){console.error(String(r.error.message||r.error))}' +
+    'process.exit(r.status===null?1:r.status)'
+  );
+}
+
+// Frozen, byte-for-byte copy of buildPreCommitResolverJs as it shipped before the
+// enabled plugin root was consulted ahead of the sidecar. Hooks already
+// installed in vaults embed this exact script, so ownership recognition has to
+// keep reproducing it after the live builder moves on. Do not edit the body.
+function buildPreviousPreCommitResolverJs(targetSuffix, extraArgvJs = '') {
   return (
     'var fs=require("fs"),os=require("os"),cp=require("child_process"),path=require("path");' +
     'function usable(r){' +
