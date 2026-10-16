@@ -2233,10 +2233,20 @@ function readPullArchive(hypoDir) {
 
 // Durable, and only ever called after every backup it names was written durably: nothing is
 // removed from the index or the working tree until this record is on disk.
+const pullArchiveText = (rec) => `${JSON.stringify(rec, null, 2)}\n`;
 const writePullArchive = (hypoDir, rec) =>
-  atomicWrite(join(hypoDir, PULL_ARCHIVE_REL), `${JSON.stringify(rec, null, 2)}\n`, {
-    durable: true,
-  });
+  atomicWrite(join(hypoDir, PULL_ARCHIVE_REL), pullArchiveText(rec), { durable: true });
+
+// Whether the record on disk is byte for byte `text` (null: whether there is no record). Null when
+// the record cannot be read. A write that threw says nothing about what was published (`atomicWrite`
+// renames first and syncs the directory after), so the caller asks the disk.
+function pullArchiveHolds(hypoDir, text) {
+  try {
+    return readTextOrNull(join(hypoDir, PULL_ARCHIVE_REL)) === text;
+  } catch {
+    return null;
+  }
+}
 
 // Line endings as git stores them: `core.autocrlf=true` checks a file out with CRLF, so a working
 // tree text and the HEAD blob of the same file only match once both are read this way.
@@ -2250,16 +2260,48 @@ function mergeViews(...lists) {
   return [...seen.values()];
 }
 
+// The key of an entry in the set-aside lists: the path, the kind and the backup that holds it.
+const itemKey = (v) => `${v.relPath}\0${v.kind ?? 'worktree'}\0${v.backupPath}`;
+
 // The same merge for the set-aside lists (`localOnly`, `unowned`, `cleared`, `gitignoreSaved`),
 // keyed by the backup, so a retry that finds an entry again does not list it twice and one that
 // does not find it any more (the file is already gone) does not lose it.
 function mergeItems(...lists) {
   const seen = new Map();
-  for (const v of lists.flat()) {
-    const key = `${v.relPath}\0${v.kind ?? 'worktree'}\0${v.backupPath}`;
-    if (!seen.has(key)) seen.set(key, v);
-  }
+  for (const v of lists.flat()) if (!seen.has(itemKey(v))) seen.set(itemKey(v), v);
   return [...seen.values()];
+}
+
+// The record `rec` without what an undo took back: `undone` (the undo's own `all`, every entry it
+// put back) and `moved.unowned` (copies, never put back). An entry the earlier record
+// (`moved.priorRecord`) also holds under the same key stays: `backUpGeneratedPath` reuses a backup
+// that already holds the same bytes, so one backup path can belong to the earlier run and to this
+// one. The lines this run set aside leave, except those the earlier record carries too. `stage`
+// and `targetSha` return to the earlier record's values, so a `merged` record stays one. Null when
+// nothing is left.
+function pullArchiveWithout(rec, moved, undone) {
+  const prior = moved.priorRecord ?? null;
+  const without = (list, gone, earlier) => {
+    const goneKeys = new Set(gone.map(itemKey));
+    const earlierKeys = new Set((earlier ?? []).map(itemKey));
+    return list.filter((v) => !goneKeys.has(itemKey(v)) || earlierKeys.has(itemKey(v)));
+  };
+  const earlierLines = prior?.gitignoreLines ?? [];
+  const left = {
+    v: 2,
+    stage: moved.priorRecord?.stage ?? rec.stage,
+    targetSha: moved.priorRecord?.targetSha ?? rec.targetSha,
+    gitignoreLines: rec.gitignoreLines.filter(
+      (l) => !(moved.gitignoreLines ?? []).includes(l) || earlierLines.includes(l),
+    ),
+    views: without(rec.views, undone, prior?.views),
+    localOnly: without(rec.localOnly, undone, prior?.localOnly),
+    unowned: without(rec.unowned, moved.unowned ?? [], prior?.unowned),
+    cleared: without(rec.cleared, undone, prior?.cleared),
+    gitignoreSaved: without(rec.gitignoreSaved, undone, prior?.gitignoreSaved),
+  };
+  const anything = ['gitignoreLines', 'views', 'localOnly', 'unowned', 'cleared', 'gitignoreSaved'];
+  return anything.some((k) => left[k].length) ? left : null;
 }
 
 /**
@@ -2334,9 +2376,14 @@ export function markPullArchiveMerged(hypoDir) {
 /**
  * The step before `merge --ff-only <targetRev>` or `pull --no-rebase` takes in a migration (or
  * rollback) commit: clear what would block it, without ever migrating this machine. Returns
- * `{ok, deferred?, reason?, notice?, backups[], archived[], localOnly[], unowned[], cleared[], gitignoreLines[], gitignoreSaved[]}`.
+ * `{ok, deferred?, reason?, notice?, backups[], archived[], localOnly[], unowned[], cleared[], gitignoreLines[], gitignoreSaved[], priorRecord, recordWritten}`.
  * A stopped run (`ok: false`) reports everything it had moved up to that point in the same lists,
- * so the caller can take it back.
+ * so the caller can take it back. `priorRecord` is the whole archive record this run read before it
+ * wrote its own (null when there was none), and `recordWritten` is true only once this run's own
+ * write of the record returned (or threw after the disk already held its bytes): until then the
+ * record on disk is the earlier run's, and the undo leaves it alone. `recordUncertain` is true when
+ * that write threw and the disk holds neither its bytes nor the earlier ones; the undo then leaves
+ * the record and every backup in place.
  *
  * The paths looked at are the ones `targetRev` changes since its merge-base with HEAD (so a
  * diverged history counts only what is coming in). A local change on any of them that is not a
@@ -2361,7 +2408,11 @@ export function markPullArchiveMerged(hypoDir) {
  * Before anything is removed or unstaged, everything set aside (`archived`, `localOnly`, `unowned`,
  * `cleared`, `gitignoreSaved`, the lines) is written to `.cache/pull-archive.json`, so a crash at
  * any later point leaves a record that names every backup. The lists also carry what an earlier
- * run that stopped had recorded, merged by backup path.
+ * run that stopped had recorded, merged by backup path. The record is touched only when this run
+ * set something aside or the recovery of an earlier `archived` record leaves something for the
+ * caller to take back (a record that held only `.gitignore` lines is not rewritten): the callers
+ * undo only when a file was moved, so a rewrite for nothing would cost a failed attempt the
+ * earlier record's `merged` stage.
  *
  * The root `hot.md` that `targetRev` deletes while it is clean is the one path nobody else
  * touches: its bytes are copied to `unowned[]` (`{relPath, kind, backupPath}`, not part of
@@ -2376,6 +2427,12 @@ export function markPullArchiveMerged(hypoDir) {
  * and index blob are read again and compared with what the backup took (and a cleared untracked
  * file with the bytes just backed up). A difference means another process wrote meanwhile: nothing
  * more is changed and `{ok: false, deferred: 'concurrent-change'}` comes back.
+ *
+ * Right after those bytes are read (the snapshot), a blocked path that step 3 saw unstaged but
+ * whose index blob now differs from HEAD, or a blocked `.gitignore` whose bytes differ from the
+ * ones step 4 judged, stops the run the same way: another process staged or edited it in the
+ * window between the scan and the snapshot. `testHooks.beforeSnapshot` runs just before the
+ * snapshot is read.
  *
  * `testHooks.beforeUnstage` runs before the first of those comparisons, `testHooks.afterArchive`
  * after the archive record is written and the stage is released, before the second (and before any
@@ -2443,6 +2500,12 @@ function clearBlockingPaths(hypoDir, targetRev, opts) {
   // Owned views removed without a backup (the generator wrote those bytes); a failed move writes
   // them back from here.
   const ownedRemoved = [];
+  // True once this run's `writePullArchive` returned. Until then the record on disk is an earlier
+  // run's, and the undo must not rewrite or delete it.
+  let recordWritten = false;
+  // True when this run's record write threw and the disk holds neither the bytes it meant nor the
+  // earlier ones: whether the record was published cannot be judged.
+  let recordUncertain = false;
   const stop = (extra) => ({
     ok: false,
     backups,
@@ -2453,6 +2516,9 @@ function clearBlockingPaths(hypoDir, targetRev, opts) {
     gitignoreLines,
     gitignoreSaved,
     ownedRemoved,
+    priorRecord: prior ?? null,
+    recordWritten,
+    recordUncertain,
     ...extra,
   });
 
@@ -2460,6 +2526,13 @@ function clearBlockingPaths(hypoDir, targetRev, opts) {
   // archived bytes into this run. The `.gitignore` write is a restore, so it is safe before the
   // checks below.
   const prior = readPullArchive(hypoDir);
+  // The earlier record's exact bytes (null: no file), what a throwing write is judged against.
+  let priorRecordText;
+  try {
+    priorRecordText = readTextOrNull(join(hypoDir, PULL_ARCHIVE_REL));
+  } catch {
+    priorRecordText = undefined; // unreadable: no later read can match it
+  }
   const recovered =
     prior && prior.stage === 'archived' && !isAncestorOfHead(hypoDir, prior.targetSha)
       ? prior
@@ -2543,7 +2616,9 @@ function clearBlockingPaths(hypoDir, targetRev, opts) {
   // tree only, so a person's stage boundary would be gone and the backup the notice names deleted.
   // It waits until they commit or unstage it. Everything below this check therefore sees a
   // `.gitignore` that was unstaged when step 3 looked, and keeps no stage copy of it. A stage made
-  // after step 3 and before the snapshot below is not caught here (a known, narrow window).
+  // after step 3 and before the snapshot below is caught right after the snapshot (`lateStage`),
+  // and so is an edit of the `.gitignore` after this step read it (`lateGitignoreEdit`).
+  let judgedGitignoreText = null;
   if (staged.has('.gitignore') && blocked.includes('.gitignore')) {
     return stop({
       deferred: 'gitignore',
@@ -2555,7 +2630,8 @@ function clearBlockingPaths(hypoDir, targetRev, opts) {
   if (blocked.includes('.gitignore')) {
     const headText = gitShowText(hypoDir, 'HEAD', '.gitignore') ?? '';
     const targetText = gitShowText(hypoDir, target, '.gitignore') ?? '';
-    const text = readTextOrNull(join(hypoDir, '.gitignore')) ?? '';
+    judgedGitignoreText = readTextOrNull(join(hypoDir, '.gitignore'));
+    const text = judgedGitignoreText ?? '';
     if (!mergeAdditiveGitignore(headText, text, targetText).ok) {
       return stop({
         deferred: 'gitignore',
@@ -2626,6 +2702,19 @@ function clearBlockingPaths(hypoDir, targetRev, opts) {
     }
   }
 
+  // The vault's own writers are shut out by the vault commit lock the caller holds, so a change
+  // since the snapshot came from another Hypomnema process that does not take it, or a person.
+  // Either way this run changes nothing more and the bytes stay where they are. ponytail: an
+  // external editor can still save between this re-read and the git command right after it; that
+  // window (milliseconds) is accepted, a compare-and-swap does not exist for a working tree.
+  const changedSince = () => ({
+    deferred: 'concurrent-change',
+    reason: 'changed-during-clear',
+    notice:
+      '이행 커밋을 받는 도중 생성 파일이나 인덱스가 바뀌어 아무것도 더 바꾸지 않고 미뤘습니다. 다음 동기화에서 다시 시도합니다',
+  });
+  testHooks?.beforeSnapshot?.();
+
   // 6. Blocked generated paths: the working-tree bytes, and the staged bytes of a staged path.
   // `snapshot` is what every blocked path (`.gitignore` too) held when its backup was taken: the
   // unstage and the restore below run only while the bytes still match it (`drifted`).
@@ -2635,6 +2724,17 @@ function clearBlockingPaths(hypoDir, targetRev, opts) {
       { work: readTextOrNull(join(hypoDir, p)), index: gitShowText(hypoDir, ':0', p) },
     ]),
   );
+  // Steps 3 and 4 judged these paths earlier. A path they saw unstaged that holds a different index
+  // blob than HEAD now was staged in between, and a `.gitignore` whose bytes are not the ones step 4
+  // judged was edited in between. No blocked path has been backed up or recorded yet, so stopping
+  // here leaves the stage and the bytes as the other writer left them.
+  const lateStage = blocked.some(
+    (p) => !staged.has(p) && snapshot.get(p).index !== gitShowText(hypoDir, 'HEAD', p),
+  );
+  if (lateStage) return stop(changedSince());
+  const lateGitignoreEdit =
+    blocked.includes('.gitignore') && snapshot.get('.gitignore').work !== judgedGitignoreText;
+  if (lateGitignoreEdit) return stop(changedSince());
   for (const path of blocked.filter(isGeneratedViewPath)) {
     const versions = [];
     const { work, index } = snapshot.get(path);
@@ -2691,29 +2791,50 @@ function clearBlockingPaths(hypoDir, targetRev, opts) {
     }
     untracked.push({ path, text });
   }
+  // What this run set aside itself, counted before the earlier run's entries are merged in.
+  const thisRunSetAside = [fresh, localOnly, unowned, cleared, gitignoreSaved, gitignoreLines].some(
+    (list) => list.length,
+  );
+  // What the recovery carries into the lists the caller counts. A record that only held
+  // `.gitignore` lines was put back in step 1 and leaves nothing for the caller to undo.
+  const recoveredCarries =
+    recovered !== null &&
+    (recovered.views.length > 0 ||
+      recovered.localOnly.length > 0 ||
+      recovered.unowned.length > 0 ||
+      recovered.cleared.length > 0 ||
+      carriedGitignore.length > 0);
   archived = mergeViews(recovered?.views ?? [], fresh);
   localOnly = mergeItems(recovered?.localOnly ?? [], localOnly);
   unowned = mergeItems(recovered?.unowned ?? [], unowned);
   cleared = mergeItems(recovered?.cleared ?? [], cleared);
   gitignoreSaved = mergeItems(carriedGitignore, gitignoreSaved);
-  const anySetAside = [archived, localOnly, unowned, cleared, gitignoreSaved, gitignoreLines].some(
-    (list) => list.length,
-  );
-  if (prior || anySetAside) {
+  // The record is rewritten only when this run has something to set aside or to carry. The callers
+  // undo only when a file was moved, so a rewrite for nothing would leave a failed attempt with a
+  // record that lost the earlier run's `merged` stage.
+  const touchesRecord = thisRunSetAside || recoveredCarries;
+  if (touchesRecord) {
     cacheGate();
+    const record = {
+      v: 2,
+      stage: 'archived',
+      targetSha: target,
+      gitignoreLines: [...new Set([...(prior?.gitignoreLines ?? []), ...gitignoreLines])],
+      views: mergeViews(prior?.views ?? [], archived),
+      localOnly: mergeItems(prior?.localOnly ?? [], localOnly),
+      unowned: mergeItems(prior?.unowned ?? [], unowned),
+      cleared: mergeItems(prior?.cleared ?? [], cleared),
+      gitignoreSaved: mergeItems(prior?.gitignoreSaved ?? [], gitignoreSaved),
+    };
+    const intendedRecordText = pullArchiveText(record);
     try {
-      writePullArchive(hypoDir, {
-        v: 2,
-        stage: 'archived',
-        targetSha: target,
-        gitignoreLines: [...new Set([...(prior?.gitignoreLines ?? []), ...gitignoreLines])],
-        views: mergeViews(prior?.views ?? [], archived),
-        localOnly: mergeItems(prior?.localOnly ?? [], localOnly),
-        unowned: mergeItems(prior?.unowned ?? [], unowned),
-        cleared: mergeItems(prior?.cleared ?? [], cleared),
-        gitignoreSaved,
-      });
+      writePullArchive(hypoDir, record);
+      recordWritten = true;
     } catch {
+      // A throw can come after the rename published the record (the directory sync): ask the disk.
+      const heldIntended = pullArchiveHolds(hypoDir, intendedRecordText) === true;
+      if (heldIntended) recordWritten = true;
+      else if (pullArchiveHolds(hypoDir, priorRecordText) !== true) recordUncertain = true;
       return stop({ reason: 'archive-write-failed' });
     }
     // The notice naming every backup is on disk before anything is removed or unstaged: a stop at
@@ -2724,17 +2845,6 @@ function clearBlockingPaths(hypoDir, targetRev, opts) {
       return stop({ reason: 'notice-write-failed' });
     }
   }
-  // The vault's own writers are shut out by the vault commit lock the caller holds, so a change
-  // since the snapshot came from another Hypomnema process that does not take it, or a person.
-  // Either way this run changes nothing more and the bytes stay where they are. ponytail: an
-  // external editor can still save between this re-read and the git command right after it; that
-  // window (milliseconds) is accepted, a compare-and-swap does not exist for a working tree.
-  const changedSince = () => ({
-    deferred: 'concurrent-change',
-    reason: 'changed-during-clear',
-    notice:
-      '이행 커밋을 받는 도중 생성 파일이나 인덱스가 바뀌어 아무것도 더 바꾸지 않고 미뤘습니다. 다음 동기화에서 다시 시도합니다',
-  });
   const read = (p) => {
     try {
       return readTextOrNull(join(hypoDir, p));
@@ -2787,6 +2897,9 @@ function clearBlockingPaths(hypoDir, targetRev, opts) {
     gitignoreLines,
     gitignoreSaved,
     ownedRemoved,
+    priorRecord: prior ?? null,
+    recordWritten,
+    recordUncertain,
   };
 }
 
@@ -2798,9 +2911,20 @@ function clearBlockingPaths(hypoDir, targetRev, opts) {
  * staged one is put back in the index only when the index entry still equals HEAD's
  * (`hash-object -w`, then `update-index --cacheinfo`, with the vault's prefix in front). The
  * backup bytes are written as they are. When every path is back, the backup files made for them
- * (and for `unowned[]`) and `.cache/pull-archive.json` (when anything was set aside) are deleted;
- * otherwise those stay for the next catch-up to carry. `keepRecord` leaves the record in place (the
- * clearing step uses it to take back a stopped run's `.gitignore` bytes while that record lives on).
+ * (and for `unowned[]`) are deleted, and `.cache/pull-archive.json` loses the entries this run took
+ * back (`pullArchiveWithout`; deleted when nothing is left); otherwise those stay for the next
+ * catch-up to carry. The order is record, then the notice lines, then the backups: a stop in
+ * between leaves a backup nobody names, never a record naming a backup that is gone. When the
+ * record cannot be rewritten (the disk does not hold the bytes the rewrite meant, `pullArchiveHolds`;
+ * a throw after the rename published them counts as written), the result is `ok: false` with a
+ * notice naming the record, and the record, the notice lines and every backup stay. The callers
+ * (`fastForwardTo`, `pullRemote`) read only `.notices`, so that sentence is the user's only signal;
+ * `fastForwardTo` appends it to its `notice`. The record is
+ * touched only when `moved.recordWritten` says this run wrote it; an earlier run's record is left
+ * byte for byte. A backup the record on disk or `moved.priorRecord` still names is never deleted
+ * (a run that finds the same bytes already backed up reuses that file, so the earlier run and this
+ * one can share it). `keepRecord` leaves the record in place (the clearing step uses it to take
+ * back a stopped run's `.gitignore` bytes while that record lives on).
  * `moved.gitignoreSaved[]` is the exact `.gitignore` bytes, put back with the same guards as a
  * view: a working tree that is absent or at HEAD, an index entry that is at HEAD. A `.gitignore`
  * written since is left alone, with a notice naming the backup.
@@ -2896,26 +3020,79 @@ export function undoClearedPaths(hypoDir, moved, { keepRecord = false } = {}) {
       );
     }
   }
+  // The record may or may not be the one this run meant to write: it stays as it is, the notice
+  // lines stay and no backup is deleted. The callers read only `.notices`, so this sentence is what
+  // reaches the user.
+  if (moved.recordUncertain) {
+    return {
+      ok: false,
+      notices: [
+        ...notices,
+        `보관 기록(${PULL_ARCHIVE_REL})이 게시됐는지 판정하지 못해 기록과 백업 파일을 모두 그대로 남겼습니다. 기록이 가리키는 항목을 확인한 뒤 정리하세요.`,
+      ],
+    };
+  }
   if (allBack) {
+    // Each deletion is synced before the next step relies on it: a power loss that replays the
+    // backup removal but not the record change would leave a record naming a backup that is gone.
+    const syncDir = (dir) => {
+      if (existsSync(dir)) fsyncDir(dir);
+    };
+    // The record goes first: a stop in between leaves a backup nobody names, not a record that
+    // names a backup that is gone. Only a record this run wrote is touched; one written by an
+    // earlier run stays as it is. What this run took back leaves the record, what an earlier run
+    // left in it stays, and a record with nothing left is deleted.
+    let rewriteFailed = false;
+    if (moved.recordWritten && !keepRecord && all.length + (moved.unowned ?? []).length > 0) {
+      const record = join(hypoDir, PULL_ARCHIVE_REL);
+      const rec = readPullArchive(hypoDir);
+      const rest = rec && pullArchiveWithout(rec, moved, all);
+      const intendedRecordText = rest ? pullArchiveText(rest) : null;
+      try {
+        if (rest) writePullArchive(hypoDir, rest);
+        else rmSync(record, { force: true });
+        syncDir(dirname(record));
+      } catch {
+        // A throw after the rename still left the intended bytes on disk: go on as written.
+        const published = pullArchiveHolds(hypoDir, intendedRecordText) === true;
+        rewriteFailed = !published;
+      }
+    }
+    // The record is in an unknown state (the disk holds neither the bytes this run meant to write
+    // nor, necessarily, the earlier ones): it stays as it is, the notice lines stay (they name the
+    // backups) and no backup is deleted. The callers read only `.notices` of this result, so this
+    // sentence is what reaches the user.
+    if (rewriteFailed) {
+      return {
+        ok: false,
+        notices: [
+          ...notices,
+          `보관 기록(${PULL_ARCHIVE_REL})을 다시 쓰지 못해 기록과 백업 파일을 모두 그대로 남겼습니다. 기록이 가리키는 항목을 확인한 뒤 정리하세요.`,
+        ],
+      };
+    }
     // Every path is back where it was, so the lines naming the backups are retracted before the
     // backups go. A stop in between leaves a notice for a backup that is still there.
     if (!keepRecord) {
       retractRootHotHealthNotice(hypoDir, clearingNoticeLines(hypoDir, moved).join('\n'));
     }
-    // Each deletion is synced before the next step relies on it: a power loss that replays the
-    // backup removal but not the record removal would leave a record naming a backup that is gone.
-    const syncDir = (dir) => {
-      if (existsSync(dir)) fsyncDir(dir);
-    };
-    // The record goes first: a stop in between leaves a backup nobody names, not a record that
-    // names a backup that is gone.
-    if (!keepRecord && all.length + (moved.unowned ?? []).length > 0) {
-      const record = join(hypoDir, PULL_ARCHIVE_REL);
-      rmSync(record, { force: true });
-      syncDir(dirname(record));
-    }
+    // A backup a record still names is not deleted: the earlier run's record, or this run's own
+    // when it reused that backup, or the record `keepRecord` leaves in place.
+    const backupPathsOf = (rec) =>
+      rec
+        ? [rec.views, rec.localOnly, rec.unowned, rec.cleared, rec.gitignoreSaved].flatMap((list) =>
+            (list ?? []).map((v) => v.backupPath),
+          )
+        : [];
+    const referencedBackups = new Set([
+      ...backupPathsOf(readPullArchive(hypoDir)),
+      ...backupPathsOf(moved.priorRecord),
+    ]);
     const backups = [...all, ...(moved.unowned ?? [])].map((v) => v.backupPath);
-    for (const backupPath of backups) rmSync(backupPath, { force: true });
+    for (const backupPath of backups) {
+      const deletable = !referencedBackups.has(backupPath);
+      if (deletable) rmSync(backupPath, { force: true });
+    }
     for (const dir of new Set(backups.map((b) => dirname(b)))) syncDir(dir);
   }
   return { ok: allBack, notices };
