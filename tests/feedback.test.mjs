@@ -6281,8 +6281,11 @@ test('precompact-bypassed-gate-still-shows-a-pending-notice: HYPO_SKIP_GATE answ
     ];
     assert.equal(run('feedback-sync.mjs', ['--write', ...fbArgs]).status, 0);
     fbSeedPending(claudeHome, dir);
-    // an uncommitted file in the vault makes the gate fail, so the bypass is what answers
-    writeFileSync(join(dir, 'uncommitted.txt'), 'x');
+    // an uncommitted file under projects/ makes the gate fail, so the bypass is what answers.
+    // The hook gets no session id, so the gate cannot read a write record and blocks every
+    // uncommitted projects/ file; a file at the root would only be a notice.
+    mkdirSync(join(dir, 'projects', 'p'), { recursive: true });
+    writeFileSync(join(dir, 'projects', 'p', 'uncommitted.txt'), 'x');
     const r = runHook('hypo-personal-check.mjs', '', {
       HYPO_DIR: dir,
       HOME: home,
