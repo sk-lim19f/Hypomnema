@@ -8,10 +8,12 @@
 //     original mode. A brand-new file is chmodded to 0o666 & ~umask to keep the
 //     default mode. The directory is made before the umask is lowered, for the
 //     same reason.
-//   - chmod failure: the file keeps the narrower mode. The call throws
-//     SETTINGS_MODE_NOT_RESTORED (written: true) only if that is wider than the
-//     original, which the umask makes close to unreachable; otherwise it only
-//     prints one line to stderr.
+//   - chmod failure: the write already happened, so the call never throws for it (a caller
+//     that goes on to copy a hook the new settings name would otherwise leave settings pointing
+//     at a missing file). The file keeps the narrower mode and one line goes to stderr; when
+//     that is wider than the original (the umask makes it close to unreachable) the result
+//     carries `modeWidened: true` and the line names both modes. A new file whose chmod to the
+//     default mode fails stays at 0o600 and the line says so.
 //   - read-only file: a 0o444 settings.json in a writable directory is now replaced
 //     (the old direct write refused with EACCES) and put back to 0o444.
 //   - hard links, owner, ACL and xattr: rename breaks a hard link (the other name
@@ -92,9 +94,10 @@ function resolveSettingsTarget(path) {
  *
  * `atomic` is false when the directory refused the temp file (EACCES, EPERM) and
  * the bytes went in place instead. `modeRestored` is true only when the rename
- * changed the mode and the chmod back succeeded.
+ * changed the mode and the chmod back succeeded. `modeWidened` is true when that chmod failed and
+ * the file is now wider than it was (never thrown: the bytes are already written).
  *
- * @returns {{atomic: boolean, target: string, viaLink: boolean, modeRestored: boolean}}
+ * @returns {{atomic: boolean, target: string, viaLink: boolean, modeRestored: boolean, modeWidened: boolean}}
  */
 export function writeSettingsJson(path, text) {
   const { target, viaLink } = resolveSettingsTarget(path);
@@ -123,8 +126,18 @@ export function writeSettingsJson(path, text) {
       `settings.json: ${dirname(target)} is not writable for an atomic replace, wrote in place\n`,
     );
   }
-  if (atomic && mode === undefined) chmodSync(target, 0o666 & ~oldMask); // a new file keeps the default mode
+  if (atomic && mode === undefined) {
+    try {
+      chmodSync(target, 0o666 & ~oldMask); // a new file keeps the default mode
+    } catch (err) {
+      const now = (statSync(target).mode & 0o7777).toString(8);
+      process.stderr.write(
+        `settings.json: written, ${target} stays at mode ${now} (chmod failed: ${err.code ?? err.message})\n`,
+      );
+    }
+  }
   let modeRestored = false;
+  let modeWidened = false;
   if (atomic && mode !== undefined) {
     const newMode = statSync(target).mode & 0o7777;
     const restoreMode = newMode !== mode;
@@ -133,20 +146,12 @@ export function writeSettingsJson(path, text) {
         chmodSync(target, mode);
         modeRestored = true;
       } catch (err) {
-        const wider = (newMode & ~mode) !== 0;
-        const detail = `${target} is ${newMode.toString(8)}, was ${mode.toString(8)} (${err.code ?? err.message})`;
-        if (wider) {
-          throw Object.assign(
-            new Error(`settings.json was written, but its mode was not restored: ${detail}`),
-            {
-              code: 'SETTINGS_MODE_NOT_RESTORED',
-              written: true,
-            },
-          );
-        }
-        process.stderr.write(`settings.json: written, mode not restored: ${detail}\n`);
+        modeWidened = (newMode & ~mode) !== 0;
+        process.stderr.write(
+          `settings.json: written, mode not restored: ${target} is ${newMode.toString(8)}, was ${mode.toString(8)} (${err.code ?? err.message})\n`,
+        );
       }
     }
   }
-  return { atomic, target, viaLink, modeRestored };
+  return { atomic, target, viaLink, modeRestored, modeWidened };
 }

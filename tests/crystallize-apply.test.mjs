@@ -33,6 +33,7 @@ import { closeGatePath, closeGateStatus } from '../hooks/close-gate-store.mjs';
 import { readJournal } from '../hooks/close-journal.mjs';
 import {
   GITATTRIBUTES_BLOCK,
+  buildBaselineEntry,
   closeIdFor,
   formatSessionEntry,
   isBaselineId,
@@ -6373,7 +6374,8 @@ const FLAT_STATE = (today) =>
 // Moves a vault whose session-state.md is FLAT_STATE and closes `legacy` plus `done` of the Alpha
 // track, both without `supersedes`. `baseBytes(flat)` gives the bytes the session's base record
 // holds a hash of (`null`: the session has no base record). Calls `check` with what the close wrote.
-function closeAfterMove(label, baseBytes, check) {
+// `afterMove(dir)` runs right after the move, to change the baseline the move published.
+function closeAfterMove(label, baseBytes, check, afterMove) {
   withWiki(
     (dir, today) =>
       writeFileSync(join(dir, 'projects', 'test-project', 'session-state.md'), FLAT_STATE(today)),
@@ -6384,6 +6386,7 @@ function closeAfterMove(label, baseBytes, check) {
       if (baseBytes) snapshotBase(dir, sid, [rel], { [rel]: hashContent(baseBytes(flat)) });
       const moved = migrateVaultToSessionEntries(dir);
       assert.equal(moved.migrated, true, JSON.stringify(moved));
+      afterMove?.(dir);
       const baseline = loadSessionModel(dir, 'test-project').entries.find(
         (e) => isBaselineId(e.closeId) && e.tracks.length > 0,
       );
@@ -6456,6 +6459,44 @@ test("a close whose session read the CRLF checkout of the baseline's source supe
       for (const t of entry.tracks) {
         assert.deepEqual(t.supersedes, [baseline.closeId], JSON.stringify(entry.tracks));
       }
+    },
+  );
+});
+
+// Disabling the check: in flatReadBaselineHeads delete the `rebuiltBaselineId(...) !== e.closeId` line.
+test('a close whose session read the parent of the baseline but not the saved bytes it was made from supersedes nothing and leaves its tracks active', () => {
+  closeAfterMove(
+    'mid-move-saved-bytes',
+    (flat) => flat,
+    ({ dir, baseline, alpha, entry }) => {
+      for (const t of entry.tracks) assert.equal(t.supersedes, undefined, JSON.stringify(t));
+      const tracks = trackHeads(loadSessionModel(dir, 'test-project').entries);
+      const heads = (id) => tracks.find((t) => t.trackId === id).heads.map((h) => h.closeId);
+      assert.ok(heads('legacy').includes(baseline.closeId), 'the saved-bytes baseline is a head');
+      assert.ok(heads(alpha).includes(baseline.closeId));
+      const betaId = baseline.tracks.find((t) => t.id.startsWith('legacy-beta')).id;
+      assert.notEqual(tracks.find((t) => t.trackId === betaId).done, true);
+      const view = readFileSync(join(dir, 'projects', 'test-project', 'session-state.md'), 'utf-8');
+      assert.ok(view.includes('SAVED-BYTES-BETA'), 'the unread baseline head is still live');
+    },
+    (dir) => {
+      // The commit that added the baseline keeps the flat file the session read as its parent, but
+      // the baseline is rebuilt from other saved bytes (an archive resumed before the move).
+      const [file] = sessionFilesOf(dir).filter((f) => /-baseline-[0-9a-f]{16}\.md$/.test(f));
+      const old = parseSessionEntry(readFileSync(join(sessionsDirOf(dir), file), 'utf-8')).entry;
+      const saved = buildBaselineEntry({
+        kind: 'state',
+        text: FLAT_STATE(old.date).replace('BETA-BODY', 'SAVED-BYTES-BETA'),
+        date: old.date,
+        visibilityScope: old.visibilityScope,
+        project: old.project,
+      });
+      rmSync(join(sessionsDirOf(dir), file));
+      writeFileSync(join(sessionsDirOf(dir), saved.fileName), saved.text);
+      const git = (...a) => spawnSync('git', ['-C', dir, ...a], { encoding: 'utf-8' });
+      assert.equal(git('add', '-A').status, 0);
+      const amended = git('commit', '--amend', '--no-edit', '--no-verify');
+      assert.equal(amended.status, 0, amended.stderr);
     },
   );
 });

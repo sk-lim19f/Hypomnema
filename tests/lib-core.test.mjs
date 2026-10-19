@@ -1344,7 +1344,8 @@ test('writeSettingsJson replaces a read-only settings.json and keeps it read-onl
   });
 });
 
-test('writeSettingsJson reports a mode it could not narrow back as an error that says the write happened', () => {
+// Disabling the check: in writeSettingsJson make `modeWidened` stay false (drop the assignment).
+test('writeSettingsJson returns modeWidened and names both modes on stderr when a mode it could not narrow back is wider, and does not throw', () => {
   withTmpDir((dir) => {
     const file = join(dir, 'settings.json');
     writeFileSync(file, 'old\n');
@@ -1352,12 +1353,33 @@ test('writeSettingsJson reports a mode it could not narrow back as an error that
     // longer be widened, because the write runs under umask 0o077)
     chmodSync(file, 0o444);
     const res = runSettingsWriter(dir, file, 'new\n', { preload: chmodFaultPreload(dir) });
-    assert.equal(res.status, 3, res.stderr);
-    assert.match(
-      res.stderr,
-      /^CAUGHT SETTINGS_MODE_NOT_RESTORED\|true\|settings\.json was written, but/m,
-    );
+    assert.equal(res.status, 0, res.stderr);
+    assert.equal(res.json.modeRestored, false);
+    assert.equal(res.json.modeWidened, true);
+    assert.equal(res.json.atomic, true);
+    const lines = res.stderr.trim().split('\n');
+    assert.equal(lines.length, 1, res.stderr);
+    assert.match(lines[0], /written, mode not restored/);
+    assert.ok(lines[0].includes(res.json.target), lines[0]);
+    assert.match(lines[0], /is 600, was 444/);
     assert.equal(readFileSync(file, 'utf8'), 'new\n');
+    assert.equal(statSync(file).mode & 0o777, 0o600);
+  });
+});
+
+test('writeSettingsJson keeps the bytes of a new file and says so when the chmod to the default mode fails', () => {
+  withTmpDir((dir) => {
+    const file = join(dir, 'settings.json');
+    const res = runSettingsWriter(dir, file, 'fresh\n', { preload: chmodFaultPreload(dir) });
+    assert.equal(res.status, 0, res.stderr);
+    assert.equal(res.json.atomic, true);
+    assert.equal(res.json.modeWidened, false);
+    assert.equal(readFileSync(file, 'utf8'), 'fresh\n');
+    assert.equal(statSync(file).mode & 0o777, 0o600);
+    const lines = res.stderr.trim().split('\n');
+    assert.equal(lines.length, 1, res.stderr);
+    assert.ok(lines[0].includes(res.json.target), lines[0]);
+    assert.match(lines[0], /stays at mode 600/);
   });
 });
 
@@ -1369,6 +1391,7 @@ test('writeSettingsJson keeps the write and only notes a mode it could not resto
     const res = runSettingsWriter(dir, file, 'new\n', { preload: chmodFaultPreload(dir) });
     assert.equal(res.status, 0, res.stderr);
     assert.equal(res.json.modeRestored, false);
+    assert.equal(res.json.modeWidened, false);
     assert.match(res.stderr, /written, mode not restored/);
     assert.equal(readFileSync(file, 'utf8'), 'new\n');
   });

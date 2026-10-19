@@ -70,6 +70,7 @@ import {
   localChangesOn,
   markPullArchiveMerged,
   pathInHead,
+  pullRemote,
   readGeneratedViewsRecord,
   readVisibilityScope,
   resolveActiveProject,
@@ -6167,6 +6168,140 @@ test('a recovered record whose rewrite cannot be judged reaches undo and names t
     assert.match(r.notice, /\.cache\/pull-archive\.json/);
     assert.equal(existsSync(earlier.backupPath), true, 'the backup stays');
   });
+});
+
+// A machine on the migrated side whose ignored `projects/p/hot.md` holds its own writing, and an
+// upstream rollback commit that tracks that path again: git overwrites an ignored untracked file
+// without a word when the merge lands, so the clearing step has to set the bytes aside first.
+// `untracked` leaves the local bytes untracked (ignored); `ita` registers them with `git add -N`.
+function withIgnoredViewUnderRollback(fn, { ita = false } = {}) {
+  withCatchUp(({ a, b }) => {
+    cgitOk(b, ['merge', '-q', '--ff-only', '@{u}']);
+    put(b, 'projects/p/hot.md', W1);
+    if (ita) cgitOk(b, ['add', '-N', '-f', 'projects/p/hot.md']);
+    put(a, '.gitignore', '.cache/\n');
+    put(a, 'projects/p/hot.md', 'ROLLED_BACK_HOT\n');
+    cgitOk(a, ['add', '-f', '.gitignore', 'projects/p/hot.md']);
+    cgitOk(a, ['commit', '-q', '-m', 'rollback']);
+    cgitOk(a, ['push', '-q']);
+    cgitOk(b, ['fetch', '-q']);
+    fn({ a, b });
+  });
+}
+
+test('a pull whose clearing step failed after moving bytes merges nothing and keeps the local bytes', () => {
+  withIgnoredViewUnderRollback(({ b }) => {
+    const head = headOf(b);
+    const faulted = withRecordRenameFault(join(b, RECORD_REL), { when: 'before', nth: 1 }, (s) => {
+      const res = pullRemote(b);
+      return { res, fired: s.fired };
+    });
+    assert.equal(faulted.fired, true, 'the record write was the failing rename');
+    const { res } = faulted;
+    assert.notEqual(res.pulled, true, JSON.stringify(res));
+    assert.equal(res.deferred, 'clear-failed');
+    assert.equal(headOf(b), head, 'nothing was merged');
+    assert.equal(readRel(b, 'projects/p/hot.md'), W1, 'the ignored local bytes are still on disk');
+    assert.ok(
+      res.notices.some(
+        (n) => n.includes('병합하지 않았습니다') && n.includes('archive-write-failed'),
+      ),
+      JSON.stringify(res.notices),
+    );
+    // the next pull retries and lands, with the local bytes kept in a backup
+    const again = pullRemote(b);
+    assert.equal(again.pulled, true, JSON.stringify(again));
+    assert.equal(readRel(b, 'projects/p/hot.md'), 'ROLLED_BACK_HOT\n');
+    assert.deepEqual(
+      backupsIn(b, 'projects/p/hot.md').map((rel) => readRel(b, rel)),
+      [W1],
+    );
+  });
+});
+
+test('a pull whose clearing step succeeds still merges and keeps the local bytes in a backup', () => {
+  withIgnoredViewUnderRollback(({ b }) => {
+    const res = pullRemote(b);
+    assert.equal(res.pulled, true, JSON.stringify(res));
+    assert.equal(res.deferred, undefined);
+    assert.equal(readRel(b, 'projects/p/hot.md'), 'ROLLED_BACK_HOT\n');
+    assert.deepEqual(
+      backupsIn(b, 'projects/p/hot.md').map((rel) => readRel(b, rel)),
+      [W1],
+    );
+  });
+});
+
+test('an undo whose record removal cannot be synced keeps every backup and names the record', () => {
+  withCatchUp(({ b }) => {
+    put(b, 'projects/p/hot.md', W1);
+    const r = clear(b);
+    assert.equal(r.ok, true, JSON.stringify(r));
+    const record = join(b, RECORD_REL);
+    // Once the record is gone the visible state is the intended one; the directory sync after it
+    // fails with EIO, as a disk that lost the write would.
+    const nodeFs = createRequire(import.meta.url)('node:fs');
+    const { fsyncSync } = nodeFs;
+    nodeFs.fsyncSync = (fd) => {
+      if (fstatSync(fd).isDirectory() && !existsSync(record)) {
+        throw Object.assign(new Error('injected directory sync fault'), { code: 'EIO' });
+      }
+      return fsyncSync(fd);
+    };
+    syncBuiltinESMExports();
+    let undone;
+    try {
+      undone = undoClearedPaths(b, r);
+    } finally {
+      nodeFs.fsyncSync = fsyncSync;
+      syncBuiltinESMExports();
+    }
+    assert.equal(undone.ok, false, JSON.stringify(undone));
+    assert.ok(
+      undone.notices.some((n) => n.includes('.cache/pull-archive.json')),
+      JSON.stringify(undone.notices),
+    );
+    assert.equal(existsSync(r.backups[0]), true, 'the backup stays');
+    assert.equal(readRel(b, 'projects/p/hot.md'), W1, 'the bytes are back');
+  });
+});
+
+test('an undo whose record removal syncs deletes the record and the backups', () => {
+  withCatchUp(({ b }) => {
+    put(b, 'projects/p/hot.md', W1);
+    const r = clear(b);
+    assert.equal(r.ok, true, JSON.stringify(r));
+    const undone = undoClearedPaths(b, r);
+    assert.equal(undone.ok, true, JSON.stringify(undone));
+    assert.equal(existsSync(join(b, RECORD_REL)), false, 'the record is gone');
+    assert.equal(existsSync(r.backups[0]), false, 'the backup is deleted');
+  });
+});
+
+test('an intent-to-add entry on a blocked path defers up front on every attempt and is never a concurrent change', () => {
+  withIgnoredViewUnderRollback(
+    ({ b }) => {
+      assert.equal(cgitOk(b, ['diff', '--cached', '--name-only']).trim(), '', 'not staged');
+      assert.match(cgitOk(b, ['ls-files', '-s', '--', 'projects/p/hot.md']), /^100644 e69de29b/);
+      const head = headOf(b);
+      for (const attempt of [1, 2]) {
+        const r = clear(b);
+        assert.equal(r.ok, false, `attempt ${attempt}`);
+        assert.equal(r.deferred, 'intent-to-add', `attempt ${attempt}: ${JSON.stringify(r)}`);
+        assert.equal(r.reason, 'intent-to-add');
+        assert.notEqual(r.reason, 'changed-during-clear');
+        assert.match(r.notice, /projects\/p\/hot\.md/);
+        assert.match(r.notice, /git restore --staged/);
+        assert.deepEqual(r.backups, [], 'nothing was set aside');
+        assert.equal(readRel(b, 'projects/p/hot.md'), W1);
+        assert.equal(headOf(b), head);
+      }
+      // the person releases the entry: the clearing step goes through
+      cgitOk(b, ['restore', '--staged', '--', 'projects/p/hot.md']);
+      assert.equal(clear(b).ok, true);
+    },
+    { ita: true },
+  );
 });
 
 test('a user .gitignore rule that hides projects/*/sessions/ defers the move and touches nothing', () => {

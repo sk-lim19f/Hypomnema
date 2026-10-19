@@ -3041,6 +3041,69 @@ require('node:module').syncBuiltinESMExports();
   });
 });
 
+// Disabling the check: in writeSettingsJson (scripts/lib/settings-write.mjs) throw instead of
+// printing when the mode cannot be restored and is wider.
+test('--apply still copies the renamed hook when settings.json could not get its mode back', () => {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      const initR = runWithHome('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-git-init'], home);
+      assert.equal(initR.status, 0, `init failed: ${initR.stderr}`);
+
+      const settingsPath = join(home, '.claude', 'settings.json');
+      const hookPath = join(home, '.claude', 'hooks', 'hypo-session-start.mjs');
+      const cfg = JSON.parse(readFileSync(settingsPath, 'utf-8'));
+      const text = JSON.stringify(cfg).replaceAll(
+        'hypo-session-start.mjs',
+        'wiki-session-start.mjs',
+      );
+      assert.notEqual(text, JSON.stringify(cfg), 'fixture must carry the hook registration');
+      writeFileSync(settingsPath, text);
+      chmodSync(settingsPath, 0o444);
+      rmSync(hookPath);
+
+      // Only chmod on settings.json* refuses, as a filesystem that will not widen or narrow it would.
+      const preloadPath = join(dir, 'settings-chmod-fault.cjs');
+      writeFileSync(
+        preloadPath,
+        `const fs = require('node:fs');
+const path = require('node:path');
+const real = fs.chmodSync;
+fs.chmodSync = function (target) {
+  if (path.basename(String(target)).startsWith('settings.json')) {
+    const err = new Error('injected chmod failure');
+    err.code = 'EPERM';
+    throw err;
+  }
+  return real.apply(this, arguments);
+};
+require('node:module').syncBuiltinESMExports();
+`,
+      );
+      const r = spawnSync(
+        process.execPath,
+        [join(SCRIPTS, 'upgrade.mjs'), `--hypo-dir=${hypoDir}`, '--apply', '--json'],
+        {
+          encoding: 'utf-8',
+          env: {
+            ...process.env,
+            HYPO_DIR: '',
+            HOME: home,
+            NODE_OPTIONS: `--require=${preloadPath}`,
+          },
+        },
+      );
+      assert.equal(r.status, 0, `${r.stderr}\n${r.stdout}`);
+      assert.match(r.stderr, /settings\.json: written, mode not restored: .*is 600, was 444/);
+      assert.ok(
+        readFileSync(settingsPath, 'utf-8').includes('hypo-session-start.mjs'),
+        'settings.json names the renamed hook',
+      );
+      assert.ok(existsSync(hookPath), 'the hook settings.json now names was copied');
+    });
+  });
+});
+
 // ── the root hot.md rewrite has to reach vaults that already exist ──────────
 //
 // init never touches an existing SCHEMA.md or hypo-guide.md, and upgrade only

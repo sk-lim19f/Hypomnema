@@ -992,14 +992,16 @@ suite('git-hooks-dir.mjs: the resolver prefers the enabled plugin root over the 
 
 // A hypomnema-shaped root under `base`: absolute, named, versioned, and carrying
 // a worker that prints which root ran. `name` lets a row fake a foreign package.
-function makeRoot(base, label, version, name = 'hypomnema') {
+function makeRoot(base, label, version, name = 'hypomnema', worker = true) {
   const root = join(base, label);
   mkdirSync(join(root, 'hooks'), { recursive: true });
   writeFileSync(join(root, 'package.json'), JSON.stringify({ name, version }));
-  writeFileSync(
-    join(root, 'hooks', 'hypo-pre-commit.mjs'),
-    `console.log("ROOT=" + ${JSON.stringify(root)});\n`,
-  );
+  if (worker) {
+    writeFileSync(
+      join(root, 'hooks', 'hypo-pre-commit.mjs'),
+      `console.log("ROOT=" + ${JSON.stringify(root)});\n`,
+    );
+  }
   return root;
 }
 
@@ -1144,6 +1146,35 @@ const ROOT_ROWS = [
     expect: 'sidecar',
   },
   {
+    name: 'a newer plugin root without the worker script, a complete older sidecar',
+    plugin: '1.10.1',
+    pluginWorker: false,
+    sidecar: '1.10.0',
+    expect: 'sidecar',
+  },
+  {
+    name: 'a newer sidecar without the worker script, a complete older plugin root',
+    plugin: '1.10.0',
+    sidecar: '1.10.1',
+    sidecarWorker: false,
+    expect: 'plugin',
+  },
+  {
+    name: 'a user row without the worker script, a project row that has it',
+    plugin: '1.10.1',
+    pluginWorker: false,
+    sidecar: '1.0.0',
+    registry: ({ plugin, extra }) => ({
+      plugins: {
+        'hypo@hypomnema': [
+          { scope: 'user', installPath: plugin },
+          { scope: 'project', installPath: extra },
+        ],
+      },
+    }),
+    expect: 'extra',
+  },
+  {
     name: 'work profile: sidecar 1.10.1, registry 1.10.0',
     plugin: '1.10.0',
     sidecar: '1.10.1',
@@ -1190,8 +1221,8 @@ const ROOT_ROWS = [
 
 // Builds one row's HOME and returns the roots it created.
 function buildRootRow(row, base, home) {
-  const plugin = makeRoot(base, 'plugin', row.plugin, row.pluginName);
-  const sidecar = makeRoot(base, 'sidecar', row.sidecar);
+  const plugin = makeRoot(base, 'plugin', row.plugin, row.pluginName, row.pluginWorker);
+  const sidecar = makeRoot(base, 'sidecar', row.sidecar, undefined, row.sidecarWorker);
   const extra = makeRoot(base, 'extra', '1.10.0');
   const roots = { plugin, sidecar, extra };
   writeResolverInputs(home, {

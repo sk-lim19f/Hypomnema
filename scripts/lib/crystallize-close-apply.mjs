@@ -68,6 +68,7 @@ import {
 import {
   isValidProjectName,
   TRACK_ID_RE,
+  buildBaselineEntry,
   closeIdFor,
   entryFileName,
   formatSessionEntry,
@@ -2373,11 +2374,32 @@ const ENTRY_CONFLICT_HELP = (relPath, reason) =>
       `foreign bytes yourself and retry.`;
 
 /**
+ * The id a baseline built from `text` (the flat session-state.md) gets, with `entry`'s stored done
+ * heads and scope; `null` when the entry cannot be rebuilt.
+ */
+function rebuiltBaselineId(entry, text, project) {
+  try {
+    return buildBaselineEntry({
+      kind: 'state',
+      text,
+      date: entry.date,
+      visibilityScope: entry.visibilityScope,
+      project: entry.project ?? project,
+      legacyDone: entry.tracks.filter((t) => t.done === true).map((t) => t.id),
+    }).closeId;
+  } catch {
+    return null; // an input that cannot be rebuilt is not proof, so the baseline is not counted
+  }
+}
+
+/**
  * The baseline heads this session was shown when it read the old flat `session-state.md`:
  * `{trackId: [closeId]}`. A session that began before the vault moved to entries read that file,
  * and its base record holds the file's hash. The move wrote the same bytes into a baseline, so a
  * baseline whose source (the flat file in the parent of the commit that added it) hashes to what the
- * session read counts as heard, and a close can replace its heads. The LF source and its CRLF form
+ * session read counts as heard, and a close can replace its heads. The source must also build the
+ * baseline's own id (see rebuiltBaselineId), else the baseline holds other bytes than the session
+ * read and is left alone. The LF source and its CRLF form
  * are both compared, since a checkout with autocrlf shows the session the CRLF bytes. `{}` when the
  * vault is not moved, the session recorded no hash of the file, or no baseline matches (a
  * baseline made from local bytes that differ from HEAD has no source to find, so it is not
@@ -2415,6 +2437,12 @@ function flatReadBaselineHeads(hypoDir, sessionId, project, model) {
     const crlf = text.replace(/\n/g, '\r\n');
     const match = wanted.has(hashContent(text)) || wanted.has(hashContent(crlf));
     if (!match) continue;
+    // The hash proves the parent held the bytes the session read, not that those bytes made this
+    // baseline: an archive resumed while the flat file was still tracked can publish a baseline of
+    // other saved bytes in a commit whose parent holds the old file. Rebuild the id from the parent
+    // text (done heads and scope as the baseline stores them) and count the baseline only when it
+    // is the same one.
+    if (rebuiltBaselineId(e, text, project) !== e.closeId) continue;
     for (const t of e.tracks) heads[t.id] = [...new Set([...(heads[t.id] ?? []), e.closeId])];
   }
   return heads;

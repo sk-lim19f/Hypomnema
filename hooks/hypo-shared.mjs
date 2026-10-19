@@ -2610,6 +2610,20 @@ function clearBlockingPaths(hypoDir, targetRev, opts) {
   if (blocked.some((p) => p !== '.gitignore' && !isGeneratedViewPath(p))) {
     return stop({ reason: 'other-dirty' });
   }
+  // An intent-to-add entry (`git add -N`) reads as unstaged here (`diff --cached` leaves it out), but
+  // the index already holds an empty blob for a path HEAD lacks. The late-stage check below would
+  // read that as a concurrent stage on every attempt, with no writer involved, so it waits for the
+  // person who made it. A real stage of a path is in `staged` and never matches.
+  const intentToAdd = blocked.find(
+    (p) => !staged.has(p) && !pathInHead(hypoDir, p) && gitShowText(hypoDir, ':0', p) === '',
+  );
+  if (intentToAdd) {
+    return stop({
+      deferred: 'intent-to-add',
+      reason: 'intent-to-add',
+      notice: `${intentToAdd}에 git add -N 으로 추가 의도만 등록해 둔 항목이 있어 이행 커밋을 받지 못했습니다. 그 파일을 커밋하거나 git restore --staged 로 등록을 풀면 다음 동기화에서 받습니다`,
+    });
+  }
 
   // 4. `.gitignore`: only a pure working-tree addition can be set aside. A staged one is not set
   // aside at all: the merge would take it out of the index and the lines come back to the working
@@ -3053,11 +3067,20 @@ export function undoClearedPaths(hypoDir, moved, { keepRecord = false } = {}) {
       try {
         if (rest) writePullArchive(hypoDir, rest);
         else if (!rewriteFailed) rmSync(record, { force: true });
-        syncDir(dirname(record));
       } catch {
         // A throw after the rename still left the intended bytes on disk: go on as written.
         const published = pullArchiveHolds(hypoDir, intendedRecordText) === true;
         rewriteFailed = !published;
+      }
+      // The disk showing the intended bytes is not durable: a power loss can replay the old record
+      // while the backups below are gone. The change counts as done only once the directory sync
+      // succeeded; a sync that throws keeps the record, the notice lines and every backup.
+      if (!rewriteFailed) {
+        try {
+          syncDir(dirname(record));
+        } catch {
+          rewriteFailed = true;
+        }
       }
     }
     // The record is in an unknown state (the disk holds neither the bytes this run meant to write
@@ -5544,7 +5567,8 @@ export function pullRemote(hypoDir, { testHooks, leaveNotices = true } = {}) {
     appendSyncFailure(hypoDir, 'pull', note || `pull deferred: ${why}`);
     return done({ pulled: false, conflict: false, deferred: why });
   };
-  // What the clearing step moved. A pull that does not land takes it back.
+  // What the clearing step moved. A pull that does not land takes it back. Returns whether anything
+  // was moved (so the take-back ran).
   let pre = null;
   const takeBack = () => {
     const moved = pre
@@ -5557,6 +5581,7 @@ export function pullRemote(hypoDir, { testHooks, leaveNotices = true } = {}) {
       : 0;
     if (moved > 0) notices.push(...undoClearedPaths(hypoDir, pre).notices);
     pre = null;
+    return moved > 0;
   };
   try {
     const owned = finishOwnedMerge(hypoDir);
@@ -5583,14 +5608,23 @@ export function pullRemote(hypoDir, { testHooks, leaveNotices = true } = {}) {
     if (canCatchUp) {
       pre = clearGeneratedPathsBlockingPull(hypoDir, '@{u}', { testHooks });
       if (!pre.ok) {
-        const { deferred, notice } = pre;
-        takeBack();
+        const { deferred, notice, reason } = pre;
+        const tookBack = takeBack();
         if (deferred) {
           if (notice) notices.push(notice);
           return defer(deferred, notice);
         }
-        // Any other stop (another file is dirty, a revision git cannot read): pull anyway and let
-        // git report its own failure.
+        // A stop after bytes were moved and put back (the record could not be written, an unstage
+        // or checkout failed): the take-back may leave an ignored file that the merge would
+        // overwrite without a word, with its backup and record gone. Merge nothing; the next pull
+        // runs the clearing step again.
+        if (tookBack) {
+          const note = `이행 커밋을 받으려고 옛 세션 현황을 보관하던 중 멈춰(${reason}) 보관한 내용을 되돌리고 병합하지 않았습니다. 다음 동기화에서 다시 시도합니다`;
+          notices.push(note);
+          return defer('clear-failed', note);
+        }
+        // Any other stop (another file is dirty, a revision git cannot read) moved nothing: pull
+        // anyway and let git report its own failure.
       } else if (pre.backups.length) {
         const where = [...new Set(pre.backups.map(backupPathForNotice))].join(', ');
         notices.push(`이행 커밋을 받으려고 이 기계의 옛 세션 현황 변경을 ${where}에 보관했습니다.`);
