@@ -1088,6 +1088,33 @@ require('node:module').syncBuiltinESMExports();
   return preloadPath;
 }
 
+// Wraps fs.renameSync for a destination named settings.json*. With `observePath` it appends the
+// mode of the temp file (the rename source) before calling through; with `errCode` it throws that
+// error code instead of renaming.
+function settingsRenamePreload(dir, { errCode, observePath } = {}) {
+  const preloadPath = join(dir, 'settings-rename-fault.cjs');
+  writeFileSync(
+    preloadPath,
+    `const fs = require('node:fs');
+const path = require('node:path');
+const real = fs.renameSync;
+fs.renameSync = function (from, to) {
+  if (path.basename(String(to)).startsWith('settings.json')) {
+    if (${JSON.stringify(observePath ?? null)}) {
+      fs.appendFileSync(${JSON.stringify(observePath ?? '')}, (fs.statSync(from).mode & 0o777).toString(8) + '\\n');
+    }
+    if (${JSON.stringify(errCode ?? null)}) {
+      throw Object.assign(new Error('injected rename failure'), { code: ${JSON.stringify(errCode ?? '')} });
+    }
+  }
+  return real.apply(this, arguments);
+};
+require('node:module').syncBuiltinESMExports();
+`,
+  );
+  return preloadPath;
+}
+
 function skipAsRoot(name) {
   console.log(`  skipped (running as root, permissions are not enforced): ${name}`);
 }
@@ -1204,6 +1231,54 @@ test('writeSettingsJson falls back to an in-place write with a notice when atomi
   });
 });
 
+// Distinguishes a rename refused for a reason other than a read-only directory (a bind-mounted
+// single file answers EBUSY) from a real failure: the former still has to write in place.
+test('writeSettingsJson falls back to an in-place write when the rename onto settings.json is EBUSY', () => {
+  withTmpDir((dir) => {
+    const file = join(dir, 'settings.json');
+    writeFileSync(file, 'old\n');
+    const res = runSettingsWriter(dir, file, 'new\n', {
+      preload: settingsRenamePreload(dir, { errCode: 'EBUSY' }),
+    });
+    assert.equal(res.status, 0, res.stderr);
+    assert.equal(res.json.atomic, false);
+    assert.equal(readFileSync(file, 'utf8'), 'new\n');
+    assert.match(res.stderr, /wrote in place/);
+    assert.equal(res.stderr.trim().split('\n').length, 1);
+    assert.deepEqual(
+      readdirSync(dir).filter((n) => n.endsWith('.tmp')),
+      [],
+    );
+  });
+});
+
+test('a 0o600 settings.json is never wider than 0o600 while it is being replaced', () => {
+  withTmpDir((dir) => {
+    const file = join(dir, 'settings.json');
+    writeFileSync(file, 'old\n');
+    chmodSync(file, 0o600);
+    const observed = join(dir, 'observed-modes.txt');
+    const res = runSettingsWriter(dir, file, 'new\n', {
+      preload: settingsRenamePreload(dir, { observePath: observed }),
+    });
+    assert.equal(res.status, 0, res.stderr);
+    assert.equal(readFileSync(observed, 'utf8'), '600\n', 'the temp file mode at the rename');
+    assert.equal(statSync(file).mode & 0o777, 0o600);
+    assert.equal(readFileSync(file, 'utf8'), 'new\n');
+  });
+});
+
+test('a settings.json written where none existed gets the default mode, not the narrowed one', () => {
+  withTmpDir((dir) => {
+    const file = join(dir, 'settings.json');
+    const res = runSettingsWriter(dir, file, 'new\n');
+    assert.equal(res.status, 0, res.stderr);
+    assert.equal(res.json.atomic, true);
+    assert.equal(readFileSync(file, 'utf8'), 'new\n');
+    assert.equal(statSync(file).mode & 0o777, 0o644); // the child runs under umask 0o022
+  });
+});
+
 test('a symlinked settings.json whose target directory is read-only keeps the link and gets the bytes in place', () => {
   if (IS_ROOT) return skipAsRoot('symlink into a read-only directory');
   withTmpDir((dir) => {
@@ -1239,6 +1314,19 @@ test('writeSettingsJson keeps the file mode', () => {
     assert.equal(readFileSync(file, 'utf8'), 'new\n');
     assert.equal(statSync(file).mode & 0o777, 0o600);
     assert.equal(res.json.atomic, true);
+    // the write runs under umask 0o077, so a 0o600 original needs no chmod back
+    assert.equal(res.json.modeRestored, false);
+  });
+});
+
+test('writeSettingsJson widens a narrowed file back to an original 0o640', () => {
+  withTmpDir((dir) => {
+    const file = join(dir, 'settings.json');
+    writeFileSync(file, 'old\n');
+    chmodSync(file, 0o640);
+    const res = runSettingsWriter(dir, file, 'new\n');
+    assert.equal(res.status, 0, res.stderr);
+    assert.equal(statSync(file).mode & 0o777, 0o640);
     assert.equal(res.json.modeRestored, true);
   });
 });
@@ -1260,7 +1348,9 @@ test('writeSettingsJson reports a mode it could not narrow back as an error that
   withTmpDir((dir) => {
     const file = join(dir, 'settings.json');
     writeFileSync(file, 'old\n');
-    chmodSync(file, 0o600);
+    // 0o444: the 0o600 the write leaves is wider by the owner write bit (a 0o600 original can no
+    // longer be widened, because the write runs under umask 0o077)
+    chmodSync(file, 0o444);
     const res = runSettingsWriter(dir, file, 'new\n', { preload: chmodFaultPreload(dir) });
     assert.equal(res.status, 3, res.stderr);
     assert.match(

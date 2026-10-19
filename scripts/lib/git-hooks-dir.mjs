@@ -668,14 +668,11 @@ export function publishHookFile(hookPath, content) {
     return { ok: true };
   } catch (error) {
     let cleaned = false;
-    const cleanup = true;
-    if (cleanup) {
-      try {
-        rmSync(candidatePath, { force: true });
-        cleaned = true;
-      } catch {
-        // Reported through `cleaned: false`, not thrown over the original error.
-      }
+    try {
+      rmSync(candidatePath, { force: true });
+      cleaned = true;
+    } catch {
+      // Reported through `cleaned: false`, not thrown over the original error.
     }
     return { ok: false, error, candidatePath, cleaned };
   }

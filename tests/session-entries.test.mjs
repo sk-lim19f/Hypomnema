@@ -6052,6 +6052,36 @@ test('an undo whose record rewrite throws after publishing goes on as written', 
   });
 });
 
+// The pair of this one is 'an undo whose record rewrite throws after publishing goes on as written'
+// and the first test of this file (a readable record is still trimmed to the earlier entries).
+test('an undo that finds the record unreadable keeps it, its notice and every backup and names it', () => {
+  withCatchUp(({ b }) => {
+    const earlier = earlierView(b);
+    seedRecord(b, { stage: 'merged', targetSha: headOf(b), views: [earlier] });
+    put(b, 'projects/p/hot.md', W1);
+    const noticeRel = '.cache/root-hot-projection-notice.json';
+    const garbage = '{"v":2,"stage":"merged","not":"a pull archive"}\n';
+    const r = fastForwardTo(b, '@{u}', {
+      testHooks: {
+        // between the clearing step and the undo: the record fails the shape check
+        afterArchive: () => {
+          put(b, '.git/index.lock', '');
+          put(b, RECORD_REL, garbage);
+        },
+      },
+    });
+    assert.equal(r.reason, 'checkout-failed');
+    assert.equal(r.pre.recordWritten, true);
+    assert.equal(r.pre.archived.length, 1, 'there was a view for the undo to take back');
+    assert.equal(readRel(b, RECORD_REL), garbage, 'the record is not deleted');
+    assert.equal(existsSync(r.pre.archived[0].backupPath), true, 'this run backup stays');
+    assert.equal(existsSync(earlier.backupPath), true, 'the earlier backup stays');
+    assert.match(readRel(b, noticeRel), VIEW_NOTICE, 'the notice naming the backup stays');
+    assert.equal(readRel(b, 'projects/p/hot.md'), W1, 'the undo put the bytes back');
+    assert.match(r.notice, /\.cache\/pull-archive\.json/);
+  });
+});
+
 // The clearing step's own record write is the 1st rename onto the record. An earlier merged record
 // plus a new blocked view means this run has something to set aside, so it writes a record.
 function runClearWithRecordFault(b, when) {

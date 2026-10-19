@@ -3048,9 +3048,11 @@ export function undoClearedPaths(hypoDir, moved, { keepRecord = false } = {}) {
       const rec = readPullArchive(hypoDir);
       const rest = rec && pullArchiveWithout(rec, moved, all);
       const intendedRecordText = rest ? pullArchiveText(rest) : null;
+      // A record that is there but unreadable (read error, wrong shape) is not one with nothing left.
+      rewriteFailed = rec === null && existsSync(record);
       try {
         if (rest) writePullArchive(hypoDir, rest);
-        else rmSync(record, { force: true });
+        else if (!rewriteFailed) rmSync(record, { force: true });
         syncDir(dirname(record));
       } catch {
         // A throw after the rename still left the intended bytes on disk: go on as written.

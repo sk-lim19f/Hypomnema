@@ -3,17 +3,29 @@
 // second temp+rename of its own.
 //
 // What the rename costs (the helper accepts these rather than fork the writer):
-//   - mode window: between the rename and the chmod back, the new file shows the
-//     default mode (0o666 & ~umask). An original 0o600 is readable for that moment.
-//   - chmod failure: the file keeps the default mode. If that is wider than the
-//     original the call throws SETTINGS_MODE_NOT_RESTORED (written: true); if not,
-//     it only prints one line to stderr.
+//   - mode window: closed. The write runs under umask 0o077, so the temp file and the
+//     renamed file are never wider than 0o600 and the chmod back only widens to the
+//     original mode. A brand-new file is chmodded to 0o666 & ~umask to keep the
+//     default mode. The directory is made before the umask is lowered, for the
+//     same reason.
+//   - chmod failure: the file keeps the narrower mode. The call throws
+//     SETTINGS_MODE_NOT_RESTORED (written: true) only if that is wider than the
+//     original, which the umask makes close to unreachable; otherwise it only
+//     prints one line to stderr.
 //   - read-only file: a 0o444 settings.json in a writable directory is now replaced
 //     (the old direct write refused with EACCES) and put back to 0o444.
 //   - hard links, owner, ACL and xattr: rename breaks a hard link (the other name
 //     keeps the old inode) and does not carry owner, ACL or xattr to the new file.
 //     Only the mode is restored.
-import { chmodSync, lstatSync, readlinkSync, realpathSync, statSync, writeFileSync } from 'node:fs';
+import {
+  chmodSync,
+  lstatSync,
+  mkdirSync,
+  readlinkSync,
+  realpathSync,
+  statSync,
+  writeFileSync,
+} from 'node:fs';
 import { basename, dirname, isAbsolute, join, sep } from 'node:path';
 import { atomicWrite } from '../../hooks/atomic-write.mjs';
 
@@ -93,10 +105,17 @@ export function writeSettingsJson(path, text) {
     if (err.code !== 'ENOENT') throw err;
   }
   let atomic = true;
+  mkdirSync(dirname(target), { recursive: true }); // before the umask below, so a new directory keeps its default mode
+  const oldMask = process.umask(0o077);
   try {
-    atomicWrite(target, text);
+    try {
+      atomicWrite(target, text);
+    } finally {
+      process.umask(oldMask);
+    }
   } catch (err) {
-    const fallback = err.code === 'EACCES' || err.code === 'EPERM';
+    // EBUSY (rename onto a bind-mounted file) and EXDEV take the in-place path like a read-only directory.
+    const fallback = ['EACCES', 'EPERM', 'EBUSY', 'EXDEV'].includes(err.code);
     if (!fallback) throw err;
     writeFileSync(target, text); // opens the file as is, so its mode stays
     atomic = false;
@@ -104,6 +123,7 @@ export function writeSettingsJson(path, text) {
       `settings.json: ${dirname(target)} is not writable for an atomic replace, wrote in place\n`,
     );
   }
+  if (atomic && mode === undefined) chmodSync(target, 0o666 & ~oldMask); // a new file keeps the default mode
   let modeRestored = false;
   if (atomic && mode !== undefined) {
     const newMode = statSync(target).mode & 0o7777;
