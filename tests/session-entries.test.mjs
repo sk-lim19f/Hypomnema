@@ -6219,6 +6219,27 @@ test('a pull whose clearing step failed after moving bytes merges nothing and ke
   });
 });
 
+test("a pull whose clearing step stopped on git's own error puts git's message in the notice and the record", () => {
+  withCatchUp(({ b }) => {
+    put(b, '.gitignore', '.cache/\nlocal-only/\n');
+    const head = headOf(b);
+    const res = pullRemote(b, { testHooks: holdIndex(b) });
+    assert.equal(res.deferred, 'clear-failed', JSON.stringify(res));
+    assert.equal(headOf(b), head, 'nothing was merged');
+    const note = res.notices.find((n) => n.includes('checkout-failed'));
+    assert.ok(note, JSON.stringify(res.notices));
+    assert.match(note, /index\.lock/, 'the notice carries git lock message');
+    assert.match(note, /직접 지운/, 'the notice says a stale lock can be removed by hand');
+    const failures = readFileSync(join(b, '.cache', 'sync-state.json'), 'utf-8')
+      .trim()
+      .split('\n')
+      .map((l) => JSON.parse(l));
+    const last = failures.at(-1);
+    assert.equal(last.op, 'pull');
+    assert.match(last.error, /index\.lock/, 'the recorded failure carries git lock message');
+  });
+});
+
 test('a pull whose clearing step succeeds still merges and keeps the local bytes in a backup', () => {
   withIgnoredViewUnderRollback(({ b }) => {
     const res = pullRemote(b);

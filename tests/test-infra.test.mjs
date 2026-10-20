@@ -6,6 +6,7 @@
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
 import {
+  copyFileSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -13,6 +14,7 @@ import {
   readFileSync,
   writeFileSync,
 } from 'node:fs';
+import { createRequire, syncBuiltinESMExports } from 'node:module';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { pathToFileURL } from 'node:url';
@@ -90,6 +92,38 @@ try {
     // The child may still be exiting; its only target is the wiki dir, which is gone.
     sleepSync(600);
     spawnSync('rm', ['-rf', scratch]);
+  }
+});
+
+// The race test above shows the cleanup survives one late writer; it cannot show that ENOTEMPTY
+// happened, so a cleanup without retries could pass it on a quiet disk. This one pins the call
+// itself: each helper removes its directory with Node's retry options on.
+// Disabling the check: in helpers.mjs make `RM_RETRY` `{ recursive: true, force: true }`.
+test('the fixture cleanups remove their directory with retry options', () => {
+  const nodeFs = createRequire(import.meta.url)('node:fs');
+  const { rmSync } = nodeFs;
+  const calls = [];
+  nodeFs.rmSync = (path, options) => {
+    calls.push({ path, options });
+    return rmSync(path, options);
+  };
+  syncBuiltinESMExports();
+  const dirs = [];
+  try {
+    withTmpDir((dir) => dirs.push(dir));
+    withWiki(null, (dir) => dirs.push(dir));
+  } finally {
+    nodeFs.rmSync = rmSync;
+    syncBuiltinESMExports();
+  }
+  assert.equal(dirs.length, 2);
+  for (const dir of dirs) {
+    const call = calls.find((c) => c.path === dir);
+    assert.ok(call, `${dir}: the helper never removed its directory through rmSync`);
+    assert.equal(call.options.recursive, true, dir);
+    assert.ok(call.options.maxRetries >= 3, `${dir}: ${JSON.stringify(call.options)}`);
+    assert.ok(call.options.retryDelay > 0, `${dir}: ${JSON.stringify(call.options)}`);
+    assert.equal(existsSync(dir), false, `${dir}: still there`);
   }
 });
 
@@ -247,4 +281,70 @@ test('parallel.mjs strips --jobs before it reaches the runner', () => {
   const r = runParallel(['--shards=1', '--jobs=1', `--grep=${REJECTS_JOBS}`]);
   assert.equal(r.status, 0, `exit ${r.status}: ${r.stderr}`);
   assert.ok(r.stdout.includes('1 passed, 0 failed'), r.stdout);
+});
+
+// A copy of the real parallel.mjs beside a stand-in runner and stand-in area files, so the cap is
+// observed on the real scheduler without running any real test. Each stand-in child logs its start
+// and end, and holds until more than `cap` children are alive at once (an uncapped scheduler gets
+// there at once) or a second has passed (a capped one never does and waits it out). Passing never
+// depends on speed: the assertions are the upper bound and that every unit ran exactly once.
+const STAND_IN_RUNNER = `import { appendFileSync, readFileSync, writeFileSync } from 'node:fs';
+const argv = process.argv.slice(2);
+const unit = argv.find((a) => a.startsWith('--file=') || a.startsWith('--shard='));
+const report = argv.find((a) => a.startsWith('--json=')).slice('--json='.length);
+const { UNIT_LOG: log, UNIT_CAP: cap } = process.env;
+appendFileSync(log, 'start ' + unit + '\\n');
+const alive = () => {
+  const lines = readFileSync(log, 'utf-8').split('\\n');
+  return lines.filter((l) => l.startsWith('start ')).length - lines.filter((l) => l.startsWith('end ')).length;
+};
+const deadline = Date.now() + 1000;
+while (alive() <= Number(cap) && Date.now() < deadline) {
+  await new Promise((r) => setTimeout(r, 20));
+}
+appendFileSync(log, 'end ' + unit + '\\n');
+writeFileSync(report, JSON.stringify({ passed: 1, failed: 0, failures: [], timings: [] }));
+`;
+
+test('parallel.mjs never runs more children at once than --jobs and runs every unit exactly once', () => {
+  const cases = [
+    { args: ['--by-file', '--jobs=2'], units: ['a', 'b', 'c', 'd', 'e'].map((x) => `--file=${x}`) },
+    {
+      args: ['--shards=5', '--jobs=2'],
+      units: [1, 2, 3, 4, 5].map((i) => `--shard=${i}/5`),
+    },
+  ];
+  for (const { args, units } of cases) {
+    withTmpDir((dir) => {
+      const tree = join(dir, 'tests');
+      mkdirSync(tree);
+      copyFileSync(PARALLEL, join(tree, 'parallel.mjs'));
+      writeFileSync(join(tree, 'runner.mjs'), STAND_IN_RUNNER);
+      for (const x of ['a', 'b', 'c', 'd', 'e']) writeFileSync(join(tree, `${x}.test.mjs`), '');
+      const log = join(dir, 'units.log');
+      writeFileSync(log, '');
+      const r = spawnSync(process.execPath, [join(tree, 'parallel.mjs'), ...args], {
+        encoding: 'utf-8',
+        timeout: 60000,
+        env: childEnv(dir, { UNIT_LOG: log, UNIT_CAP: '2' }),
+      });
+      const label = args.join(' ');
+      assert.equal(r.error, undefined, `${label}: ${r.error}`);
+      assert.equal(r.status, 0, `${label}: exit ${r.status} ${r.stderr}`);
+      const events = readFileSync(log, 'utf-8').split('\n').filter(Boolean);
+      let alive = 0;
+      let peak = 0;
+      for (const e of events) {
+        alive += e.startsWith('start ') ? 1 : -1;
+        peak = Math.max(peak, alive);
+      }
+      assert.ok(peak <= 2, `${label}: ${peak} children alive at once, cap is 2`);
+      for (const kind of ['start', 'end']) {
+        const seen = events
+          .filter((e) => e.startsWith(`${kind} `))
+          .map((e) => e.slice(kind.length + 1));
+        assert.deepEqual(seen.sort(), [...units].sort(), `${label}: ${kind} of every unit, once`);
+      }
+    });
+  }
 });

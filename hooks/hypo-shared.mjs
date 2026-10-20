@@ -1718,6 +1718,21 @@ const vaultGit = (hypoDir, args, extra = {}) =>
     ...extra,
   });
 
+/**
+ * Git's own words for a failed command: the first three non-empty lines of its stderr (stdout when
+ * stderr is empty) on one line, at most 400 characters. A stale `.git/index.lock` is named in the
+ * first of them, with the path.
+ */
+function gitFailureText(run) {
+  return String(run?.stderr || run?.stdout || '')
+    .split('\n')
+    .map((l) => l.trim())
+    .filter(Boolean)
+    .slice(0, 3)
+    .join(' ')
+    .slice(0, 400);
+}
+
 /** `<rev>:./<relPath>`: a `git show` / `cat-file` argument resolved from the vault. */
 export function revPathArg(rev, relPath) {
   return `${rev}:./${relPath}`;
@@ -2378,9 +2393,11 @@ export function markPullArchiveMerged(hypoDir) {
  * rollback) commit: clear what would block it, without ever migrating this machine. Returns
  * `{ok, deferred?, reason?, notice?, backups[], archived[], localOnly[], unowned[], cleared[], gitignoreLines[], gitignoreSaved[], priorRecord, recordWritten}`.
  * A stopped run (`ok: false`) reports everything it had moved up to that point in the same lists,
- * so the caller can take it back. `priorRecord` is the whole archive record this run read before it
- * wrote its own (null when there was none), and `recordWritten` is true only once this run's own
- * write of the record returned (or threw after the disk already held its bytes): until then the
+ * so the caller can take it back. A stop on a failed git command (`unstage-failed`,
+ * `checkout-failed`) also carries `gitError`, the first lines of git's own message (a stale
+ * `.git/index.lock` with its path), which `pullRemote` puts in its notice and the recorded failure.
+ * `priorRecord` is the whole archive record this run read before it wrote its own (null when
+ * there was none), and `recordWritten` is true only once this run's own write of the record returned (or threw after the disk already held its bytes): until then the
  * record on disk is the earlier run's, and the undo leaves it alone. `recordUncertain` is true when
  * that write threw and the disk holds neither its bytes nor the earlier ones; the undo then leaves
  * the record and every backup in place.
@@ -2875,11 +2892,11 @@ function clearBlockingPaths(hypoDir, targetRev, opts) {
   testHooks?.beforeUnstage?.();
   if (drifted(false)) return stop(changedSince());
   const unstage = blocked.filter((p) => staged.has(p));
-  if (
-    unstage.length &&
-    vaultGit(hypoDir, ['reset', '-q', '--', ...literalSpecs(unstage)]).status !== 0
-  ) {
-    return stop({ reason: 'unstage-failed' });
+  const unstageRun = unstage.length
+    ? vaultGit(hypoDir, ['reset', '-q', '--', ...literalSpecs(unstage)])
+    : null;
+  if (unstageRun && unstageRun.status !== 0) {
+    return stop({ reason: 'unstage-failed', gitError: gitFailureText(unstageRun) });
   }
   testHooks?.afterArchive?.();
   if (drifted(true)) return stop(changedSince());
@@ -2898,7 +2915,7 @@ function clearBlockingPaths(hypoDir, targetRev, opts) {
   if (restore.length) {
     const r = vaultGit(hypoDir, ['checkout', 'HEAD', '--', ...literalSpecs(restore)]);
     if (r.status !== 0) {
-      return stop({ reason: 'checkout-failed' });
+      return stop({ reason: 'checkout-failed', gitError: gitFailureText(r) });
     }
   }
   return {
@@ -5563,8 +5580,8 @@ export function pullRemote(hypoDir, { testHooks, leaveNotices = true } = {}) {
   };
   // A deferral skips the pull on purpose; it is recorded like a failed pull so doctor shows it, and
   // so the last record names the cause even when the deferral came without a notice.
-  const defer = (why, note) => {
-    appendSyncFailure(hypoDir, 'pull', note || `pull deferred: ${why}`);
+  const defer = (why, note, recorded) => {
+    appendSyncFailure(hypoDir, 'pull', recorded || note || `pull deferred: ${why}`);
     return done({ pulled: false, conflict: false, deferred: why });
   };
   // What the clearing step moved. A pull that does not land takes it back. Returns whether anything
@@ -5608,7 +5625,7 @@ export function pullRemote(hypoDir, { testHooks, leaveNotices = true } = {}) {
     if (canCatchUp) {
       pre = clearGeneratedPathsBlockingPull(hypoDir, '@{u}', { testHooks });
       if (!pre.ok) {
-        const { deferred, notice, reason } = pre;
+        const { deferred, notice, reason, gitError } = pre;
         const tookBack = takeBack();
         if (deferred) {
           if (notice) notices.push(notice);
@@ -5619,9 +5636,15 @@ export function pullRemote(hypoDir, { testHooks, leaveNotices = true } = {}) {
         // overwrite without a word, with its backup and record gone. Merge nothing; the next pull
         // runs the clearing step again.
         if (tookBack) {
-          const note = `이행 커밋을 받으려고 옛 세션 현황을 보관하던 중 멈춰(${reason}) 보관한 내용을 되돌리고 병합하지 않았습니다. 다음 동기화에서 다시 시도합니다`;
+          const note =
+            `이행 커밋을 받으려고 옛 세션 현황을 보관하던 중 멈춰(${reason}) 보관한 내용을 되돌리고 병합하지 않았습니다. 다음 동기화에서 다시 시도합니다` +
+            (gitError
+              ? `. git의 말: ${gitError}. git이 잠금 파일(.lock)을 가리키는데 실행 중인 git 프로세스가 없다면, 그 파일을 직접 지운 뒤 다음 동기화를 기다리면 됩니다`
+              : '');
           notices.push(note);
-          return defer('clear-failed', note);
+          // The record keeps git's own line: retrying cannot fix a stale lock, and the one-line
+          // summary of a long note would cut it off.
+          return defer('clear-failed', note, gitError ? `${reason}: ${gitError}` : undefined);
         }
         // Any other stop (another file is dirty, a revision git cannot read) moved nothing: pull
         // anyway and let git report its own failure.
