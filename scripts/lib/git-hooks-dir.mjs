@@ -968,22 +968,37 @@ export function resolveGitHooksDir(repoRoot, { timeoutMs = 5000 } = {}) {
  * @returns {null | string} null when writing is safe, else a reason to log
  */
 export function unsafeHookTargetReason(hookPath) {
+  return unsafeHookTarget(hookPath)?.reason ?? null;
+}
+
+/**
+ * Same probe as unsafeHookTargetReason, with `operational` telling a refusal on purpose
+ * (a symlink, a non-regular file) from a probe that failed with an errno (EACCES, EIO, ...)
+ * and so says nothing about whether the entry is safe. Callers that must not carry on past a
+ * failed probe read this field instead of parsing the message.
+ *
+ * @returns {null | {reason: string, operational: boolean}}
+ */
+export function unsafeHookTarget(hookPath) {
   let st;
   try {
     st = lstatSync(hookPath);
   } catch (e) {
     if (e && e.code === 'ENOENT') return null; // genuinely absent — safe to create
-    return `cannot stat (${e.code || e.message})`;
+    return { reason: `cannot stat (${e.code || e.message})`, operational: true };
   }
-  if (st.isSymbolicLink()) return 'is a symlink — refusing to write through it';
-  if (!st.isFile()) return 'exists but is not a regular file';
+  if (st.isSymbolicLink()) {
+    return { reason: 'is a symlink — refusing to write through it', operational: false };
+  }
+  if (!st.isFile()) return { reason: 'exists but is not a regular file', operational: false };
   return null;
 }
 
 /**
  * Write-side wrapper: the hooks directory only if it is safe to install into.
  * Returns `{dir}` when installing is allowed, otherwise `{skip}` carrying a
- * human-readable reason for the caller to log.
+ * human-readable reason for the caller to log. `operational: true` marks a skip that is a
+ * failed probe (git could not resolve the hooks dir), not a deliberate refusal.
  */
 export function hooksDirForInstall(repoRoot, opts) {
   const r = resolveGitHooksDir(repoRoot, opts);
@@ -996,7 +1011,8 @@ export function hooksDirForInstall(repoRoot, opts) {
       return { skip: `hooks path is not a directory, so git runs no hooks (${r.path})` };
     }
     if (r.reason === 'git-unavailable') return { skip: 'git not available on PATH' };
-    return { skip: `could not resolve hooks dir (${r.detail || r.reason})` };
+    // operational: git or the filesystem failed, which is not a decision to leave the hook alone
+    return { skip: `could not resolve hooks dir (${r.detail || r.reason})`, operational: true };
   }
   if (!r.owned) {
     return {

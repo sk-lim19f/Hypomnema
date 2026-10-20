@@ -39,6 +39,7 @@ import { createHash } from 'crypto';
 import { expandHome, resolveHypoRoot } from './lib/hypo-root.mjs';
 import {
   hooksDirForInstall,
+  unsafeHookTarget,
   unsafeHookTargetReason,
   findMarkerSpan,
   WIKI_PRE_COMMIT_MARKER_START,
@@ -782,21 +783,24 @@ function publishWikiHook(hookPath, newContent, bakPath) {
 // that commit run without the .hypoignore guard the install was meant to put
 // in front of it.
 function installWikiPreCommitHook(hypoDir, dryRun, force, lintStrict) {
-  const { dir: hooksDir, skip } = hooksDirForInstall(hypoDir);
+  const { dir: hooksDir, skip, operational } = hooksDirForInstall(hypoDir);
   if (!hooksDir) {
-    // no git repo — silently skip, as before; anything else is worth surfacing
-    if (skip) log('skipped', `${hypoDir} pre-commit (${skip})`);
-    return 'skipped';
+    // no git repo is silent, as before; a refusal on purpose (hooks disabled, shared hooks dir,
+    // git missing) is a skip; git or the filesystem failing to resolve the dir is a failure
+    if (skip) log(operational ? 'errors' : 'skipped', `${hypoDir} pre-commit (${skip})`);
+    return operational ? 'failed' : 'skipped';
   }
   const hookPath = join(hooksDir, 'pre-commit');
   const newContent = wikiPreCommitContent(hypoDir, lintStrict);
 
   // Before every branch below, including --force: a symlink here would send the
   // write through to an arbitrary external file.
-  const unsafe = unsafeHookTargetReason(hookPath);
+  const unsafe = unsafeHookTarget(hookPath);
   if (unsafe) {
-    log('skipped', `${hookPath} (${unsafe})`);
-    return 'skipped';
+    // a stat that failed with an errno (EACCES on the hooks dir) is not a decision to leave
+    // the hook alone: the guard is not in place and the first commit must not run
+    log(unsafe.operational ? 'errors' : 'skipped', `${hookPath} (${unsafe.reason})`);
+    return unsafe.operational ? 'failed' : 'skipped';
   }
 
   if (existsSync(hookPath)) {

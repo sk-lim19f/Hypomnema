@@ -1382,6 +1382,24 @@ test('a successful in-place fallback through the temp-dir backup leaves no hypo-
   });
 });
 
+test('a successful in-place fallback in a directory named hypo-settings-mine keeps that directory and its files', () => {
+  withTmpDir((dir) => {
+    const mine = join(dir, 'hypo-settings-mine');
+    mkdirSync(mine);
+    const file = join(mine, 'settings.json');
+    writeFileSync(file, OLD_SETTINGS);
+    writeFileSync(join(mine, 'keep.txt'), 'user data');
+    const res = runSettingsWriter(dir, file, NEW_SETTINGS, {
+      preload: settingsRenamePreload(dir, { errCode: 'EBUSY' }),
+    });
+    assert.equal(res.status, 0, res.stderr);
+    assert.equal(res.json.atomic, false);
+    assert.equal(readFileSync(file, 'utf8'), NEW_SETTINGS);
+    assert.equal(readFileSync(join(mine, 'keep.txt'), 'utf8'), 'user data');
+    assert.deepEqual(readdirSync(mine).sort(), ['keep.txt', 'settings.json']);
+  });
+});
+
 test('with no backup possible the in-place fallback refuses and leaves settings.json byte-identical', () => {
   withTmpDir((dir) => {
     const file = join(dir, 'settings.json');

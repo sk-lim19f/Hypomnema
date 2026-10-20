@@ -19,6 +19,7 @@ import {
   cpSync,
   readdirSync,
   realpathSync,
+  chmodSync,
 } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -3118,8 +3119,9 @@ test('init re-run over a previous-resolver hook leaves the live hook whole when 
 });
 
 // A fresh vault (git init is the default) with a bare remote. fault 'write' tears the hook
-// candidate, so the hook never lands; '' runs the same flow without a fault.
-function runInitWithRemote(fault) {
+// candidate, so the hook never lands; '' runs the same flow without a fault. A `hooksDirMode`
+// pre-creates the repo and sets that mode on .git/hooks, so probing the hook target fails.
+function runInitWithRemote(fault, hooksDirMode, makeEnv) {
   let out;
   withTmpHome((home) => {
     withTmpDir((dir) => {
@@ -3137,18 +3139,30 @@ function runInitWithRemote(fault) {
         GIT_COMMITTER_EMAIL: 't@t.test',
       };
       if (fault) env.HYPO_TEST_HOOK_FAULT = fault;
+      if (makeEnv) Object.assign(env, makeEnv(dir, env));
       delete env.CLAUDE_CONFIG_DIR;
-      const r = spawnSync(
-        process.execPath,
-        [
-          '-r',
-          preloadPath,
-          join(SCRIPTS, 'init.mjs'),
-          `--hypo-dir=${hypoDir}`,
-          `--git-remote=${remote}`,
-        ],
-        { encoding: 'utf-8', env },
-      );
+      const gitHooks = join(hypoDir, '.git', 'hooks');
+      if (hooksDirMode !== undefined) {
+        mkdirSync(hypoDir, { recursive: true });
+        spawnSync('git', ['init', hypoDir], { stdio: 'ignore' });
+        chmodSync(gitHooks, hooksDirMode);
+      }
+      let r;
+      try {
+        r = spawnSync(
+          process.execPath,
+          [
+            '-r',
+            preloadPath,
+            join(SCRIPTS, 'init.mjs'),
+            `--hypo-dir=${hypoDir}`,
+            `--git-remote=${remote}`,
+          ],
+          { encoding: 'utf-8', env },
+        );
+      } finally {
+        if (hooksDirMode !== undefined) chmodSync(gitHooks, 0o755); // so the temp dir can be removed
+      }
       const head = spawnSync('git', ['-C', hypoDir, 'rev-parse', '--verify', 'HEAD'], {
         encoding: 'utf-8',
       });
@@ -3167,6 +3181,40 @@ test('init does not make the first commit or push when the pre-commit hook could
   assert.equal(remoteRefs.trim(), '', 'nothing may be pushed to the remote');
   assert.match(r.stdout, /first commit was not made because the pre-commit hook/);
   assert.match(r.stdout, /re-run `hypomnema init`/);
+});
+
+test('init does not make the first commit or push when the hooks directory cannot be probed', () => {
+  if (process.getuid?.() === 0) {
+    console.log('  skipped (running as root, permissions are not enforced): unprobeable hooks dir');
+    return;
+  }
+  const { r, headStatus, remoteRefs } = runInitWithRemote('', 0o000);
+  assert.notEqual(r.status, 0, `an unprobeable hooks dir must not exit 0: ${r.stdout}`);
+  assert.match(r.stdout, /cannot stat \(EACCES\)/);
+  assert.notEqual(headStatus, 0, 'no commit may exist: it would have run without the guard');
+  assert.equal(remoteRefs.trim(), '', 'nothing may be pushed to the remote');
+  assert.match(r.stdout, /first commit was not made because the pre-commit hook/);
+});
+
+test('init does not make the first commit or push when git cannot resolve the hooks dir', () => {
+  // A git that fails only the hooks-dir probe and runs every other command: the first commit
+  // would land without the guard if the failed probe counted as a deliberate skip.
+  const { r, headStatus, remoteRefs } = runInitWithRemote('', undefined, (dir, env) => {
+    const bin = join(dir, 'bin');
+    mkdirSync(bin, { recursive: true });
+    const realGit = spawnSync('which', ['git'], { encoding: 'utf-8' }).stdout.trim();
+    writeFileSync(
+      join(bin, 'git'),
+      `#!/bin/sh\nfor a in "$@"; do [ "$a" = --absolute-git-dir ] && exit 128; done\nexec '${realGit}' "$@"\n`,
+      { mode: 0o755 },
+    );
+    return { PATH: `${bin}:${env.PATH}` };
+  });
+  assert.notEqual(r.status, 0, `a failed hooks-dir probe must not exit 0: ${r.stdout}`);
+  assert.match(r.stdout, /could not resolve hooks dir/);
+  assert.notEqual(headStatus, 0, 'no commit may exist: it would have run without the guard');
+  assert.equal(remoteRefs.trim(), '', 'nothing may be pushed to the remote');
+  assert.match(r.stdout, /first commit was not made because the pre-commit hook/);
 });
 
 test('init without a hook fault still makes the first commit and pushes it', () => {

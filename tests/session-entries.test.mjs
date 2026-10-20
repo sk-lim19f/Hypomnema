@@ -5818,6 +5818,17 @@ test('a failed checkout with no earlier record removes the record it wrote', () 
   });
 });
 
+test("a clearing step stopped on git's own error carries git's message in the fast-forward notice", () => {
+  withCatchUp(({ b }) => {
+    put(b, '.gitignore', '.cache/\nlocal-only/\n');
+    const r = fastForwardTo(b, '@{u}', { testHooks: holdIndex(b) });
+    assert.equal(r.ok, false);
+    assert.equal(r.reason, 'checkout-failed');
+    assert.match(r.notice ?? '', /git의 말: .*index\.lock/, 'the notice carries git lock message');
+    assert.match(r.notice, /직접 지운/, 'the notice says a stale lock can be removed by hand');
+  });
+});
+
 test('an undo keeps a backup the earlier record also names when this run reused it', () => {
   withCatchUp(({ b }) => {
     // the first path backUpGeneratedPath picks for W1 already holds W1: this run reuses it

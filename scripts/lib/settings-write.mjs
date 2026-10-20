@@ -34,6 +34,7 @@ import {
   readlinkSync,
   realpathSync,
   rmSync,
+  rmdirSync,
   statSync,
   unlinkSync,
   writeFileSync,
@@ -101,8 +102,9 @@ function resolveSettingsTarget(path) {
  * Save the current bytes of `target` before an in-place write. 'wx' so a backup kept by an
  * earlier failed run (or a link planted at that name) is never overwritten or followed.
  *
- * @returns {string|null} the backup path, or null when the bytes could not be read or no
- *   backup file could be written.
+ * @returns {{path: string, tempDir: string|null}|null} the backup path and the temp directory
+ *   this call made for it (null for a sibling backup), or null when the bytes could not be read
+ *   or no backup file could be written.
  */
 function saveBackup(target) {
   let bytes;
@@ -115,7 +117,7 @@ function saveBackup(target) {
   const sibling = join(dirname(target), name);
   try {
     writeFileSync(sibling, bytes, { flag: 'wx', mode: 0o600 });
-    return sibling;
+    return { path: sibling, tempDir: null };
   } catch {
     // the directory that refused the temp file usually refuses this too; try the OS temp dir
   }
@@ -124,20 +126,20 @@ function saveBackup(target) {
     dir = mkdtempSync(join(tmpdir(), 'hypo-settings-'));
     const inTmp = join(dir, name);
     writeFileSync(inTmp, bytes, { flag: 'wx', mode: 0o600 });
-    return inTmp;
+    return { path: inTmp, tempDir: dir };
   } catch {
     if (dir) rmSync(dir, { recursive: true, force: true });
     return null;
   }
 }
 
+// Removes the backup file, then only the temp directory saveBackup recorded, and only if it is
+// empty. A directory is never chosen by its name: a settings.json may live in a user directory
+// called hypo-settings-something.
 function removeBackup(backup) {
   try {
-    if (basename(dirname(backup)).startsWith('hypo-settings-')) {
-      rmSync(dirname(backup), { recursive: true, force: true });
-    } else {
-      unlinkSync(backup);
-    }
+    unlinkSync(backup.path);
+    if (backup.tempDir) rmdirSync(backup.tempDir);
   } catch {
     // a leftover backup is harmless; the file itself is already correct
   }
@@ -192,7 +194,7 @@ export function writeSettingsJson(path, text) {
     // Printed before the write so a kill mid-write still leaves the backup path on screen.
     process.stderr.write(
       `settings.json: ${dirname(target)} is not writable for an atomic replace, wrote in place` +
-        (backup ? ` (previous bytes saved at ${backup} until the write is verified)` : '') +
+        (backup ? ` (previous bytes saved at ${backup.path} until the write is verified)` : '') +
         '\n',
     );
     try {
@@ -201,7 +203,7 @@ export function writeSettingsJson(path, text) {
       if (!backup) throw werr;
       throw Object.assign(
         new Error(
-          `settings.json: the in-place write to ${target} failed (${werr.code ?? werr.message}); the previous bytes are kept at ${backup}`,
+          `settings.json: the in-place write to ${target} failed (${werr.code ?? werr.message}); the previous bytes are kept at ${backup.path}`,
         ),
         { code: werr.code, cause: werr },
       );
@@ -215,7 +217,7 @@ export function writeSettingsJson(path, text) {
       }
       if (!intact) {
         throw new Error(
-          `settings.json: ${target} does not read back as what was written; the previous bytes are kept at ${backup}`,
+          `settings.json: ${target} does not read back as what was written; the previous bytes are kept at ${backup.path}`,
         );
       }
       removeBackup(backup);

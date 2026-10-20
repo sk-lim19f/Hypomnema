@@ -943,8 +943,9 @@ function returnStrandedIndex(hypoDir, sha, headBefore) {
  * `archived[]`, `localOnly[]`, `unowned[]` and `cleared[]` are for the caller, after a successful
  * merge). The `.gitignore` goes back as the exact bytes it held (`undoClearedPaths`), not as lines
  * appended; a `.gitignore` that is staged when the clearing step checks is deferred, not moved.
- * `notice` carries git's whole stderr after a failed merge, which names the files in the way, and
- * any path that could not be put back.
+ * `notice` carries git's whole stderr after a failed merge, which names the files in the way, git's
+ * own first lines when the clearing step stopped on a failed checkout or reset (a stale index lock),
+ * and any path that could not be put back.
  */
 export function fastForwardTo(hypoDir, sha, { testHooks } = {}) {
   const pre = clearGeneratedPathsBlockingPull(hypoDir, sha, { testHooks });
@@ -958,7 +959,12 @@ export function fastForwardTo(hypoDir, sha, { testHooks } = {}) {
     0;
   if (!pre.ok) {
     const undone = moved ? undoClearedPaths(hypoDir, pre).notices : [];
-    const notice = [pre.notice, ...undone].filter(Boolean).join('\n') || undefined;
+    // git's own first lines (a stale .git/index.lock) say why the clearing step stopped; without
+    // them the same notice repeats every run with no diagnosis. Same wording as pullRemote.
+    const gitSaid = pre.gitError
+      ? `git의 말: ${pre.gitError}. git이 잠금 파일(.lock)을 가리키는데 실행 중인 git 프로세스가 없다면, 그 파일을 직접 지운 뒤 다시 시도하면 됩니다`
+      : null;
+    const notice = [pre.notice, gitSaid, ...undone].filter(Boolean).join('\n') || undefined;
     return { ok: false, pre, deferred: pre.deferred, reason: pre.reason, notice };
   }
   const headBefore = gitRun(hypoDir, ['rev-parse', '--verify', '--quiet', 'HEAD']).stdout.trim();
