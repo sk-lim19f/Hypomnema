@@ -27,6 +27,8 @@ import {
   snapshotBase,
   overwriteTargets,
   advanceBaseForWrite,
+  beginObservedGeneration,
+  recordObserved,
   hashContent,
 } from '../hooks/base-store.mjs';
 import { closeGatePath, closeGateStatus } from '../hooks/close-gate-store.mjs';
@@ -6375,7 +6377,9 @@ const FLAT_STATE = (today) =>
 // track, both without `supersedes`. `baseBytes(flat)` gives the bytes the session's base record
 // holds a hash of (`null`: the session has no base record). Calls `check` with what the close wrote.
 // `afterMove(dir)` runs right after the move, to change the baseline the move published.
-function closeAfterMove(label, baseBytes, check, afterMove) {
+// `observedBytes(flat)` (needs a base record) gives the bytes a later SessionStart showed the
+// session, recorded with the real writer (`recordObserved`) in the current generation.
+function closeAfterMove(label, baseBytes, check, afterMove, observedBytes) {
   withWiki(
     (dir, today) =>
       writeFileSync(join(dir, 'projects', 'test-project', 'session-state.md'), FLAT_STATE(today)),
@@ -6384,6 +6388,11 @@ function closeAfterMove(label, baseBytes, check, afterMove) {
       const flat = readFileSync(join(dir, rel), 'utf-8');
       const sid = newPinSession(label);
       if (baseBytes) snapshotBase(dir, sid, [rel], { [rel]: hashContent(baseBytes(flat)) });
+      if (observedBytes) {
+        assert.equal(beginObservedGeneration(dir, sid), true, 'the base record takes a generation');
+        const shown = hashContent(observedBytes(flat));
+        assert.equal(recordObserved(dir, sid, rel, shown), true, 'the observation was recorded');
+      }
       const moved = migrateVaultToSessionEntries(dir);
       assert.equal(moved.migrated, true, JSON.stringify(moved));
       afterMove?.(dir);
@@ -6447,6 +6456,36 @@ test('a close whose session read other bytes than the baseline was made from sup
     ({ entry }) => {
       for (const t of entry.tracks) assert.equal(t.supersedes, undefined, JSON.stringify(t));
     },
+  );
+});
+
+// The session's first snapshot holds an older state A, and a later SessionStart showed it the state
+// the move was made from (B). Disabling the check: in flatReadBaselineHeads replace
+// `readObservedHash(hypoDir, sessionId, rel)` with `null`.
+test('a close whose session was later shown the bytes the baseline was made from supersedes its heads', () => {
+  closeAfterMove(
+    'mid-move-observed',
+    (flat) => `${flat}\nthe state this session first read (A)\n`,
+    ({ baseline, entry }) => {
+      for (const t of entry.tracks) {
+        assert.deepEqual(t.supersedes, [baseline.closeId], JSON.stringify(entry.tracks));
+      }
+    },
+    undefined,
+    (flat) => flat,
+  );
+});
+
+test('a close whose session was shown other bytes than the baseline was made from supersedes nothing', () => {
+  // snapshot A, observed B, but the move was made from C (the flat file as it is now)
+  closeAfterMove(
+    'mid-move-observed-other',
+    (flat) => `${flat}\nthe state this session first read (A)\n`,
+    ({ entry }) => {
+      for (const t of entry.tracks) assert.equal(t.supersedes, undefined, JSON.stringify(t));
+    },
+    undefined,
+    (flat) => `${flat}\nthe state a later SessionStart showed (B)\n`,
   );
 });
 
