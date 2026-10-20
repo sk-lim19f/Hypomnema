@@ -6482,8 +6482,14 @@ test('a close whose session read the parent of the baseline but not the saved by
     (dir) => {
       // The commit that added the baseline keeps the flat file the session read as its parent, but
       // the baseline is rebuilt from other saved bytes (an archive resumed before the move).
-      const [file] = sessionFilesOf(dir).filter((f) => /-baseline-[0-9a-f]{16}\.md$/.test(f));
-      const old = parseSessionEntry(readFileSync(join(sessionsDirOf(dir), file), 'utf-8')).entry;
+      // Pick the state baseline by its tracks, not by name: the hot baseline sits beside it and the
+      // ids hash the date, so which one sorts first changes from day to day.
+      const entryOf = (f) =>
+        parseSessionEntry(readFileSync(join(sessionsDirOf(dir), f), 'utf-8')).entry;
+      const file = sessionFilesOf(dir).find(
+        (f) => /-baseline-[0-9a-f]{16}\.md$/.test(f) && entryOf(f).tracks.length > 0,
+      );
+      const old = entryOf(file);
       const saved = buildBaselineEntry({
         kind: 'state',
         text: FLAT_STATE(old.date).replace('BETA-BODY', 'SAVED-BYTES-BETA'),
