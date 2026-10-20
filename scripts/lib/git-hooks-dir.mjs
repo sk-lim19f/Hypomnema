@@ -312,6 +312,13 @@ function buildPreCommitResolverJs(targetSuffix, extraArgvJs = '') {
     '.");' +
     'console.error("Checked ~/.claude/settings.json (enabledPlugins), ~/.claude/hypo-pkg.json (pkgRoot) and ~/.claude/plugins/installed_plugins.json (hypo@hypomnema installPath, legacy hypomnema@hypomnema).");' +
     'console.error("Fix: run `hypomnema upgrade --apply` (or `/hypo:upgrade` on a plugin install), or reinstall Hypomnema.");' +
+    // A 1.10.0 uninstaller does not recognize this hook body and keeps it, so once the
+    // plugin is gone every commit lands here. Name the file and say how to remove it.
+    // git is asked for the path because the hook may live under core.hooksPath; if that
+    // fails the text says where to look instead. No single quote may appear in this text.
+    'var hp="";try{var g=cp.spawnSync("git",["rev-parse","--git-path","hooks/pre-commit"],{encoding:"utf-8"});' +
+    'if(g.status===0&&g.stdout.trim())hp=path.resolve(g.stdout.trim())}catch(e){}' +
+    'console.error("If Hypomnema was uninstalled, this hook can be removed by deleting "+(hp||"the pre-commit file in this repository hooks directory")+" (or by running uninstall from Hypomnema 1.10.1 or newer).");' +
     'process.exit(1)' +
     '}' +
     'var r=cp.spawnSync(process.execPath,[root+"' +

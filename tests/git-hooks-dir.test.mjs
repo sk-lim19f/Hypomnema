@@ -913,6 +913,68 @@ test('exits 1 with a helpful stderr message when neither source resolves', () =>
   });
 });
 
+// A 1.10.0 uninstaller keeps this hook body, so after the plugin is removed every commit
+// reaches this message. It has to say which file to delete. Run through a real commit
+// so the path comes from git (the hook may sit under core.hooksPath), not from the test.
+function commitWithUnresolvableRoot(vault, home, hooksPathConfig) {
+  const git = (args) =>
+    spawnSync('git', args, {
+      encoding: 'utf-8',
+      cwd: vault,
+      env: {
+        PATH: process.env.PATH,
+        HOME: home,
+        GIT_AUTHOR_NAME: 't',
+        GIT_AUTHOR_EMAIL: 't@t.test',
+        GIT_COMMITTER_NAME: 't',
+        GIT_COMMITTER_EMAIL: 't@t.test',
+      },
+    });
+  assert.equal(git(['init', '-q']).status, 0);
+  if (hooksPathConfig) assert.equal(git(['config', 'core.hooksPath', hooksPathConfig]).status, 0);
+  const hooksDir = hooksPathConfig ? join(vault, hooksPathConfig) : join(vault, '.git', 'hooks');
+  mkdirSync(hooksDir, { recursive: true });
+  const hookPath = join(hooksDir, 'pre-commit');
+  writeFileSync(hookPath, wikiPreCommitContent(vault, false), { mode: 0o755 });
+  writeFileSync(join(vault, 'a.md'), 'a\n');
+  assert.equal(git(['add', 'a.md']).status, 0);
+  return { hookPath, attempt: git(['commit', '-q', '-m', 'x']) };
+}
+
+test('the unresolved-root message names the active hook file and how to remove it', () => {
+  withResolverFixture(({ home, vault }) => {
+    const { hookPath, attempt } = commitWithUnresolvableRoot(vault, home, null);
+    assert.notEqual(attempt.status, 0, 'the commit must be refused');
+    assert.match(attempt.stderr, /could not resolve the install root/);
+    assert.ok(
+      attempt.stderr.includes(`deleting ${realpathSync(hookPath)}`),
+      `the message must name the hook file: ${attempt.stderr}`,
+    );
+    assert.match(attempt.stderr, /If Hypomnema was uninstalled/);
+    assert.match(attempt.stderr, /uninstall from Hypomnema 1\.10\.1 or newer/);
+  });
+});
+
+test('the unresolved-root message follows core.hooksPath to the active hook file', () => {
+  withResolverFixture(({ home, vault }) => {
+    const { hookPath, attempt } = commitWithUnresolvableRoot(vault, home, 'custom-hooks');
+    assert.notEqual(attempt.status, 0);
+    assert.ok(
+      attempt.stderr.includes(`deleting ${realpathSync(hookPath)}`),
+      `the message must name the core.hooksPath hook: ${attempt.stderr}`,
+    );
+  });
+});
+
+test('outside a git repository the unresolved-root message still gives the removal guidance', () => {
+  withResolverFixture(({ base, home, vault }) => {
+    const run = runGeneratedHook(base, vault, wikiPreCommitContent(vault, false), home);
+    assert.notEqual(run.status, 0);
+    assert.match(run.stderr, /can be removed by deleting the pre-commit file in this repository/);
+    assert.match(run.stderr, /uninstall from Hypomnema 1\.10\.1 or newer/);
+  });
+});
+
 // ── the security fix itself: a relative pkgRoot must not resolve against the
 // commit-time cwd ───────────────────────────────────────────────────────────
 
@@ -1251,7 +1313,7 @@ test('the resolver and resolveCommitTimeRoot pick the same root on every fixture
   }
 });
 
-test('resolveCommitTimeRoot agrees with compareSemver on prerelease, v prefix and build metadata', () => {
+test('the hand-written resolver expectation table agrees with compareSemver on prerelease, v prefix and build metadata', () => {
   for (const row of ROOT_ROWS.filter((r) => r.cmp)) {
     const verdict = compareSemver(row.plugin, row.sidecar) < 0 ? 'sidecar' : 'plugin';
     assert.equal(

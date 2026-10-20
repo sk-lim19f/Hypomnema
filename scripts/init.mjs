@@ -775,12 +775,18 @@ function publishWikiHook(hookPath, newContent, bakPath) {
   return false;
 }
 
+// Returns 'installed' (written, or already current), 'skipped' (a legitimate
+// reason not to touch the hook, logged where it is worth surfacing) or 'failed'
+// (the write was attempted and did not land). Only 'failed' stops the first
+// commit: a skipped install is today's behavior, but a failed one would let
+// that commit run without the .hypoignore guard the install was meant to put
+// in front of it.
 function installWikiPreCommitHook(hypoDir, dryRun, force, lintStrict) {
   const { dir: hooksDir, skip } = hooksDirForInstall(hypoDir);
   if (!hooksDir) {
     // no git repo — silently skip, as before; anything else is worth surfacing
     if (skip) log('skipped', `${hypoDir} pre-commit (${skip})`);
-    return;
+    return 'skipped';
   }
   const hookPath = join(hooksDir, 'pre-commit');
   const newContent = wikiPreCommitContent(hypoDir, lintStrict);
@@ -790,7 +796,7 @@ function installWikiPreCommitHook(hypoDir, dryRun, force, lintStrict) {
   const unsafe = unsafeHookTargetReason(hookPath);
   if (unsafe) {
     log('skipped', `${hookPath} (${unsafe})`);
-    return;
+    return 'skipped';
   }
 
   if (existsSync(hookPath)) {
@@ -798,7 +804,7 @@ function installWikiPreCommitHook(hypoDir, dryRun, force, lintStrict) {
     if (existing.includes(WIKI_PRE_COMMIT_MARKER_START)) {
       if (existing === newContent) {
         log('skipped', `${hookPath} (pre-commit up to date)`);
-        return;
+        return 'installed';
       }
       // Back this up first. The marker's presence says our block is IN the
       // file; it says nothing about what else is, and this branch replaces the
@@ -811,11 +817,11 @@ function installWikiPreCommitHook(hypoDir, dryRun, force, lintStrict) {
       const bakPath = uniqueBakPath(hookPath);
       if (!bakPath) {
         log('skipped', `${hookPath} (unsafe backup path) — not overwriting without a safe backup`);
-        return;
+        return 'skipped';
       }
       if (!dryRun) {
         writeFileSync(bakPath, existing);
-        if (!publishWikiHook(hookPath, newContent, bakPath)) return;
+        if (!publishWikiHook(hookPath, newContent, bakPath)) return 'failed';
       }
       log('merged', `${hookPath} (pre-commit updated, backup at ${basename(bakPath)})`);
     } else if (force) {
@@ -829,11 +835,11 @@ function installWikiPreCommitHook(hypoDir, dryRun, force, lintStrict) {
           'skipped',
           `${hookPath} (unsafe backup path) — not force-overwriting without a safe backup`,
         );
-        return;
+        return 'skipped';
       }
       if (!dryRun) {
         writeFileSync(bakPath, existing);
-        if (!publishWikiHook(hookPath, newContent, bakPath)) return;
+        if (!publishWikiHook(hookPath, newContent, bakPath)) return 'failed';
       }
       log('merged', `${hookPath} (force-overwritten, backup at ${basename(bakPath)})`);
     } else {
@@ -841,14 +847,16 @@ function installWikiPreCommitHook(hypoDir, dryRun, force, lintStrict) {
         'skipped',
         `${hookPath} (user pre-commit exists — re-run with --force-commands to install)`,
       );
+      return 'skipped';
     }
-    return;
+    return 'installed';
   }
   if (!dryRun) {
     mkdirSync(hooksDir, { recursive: true });
-    if (!publishWikiHook(hookPath, newContent)) return;
+    if (!publishWikiHook(hookPath, newContent)) return 'failed';
   }
   log('created', hookPath);
+  return 'installed';
 }
 
 // ── shell function setup ─────────────────────────────────────────────────────
@@ -1340,8 +1348,11 @@ if (args.hooks) {
 // back on — skip installing the hook with a guessed root; an existing hook (if
 // any) is left exactly as-is, and channelUnresolvedNotice() above says what to
 // do next.
+let wikiHookFailed = false;
 if (!channelUnresolved) {
-  installWikiPreCommitHook(args.hypoDir, args.dryRun, args.forceCommands, args.lintStrict);
+  wikiHookFailed =
+    installWikiPreCommitHook(args.hypoDir, args.dryRun, args.forceCommands, args.lintStrict) ===
+    'failed';
 } else {
   log(
     'skipped',
@@ -1350,8 +1361,18 @@ if (!channelUnresolved) {
 }
 
 // 9. first commit + push (skip when cloned from remote — already has commits)
+// A failed hook install means the commit below would run without the .hypoignore
+// guard, so files excluded only by .hypoignore could be committed and pushed.
 if (args.gitInit && !args.fromRemote) {
-  madeFirstCommit = firstCommit(args.hypoDir, args.gitRemote, args.dryRun);
+  if (wikiHookFailed) {
+    log(
+      'errors',
+      'first commit was not made because the pre-commit hook could not be installed; ' +
+        'fix the permissions of the hooks directory and re-run `hypomnema init`',
+    );
+  } else {
+    madeFirstCommit = firstCommit(args.hypoDir, args.gitRemote, args.dryRun);
+  }
 }
 
 // ── report ───────────────────────────────────────────────────────────────────

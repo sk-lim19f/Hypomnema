@@ -19,15 +19,26 @@
 //   - hard links, owner, ACL and xattr: rename breaks a hard link (the other name
 //     keeps the old inode) and does not carry owner, ACL or xattr to the new file.
 //     Only the mode is restored.
+//   - in-place fallback: when no atomic replace is possible the bytes go straight into
+//     the live file, and a kill or a partial write would leave truncated JSON with no copy
+//     of the old file. So the current bytes are saved first, beside the file
+//     (`settings.json.hypo-bak`) or else in a fresh directory under the OS temp dir. With
+//     no backup possible the write is refused. The backup is removed once the file reads
+//     back as what was written and kept, with its path in the error, when it does not.
 import {
   chmodSync,
   lstatSync,
   mkdirSync,
+  mkdtempSync,
+  readFileSync,
   readlinkSync,
   realpathSync,
+  rmSync,
   statSync,
+  unlinkSync,
   writeFileSync,
 } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { basename, dirname, isAbsolute, join, sep } from 'node:path';
 import { atomicWrite } from '../../hooks/atomic-write.mjs';
 
@@ -87,13 +98,60 @@ function resolveSettingsTarget(path) {
 }
 
 /**
+ * Save the current bytes of `target` before an in-place write. 'wx' so a backup kept by an
+ * earlier failed run (or a link planted at that name) is never overwritten or followed.
+ *
+ * @returns {string|null} the backup path, or null when the bytes could not be read or no
+ *   backup file could be written.
+ */
+function saveBackup(target) {
+  let bytes;
+  try {
+    bytes = readFileSync(target);
+  } catch {
+    return null;
+  }
+  const name = `${basename(target)}.hypo-bak`;
+  const sibling = join(dirname(target), name);
+  try {
+    writeFileSync(sibling, bytes, { flag: 'wx', mode: 0o600 });
+    return sibling;
+  } catch {
+    // the directory that refused the temp file usually refuses this too; try the OS temp dir
+  }
+  let dir;
+  try {
+    dir = mkdtempSync(join(tmpdir(), 'hypo-settings-'));
+    const inTmp = join(dir, name);
+    writeFileSync(inTmp, bytes, { flag: 'wx', mode: 0o600 });
+    return inTmp;
+  } catch {
+    if (dir) rmSync(dir, { recursive: true, force: true });
+    return null;
+  }
+}
+
+function removeBackup(backup) {
+  try {
+    if (basename(dirname(backup)).startsWith('hypo-settings-')) {
+      rmSync(dirname(backup), { recursive: true, force: true });
+    } else {
+      unlinkSync(backup);
+    }
+  } catch {
+    // a leftover backup is harmless; the file itself is already correct
+  }
+}
+
+/**
  * Write `text` to settings.json at `path`. A symlink stays a link and its last
  * target gets the bytes. A dangling link into an existing directory is created
  * through the link; into a missing directory it is refused (ENOENT) and no
  * directory is made. A path that is not a link and does not exist is created.
  *
  * `atomic` is false when the directory refused the temp file (EACCES, EPERM) and
- * the bytes went in place instead. `modeRestored` is true only when the rename
+ * the bytes went in place instead, after the old bytes were saved to a backup (see the header).
+ * `modeRestored` is true only when the rename
  * changed the mode and the chmod back succeeded. `modeWidened` is true when that chmod failed and
  * the file is now wider than it was (never thrown: the bytes are already written).
  *
@@ -120,11 +178,48 @@ export function writeSettingsJson(path, text) {
     // EBUSY (rename onto a bind-mounted file) and EXDEV take the in-place path like a read-only directory.
     const fallback = ['EACCES', 'EPERM', 'EBUSY', 'EXDEV'].includes(err.code);
     if (!fallback) throw err;
-    writeFileSync(target, text); // opens the file as is, so its mode stays
+    // A missing target has no old bytes to lose. Otherwise no backup means no write.
+    const backup = mode === undefined ? null : saveBackup(target);
+    if (mode !== undefined && !backup) {
+      throw Object.assign(
+        new Error(
+          `settings.json: ${target} was not changed because neither an atomic replace (${err.code}) nor a backup of the current file was possible`,
+        ),
+        { code: err.code, cause: err },
+      );
+    }
     atomic = false;
+    // Printed before the write so a kill mid-write still leaves the backup path on screen.
     process.stderr.write(
-      `settings.json: ${dirname(target)} is not writable for an atomic replace, wrote in place\n`,
+      `settings.json: ${dirname(target)} is not writable for an atomic replace, wrote in place` +
+        (backup ? ` (previous bytes saved at ${backup} until the write is verified)` : '') +
+        '\n',
     );
+    try {
+      writeFileSync(target, text); // opens the file as is, so its mode stays
+    } catch (werr) {
+      if (!backup) throw werr;
+      throw Object.assign(
+        new Error(
+          `settings.json: the in-place write to ${target} failed (${werr.code ?? werr.message}); the previous bytes are kept at ${backup}`,
+        ),
+        { code: werr.code, cause: werr },
+      );
+    }
+    if (backup) {
+      let intact = false;
+      try {
+        intact = Buffer.from(text).equals(readFileSync(target));
+      } catch {
+        // unreadable counts as not intact
+      }
+      if (!intact) {
+        throw new Error(
+          `settings.json: ${target} does not read back as what was written; the previous bytes are kept at ${backup}`,
+        );
+      }
+      removeBackup(backup);
+    }
   }
   if (atomic && mode === undefined) {
     try {

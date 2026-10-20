@@ -839,6 +839,10 @@ function applyWikiPreCommitRoot(info) {
       : `; the unused candidate file ${published.candidatePath} could not be removed`;
     return {
       ok: false,
+      // Set only here, not on the refusals above: a refusal is a soft skip, but
+      // a write that failed leaves a hook the user asked --apply to migrate
+      // still on the old form, so the run must not exit 0.
+      writeFailed: true,
       reason:
         `writing the new hook failed (${published.error.code || published.error.message}); ` +
         `the existing hook is unchanged and its bytes are also saved at ${bakPath}${leftover}`,
@@ -1634,6 +1638,7 @@ let appliedHypoignore = [];
 let appliedGitignore = [];
 let appliedWikiPreCommitRoot = false;
 let wikiPreCommitApplyFailReason = null;
+let wikiPreCommitWriteFailed = false;
 let appliedExtensions = null;
 let appliedExtensionsCodex = null;
 
@@ -1834,6 +1839,7 @@ if (args.apply) {
     const wikiPreCommitResult = applyWikiPreCommitRoot(wikiPreCommitInfo);
     appliedWikiPreCommitRoot = wikiPreCommitResult.ok;
     if (!wikiPreCommitResult.ok) wikiPreCommitApplyFailReason = wikiPreCommitResult.reason;
+    wikiPreCommitWriteFailed = wikiPreCommitResult.writeFailed === true;
   }
   // codex core hooks + settings + wiki-*→hypo-* rename mirror. Same merged,
   // single-write transform as the claude side above.
@@ -1950,6 +1956,10 @@ if (args.json) {
               // checkWikiPreCommitRoot above). Absent/false for both a clean
               // new-form hook and an old-form one this run can still parse.
               unrecognized: wikiPreCommitInfo.unrecognized === true,
+              // Why --apply left the hook as it was (null when it did not try, or
+              // when it migrated). Together with applied.wikiPreCommitRoot this
+              // tells a refusal from a write that failed.
+              applyFailure: wikiPreCommitApplyFailReason,
             }
           : null,
         extensions: extCheck,
@@ -1984,6 +1994,7 @@ if (args.json) {
   );
   process.exit(
     (hasDrift && !args.apply) ||
+      wikiPreCommitWriteFailed ||
       extCheck.conflicts.length > 0 ||
       (extCheckCodex?.conflicts.length ?? 0) > 0
       ? 1
@@ -2602,4 +2613,4 @@ console.log(lines.join('\n'));
 // drift, which only fails check mode). --force-extensions clears the resolvable
 // cases; an unfollowable symlink/non-regular dest still counts and stays exit 1.
 const extBlocked = extCheck.conflicts.length > 0 || (extCheckCodex?.conflicts.length ?? 0) > 0;
-process.exit((hasDrift && !args.apply) || extBlocked ? 1 : 0);
+process.exit((hasDrift && !args.apply) || extBlocked || wikiPreCommitWriteFailed ? 1 : 0);

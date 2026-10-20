@@ -1252,6 +1252,165 @@ test('writeSettingsJson falls back to an in-place write when the rename onto set
   });
 });
 
+// Every rename onto settings.json answers EBUSY (so the write goes in place) and, per
+// HYPO_TEST_INPLACE, the in-place write to the live file itself is torn: 'tear' writes half
+// the bytes and throws EIO, 'short' writes half and reports success. Matching the exact
+// basename keeps the backup (settings.json.hypo-bak) and the temp file out of the fault.
+function inPlaceFaultPreload(dir) {
+  const preloadPath = join(dir, 'in-place-fault.cjs');
+  writeFileSync(
+    preloadPath,
+    `const fs = require('node:fs');
+const path = require('node:path');
+const realRename = fs.renameSync;
+const realWrite = fs.writeFileSync;
+fs.renameSync = function (from, to) {
+  if (path.basename(String(to)).startsWith('settings.json')) {
+    throw Object.assign(new Error('injected rename failure'), { code: 'EBUSY' });
+  }
+  return realRename.apply(this, arguments);
+};
+fs.writeFileSync = function (target, data, options) {
+  const mode = process.env.HYPO_TEST_INPLACE;
+  if (mode && typeof target === 'string' && path.basename(target) === 'settings.json') {
+    realWrite(target, data.slice(0, Math.floor(data.length / 2)), options);
+    if (mode === 'short') return;
+    throw Object.assign(new Error('injected in-place failure'), { code: 'EIO' });
+  }
+  return realWrite.apply(this, arguments);
+};
+require('node:module').syncBuiltinESMExports();
+`,
+  );
+  return preloadPath;
+}
+
+const OLD_SETTINGS = '{"hooks":{"a":[1,2,3]},"keep":"these bytes"}\n';
+const NEW_SETTINGS = '{"hooks":{"a":[4,5,6]},"new":"payload bytes"}\n';
+
+test('an in-place write that fails leaves the original bytes at the backup path the error names', () => {
+  withTmpDir((dir) => {
+    const file = join(dir, 'settings.json');
+    writeFileSync(file, OLD_SETTINGS);
+    const res = runSettingsWriter(dir, file, NEW_SETTINGS, {
+      preload: inPlaceFaultPreload(dir),
+      env: { HYPO_TEST_INPLACE: 'tear' },
+    });
+    assert.equal(res.status, 3, res.stderr);
+    assert.match(res.stderr, /CAUGHT EIO/);
+    const backup = `${realpathSync(dir)}/settings.json.hypo-bak`;
+    assert.ok(
+      res.stderr.includes(backup),
+      `the error and notice must name ${backup}: ${res.stderr}`,
+    );
+    assert.equal(readFileSync(backup, 'utf8'), OLD_SETTINGS, 'the backup holds the old bytes');
+    assert.notEqual(
+      readFileSync(file, 'utf8'),
+      OLD_SETTINGS,
+      'the fixture must have torn the file',
+    );
+  });
+});
+
+test('an in-place write whose read-back differs keeps the backup and throws with its path', () => {
+  withTmpDir((dir) => {
+    const file = join(dir, 'settings.json');
+    writeFileSync(file, OLD_SETTINGS);
+    const res = runSettingsWriter(dir, file, NEW_SETTINGS, {
+      preload: inPlaceFaultPreload(dir),
+      env: { HYPO_TEST_INPLACE: 'short' },
+    });
+    assert.equal(res.status, 3, res.stderr);
+    assert.match(res.stderr, /does not read back as what was written/);
+    assert.equal(readFileSync(join(dir, 'settings.json.hypo-bak'), 'utf8'), OLD_SETTINGS);
+  });
+});
+
+test('with the directory beside the file refusing a backup, the backup goes to a fresh temp directory', () => {
+  withTmpDir((dir) => {
+    const file = join(dir, 'settings.json');
+    writeFileSync(file, OLD_SETTINGS);
+    mkdirSync(join(dir, 'settings.json.hypo-bak')); // the sibling name is taken
+    const tmp = join(dir, 'tmp');
+    mkdirSync(tmp);
+    const res = runSettingsWriter(dir, file, NEW_SETTINGS, {
+      preload: inPlaceFaultPreload(dir),
+      env: { HYPO_TEST_INPLACE: 'tear', TMPDIR: tmp },
+    });
+    assert.equal(res.status, 3, res.stderr);
+    const made = readdirSync(tmp).filter((n) => n.startsWith('hypo-settings-'));
+    assert.equal(made.length, 1, `one fresh directory under TMPDIR: ${readdirSync(tmp)}`);
+    const backup = join(tmp, made[0], 'settings.json.hypo-bak');
+    assert.equal(readFileSync(backup, 'utf8'), OLD_SETTINGS);
+    assert.ok(res.stderr.includes(made[0]), 'the error must name the backup directory');
+  });
+});
+
+test('a successful in-place fallback removes its backup and the notice names where it was', () => {
+  withTmpDir((dir) => {
+    const file = join(dir, 'settings.json');
+    writeFileSync(file, OLD_SETTINGS);
+    const res = runSettingsWriter(dir, file, NEW_SETTINGS, {
+      preload: settingsRenamePreload(dir, { errCode: 'EBUSY' }),
+    });
+    assert.equal(res.status, 0, res.stderr);
+    assert.equal(res.json.atomic, false);
+    assert.equal(readFileSync(file, 'utf8'), NEW_SETTINGS);
+    assert.match(res.stderr, /wrote in place \(previous bytes saved at .*settings\.json\.hypo-bak/);
+    assert.deepEqual(
+      readdirSync(dir).filter((n) => n.includes('hypo-bak')),
+      [],
+      'the backup must be gone after a verified write',
+    );
+  });
+});
+
+test('a successful in-place fallback through the temp-dir backup leaves no hypo-settings directory', () => {
+  withTmpDir((dir) => {
+    const file = join(dir, 'settings.json');
+    writeFileSync(file, OLD_SETTINGS);
+    mkdirSync(join(dir, 'settings.json.hypo-bak'));
+    const tmp = join(dir, 'tmp');
+    mkdirSync(tmp);
+    const res = runSettingsWriter(dir, file, NEW_SETTINGS, {
+      preload: settingsRenamePreload(dir, { errCode: 'EBUSY' }),
+      env: { TMPDIR: tmp },
+    });
+    assert.equal(res.status, 0, res.stderr);
+    assert.equal(readFileSync(file, 'utf8'), NEW_SETTINGS);
+    assert.deepEqual(readdirSync(tmp), []);
+  });
+});
+
+test('with no backup possible the in-place fallback refuses and leaves settings.json byte-identical', () => {
+  withTmpDir((dir) => {
+    const file = join(dir, 'settings.json');
+    writeFileSync(file, OLD_SETTINGS);
+    mkdirSync(join(dir, 'settings.json.hypo-bak')); // sibling name taken
+    const res = runSettingsWriter(dir, file, NEW_SETTINGS, {
+      preload: settingsRenamePreload(dir, { errCode: 'EBUSY' }),
+      env: { TMPDIR: join(dir, 'no-such-tmp') }, // mkdtemp fails too
+    });
+    assert.equal(res.status, 3, res.stderr);
+    assert.match(res.stderr, /CAUGHT EBUSY/);
+    assert.match(res.stderr, /was not changed because neither an atomic replace/);
+    assert.equal(readFileSync(file, 'utf8'), OLD_SETTINGS);
+  });
+});
+
+test('a missing settings.json needs no backup on the in-place path', () => {
+  withTmpDir((dir) => {
+    const file = join(dir, 'settings.json');
+    const res = runSettingsWriter(dir, file, NEW_SETTINGS, {
+      preload: settingsRenamePreload(dir, { errCode: 'EBUSY' }),
+      env: { TMPDIR: join(dir, 'no-such-tmp') },
+    });
+    assert.equal(res.status, 0, res.stderr);
+    assert.equal(readFileSync(file, 'utf8'), NEW_SETTINGS);
+    assert.doesNotMatch(res.stderr, /previous bytes saved/);
+  });
+});
+
 test('a 0o600 settings.json is never wider than 0o600 while it is being replaced', () => {
   withTmpDir((dir) => {
     const file = join(dir, 'settings.json');

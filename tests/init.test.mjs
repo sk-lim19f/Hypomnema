@@ -3056,8 +3056,18 @@ test('init re-run leaves an existing root session-state.md untouched', () => {
       for (let i = 0; i < 2; i++) {
         const r = runWithHome('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-git-init'], home);
         assert.equal(r.status, 0, `init run ${i} failed: ${r.stderr}${r.stdout}`);
+        if (i === 0) {
+          assert.ok(existsSync(join(hypoDir, 'hypo-config.md')), 'first run must scaffold');
+        } else {
+          assert.doesNotMatch(r.stdout, /Errors:/, 'the rerun must report success');
+        }
       }
       assert.equal(readFileSync(join(hypoDir, 'session-state.md'), 'utf-8'), own);
+      assert.ok(existsSync(join(hypoDir, 'hypo-config.md')), 'init must have scaffolded the vault');
+      assert.ok(
+        existsSync(join(hypoDir, 'projects', '_template', 'index.md')),
+        'init must have copied projects/_template',
+      );
     });
   });
 });
@@ -3105,6 +3115,65 @@ test('init re-run over a previous-resolver hook leaves the live hook whole when 
     );
     assert.match(r.stdout, /pre-commit\.bak/, `the error line must name the .bak: ${r.stdout}`);
   });
+});
+
+// A fresh vault (git init is the default) with a bare remote. fault 'write' tears the hook
+// candidate, so the hook never lands; '' runs the same flow without a fault.
+function runInitWithRemote(fault) {
+  let out;
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      const remote = join(dir, 'remote.git');
+      spawnSync('git', ['init', '--bare', remote], { stdio: 'ignore' });
+      const { preloadPath, firedPath } = hookWriteFaultPreload(dir);
+      const env = {
+        ...process.env,
+        HOME: home,
+        HYPO_DIR: hypoDir,
+        GIT_AUTHOR_NAME: 't',
+        GIT_AUTHOR_EMAIL: 't@t.test',
+        GIT_COMMITTER_NAME: 't',
+        GIT_COMMITTER_EMAIL: 't@t.test',
+      };
+      if (fault) env.HYPO_TEST_HOOK_FAULT = fault;
+      delete env.CLAUDE_CONFIG_DIR;
+      const r = spawnSync(
+        process.execPath,
+        [
+          '-r',
+          preloadPath,
+          join(SCRIPTS, 'init.mjs'),
+          `--hypo-dir=${hypoDir}`,
+          `--git-remote=${remote}`,
+        ],
+        { encoding: 'utf-8', env },
+      );
+      const head = spawnSync('git', ['-C', hypoDir, 'rev-parse', '--verify', 'HEAD'], {
+        encoding: 'utf-8',
+      });
+      const refs = spawnSync('git', ['-C', remote, 'for-each-ref'], { encoding: 'utf-8' });
+      out = { r, fired: existsSync(firedPath), headStatus: head.status, remoteRefs: refs.stdout };
+    });
+  });
+  return out;
+}
+
+test('init does not make the first commit or push when the pre-commit hook could not be installed', () => {
+  const { r, fired, headStatus, remoteRefs } = runInitWithRemote('write');
+  assert.ok(fired, `the injected write fault never fired: ${r.stderr}`);
+  assert.notEqual(r.status, 0, 'a failed hook write must not exit 0');
+  assert.notEqual(headStatus, 0, 'no commit may exist: it would have run without the guard');
+  assert.equal(remoteRefs.trim(), '', 'nothing may be pushed to the remote');
+  assert.match(r.stdout, /first commit was not made because the pre-commit hook/);
+  assert.match(r.stdout, /re-run `hypomnema init`/);
+});
+
+test('init without a hook fault still makes the first commit and pushes it', () => {
+  const { r, headStatus, remoteRefs } = runInitWithRemote('');
+  assert.equal(r.status, 0, `init failed: ${r.stderr}${r.stdout}`);
+  assert.equal(headStatus, 0, 'the control run must commit');
+  assert.notEqual(remoteRefs.trim(), '', 'the control run must push');
 });
 
 test('init re-run over a previous-resolver hook replaces it with the current resolver', () => {

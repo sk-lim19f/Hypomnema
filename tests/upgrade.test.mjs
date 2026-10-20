@@ -2582,9 +2582,9 @@ test('upgrade leaves a current-resolver hook as it is', () => {
 
 // Runs `upgrade --apply` with the hook-write fault preload armed. NODE_OPTIONS
 // reaches only node children, and upgrade's git probe is not one.
-function runUpgradeWithHookFault(upgrade, wiki, home, mode, dir) {
+function runUpgradeWithHookFault(upgrade, wiki, home, mode, dir, extraArgs = []) {
   const { preloadPath, firedPath } = hookWriteFaultPreload(dir);
-  const r = spawnSync(process.execPath, [upgrade, `--hypo-dir=${wiki}`, '--apply'], {
+  const r = spawnSync(process.execPath, [upgrade, `--hypo-dir=${wiki}`, '--apply', ...extraArgs], {
     encoding: 'utf-8',
     env: {
       ...process.env,
@@ -2603,7 +2603,7 @@ test('a hook write that fails partway leaves the live previous-resolver hook who
       const hookPath = seedPreviousResolverHook(wiki, false);
       const previous = previousFormPreCommitContent(wiki, false);
       const { r, firedPath } = runUpgradeWithHookFault(upgrade, wiki, home, 'write', dir);
-      assert.equal(r.status, 0, `${r.stderr}\n${r.stdout}`);
+      assert.equal(r.status, 1, `a failed hook write must not exit 0: ${r.stderr}\n${r.stdout}`);
       assert.ok(existsSync(firedPath), 'the injected write fault must have fired');
       assert.match(
         readFileSync(firedPath, 'utf-8'),
@@ -2628,7 +2628,7 @@ test('a failed final rename leaves the live hook and removes the candidate', () 
       const hookPath = seedPreviousResolverHook(wiki, false);
       const previous = previousFormPreCommitContent(wiki, false);
       const { r, firedPath } = runUpgradeWithHookFault(upgrade, wiki, home, 'rename', dir);
-      assert.equal(r.status, 0, `${r.stderr}\n${r.stdout}`);
+      assert.equal(r.status, 1, `a failed hook rename must not exit 0: ${r.stderr}\n${r.stdout}`);
       assert.equal(
         readFileSync(firedPath, 'utf-8'),
         join(realpathSync(dirname(hookPath)), 'pre-commit'),
@@ -2647,6 +2647,38 @@ test('a failed final rename leaves the live hook and removes the candidate', () 
       assert.equal(readFileSync(hookPath, 'utf-8'), wikiPreCommitContent(wiki, false));
       assert.match(again.stdout, /moved to the current commit-time resolver/);
     });
+  });
+});
+
+for (const mode of ['write', 'rename']) {
+  test(`--apply --json reports a failed hook ${mode} in the exit code and names the reason`, () => {
+    withFakeUpgradeInstall(true, ({ upgrade, home, wiki }) => {
+      withTmpDir((dir) => {
+        const hookPath = seedPreviousResolverHook(wiki, false);
+        const { r } = runUpgradeWithHookFault(upgrade, wiki, home, mode, dir, ['--json']);
+        assert.equal(r.status, 1, `must exit non-zero: ${r.stderr}\n${r.stdout}`);
+        const out = JSON.parse(r.stdout);
+        assert.equal(out.applied.wikiPreCommitRoot, false);
+        assert.match(out.wikiPreCommitRoot.applyFailure, /writing the new hook failed.*EIO/);
+        assert.match(out.wikiPreCommitRoot.applyFailure, /pre-commit\.bak/);
+        assert.equal(
+          readFileSync(hookPath, 'utf-8'),
+          previousFormPreCommitContent(wiki, false),
+          'the live hook keeps the previous bytes',
+        );
+      });
+    });
+  });
+}
+
+test('--apply --json with no hook fault exits 0 and reports no apply failure', () => {
+  withFakeUpgradeInstall(true, ({ upgrade, home, wiki }) => {
+    seedPreviousResolverHook(wiki, false);
+    const r = runUpgrade(upgrade, [`--hypo-dir=${wiki}`, '--apply', '--json'], home);
+    assert.equal(r.status, 0, `${r.stderr}\n${r.stdout}`);
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.applied.wikiPreCommitRoot, true);
+    assert.equal(out.wikiPreCommitRoot.applyFailure, null);
   });
 });
 
