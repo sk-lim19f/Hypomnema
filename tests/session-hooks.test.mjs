@@ -5014,6 +5014,70 @@ test('PreCompact skips its feedback follow-up when the gate used up the deadline
   });
 });
 
+// Distinguishes: pure drift found with the deadline already used up (the --write self-heal is not
+// started and a notice says so) from the same drift with time left (the --write runs once). The
+// deadline is spent by a preload that moves performance.now() far ahead once the check stand-in
+// has finished, so the outcome does not depend on how fast the machine is.
+// Disabling the check: in hypo-personal-check.mjs make `writeLeft === 0` `false`.
+test('PreCompact skips the drift self-heal --write when the gate used up the deadline, and says so', () => {
+  const run = (root, dir, spend) => {
+    const log = join(root, 'feedback.log');
+    const checked = join(root, 'checked');
+    writeFileSync(
+      join(root, 'scripts', 'feedback-sync.mjs'),
+      `import { appendFileSync, writeFileSync } from 'node:fs';
+const write = process.argv.includes('--write');
+appendFileSync(${JSON.stringify(log)}, (write ? 'write' : 'check') + '\\n');
+if (write) {
+  console.log(JSON.stringify({ mode: 'write', targets: {}, warnings: [] }));
+} else {
+  console.log(JSON.stringify({ mode: 'check', targets: { claude: { dirty: true } }, warnings: [] }));
+  writeFileSync(${JSON.stringify(checked)}, 'done');
+  process.exitCode = 1;
+}
+`,
+    );
+    const preload = join(root, 'spend-deadline.cjs');
+    writeFileSync(
+      preload,
+      `const { existsSync } = require('node:fs');
+const real = performance.now.bind(performance);
+performance.now = () => (existsSync(${JSON.stringify(checked)}) ? real() + 3600000 : real());
+`,
+    );
+    const r = spawnFromCopy(root, 'hooks/hypo-personal-check.mjs', [], dir, {
+      input: JSON.stringify(preCompactPayload),
+      env: spend ? { NODE_OPTIONS: `--require ${preload}` } : {},
+    });
+    const runs = existsSync(log) ? readFileSync(log, 'utf-8').split('\n').filter(Boolean) : [];
+    return { msg: JSON.parse(r.stdout).systemMessage || '', runs };
+  };
+  withCleanWiki((dir) => {
+    withPackageCopy((root) => {
+      writeFileSync(join(root, 'scripts', 'lint.mjs'), LINT_FINE);
+      const roomy = run(root, dir, false);
+      assert.deepEqual(
+        roomy.runs,
+        ['check', 'write'],
+        `with time left the drift is re-synced: ${roomy.msg}`,
+      );
+    });
+    withPackageCopy((root) => {
+      writeFileSync(join(root, 'scripts', 'lint.mjs'), LINT_FINE);
+      const spent = run(root, dir, true);
+      assert.deepEqual(
+        spent.runs,
+        ['check'],
+        `no --write once the deadline is used up: ${spent.msg}`,
+      );
+      assert.match(
+        spent.msg,
+        /feedback projection drift \(claude\) was not re-synced: the gate used up its/,
+      );
+    });
+  });
+});
+
 // Distinguishes: the cause the gate recorded (a time limit; a tool that is really missing) from
 // the old fixed wording that blamed a missing hypo-pkg.json whatever happened. Both render
 // branches: the HYPO_SKIP_GATE bypass line and the advisory reasons.
