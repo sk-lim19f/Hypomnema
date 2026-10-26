@@ -1118,7 +1118,7 @@ test('doctor-close-artifacts: the same marker beside its valid receipt (closed) 
 // above starts from close artifacts and then reads markers, so it never sees
 // this state: doctor enumerates the receipts themselves. No close artifact is
 // planted here on purpose, the state must surface on its own.
-function fileDemoReceipt(dir, sessionId) {
+function fileDemoReceipt(dir, sessionId, scope = { mode: 'project', projects: ['demo'] }) {
   gitRepo(dir);
   const git = (args) =>
     spawnSync('git', ['-C', dir, ...args], {
@@ -1134,7 +1134,7 @@ function fileDemoReceipt(dir, sessionId) {
     sessionId,
     repo: { toplevel: git(['rev-parse', '--show-toplevel']).stdout.trim() },
     commit: git(['rev-parse', 'HEAD']).stdout.trim(),
-    scope: { mode: 'project', projects: ['demo'] },
+    scope,
     entries: [{ path: 'log.md', kind: 'append', expected: { entryBlocks: ['entry'] } }],
     skipped: { lint: false, feedback: false },
     createdAt: new Date().toISOString(),
@@ -1162,6 +1162,68 @@ test('doctor-close-checkpoint: a receipt with no marker is a broken checkpoint â
       existsSync(join(dir, '.cache', 'session-closed-sess-half.marker')),
       false,
       'doctor must not write the marker it found missing',
+    );
+  });
+});
+
+// The recovery command names the vault doctor checked and the scope the receipt certified. Without
+// `--hypo-dir` it can act on another vault, and without `--project` / `--log-only` an apply whose
+// project only appeared in its payload reaches no-attribution-evidence.
+test('doctor-close-checkpoint: the recovery command for a single-project receipt carries --hypo-dir and --project', () => {
+  withTmpDir((dir) => {
+    baseWiki(dir);
+    fileDemoReceipt(dir, 'sess-scope-one');
+    const check = doctorCheckpointCheck(dir);
+    assert.ok(check, 'a markerless receipt must surface');
+    assert.ok(
+      check.detail.includes(
+        `--mark-session-closed --session-id=sess-scope-one --hypo-dir='${dir}' --project='demo'`,
+      ),
+      check.detail,
+    );
+    assert.doesNotMatch(check.detail, /--log-only/);
+  });
+});
+
+test('doctor-close-checkpoint: the recovery command for a log-only receipt carries --hypo-dir and --log-only', () => {
+  withTmpDir((dir) => {
+    baseWiki(dir);
+    fileDemoReceipt(dir, 'sess-scope-log', { mode: 'log-only', projects: [] });
+    const check = doctorCheckpointCheck(dir);
+    assert.ok(check, 'a markerless receipt must surface');
+    assert.ok(
+      check.detail.includes(
+        `--mark-session-closed --session-id=sess-scope-log --hypo-dir='${dir}' --log-only`,
+      ),
+      check.detail,
+    );
+    assert.doesNotMatch(check.detail, /--project/);
+  });
+});
+
+test('doctor-close-checkpoint: a multi-project receipt gets no one-project command, it names the projects and the close-again path', () => {
+  withTmpDir((dir) => {
+    baseWiki(dir);
+    fileDemoReceipt(dir, 'sess-scope-many', { mode: 'project', projects: ['demo', 'other'] });
+    const check = doctorCheckpointCheck(dir);
+    assert.ok(check, 'a markerless receipt must surface');
+    assert.doesNotMatch(check.detail, /--mark-session-closed --session-id=sess-scope-many/);
+    assert.match(check.detail, /covers 2 projects \(demo, other\)/);
+    assert.match(check.detail, /\/hypo:crystallize/);
+  });
+});
+
+test('doctor-close-checkpoint: a receipt with no readable scope still gets --hypo-dir and asks for the scope', () => {
+  withTmpDir((dir) => {
+    baseWiki(dir);
+    fileDemoReceipt(dir, 'sess-scope-none', { mode: 'project', projects: [] });
+    const check = doctorCheckpointCheck(dir);
+    assert.ok(check, 'a markerless receipt must surface');
+    assert.ok(
+      check.detail.includes(
+        `--session-id=sess-scope-none --hypo-dir='${dir}' plus --project=<slug>`,
+      ),
+      check.detail,
     );
   });
 });

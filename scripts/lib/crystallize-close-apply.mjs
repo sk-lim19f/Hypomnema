@@ -1560,7 +1560,7 @@ export function runMarkSessionClosed(args, testHooks = null) {
     // computed once per run, so neither repeats on a later gate read.
     if (hostTagWarning) console.log(`\n⚠ ${hostTagWarning}`);
     if (receiptResult.leftUnverifiable) console.log(`  · ${LEFT_UNVERIFIABLE_NOTE}`);
-    for (const n of proofNotices) console.log(`  · ${n.reason}`);
+    printGateNotices(result.notices);
   }
   process.exit(0);
 }
@@ -5036,6 +5036,15 @@ function buildCloseResult({
 const DOCTOR_HINT =
   'doctor (`/hypo:doctor` in Claude Code, or `hypomnema doctor` with the npm CLI)';
 
+// The gate's demotions (what it declined to block on, such as a lint the deadline cut short) in
+// the text report. JSON carries them as `notices` / `gateNotices`; without this a terminal user
+// reads a bare success for a close the gate could not fully check.
+function printGateNotices(notices) {
+  if (!notices || notices.length === 0) return;
+  console.log('  Gate notices (not blockers):');
+  for (const n of notices) console.log(`  · ${n.reason}`);
+}
+
 // The human-readable (non --json) rendering of the same settled state.
 function printCloseReport({
   project,
@@ -5061,6 +5070,7 @@ function printCloseReport({
   restructureWaivers,
   obsoleteNotices,
   hostTagWarning,
+  gateNotices,
 }) {
   console.log(`Session-close apply (project: ${project}, date: ${date}):`);
   for (const a of applied) console.log(`  ✓ wrote ${a}`);
@@ -5071,6 +5081,7 @@ function printCloseReport({
   for (const n of obsoleteNotices || []) console.log(`  · ${n}`);
   // What the verification saw but did not gate on (this close has no log lines under its date).
   for (const n of verification?.notices || []) console.log(`  · ${n.reason}`);
+  printGateNotices(gateNotices);
   // Surfaced unconditionally, success or failure. `restructure: true` no
   // longer waives the guard: the target below is still WITHHELD
   // and shows up in the conflicts loop right after this one. This line only
@@ -5887,6 +5898,7 @@ export function applySessionClose(args, testHooks = null) {
       restructureWaivers,
       obsoleteNotices: [...obsoleteNotices, ...notices],
       hostTagWarning: hostTagNotice,
+      gateNotices,
     });
   }
   process.exit(ok ? 0 : 1);

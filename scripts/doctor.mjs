@@ -23,6 +23,7 @@ import { loadHypoIgnore, isScanIgnored } from './lib/hypo-ignore.mjs';
 import { readRenameMarker, renameMarkerPath, RENAME_MARKER_REL } from './lib/rename-marker.mjs';
 import {
   resolveGitHooksDir,
+  shellSingleQuote,
   WIKI_PRE_COMMIT_MARKER_START,
   parseWikiPreCommitRoot,
 } from './lib/git-hooks-dir.mjs';
@@ -1413,6 +1414,47 @@ function checkReceiptEvidence(hypoDir, namedByMarkerWalk = new Set()) {
   );
 }
 
+// The scope a receipt body names, when its shape is one a writer emits: a log-only receipt, or
+// a project receipt naming at least one slug. Anything else is unknown (null), so the recovery
+// text asks for the scope instead of guessing it.
+function receiptScope(body) {
+  const scope = body?.scope;
+  if (!scope || typeof scope !== 'object') return null;
+  if (scope.mode === 'log-only') return { logOnly: true, projects: [] };
+  const ok =
+    scope.mode === 'project' &&
+    Array.isArray(scope.projects) &&
+    scope.projects.length > 0 &&
+    scope.projects.every((p) => typeof p === 'string' && p);
+  return ok ? { logOnly: false, projects: scope.projects } : null;
+}
+
+// The recovery text for one markerless receipt. `--mark-session-closed` is told the vault and the
+// scope the receipt certified: without `--hypo-dir` it can act on another vault, and without
+// `--project` or `--log-only` an apply whose project only appeared in its payload leaves it no
+// attribution evidence (a Bash apply edits no close file the transcript could show). The writer
+// takes one `--project`, so a receipt that names several projects has no single command that
+// restores its full scope: that case sends the user back through the close instead.
+function recoveryAdvice(hypoDir, crystallize, b) {
+  const base = `node "${crystallize}" --mark-session-closed --session-id=${b.sessionId} --hypo-dir=${shellSingleQuote(hypoDir)}`;
+  const { scope } = b;
+  if (scope?.logOnly) return `Recover with: ${base} --log-only`;
+  if (scope?.projects.length === 1) {
+    return `Recover with: ${base} --project=${shellSingleQuote(scope.projects[0])}`;
+  }
+  if (scope) {
+    return (
+      `Its receipt covers ${scope.projects.length} projects (${scope.projects.join(', ')}) and ` +
+      `--mark-session-closed takes one --project, so it would attest only one of them. Ask the ` +
+      `user to close again and apply it with /hypo:crystallize`
+    );
+  }
+  return (
+    `Recover with: ${base} plus --project=<slug> for the project it closed, or --log-only for a ` +
+    `session that closed no project (the receipt names no readable scope)`
+  );
+}
+
 // A close receipt with no session-closed marker beside it is a half-finished
 // close (the run stopped before the marker landed, or only the marker was
 // invalidated). checkSessionCloseArtifacts starts from close artifacts and
@@ -1449,7 +1491,7 @@ function checkHalfClosedReceipts(hypoDir) {
           0 &&
         spawnSync('git', ['-C', hypoDir, 'merge-base', '--is-ancestor', commit, 'HEAD']).status !==
           0;
-      broken.push({ sessionId, reason: checkpoint.reason, rewritten });
+      broken.push({ sessionId, reason: checkpoint.reason, rewritten, scope: receiptScope(body) });
     } catch {
       // unreadable or corrupt receipt: not this check's job to diagnose
     }
@@ -1464,7 +1506,7 @@ function checkHalfClosedReceipts(hypoDir) {
         .map((b) =>
           b.rewritten
             ? `${b.sessionId} (${b.reason}; the commit it certified is no longer in this branch's history). Restore that commit, or ask the user to close again and apply it with /hypo:crystallize`
-            : `${b.sessionId} (${b.reason}). Recover with: node "${crystallize}" --mark-session-closed --session-id=${b.sessionId}`,
+            : `${b.sessionId} (${b.reason}). ${recoveryAdvice(hypoDir, crystallize, b)}`,
         )
         .join('; ') +
       (broken.length > 3 ? ` (+${broken.length - 3} more)` : ''),

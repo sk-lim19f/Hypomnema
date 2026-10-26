@@ -20,6 +20,8 @@ import {
   readdirSync,
   chmodSync,
 } from 'node:fs';
+import nodeFs from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -1585,6 +1587,44 @@ test("ensureProjectIndex: records the index path in this session's touched-paths
         .digest('hex'),
     );
     assert.ok(readFileSync(join(dir, rel), 'utf-8').length > 0, 'the seed landed');
+  });
+});
+
+// The two interrupted-create tests below finish ensureProjectIndex and then truncate the file, so
+// they would still pass if the record moved after the write. This one dies AT the first write of
+// the seed: the file is empty, and the record and the seed hash must already be on disk.
+test('ensureProjectIndex: the record and the seed hash are on disk when the seed write itself fails', () => {
+  withTmpDir((dir) => {
+    const rel = join('projects', 'rec-project', 'index.md');
+    const sid = newPinSession('idx-write-dies');
+    const realWriteSync = nodeFs.writeSync;
+    let seed = null;
+    nodeFs.writeSync = function (fd, data, ...rest) {
+      if (seed === null && typeof data === 'string' && data.includes('project-index')) {
+        seed = data;
+        const err = new Error('injected index write failure');
+        err.code = 'EIO';
+        throw err;
+      }
+      return realWriteSync.call(this, fd, data, ...rest);
+    };
+    syncBuiltinESMExports();
+    try {
+      assert.throws(
+        () => ensureProjectIndex(dir, 'rec-project', rel, '2026-06-01', sid),
+        /EIO|injected/,
+      );
+    } finally {
+      nodeFs.writeSync = realWriteSync;
+      syncBuiltinESMExports();
+    }
+    assert.ok(seed, 'the fault must have fired at the seed write');
+    assert.equal(readFileSync(join(dir, rel)).length, 0, 'the create died before any byte landed');
+    const touched = readTouchedPathsStrict(dir, sid);
+    assert.equal(touched.state, 'ok', JSON.stringify(touched));
+    assert.deepEqual(touched.paths, [rel]);
+    const hashes = JSON.parse(readFileSync(touchedHashesPath(dir, sid), 'utf-8'));
+    assert.equal(hashes[rel], createHash('sha256').update(seed).digest('hex'));
   });
 });
 

@@ -7752,7 +7752,7 @@ const LINT_KILLED = "process.kill(process.pid, 'SIGKILL');\n";
 const LINT_SLOW = 'setTimeout(() => {}, 120000);\n';
 
 // A committed close whose receipt has not been issued yet, marked by the copied CLI.
-function markFromCopy(root, dir, sid) {
+function markFromCopy(root, dir, sid, { json = true } = {}) {
   const cleanup = seedCloseTranscript(sid);
   try {
     pinCommittedClose(dir, sid);
@@ -7764,13 +7764,13 @@ function markFromCopy(root, dir, sid) {
         '--mark-session-closed',
         `--session-id=${sid}`,
         '--project=test-project',
-        '--json',
+        ...(json ? ['--json'] : []),
       ],
       dir,
     );
     return {
       r,
-      out: JSON.parse(r.stdout),
+      out: json ? JSON.parse(r.stdout) : null,
       receipt: existsSync(join(dir, '.cache', 'sessions', sid, 'close-receipt.json')),
     };
   } finally {
@@ -7810,6 +7810,65 @@ test('--mark-session-closed: a lint cut by the deadline still issues the receipt
       );
       assert.equal(receipt, true, 'a time limit is not an error: the receipt is issued');
     });
+  });
+});
+
+// Distinguishes: the text rendering of a mark that succeeded with a lint the deadline cut short
+// (the notice is printed under a heading) from one that prints the bare success line and drops
+// gate.notices, which only the JSON carried.
+// Disabling the fix: in scripts/lib/crystallize-close-apply.mjs make `printGateNotices` return
+// before it prints.
+test('--mark-session-closed (text): a lint cut by the deadline is printed as a gate notice', () => {
+  withPackageCopy((root) => {
+    shrinkGateDeadline(root, 2500);
+    writeFileSync(join(root, 'scripts', 'lint.mjs'), LINT_SLOW);
+    withWiki(null, (dir) => {
+      const { r, receipt } = markFromCopy(root, dir, 's-t7-mark-slow-text', { json: false });
+      assert.equal(r.status, 0, `${r.stdout}\n${r.stderr}`);
+      assert.match(r.stdout, /session-closed marker written/);
+      assert.match(r.stdout, /Gate notices \(not blockers\):/);
+      assert.match(r.stdout, /·[^\n]*time limit/, `the lint time limit is named: ${r.stdout}`);
+      assert.equal(receipt, true, 'a time limit is not an error: the receipt is issued');
+    });
+  });
+});
+
+// Distinguishes: the text rendering of an apply whose gate demoted a file (printed under a heading)
+// from one that prints only the writes and drops gateNotices, which only the JSON carried.
+// Disabling the fix: in scripts/lib/crystallize-close-apply.mjs drop the `printGateNotices` call
+// in printCloseReport.
+test('--apply-session-close (text): a demotion the gate made is printed as a gate notice', () => {
+  withWiki(null, (dir, today) => {
+    seedUndiscoverableProject(dir, 'somebody-else');
+    writeFileSync(join(dir, 'projects', 'somebody-else', 'index.md'), '---\ntitle: edited\n---\n');
+    const payload = {
+      project: 'test-project',
+      date: today,
+      sessionState: {
+        content: readFileSync(join(dir, 'projects', 'test-project', 'session-state.md'), 'utf-8'),
+      },
+      projectHot: {
+        content: readFileSync(join(dir, 'projects', 'test-project', 'hot.md'), 'utf-8'),
+      },
+      sessionLog: { entry: `## [${today}] text gate notices\n` },
+      log: { entry: `## [${today}] session | test-project \u2014 text gate notices\n` },
+    };
+    const payloadPath = join(
+      tmpdir(),
+      `hypo-payload-${process.pid}-${Math.random().toString(36).slice(2, 10)}.json`,
+    );
+    writeFileSync(payloadPath, JSON.stringify(payload));
+    const cleanup = seedCloseTranscript('s-apply-gate-notices-text');
+    const r = run('crystallize.mjs', [
+      `--hypo-dir=${dir}`,
+      '--apply-session-close',
+      `--payload=${payloadPath}`,
+      '--session-id=s-apply-gate-notices-text',
+    ]);
+    cleanup();
+    assert.equal(r.status, 0, `apply failed: ${r.stdout}\n${r.stderr}`);
+    assert.match(r.stdout, /Gate notices \(not blockers\):/);
+    assert.match(r.stdout, /·[^\n]*somebody-else/, `the demoted file is named: ${r.stdout}`);
   });
 });
 
