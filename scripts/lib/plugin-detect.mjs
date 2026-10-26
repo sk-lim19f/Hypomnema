@@ -17,6 +17,7 @@
 
 import { readFileSync, existsSync } from 'node:fs';
 import { isAbsolute, join } from 'node:path';
+import { compareSemver, parseSemver } from '../../hooks/version-check.mjs';
 
 /**
  * @param {string} settingsPath  path to a Claude Code settings.json (e.g. ~/.claude/settings.json)
@@ -218,11 +219,14 @@ export function leafVersionDrift(pkgRoot) {
 // being a real Hypomnema package, must not be selected here. codex reproduction
 // (2026-09-11): a registry row's package.json carried no `name` field at all and
 // was still adopted as the durable root under the old, name-blind check.
-function selectEntry(entries, scope) {
+function selectEntry(entries, scope, requireFile) {
   return (
     entries.find(
       (e) =>
-        e && (scope === undefined || e.scope === scope) && isHypomnemaInstallRoot(e.installPath),
+        e &&
+        (scope === undefined || e.scope === scope) &&
+        isHypomnemaInstallRoot(e.installPath) &&
+        (requireFile === undefined || existsSync(join(e.installPath, requireFile))),
     ) ?? null
   );
 }
@@ -260,7 +264,10 @@ function selectEntry(entries, scope) {
 // comment exists to prevent). It also silences upgrade's dualSkipWouldCorrect
 // trigger, disabling the very self-heal that fixes a stale pointer. Drift is
 // surfaced by doctor's checkPluginLeafVersion instead.
-export function resolveEnabledPluginEntry(settingsPath, registryPath) {
+//
+// `requireFile` (a path relative to the install root, default none) makes a row
+// eligible only when that file exists. Only resolveCommitTimeRoot passes it.
+export function resolveEnabledPluginEntry(settingsPath, registryPath, requireFile) {
   const key = enabledHypomnemaPluginKey(settingsPath);
   if (!key) return { key: null, reason: 'not-enabled', entry: null, root: null };
   let reg;
@@ -273,7 +280,9 @@ export function resolveEnabledPluginEntry(settingsPath, registryPath) {
     reg && typeof reg.plugins === 'object' && !Array.isArray(reg.plugins) ? reg.plugins : null;
   const entries = plugins && Array.isArray(plugins[key]) ? plugins[key] : null;
   // Prefer the user-scope install, then any usable entry for this exact key.
-  const entry = entries ? (selectEntry(entries, 'user') ?? selectEntry(entries)) : null;
+  const entry = entries
+    ? (selectEntry(entries, 'user', requireFile) ?? selectEntry(entries, undefined, requireFile))
+    : null;
   if (!entry) return { key, reason: 'unresolved', entry: null, root: null };
   return { key, reason: 'resolved', entry, root: entry.installPath };
 }
@@ -284,6 +293,50 @@ export function resolveEnabledPluginEntry(settingsPath, registryPath) {
 // repo's existing callers already know.
 export function resolveEnabledPluginRoot(settingsPath, registryPath) {
   return resolveEnabledPluginEntry(settingsPath, registryPath).root;
+}
+
+// The install root the vault's pre-commit hook should run when a vault
+// operation fires it: the enabled plugin's root (resolveEnabledPluginEntry) and
+// the sidecar `pkgRoot` from hypo-pkg.json (`pkgJsonPath`), whichever carries the
+// higher package.json version, the plugin root on a tie. The sidecar is only a
+// candidate when isHypomnemaInstallRoot accepts it. A root whose version
+// parseSemver cannot read is dropped as a candidate, and null means neither
+// root qualified. The comparison is hooks/version-check.mjs compareSemver, the
+// same judgment SessionStart's downgrade guard makes: one question, one rule.
+//
+// A root is only eligible when `script` (relative to the root, default the
+// pre-commit worker) exists in it, as in the generated hook: a plugin root
+// without the worker must not win over a complete sidecar. For the plugin the
+// check applies per registry row, so a later row that has the script is still
+// found.
+//
+// The generated hook (scripts/lib/git-hooks-dir.mjs) runs standalone and carries
+// its own copy of this choice, so this function is the reference its tests hold
+// the script against.
+export function resolveCommitTimeRoot(
+  settingsPath,
+  registryPath,
+  pkgJsonPath,
+  script = 'hooks/hypo-pre-commit.mjs',
+) {
+  const candidate = (root) => (root && parseSemver(readPkgVersionAt(root)) ? root : null);
+  const plugin = candidate(resolveEnabledPluginEntry(settingsPath, registryPath, script).root);
+  let sidecar = null;
+  try {
+    const pkgRoot = JSON.parse(readFileSync(pkgJsonPath, 'utf-8'))?.pkgRoot;
+    sidecar =
+      isHypomnemaInstallRoot(pkgRoot) && existsSync(join(pkgRoot, script))
+        ? candidate(pkgRoot)
+        : null;
+  } catch {
+    // unreadable or corrupt sidecar: no sidecar candidate
+  }
+  if (plugin && sidecar) {
+    return compareSemver(readPkgVersionAt(plugin), readPkgVersionAt(sidecar)) < 0
+      ? sidecar
+      : plugin;
+  }
+  return plugin ?? sidecar;
 }
 
 // Single-computation answer to "is Claude's core hook/command surface

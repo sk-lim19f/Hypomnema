@@ -19,6 +19,9 @@ import {
   symlinkSync,
   unlinkSync,
   chmodSync,
+  readdirSync,
+  statSync,
+  utimesSync,
 } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -28,7 +31,10 @@ import {
   SCHEMA_VERSION_DELTAS,
 } from '../scripts/lib/template-schema-version.mjs';
 import { isHypomnemaPluginEnabled } from '../scripts/lib/plugin-detect.mjs';
-import { wikiPreCommitContent } from '../scripts/lib/git-hooks-dir.mjs';
+import {
+  previousFormPreCommitContent,
+  wikiPreCommitContent,
+} from '../scripts/lib/git-hooks-dir.mjs';
 import { writeDualSkipProvenance } from '../scripts/lib/pkg-json.mjs';
 import { PROVENANCE_FILENAME } from '../scripts/lib/pkg-provenance.mjs';
 import {
@@ -46,6 +52,7 @@ import {
   REPO,
   SCRIPTS,
   SESSION_TMP_HOME,
+  hookWriteFaultPreload,
   legacyWikiPreCommitContent,
   run,
   runWithHome,
@@ -134,6 +141,39 @@ test('--apply on tmp wiki exits 0 after applying available changes', () => {
       assert.ok(Array.isArray(out.applied.hooks), 'applied.hooks should be an array');
       assert.ok(Array.isArray(out.applied.settings), 'applied.settings should be an array');
       assert.equal(r.status, 0, `expected exit 0 after --apply: ${r.stderr}`);
+    });
+  });
+});
+
+// A profile whose settings.json is a link into a dotfiles checkout. The core
+// registrations are missing from the target, so upgrade has a transform to write.
+// A write that replaces the path itself turns the link into a regular file.
+test('upgrade --apply keeps a symlinked settings.json a link', () => {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      const initR = runWithHome('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-git-init'], home);
+      assert.equal(initR.status, 0, `init failed: ${initR.stderr}`);
+      const settingsPath = join(home, '.claude', 'settings.json');
+      const targetDir = join(dir, 'dotfiles');
+      const targetPath = join(targetDir, 'settings.json');
+      mkdirSync(targetDir, { recursive: true });
+      writeFileSync(targetPath, JSON.stringify({ model: 'opus' }, null, 2) + '\n');
+      unlinkSync(settingsPath);
+      symlinkSync(targetPath, settingsPath);
+
+      const r = runWithHome('upgrade.mjs', [`--hypo-dir=${hypoDir}`, '--json', '--apply'], home);
+      assert.equal(r.status, 0, `--apply failed: ${r.stderr}`);
+      const out = JSON.parse(r.stdout);
+      assert.ok(out.applied.settings.length > 0, 'upgrade must have registered the core hooks');
+
+      assert.ok(lstatSync(settingsPath).isSymbolicLink(), 'settings.json must stay a symlink');
+      const written = JSON.parse(readFileSync(targetPath, 'utf-8'));
+      assert.equal(written.model, 'opus', 'the existing keys survive');
+      assert.ok(
+        JSON.stringify(written.hooks).includes('hypo-session-start.mjs'),
+        'the new registrations land in the link target',
+      );
     });
   });
 });
@@ -2476,6 +2516,172 @@ test('doctor reports an unreadable-but-marked pre-commit hook, not a silent pass
   });
 });
 
+// ── a hook on the previous commit-time resolver is rewritten onto the current one ──
+//
+// v1.8.4 through v1.10.0 wrote a resolver that reads hypo-pkg.json before the
+// enabled plugin's registry entry. It bakes no root, so the old-form check
+// (root !== null) never saw it as drift and --apply left it in place.
+
+suite('upgrade.mjs: hooks on the previous resolver');
+
+// A vault hook holding the exact bytes v1.10.0 wrote.
+function seedPreviousResolverHook(wiki, lintStrict) {
+  const hookPath = seedWikiPreCommitHook(wiki, join(wiki, 'unused-root'), lintStrict, wiki, false);
+  writeFileSync(hookPath, previousFormPreCommitContent(wiki, lintStrict), { mode: 0o755 });
+  return hookPath;
+}
+
+test('upgrade --apply rewrites a previous-resolver hook onto the current resolver and keeps a .bak', () => {
+  for (const lintStrict of [false, true]) {
+    withFakeUpgradeInstall(true, ({ upgrade, home, wiki }) => {
+      const hookPath = seedPreviousResolverHook(wiki, lintStrict);
+      const previous = previousFormPreCommitContent(wiki, lintStrict);
+      const r = runUpgrade(upgrade, [`--hypo-dir=${wiki}`, '--apply'], home);
+      const label = `lint-strict ${lintStrict}`;
+      assert.equal(r.status, 0, `${label}: ${r.stderr}\n${r.stdout}`);
+      assert.equal(readFileSync(hookPath, 'utf-8'), wikiPreCommitContent(wiki, lintStrict), label);
+      assert.equal(readFileSync(`${hookPath}.bak`, 'utf-8'), previous, `${label}: .bak bytes`);
+      assert.equal(statSync(hookPath).mode & 0o777, 0o755, `${label}: hook stays executable`);
+      assert.match(r.stdout, /Wiki pre-commit.*moved to the current commit-time resolver/, label);
+      assert.doesNotMatch(r.stdout, /baked-in root null/, label);
+    });
+  }
+});
+
+test('upgrade without --apply reports a previous-resolver hook in words, not as a null root', () => {
+  withFakeUpgradeInstall(true, ({ upgrade, home, wiki }) => {
+    const hookPath = seedPreviousResolverHook(wiki, false);
+    const before = readFileSync(hookPath, 'utf-8');
+    const r = runUpgrade(upgrade, [`--hypo-dir=${wiki}`], home);
+    // A dry run exits 1 whenever something needs updating.
+    assert.equal(r.status, 1, `${r.stderr}\n${r.stdout}`);
+    assert.match(r.stdout, /Wiki pre-commit.*older resolver.*run --apply to update it/);
+    assert.doesNotMatch(r.stdout, /Wiki pre-commit[^\n]*null/);
+    assert.doesNotMatch(r.stdout, /baked in, so it goes stale/);
+    assert.equal(readFileSync(hookPath, 'utf-8'), before, 'a dry run must not touch the hook');
+  });
+});
+
+test('upgrade leaves a current-resolver hook as it is', () => {
+  withFakeUpgradeInstall(true, ({ upgrade, home, wiki }) => {
+    const hookPath = seedPreviousResolverHook(wiki, false);
+    writeFileSync(hookPath, wikiPreCommitContent(wiki, false), { mode: 0o755 });
+    const past = new Date(Date.now() - 3600_000);
+    utimesSync(hookPath, past, past);
+    const before = statSync(hookPath);
+    const r = runUpgrade(upgrade, [`--hypo-dir=${wiki}`, '--apply', '--json'], home);
+    assert.equal(r.status, 0, `${r.stderr}\n${r.stdout}`);
+    const info = JSON.parse(r.stdout).wikiPreCommitRoot;
+    assert.equal(info.drift, false);
+    assert.equal(info.previousResolver, false);
+    assert.equal(readFileSync(hookPath, 'utf-8'), wikiPreCommitContent(wiki, false));
+    assert.equal(statSync(hookPath).mtimeMs, before.mtimeMs, 'the current form is not rewritten');
+    assert.equal(existsSync(`${hookPath}.bak`), false, 'no backup for a hook that was not touched');
+  });
+});
+
+// Runs `upgrade --apply` with the hook-write fault preload armed. NODE_OPTIONS
+// reaches only node children, and upgrade's git probe is not one.
+function runUpgradeWithHookFault(upgrade, wiki, home, mode, dir, extraArgs = []) {
+  const { preloadPath, firedPath } = hookWriteFaultPreload(dir);
+  const r = spawnSync(process.execPath, [upgrade, `--hypo-dir=${wiki}`, '--apply', ...extraArgs], {
+    encoding: 'utf-8',
+    env: {
+      ...process.env,
+      HYPO_DIR: '',
+      HOME: home,
+      NODE_OPTIONS: `--require=${preloadPath}`,
+      HYPO_TEST_HOOK_FAULT: mode,
+    },
+  });
+  return { r, firedPath };
+}
+
+test('a hook write that fails partway leaves the live previous-resolver hook whole', () => {
+  withFakeUpgradeInstall(true, ({ upgrade, home, wiki }) => {
+    withTmpDir((dir) => {
+      const hookPath = seedPreviousResolverHook(wiki, false);
+      const previous = previousFormPreCommitContent(wiki, false);
+      const { r, firedPath } = runUpgradeWithHookFault(upgrade, wiki, home, 'write', dir);
+      assert.equal(r.status, 1, `a failed hook write must not exit 0: ${r.stderr}\n${r.stdout}`);
+      assert.ok(existsSync(firedPath), 'the injected write fault must have fired');
+      assert.match(
+        readFileSync(firedPath, 'utf-8'),
+        /pre-commit\.[^/]*\.tmp$/,
+        'the fault must have torn the candidate file, not the live hook',
+      );
+      assert.equal(readFileSync(hookPath, 'utf-8'), previous, 'live hook is the previous bytes');
+      assert.equal(readFileSync(`${hookPath}.bak`, 'utf-8'), previous, '.bak holds the same bytes');
+      assert.deepEqual(
+        readdirSync(dirname(hookPath)).filter((f) => /^pre-commit\..*\.tmp$/.test(f)),
+        [],
+        'no candidate file may be left behind',
+      );
+      assert.match(r.stdout, /could not update hook.*pre-commit\.bak.*still on the older resolver/);
+    });
+  });
+});
+
+test('a failed final rename leaves the live hook and removes the candidate', () => {
+  withFakeUpgradeInstall(true, ({ upgrade, home, wiki }) => {
+    withTmpDir((dir) => {
+      const hookPath = seedPreviousResolverHook(wiki, false);
+      const previous = previousFormPreCommitContent(wiki, false);
+      const { r, firedPath } = runUpgradeWithHookFault(upgrade, wiki, home, 'rename', dir);
+      assert.equal(r.status, 1, `a failed hook rename must not exit 0: ${r.stderr}\n${r.stdout}`);
+      assert.equal(
+        readFileSync(firedPath, 'utf-8'),
+        join(realpathSync(dirname(hookPath)), 'pre-commit'),
+        'the rename onto the hook failed',
+      );
+      assert.equal(readFileSync(hookPath, 'utf-8'), previous);
+      assert.deepEqual(
+        readdirSync(dirname(hookPath)).filter((f) => /^pre-commit\..*\.tmp$/.test(f)),
+        [],
+        'the complete candidate must be removed when the rename fails',
+      );
+      assert.match(r.stdout, /could not update hook.*pre-commit\.bak/);
+
+      const again = runUpgrade(upgrade, [`--hypo-dir=${wiki}`, '--apply'], home);
+      assert.equal(again.status, 0, `${again.stderr}\n${again.stdout}`);
+      assert.equal(readFileSync(hookPath, 'utf-8'), wikiPreCommitContent(wiki, false));
+      assert.match(again.stdout, /moved to the current commit-time resolver/);
+    });
+  });
+});
+
+for (const mode of ['write', 'rename']) {
+  test(`--apply --json reports a failed hook ${mode} in the exit code and names the reason`, () => {
+    withFakeUpgradeInstall(true, ({ upgrade, home, wiki }) => {
+      withTmpDir((dir) => {
+        const hookPath = seedPreviousResolverHook(wiki, false);
+        const { r } = runUpgradeWithHookFault(upgrade, wiki, home, mode, dir, ['--json']);
+        assert.equal(r.status, 1, `must exit non-zero: ${r.stderr}\n${r.stdout}`);
+        const out = JSON.parse(r.stdout);
+        assert.equal(out.applied.wikiPreCommitRoot, false);
+        assert.match(out.wikiPreCommitRoot.applyFailure, /writing the new hook failed.*EIO/);
+        assert.match(out.wikiPreCommitRoot.applyFailure, /pre-commit\.bak/);
+        assert.equal(
+          readFileSync(hookPath, 'utf-8'),
+          previousFormPreCommitContent(wiki, false),
+          'the live hook keeps the previous bytes',
+        );
+      });
+    });
+  });
+}
+
+test('--apply --json with no hook fault exits 0 and reports no apply failure', () => {
+  withFakeUpgradeInstall(true, ({ upgrade, home, wiki }) => {
+    seedPreviousResolverHook(wiki, false);
+    const r = runUpgrade(upgrade, [`--hypo-dir=${wiki}`, '--apply', '--json'], home);
+    assert.equal(r.status, 0, `${r.stderr}\n${r.stdout}`);
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.applied.wikiPreCommitRoot, true);
+    assert.equal(out.wikiPreCommitRoot.applyFailure, null);
+  });
+});
+
 // ── ISSUE-80: --apply refreshes the provenance sidecar (scripts/lib/pkg-provenance.mjs) ──
 suite('upgrade.mjs — provenance sidecar refresh (ISSUE-80)');
 
@@ -2766,17 +2972,13 @@ test('--apply removes Stop registrations the orchestrator replaced, and nothing 
 // a legacy Stop entry renamed to its new basename with nothing left to retire
 // it, so the orchestrator and the step it replaced both fired on every Stop.
 //
-// This is proven by swapping settingsPath for a symlink before --apply runs.
-// A plain writeFileSync opens through a symlink (follows it, like any other
-// open()) and rewrites the TARGET file, leaving the symlink itself in place.
-// A rename-based atomic write (temp file plus renameSync, see
-// hooks/atomic-write.mjs) replaces whatever directory entry sits at that
-// path, symlink or not, so the symlink is gone afterward. Reverting the
-// merged apply path back to three separate writeFileSync calls turns this
-// red: the symlink would survive.
+// This is proven by counting renames onto settings.json while --apply runs. One
+// writeSettingsJson call is one temp-file rename; reverting the merged apply
+// path back to three separate writes turns the count into three. The path is a
+// symlink so the same run also shows the link survives the writes.
 suite('upgrade.mjs: settings.json is committed with one atomic write');
 
-test('--apply replaces a symlinked settings.json with a real file, not a truncate-in-place write', () => {
+test('--apply commits rename, add and retire in one settings.json write and keeps the link', () => {
   withTmpHome((home) => {
     withTmpDir((dir) => {
       const hypoDir = join(dir, 'wiki');
@@ -2807,10 +3009,36 @@ test('--apply replaces a symlinked settings.json with a real file, not a truncat
         'fixture setup: settingsPath must start as a symlink',
       );
 
-      const applyR = runWithHome(
-        'upgrade.mjs',
-        [`--hypo-dir=${hypoDir}`, '--apply', '--json'],
-        home,
+      const renamesPath = join(dir, 'settings-renames.log');
+      const preloadPath = join(dir, 'count-settings-renames.cjs');
+      writeFileSync(
+        preloadPath,
+        `'use strict';
+const fs = require('node:fs');
+const path = require('node:path');
+const realRename = fs.renameSync;
+fs.renameSync = function (from, to) {
+  if (typeof to === 'string' && path.basename(to).startsWith('settings.')) {
+    fs.appendFileSync(${JSON.stringify(renamesPath)}, to + '\\n');
+  }
+  return realRename.apply(this, arguments);
+};
+require('node:module').syncBuiltinESMExports();
+`,
+      );
+      const env = { ...process.env, HOME: home, HYPO_DIR: hypoDir };
+      delete env.CLAUDE_CONFIG_DIR;
+      const applyR = spawnSync(
+        process.execPath,
+        [
+          '-r',
+          preloadPath,
+          join(SCRIPTS, 'upgrade.mjs'),
+          `--hypo-dir=${hypoDir}`,
+          '--apply',
+          '--json',
+        ],
+        { encoding: 'utf-8', env },
       );
       assert.equal(applyR.status, 0, `--apply failed: ${applyR.stderr}`);
       const applied = JSON.parse(applyR.stdout).applied;
@@ -2819,12 +3047,16 @@ test('--apply replaces a symlinked settings.json with a real file, not a truncat
         `fixture must exercise both rename and retire in the same pass: ${applyR.stdout}`,
       );
 
+      const renames = readFileSync(renamesPath, 'utf-8').trim().split('\n');
       assert.equal(
+        renames.length,
+        1,
+        `rename, add and retire must commit through one write, saw: ${renames}`,
+      );
+      assert.equal(renames[0], realpathSync(realPath), 'the one write lands on the link target');
+      assert.ok(
         lstatSync(settingsPath).isSymbolicLink(),
-        false,
-        'settings.json must be a plain file after --apply: a rename-based atomic write replaces ' +
-          'whatever sits at that path, while three separate writeFileSync calls would write through ' +
-          'the symlink and leave it in place',
+        'settings.json must stay a symlink after --apply',
       );
 
       // Functional correctness survives the atomicity fix: both outcomes are
@@ -2837,6 +3069,69 @@ test('--apply replaces a symlinked settings.json with a real file, not a truncat
           !stopCmds.includes(cmdFor('hypo-auto-commit.mjs')),
         `retired, and renamed-then-retired, Stop entries must both be gone: ${JSON.stringify(stopCmds)}`,
       );
+    });
+  });
+});
+
+// Disabling the check: in writeSettingsJson (scripts/lib/settings-write.mjs) throw instead of
+// printing when the mode cannot be restored and is wider.
+test('--apply still copies the renamed hook when settings.json could not get its mode back', () => {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      const initR = runWithHome('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-git-init'], home);
+      assert.equal(initR.status, 0, `init failed: ${initR.stderr}`);
+
+      const settingsPath = join(home, '.claude', 'settings.json');
+      const hookPath = join(home, '.claude', 'hooks', 'hypo-session-start.mjs');
+      const cfg = JSON.parse(readFileSync(settingsPath, 'utf-8'));
+      const text = JSON.stringify(cfg).replaceAll(
+        'hypo-session-start.mjs',
+        'wiki-session-start.mjs',
+      );
+      assert.notEqual(text, JSON.stringify(cfg), 'fixture must carry the hook registration');
+      writeFileSync(settingsPath, text);
+      chmodSync(settingsPath, 0o444);
+      rmSync(hookPath);
+
+      // Only chmod on settings.json* refuses, as a filesystem that will not widen or narrow it would.
+      const preloadPath = join(dir, 'settings-chmod-fault.cjs');
+      writeFileSync(
+        preloadPath,
+        `const fs = require('node:fs');
+const path = require('node:path');
+const real = fs.chmodSync;
+fs.chmodSync = function (target) {
+  if (path.basename(String(target)).startsWith('settings.json')) {
+    const err = new Error('injected chmod failure');
+    err.code = 'EPERM';
+    throw err;
+  }
+  return real.apply(this, arguments);
+};
+require('node:module').syncBuiltinESMExports();
+`,
+      );
+      const r = spawnSync(
+        process.execPath,
+        [join(SCRIPTS, 'upgrade.mjs'), `--hypo-dir=${hypoDir}`, '--apply', '--json'],
+        {
+          encoding: 'utf-8',
+          env: {
+            ...process.env,
+            HYPO_DIR: '',
+            HOME: home,
+            NODE_OPTIONS: `--require=${preloadPath}`,
+          },
+        },
+      );
+      assert.equal(r.status, 0, `${r.stderr}\n${r.stdout}`);
+      assert.match(r.stderr, /settings\.json: written, mode not restored: .*is 600, was 444/);
+      assert.ok(
+        readFileSync(settingsPath, 'utf-8').includes('hypo-session-start.mjs'),
+        'settings.json names the renamed hook',
+      );
+      assert.ok(existsSync(hookPath), 'the hook settings.json now names was copied');
     });
   });
 });

@@ -68,9 +68,11 @@ import {
 import {
   isValidProjectName,
   TRACK_ID_RE,
+  buildBaselineEntry,
   closeIdFor,
   entryFileName,
   formatSessionEntry,
+  isBaselineId,
   parseSessionEntry,
   resolveSupersedesPrefix,
   splitLegacyFrontmatter,
@@ -2382,6 +2384,81 @@ const ENTRY_CONFLICT_HELP = (relPath, reason) =>
       `foreign bytes yourself and retry.`;
 
 /**
+ * The id a baseline built from `text` (the flat session-state.md) gets, with `entry`'s stored done
+ * heads and scope; `null` when the entry cannot be rebuilt.
+ */
+function rebuiltBaselineId(entry, text, project) {
+  try {
+    return buildBaselineEntry({
+      kind: 'state',
+      text,
+      date: entry.date,
+      visibilityScope: entry.visibilityScope,
+      project: entry.project ?? project,
+      legacyDone: entry.tracks.filter((t) => t.done === true).map((t) => t.id),
+    }).closeId;
+  } catch {
+    return null; // an input that cannot be rebuilt is not proof, so the baseline is not counted
+  }
+}
+
+/**
+ * The baseline heads this session was shown when it read the old flat `session-state.md`:
+ * `{trackId: [closeId]}`. A session that began before the vault moved to entries read that file,
+ * and its base record holds the file's hash. The move wrote the same bytes into a baseline, so a
+ * baseline whose source (the flat file in the parent of the commit that added it) hashes to what the
+ * session read counts as heard, and a close can replace its heads. The source must also build the
+ * baseline's own id (see rebuiltBaselineId), else the baseline holds other bytes than the session
+ * read and is left alone. The LF source and its CRLF form
+ * are both compared, since a checkout with autocrlf shows the session the CRLF bytes. `{}` when the
+ * vault is not moved, the session recorded no hash of the file, or no baseline matches (a
+ * baseline made from local bytes that differ from HEAD has no source to find, so it is not
+ * counted, as before).
+ */
+function flatReadBaselineHeads(hypoDir, sessionId, project, model) {
+  if (!model.migrated) return {};
+  const rel = `projects/${project}/session-state.md`;
+  const base = readBaseEntry(hypoDir, sessionId, rel);
+  const wanted = new Set(
+    [base.state === 'hash' ? base.hash : null, readObservedHash(hypoDir, sessionId, rel)].filter(
+      Boolean,
+    ),
+  );
+  if (wanted.size === 0) return {};
+  const git = (...a) =>
+    spawnSync('git', ['-C', hypoDir, ...a], { encoding: 'utf-8', maxBuffer: 64 * 1024 * 1024 });
+  const heads = {};
+  for (const e of model.entries) {
+    if (!isBaselineId(e.closeId) || e.tracks.length === 0) continue;
+    const added = git(
+      'log',
+      '--diff-filter=A',
+      '--format=%H',
+      '-n',
+      '1',
+      '--',
+      `:(glob)projects/${project}/sessions/*-${e.closeId}.md`,
+    );
+    const sha = added.status === 0 ? added.stdout.trim() : '';
+    if (!sha) continue;
+    const source = git('show', revPathArg(`${sha}^`, rel));
+    if (source.status !== 0) continue;
+    const text = source.stdout;
+    const crlf = text.replace(/\n/g, '\r\n');
+    const match = wanted.has(hashContent(text)) || wanted.has(hashContent(crlf));
+    if (!match) continue;
+    // The hash proves the parent held the bytes the session read, not that those bytes made this
+    // baseline: an archive resumed while the flat file was still tracked can publish a baseline of
+    // other saved bytes in a commit whose parent holds the old file. Rebuild the id from the parent
+    // text (done heads and scope as the baseline stores them) and count the baseline only when it
+    // is the same one.
+    if (rebuiltBaselineId(e, text, project) !== e.closeId) continue;
+    for (const t of e.tracks) heads[t.id] = [...new Set([...(heads[t.id] ?? []), e.closeId])];
+  }
+  return heads;
+}
+
+/**
  * Everything about this close's entry that can be decided before a byte is
  * written: track checks, default and explicit `supersedes`, the entry bytes, and
  * what is already at `entryPath` (from entryPathFor). Refuses (`track-duplicate`, `track-unknown`,
@@ -2415,6 +2492,11 @@ function planSessionEntry(args, payload, project, entryPath, closeId, legacyForm
     }
   }
   const observed = readObservedHeads(args.hypoDir, args.sessionId, project);
+  // Both the default `supersedes` and the `legacy-*` retirement below read `observed.full`.
+  const flatRead = flatReadBaselineHeads(args.hypoDir, args.sessionId, project, model);
+  for (const [id, ids] of Object.entries(flatRead)) {
+    observed.full[id] = [...new Set([...(observed.full[id] ?? []), ...ids])];
+  }
   const entryTracks = [];
   const legacySplitRetired = [];
   const bodies = {};

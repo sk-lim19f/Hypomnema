@@ -19,6 +19,7 @@ import {
   cpSync,
   readdirSync,
   realpathSync,
+  chmodSync,
 } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -33,6 +34,7 @@ import {
   SHELL_MARKER_START,
   SHELL_MARKER_END,
   SHELL_FUNCTION_BODY,
+  wikiPreCommitContent,
 } from '../scripts/lib/git-hooks-dir.mjs';
 import {
   HOME,
@@ -42,10 +44,12 @@ import {
   SESSION_TMP_HOME,
   deriveCoreHookBasenames,
   gitRepo,
+  hookWriteFaultPreload,
   legacyWikiPreCommitContent,
   readCoreHooksConfig,
   run,
   runWithHome,
+  settingsWriteFaultPreload,
   withTmpDir,
   withTmpHome,
 } from './helpers.mjs';
@@ -2079,6 +2083,44 @@ test('dry-run leaves the wiki pre-commit hook in place; --apply removes it', () 
   });
 });
 
+// The bytes `init` wrote into a vault's pre-commit hook in v1.10.0 (worker step
+// only, resolver script as shipped). Kept as a literal on purpose: building it
+// from previousFormPreCommitContent would make the fixture and the recognizer
+// move together, and this test exists to catch exactly that.
+const V1_10_0_WORKER_HOOK =
+  '#!/bin/sh\n# hypo-managed:pre-commit:start\nnode -e \'var fs=require("fs"),os=require("os"),cp=require("child_process"),path=require("path");function usable(r){if(typeof r!=="string"||!r||!path.isAbsolute(r))return false;try{var p=JSON.parse(fs.readFileSync(r+"/package.json","utf-8"));if(p.name!=="hypomnema")return false;if(typeof p.version!=="string"||!p.version)return false}catch(e){return false}try{return fs.existsSync(r+"/hooks/hypo-pre-commit.mjs")}catch(e){return false}}function readJson(p){try{return JSON.parse(fs.readFileSync(p,"utf-8"))}catch(e){return null}}var home=os.homedir();var root=null;var pkg=readJson(home+"/.claude/hypo-pkg.json");if(pkg&&usable(pkg.pkgRoot)){root=pkg.pkgRoot}if(!root){var reg=readJson(home+"/.claude/plugins/installed_plugins.json");var plugins=reg&&reg.plugins;var arr=[];if(plugins&&Array.isArray(plugins["hypo@hypomnema"]))arr=arr.concat(plugins["hypo@hypomnema"]);if(plugins&&Array.isArray(plugins["hypomnema@hypomnema"]))arr=arr.concat(plugins["hypomnema@hypomnema"]);var entry=arr.find(function(e){return e&&e.scope==="user"&&usable(e.installPath)})||arr.find(function(e){return e&&usable(e.installPath)});if(entry){root=entry.installPath}}if(!root){console.error("hypomnema: could not resolve the install root for /hooks/hypo-pre-commit.mjs.");console.error("Checked ~/.claude/hypo-pkg.json (pkgRoot) and ~/.claude/plugins/installed_plugins.json (hypo@hypomnema installPath, legacy hypomnema@hypomnema).");console.error("Fix: run `hypomnema upgrade --apply` (or `/hypo:upgrade` on a plugin install), or reinstall Hypomnema.");process.exit(1)}var r=cp.spawnSync(process.execPath,[root+"/hooks/hypo-pre-commit.mjs"],{stdio:"inherit"});if(r.error){console.error(String(r.error.message||r.error))}process.exit(r.status===null?1:r.status)\' || exit 1\nexit 0\n# hypo-managed:pre-commit:end\n';
+const V1_10_0_WORKER_HOOK_SHA256 =
+  'a363c220b5399e80eca2f501365a08ea0db974162e0b66a8204d27cd32a1674b';
+
+test('uninstall --apply removes a hook on the previous resolver', () => {
+  assert.equal(
+    createHash('sha256').update(V1_10_0_WORKER_HOOK).digest('hex'),
+    V1_10_0_WORKER_HOOK_SHA256,
+    'fixture: the literal must stay byte-identical to what v1.10.0 shipped',
+  );
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      mkdirSync(hypoDir, { recursive: true });
+      writeFileSync(join(hypoDir, 'hypo-config.md'), '# config');
+      gitRepo(hypoDir);
+      const { dir: hooksDir } = hooksDirForInstall(hypoDir);
+      mkdirSync(hooksDir, { recursive: true });
+      const hookPath = join(hooksDir, 'pre-commit');
+      writeFileSync(hookPath, V1_10_0_WORKER_HOOK, { mode: 0o755 });
+
+      const applyR = runWithHome('uninstall.mjs', [`--hypo-dir=${hypoDir}`, '--apply'], home);
+      assert.equal(applyR.status, 0, `stderr: ${applyR.stderr}`);
+      assert.ok(!existsSync(hookPath), 'a hook on the previous resolver is ours and must go');
+      assert.match(
+        applyR.stdout,
+        /Wiki pre-commit hook removed \(1\)/,
+        `the report must carry the removal line: ${applyR.stdout}`,
+      );
+    });
+  });
+});
+
 test('preserves a user pre-commit hook that carries no Hypomnema marker', () => {
   withTmpHome((home) => {
     withTmpDir((dir) => {
@@ -2887,5 +2929,307 @@ test('init adds the block after a .gitattributes the vault already has and keeps
       readFileSync(join(hypoDir, '.gitattributes'), 'utf-8'),
       `log.md merge=union\n${GITATTRIBUTES_BLOCK}`,
     );
+  });
+});
+
+// ── settings.json writes from init and uninstall go through writeSettingsJson ──
+//
+// settingsWriteFaultPreload tears the first fs.writeFileSync to a settings.json*
+// path whose stack holds HYPO_TEST_FAULT_CALLER, half the bytes and then EIO.
+// A direct write tears the target itself; the helper writes a temp file next to
+// it and renames, so the tear lands on the throwaway name and the target keeps
+// its starting bytes. The fault runs the real CLI, so the caller name is the
+// real function on the real stack.
+
+suite('init.mjs / uninstall.mjs: a failed settings.json write leaves the file whole');
+
+function runFaulted(script, args, home, hypoDir, caller) {
+  const { preloadPath, firedPath } = settingsWriteFaultPreload(home);
+  const env = { ...process.env, HOME: home, HYPO_DIR: hypoDir, HYPO_TEST_FAULT_CALLER: caller };
+  delete env.CLAUDE_CONFIG_DIR;
+  const r = spawnSync(process.execPath, ['-r', preloadPath, join(SCRIPTS, script), ...args], {
+    encoding: 'utf-8',
+    env,
+  });
+  return { r, firedPath };
+}
+
+function assertWholeAfterFault({ r, firedPath }, settingsPath, startBytes, scriptFile, caller) {
+  assert.ok(existsSync(firedPath), `the injected fault never fired: ${r.stderr}`);
+  const stack = readFileSync(firedPath, 'utf-8');
+  assert.ok(stack.includes(scriptFile), `fault did not come from ${scriptFile}: ${stack}`);
+  assert.ok(stack.includes(caller), `fault did not come from ${caller}: ${stack}`);
+  assert.notEqual(r.status, 0, 'a failed settings.json write must not exit 0');
+  assert.equal(
+    readFileSync(settingsPath, 'utf-8'),
+    startBytes,
+    'settings.json must keep its starting bytes',
+  );
+  JSON.parse(readFileSync(settingsPath, 'utf-8'));
+}
+
+test('init keeps settings.json whole when its write fails partway', () => {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      const settingsPath = join(home, '.claude', 'settings.json');
+      mkdirSync(join(home, '.claude'), { recursive: true });
+      const startBytes = JSON.stringify(
+        { model: 'opus', permissions: { allow: ['Bash'] } },
+        null,
+        2,
+      );
+      writeFileSync(settingsPath, startBytes + '\n');
+      const fault = runFaulted(
+        'init.mjs',
+        [`--hypo-dir=${hypoDir}`, '--no-git-init', '--no-commands', '--no-shell'],
+        home,
+        hypoDir,
+        'mergeSettingsJson',
+      );
+      assertWholeAfterFault(
+        fault,
+        settingsPath,
+        startBytes + '\n',
+        'init.mjs',
+        'mergeSettingsJson',
+      );
+    });
+  });
+});
+
+test('uninstall keeps settings.json whole when the core hook strip write fails partway', () => {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      const initR = runWithHome(
+        'init.mjs',
+        [`--hypo-dir=${hypoDir}`, '--no-git-init', '--no-commands', '--no-shell'],
+        home,
+      );
+      assert.equal(initR.status, 0, `init failed: ${initR.stderr}`);
+      const settingsPath = join(home, '.claude', 'settings.json');
+      const startBytes = readFileSync(settingsPath, 'utf-8');
+      assert.ok(startBytes.includes('$HOME/.claude/hooks/'), 'fixture: init must register hooks');
+      const fault = runFaulted(
+        'uninstall.mjs',
+        [`--hypo-dir=${hypoDir}`, '--apply', '--yes'],
+        home,
+        hypoDir,
+        'stripSettingsJson',
+      );
+      assertWholeAfterFault(fault, settingsPath, startBytes, 'uninstall.mjs', 'stripSettingsJson');
+    });
+  });
+});
+
+// ── root session-state.md and the pre-commit hook publish ──
+
+suite('init.mjs: no root session-state.md, hook replaced through a candidate file');
+
+test('init does not create a root session-state.md', () => {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      const r = runWithHome('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-git-init'], home);
+      assert.equal(r.status, 0, `init failed: ${r.stderr}${r.stdout}`);
+      assert.ok(existsSync(join(hypoDir, 'hypo-config.md')), 'pre-state: init must have run');
+      assert.equal(
+        existsSync(join(hypoDir, 'session-state.md')),
+        false,
+        'the root session-state.md is a generated view per project, not a vault-root template',
+      );
+      assert.ok(
+        existsSync(join(hypoDir, 'projects', '_template', 'index.md')),
+        'projects/_template is still copied',
+      );
+    });
+  });
+});
+
+test('init re-run leaves an existing root session-state.md untouched', () => {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      mkdirSync(hypoDir, { recursive: true });
+      const own = '# my own root state\nkeep-me-7f3a\n';
+      writeFileSync(join(hypoDir, 'session-state.md'), own);
+      for (let i = 0; i < 2; i++) {
+        const r = runWithHome('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-git-init'], home);
+        assert.equal(r.status, 0, `init run ${i} failed: ${r.stderr}${r.stdout}`);
+        if (i === 0) {
+          assert.ok(existsSync(join(hypoDir, 'hypo-config.md')), 'first run must scaffold');
+        } else {
+          assert.doesNotMatch(r.stdout, /Errors:/, 'the rerun must report success');
+        }
+      }
+      assert.equal(readFileSync(join(hypoDir, 'session-state.md'), 'utf-8'), own);
+      assert.ok(existsSync(join(hypoDir, 'hypo-config.md')), 'init must have scaffolded the vault');
+      assert.ok(
+        existsSync(join(hypoDir, 'projects', '_template', 'index.md')),
+        'init must have copied projects/_template',
+      );
+    });
+  });
+});
+
+// A vault whose pre-commit hook is still the v1.10.0 form (previous resolver).
+function withPreviousResolverVault(fn) {
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      mkdirSync(hypoDir, { recursive: true });
+      writeFileSync(join(hypoDir, 'hypo-config.md'), '# config');
+      gitRepo(hypoDir);
+      const { dir: hooksDir } = hooksDirForInstall(hypoDir);
+      mkdirSync(hooksDir, { recursive: true });
+      const hookPath = join(hooksDir, 'pre-commit');
+      writeFileSync(hookPath, V1_10_0_WORKER_HOOK, { mode: 0o755 });
+      fn({ home, dir, hypoDir, hookPath });
+    });
+  });
+}
+
+test('init re-run over a previous-resolver hook leaves the live hook whole when the write fails partway', () => {
+  withPreviousResolverVault(({ home, dir, hypoDir, hookPath }) => {
+    const { preloadPath, firedPath } = hookWriteFaultPreload(dir);
+    const env = { ...process.env, HOME: home, HYPO_DIR: hypoDir, HYPO_TEST_HOOK_FAULT: 'write' };
+    delete env.CLAUDE_CONFIG_DIR;
+    const r = spawnSync(
+      process.execPath,
+      ['-r', preloadPath, join(SCRIPTS, 'init.mjs'), `--hypo-dir=${hypoDir}`, '--no-git-init'],
+      { encoding: 'utf-8', env },
+    );
+    assert.ok(existsSync(firedPath), `the injected write fault never fired: ${r.stderr}`);
+    assert.match(
+      readFileSync(firedPath, 'utf-8'),
+      /pre-commit\.[^/]*\.tmp$/,
+      'the fault must tear the candidate file, not the live hook',
+    );
+    assert.notEqual(r.status, 0, 'a failed hook write must not exit 0');
+    assert.equal(readFileSync(hookPath, 'utf-8'), V1_10_0_WORKER_HOOK, 'live hook keeps its bytes');
+    assert.equal(readFileSync(`${hookPath}.bak`, 'utf-8'), V1_10_0_WORKER_HOOK, '.bak is a copy');
+    assert.deepEqual(
+      readdirSync(join(hookPath, '..')).filter((f) => /^pre-commit\..*\.tmp$/.test(f)),
+      [],
+      'no candidate file may be left behind',
+    );
+    assert.match(r.stdout, /pre-commit\.bak/, `the error line must name the .bak: ${r.stdout}`);
+  });
+});
+
+// A fresh vault (git init is the default) with a bare remote. fault 'write' tears the hook
+// candidate, so the hook never lands; '' runs the same flow without a fault. A `hooksDirMode`
+// pre-creates the repo and sets that mode on .git/hooks, so probing the hook target fails.
+function runInitWithRemote(fault, hooksDirMode, makeEnv) {
+  let out;
+  withTmpHome((home) => {
+    withTmpDir((dir) => {
+      const hypoDir = join(dir, 'wiki');
+      const remote = join(dir, 'remote.git');
+      spawnSync('git', ['init', '--bare', remote], { stdio: 'ignore' });
+      const { preloadPath, firedPath } = hookWriteFaultPreload(dir);
+      const env = {
+        ...process.env,
+        HOME: home,
+        HYPO_DIR: hypoDir,
+        GIT_AUTHOR_NAME: 't',
+        GIT_AUTHOR_EMAIL: 't@t.test',
+        GIT_COMMITTER_NAME: 't',
+        GIT_COMMITTER_EMAIL: 't@t.test',
+      };
+      if (fault) env.HYPO_TEST_HOOK_FAULT = fault;
+      if (makeEnv) Object.assign(env, makeEnv(dir, env));
+      delete env.CLAUDE_CONFIG_DIR;
+      const gitHooks = join(hypoDir, '.git', 'hooks');
+      if (hooksDirMode !== undefined) {
+        mkdirSync(hypoDir, { recursive: true });
+        spawnSync('git', ['init', hypoDir], { stdio: 'ignore' });
+        chmodSync(gitHooks, hooksDirMode);
+      }
+      let r;
+      try {
+        r = spawnSync(
+          process.execPath,
+          [
+            '-r',
+            preloadPath,
+            join(SCRIPTS, 'init.mjs'),
+            `--hypo-dir=${hypoDir}`,
+            `--git-remote=${remote}`,
+          ],
+          { encoding: 'utf-8', env },
+        );
+      } finally {
+        if (hooksDirMode !== undefined) chmodSync(gitHooks, 0o755); // so the temp dir can be removed
+      }
+      const head = spawnSync('git', ['-C', hypoDir, 'rev-parse', '--verify', 'HEAD'], {
+        encoding: 'utf-8',
+      });
+      const refs = spawnSync('git', ['-C', remote, 'for-each-ref'], { encoding: 'utf-8' });
+      out = { r, fired: existsSync(firedPath), headStatus: head.status, remoteRefs: refs.stdout };
+    });
+  });
+  return out;
+}
+
+test('init does not make the first commit or push when the pre-commit hook could not be installed', () => {
+  const { r, fired, headStatus, remoteRefs } = runInitWithRemote('write');
+  assert.ok(fired, `the injected write fault never fired: ${r.stderr}`);
+  assert.notEqual(r.status, 0, 'a failed hook write must not exit 0');
+  assert.notEqual(headStatus, 0, 'no commit may exist: it would have run without the guard');
+  assert.equal(remoteRefs.trim(), '', 'nothing may be pushed to the remote');
+  assert.match(r.stdout, /first commit was not made because the pre-commit hook/);
+  assert.match(r.stdout, /re-run `hypomnema init`/);
+});
+
+test('init does not make the first commit or push when the hooks directory cannot be probed', () => {
+  if (process.getuid?.() === 0) {
+    console.log('  skipped (running as root, permissions are not enforced): unprobeable hooks dir');
+    return;
+  }
+  const { r, headStatus, remoteRefs } = runInitWithRemote('', 0o000);
+  assert.notEqual(r.status, 0, `an unprobeable hooks dir must not exit 0: ${r.stdout}`);
+  assert.match(r.stdout, /cannot stat \(EACCES\)/);
+  assert.notEqual(headStatus, 0, 'no commit may exist: it would have run without the guard');
+  assert.equal(remoteRefs.trim(), '', 'nothing may be pushed to the remote');
+  assert.match(r.stdout, /first commit was not made because the pre-commit hook/);
+});
+
+test('init does not make the first commit or push when git cannot resolve the hooks dir', () => {
+  // A git that fails only the hooks-dir probe and runs every other command: the first commit
+  // would land without the guard if the failed probe counted as a deliberate skip.
+  const { r, headStatus, remoteRefs } = runInitWithRemote('', undefined, (dir, env) => {
+    const bin = join(dir, 'bin');
+    mkdirSync(bin, { recursive: true });
+    const realGit = spawnSync('which', ['git'], { encoding: 'utf-8' }).stdout.trim();
+    writeFileSync(
+      join(bin, 'git'),
+      `#!/bin/sh\nfor a in "$@"; do [ "$a" = --absolute-git-dir ] && exit 128; done\nexec '${realGit}' "$@"\n`,
+      { mode: 0o755 },
+    );
+    return { PATH: `${bin}:${env.PATH}` };
+  });
+  assert.notEqual(r.status, 0, `a failed hooks-dir probe must not exit 0: ${r.stdout}`);
+  assert.match(r.stdout, /could not resolve hooks dir/);
+  assert.notEqual(headStatus, 0, 'no commit may exist: it would have run without the guard');
+  assert.equal(remoteRefs.trim(), '', 'nothing may be pushed to the remote');
+  assert.match(r.stdout, /first commit was not made because the pre-commit hook/);
+});
+
+test('init without a hook fault still makes the first commit and pushes it', () => {
+  const { r, headStatus, remoteRefs } = runInitWithRemote('');
+  assert.equal(r.status, 0, `init failed: ${r.stderr}${r.stdout}`);
+  assert.equal(headStatus, 0, 'the control run must commit');
+  assert.notEqual(remoteRefs.trim(), '', 'the control run must push');
+});
+
+test('init re-run over a previous-resolver hook replaces it with the current resolver', () => {
+  withPreviousResolverVault(({ home, hypoDir, hookPath }) => {
+    const r = runWithHome('init.mjs', [`--hypo-dir=${hypoDir}`, '--no-git-init'], home);
+    assert.equal(r.status, 0, `init failed: ${r.stderr}${r.stdout}`);
+    assert.equal(readFileSync(hookPath, 'utf-8'), wikiPreCommitContent(hypoDir, false));
+    assert.equal(statSync(hookPath).mode & 0o777, 0o755);
+    assert.equal(readFileSync(`${hookPath}.bak`, 'utf-8'), V1_10_0_WORKER_HOOK);
   });
 });

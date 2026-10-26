@@ -70,6 +70,7 @@ import {
   localChangesOn,
   markPullArchiveMerged,
   pathInHead,
+  pullRemote,
   readGeneratedViewsRecord,
   readVisibilityScope,
   resolveActiveProject,
@@ -4069,6 +4070,75 @@ test('(b) an index entry changed after the backup defers too', () => {
   });
 });
 
+// The scan of step 3 and the snapshot are separate reads: a stage or an edit that lands between them
+// is judged by neither. Disabling the stage axis: in `clearBlockingPaths` (hooks/hypo-shared.mjs)
+// change `if (lateStage) return stop(changedSince());` to `if (false) return stop(changedSince());`.
+test('(b) a .gitignore staged after the local-change scan, before the snapshot, defers and keeps the stage', () => {
+  withCatchUp(({ b }) => {
+    put(b, 'projects/p/hot.md', W1);
+    put(b, '.gitignore', '.cache/\nmine/\n'); // a pure unstaged addition: step 4 lets it through
+    const r = clear(b, '@{u}', {
+      testHooks: { beforeSnapshot: () => cgitOk(b, ['add', '.gitignore']) },
+    });
+    assert.equal(r.ok, false, JSON.stringify(r));
+    assert.equal(r.deferred, 'concurrent-change');
+    assert.equal(r.reason, 'changed-during-clear');
+    assert.ok(
+      cgitOk(b, ['diff', '--cached', '--name-only']).split('\n').includes('.gitignore'),
+      'still staged',
+    );
+    assert.equal(readRel(b, '.gitignore'), '.cache/\nmine/\n');
+    assert.equal(readRel(b, 'projects/p/hot.md'), W1, 'nothing was moved');
+  });
+});
+
+// Disabling the edit axis: change `if (lateGitignoreEdit) return stop(changedSince());` to
+// `if (false) return stop(changedSince());`.
+test('(b) a .gitignore line appended after step 4 read it, before the snapshot, defers and keeps the line', () => {
+  withCatchUp(({ b }) => {
+    put(b, 'projects/p/hot.md', W1);
+    put(b, '.gitignore', '.cache/\nmine/\n');
+    const r = clear(b, '@{u}', {
+      testHooks: {
+        beforeSnapshot: () => put(b, '.gitignore', '.cache/\nmine/\nappended-late/\n'),
+      },
+    });
+    assert.equal(r.ok, false, JSON.stringify(r));
+    assert.equal(r.deferred, 'concurrent-change');
+    assert.equal(r.reason, 'changed-during-clear');
+    assert.equal(readRel(b, '.gitignore'), '.cache/\nmine/\nappended-late/\n', 'the line stays');
+    assert.equal(readRel(b, 'projects/p/hot.md'), W1, 'nothing was moved');
+  });
+});
+
+test('(b) a view staged after the local-change scan, before the snapshot, defers', () => {
+  withCatchUp(({ b }) => {
+    put(b, 'projects/p/hot.md', W1);
+    const r = clear(b, '@{u}', {
+      testHooks: { beforeSnapshot: () => cgitOk(b, ['add', 'projects/p/hot.md']) },
+    });
+    assert.equal(r.ok, false, JSON.stringify(r));
+    assert.equal(r.deferred, 'concurrent-change');
+    assert.equal(r.reason, 'changed-during-clear');
+    assert.equal(
+      cgitOk(b, ['diff', '--cached', '--name-only']).trim(),
+      'projects/p/hot.md',
+      'the view stays staged',
+    );
+    assert.equal(readRel(b, 'projects/p/hot.md'), W1);
+  });
+});
+
+test('(b) nothing written in the snapshot window: the clearing step completes', () => {
+  withCatchUp(({ b }) => {
+    put(b, 'projects/p/hot.md', W1);
+    put(b, '.gitignore', '.cache/\nmine/\n');
+    const r = clear(b, '@{u}', { testHooks: { beforeSnapshot: () => {} } });
+    assert.equal(r.ok, true, JSON.stringify(r));
+    assert.ok(r.archived.length > 0, 'the view was set aside');
+  });
+});
+
 test('(b) hypo-auto-stage takes the vault commit lock: with it held the add is skipped, without it the file is staged; a Read never stages', () => {
   withTmpDir((dir) => {
     cgitOk(dir, ['init', '-q']);
@@ -5690,6 +5760,580 @@ test('a checkout that fails keeps the set-aside .gitignore lines in the result a
     assert.deepEqual(r.pre.gitignoreLines, ['local-only/']);
     assert.equal(readRel(b, '.gitignore'), '.cache/\nlocal-only/\n');
   });
+});
+
+// An earlier run's archive record, written compact: any rewrite by the code under test is
+// pretty-printed, so it shows up as a byte change.
+const RECORD_REL = '.cache/pull-archive.json';
+const seedRecord = (dir, rec) =>
+  put(dir, RECORD_REL, `${JSON.stringify({ v: 2, gitignoreLines: [], views: [], ...rec })}\n`);
+const readRecord = (dir) => JSON.parse(readRel(dir, RECORD_REL));
+const seedBackup = (dir, name, text) => {
+  put(dir, `.cache/backups/${name}`, text);
+  return join(dir, '.cache/backups', name);
+};
+const earlierView = (dir, relPath = 'projects/q/hot.md', text = 'earlier q view\n') => ({
+  relPath,
+  kind: 'worktree',
+  backupPath: seedBackup(dir, `earlier-${relPath.replaceAll('/', '-')}.bak`, text),
+  sha256: sha(text),
+  companionRev: headOf(dir),
+  run: 1,
+});
+const holdIndex = (dir) => ({ afterArchive: () => put(dir, '.git/index.lock', '') });
+
+test("a failed checkout undoes only this run and keeps an earlier merged record's unshared view", () => {
+  withCatchUp(({ b }) => {
+    const earlier = earlierView(b);
+    seedRecord(b, { stage: 'merged', targetSha: headOf(b), views: [earlier] });
+    put(b, '.gitignore', '.cache/\nlocal-only/\n');
+    const r = fastForwardTo(b, '@{u}', { testHooks: holdIndex(b) });
+    assert.equal(r.ok, false);
+    assert.equal(r.reason, 'checkout-failed');
+    assert.equal(r.pre.recordWritten, true, 'this run wrote the record before it stopped');
+    assert.equal(r.pre.gitignoreSaved.length, 1, 'this run set the .gitignore aside');
+    const rec = readRecord(b);
+    assert.equal(rec.stage, 'merged');
+    assert.equal(rec.targetSha, headOf(b));
+    assert.deepEqual(
+      rec.views.map((v) => v.backupPath),
+      [earlier.backupPath],
+    );
+    assert.deepEqual(rec.gitignoreSaved, []);
+    assert.deepEqual(rec.gitignoreLines, [], 'this run line is gone from the record');
+    assert.equal(existsSync(earlier.backupPath), true, 'the earlier backup stays');
+    assert.equal(existsSync(r.pre.gitignoreSaved[0].backupPath), false, 'this run backup is gone');
+    assert.equal(readRel(b, '.gitignore'), '.cache/\nlocal-only/\n');
+  });
+});
+
+test('a failed checkout with no earlier record removes the record it wrote', () => {
+  withCatchUp(({ b }) => {
+    put(b, '.gitignore', '.cache/\nlocal-only/\n');
+    const r = fastForwardTo(b, '@{u}', { testHooks: holdIndex(b) });
+    assert.equal(r.reason, 'checkout-failed');
+    assert.equal(r.pre.recordWritten, true);
+    assert.equal(existsSync(join(b, RECORD_REL)), false);
+    assert.equal(existsSync(r.pre.gitignoreSaved[0].backupPath), false);
+  });
+});
+
+test("a clearing step stopped on git's own error carries git's message in the fast-forward notice", () => {
+  withCatchUp(({ b }) => {
+    put(b, '.gitignore', '.cache/\nlocal-only/\n');
+    const r = fastForwardTo(b, '@{u}', { testHooks: holdIndex(b) });
+    assert.equal(r.ok, false);
+    assert.equal(r.reason, 'checkout-failed');
+    assert.match(r.notice ?? '', /git의 말: .*index\.lock/, 'the notice carries git lock message');
+    assert.match(r.notice, /직접 지운/, 'the notice says a stale lock can be removed by hand');
+  });
+});
+
+test('an undo keeps a backup the earlier record also names when this run reused it', () => {
+  withCatchUp(({ b }) => {
+    // the first path backUpGeneratedPath picks for W1 already holds W1: this run reuses it
+    const plain = join(b, '.cache/backups/projects/p/hot.md.pre-projection-backup.md');
+    put(b, '.cache/backups/projects/p/hot.md.pre-projection-backup.md', W1);
+    const view = {
+      relPath: 'projects/p/hot.md',
+      kind: 'worktree',
+      backupPath: plain,
+      sha256: sha(W1),
+      companionRev: headOf(b),
+      run: 1,
+    };
+    seedRecord(b, { stage: 'merged', targetSha: headOf(b), views: [view] });
+    put(b, 'projects/p/hot.md', W1);
+    const r = fastForwardTo(b, '@{u}', { testHooks: holdIndex(b) });
+    assert.equal(r.reason, 'checkout-failed');
+    assert.equal(r.pre.archived[0].backupPath, plain, 'the backup was reused');
+    const rec = readRecord(b);
+    assert.deepEqual(
+      rec.views.map((v) => v.backupPath),
+      [plain],
+      'the earlier run entry stays',
+    );
+    assert.equal(rec.stage, 'merged');
+    assert.equal(readRel(b, '.cache/backups/projects/p/hot.md.pre-projection-backup.md'), W1);
+  });
+});
+
+test('a catch-up with nothing to set aside leaves an earlier merged record byte for byte', () => {
+  withCatchUp(({ b }) => {
+    seedRecord(b, { stage: 'merged', targetSha: headOf(b), views: [earlierView(b)] });
+    const before = readRel(b, RECORD_REL);
+    const r = fastForwardTo(b, '@{u}', { testHooks: holdIndex(b) });
+    assert.match(r.reason, /^fast-forward-failed/);
+    assert.equal(r.pre.ok, true);
+    assert.equal(r.pre.recordWritten, false);
+    assert.equal(readRel(b, RECORD_REL), before);
+    assert.equal(readRecord(b).stage, 'merged');
+  });
+});
+
+test('a catch-up whose earlier record only held .gitignore lines leaves that record byte for byte', () => {
+  withCatchUp(({ b }) => {
+    // a target that leaves .gitignore alone, so the line the recovery puts back is not a block
+    const home = cgitOk(b, ['rev-parse', '--abbrev-ref', 'HEAD']).trim();
+    cgitOk(b, ['checkout', '-q', '-b', 'side']);
+    put(b, 'pages/x.md', 'x side\n');
+    commitIn(b);
+    const side = headOf(b);
+    cgitOk(b, ['checkout', '-q', home]);
+    seedRecord(b, {
+      stage: 'archived',
+      targetSha: cgitOk(b, ['rev-parse', '@{u}']).trim(),
+      gitignoreLines: ['local-only/'],
+    });
+    const before = readRel(b, RECORD_REL);
+    const r = fastForwardTo(b, side, { testHooks: holdIndex(b) });
+    assert.match(r.reason, /^fast-forward-failed/);
+    assert.ok(readRel(b, '.gitignore').split('\n').includes('local-only/'), 'the line is back');
+    assert.equal(r.pre.recordWritten, false);
+    assert.equal(readRel(b, RECORD_REL), before);
+  });
+});
+
+test('a recovered .gitignore snapshot keeps its reference and its backup until cleanup', () => {
+  withCatchUp(({ b }) => {
+    const savedPath = seedBackup(b, 'earlier-gitignore.bak', '.cache/\nlocal-only/\n');
+    const saved = { relPath: '.gitignore', kind: 'worktree', backupPath: savedPath };
+    seedRecord(b, {
+      stage: 'archived',
+      targetSha: cgitOk(b, ['rev-parse', '@{u}']).trim(),
+      gitignoreLines: ['local-only/'],
+      views: [earlierView(b, 'projects/p/hot.md', W1)],
+      gitignoreSaved: [saved],
+    });
+    const r = fastForwardTo(b, '@{u}', { testHooks: holdIndex(b) });
+    assert.equal(r.reason, 'checkout-failed');
+    assert.equal(r.pre.recordWritten, true);
+    assert.deepEqual(readRecord(b).gitignoreSaved, [saved], 'the reference stays');
+    assert.equal(existsSync(savedPath), true, 'the backup stays');
+    // the next catch-up lands: the cleanup removes the backup and the record
+    unlinkSync(join(b, '.git/index.lock'));
+    const landed = fastForwardTo(b, '@{u}');
+    assert.equal(landed.ok, true, JSON.stringify(landed));
+    markPullArchiveMerged(b);
+    assert.equal(resumePullArchive(b).resumed, true);
+    assert.equal(existsSync(savedPath), false, 'the cleanup removed the backup');
+    assert.equal(existsSync(join(b, RECORD_REL)), false, 'and the record');
+  });
+});
+
+test("an undo keeps an earlier record's saved .gitignore entry", () => {
+  withCatchUp(({ b }) => {
+    const savedPath = seedBackup(b, 'earlier-gitignore.bak', '.cache/\nmine/\n');
+    const saved = { relPath: '.gitignore', kind: 'worktree', backupPath: savedPath };
+    seedRecord(b, { stage: 'merged', targetSha: headOf(b), gitignoreSaved: [saved] });
+    put(b, 'projects/p/hot.md', W1); // a new blocked view, so this run writes the record
+    const r = fastForwardTo(b, '@{u}', { testHooks: holdIndex(b) });
+    assert.equal(r.reason, 'checkout-failed');
+    assert.equal(r.pre.recordWritten, true);
+    assert.equal(r.pre.archived.length, 1);
+    assert.deepEqual(readRecord(b).gitignoreSaved, [saved]);
+    assert.equal(existsSync(savedPath), true);
+    assert.deepEqual(readRecord(b).views, [], 'this run view is out of the record');
+  });
+});
+
+test('an undo keeps a .gitignore line the earlier record also carries', () => {
+  withCatchUp(({ b }) => {
+    seedRecord(b, {
+      stage: 'merged',
+      targetSha: headOf(b),
+      gitignoreLines: ['local-only/'],
+      views: [earlierView(b)],
+    });
+    put(b, '.gitignore', '.cache/\nlocal-only/\n');
+    const r = fastForwardTo(b, '@{u}', { testHooks: holdIndex(b) });
+    assert.equal(r.reason, 'checkout-failed');
+    assert.deepEqual(r.pre.gitignoreLines, ['local-only/']);
+    assert.deepEqual(readRecord(b).gitignoreLines, ['local-only/']);
+  });
+});
+
+test('a run stopped before it wrote the record leaves the earlier record and its backup', () => {
+  withCatchUp(({ b }) => {
+    const earlier = earlierView(b);
+    seedRecord(b, { stage: 'merged', targetSha: headOf(b), views: [earlier] });
+    const before = readRel(b, RECORD_REL);
+    // the target deletes the views of project p, which .hypoignore hides: backed up as local-only
+    put(b, '.hypoignore', 'projects/p/\n');
+    put(b, 'hot.md', 'my root edit\n'); // blocked, then staged in the snapshot window
+    const r = fastForwardTo(b, '@{u}', {
+      testHooks: { beforeSnapshot: () => cgitOk(b, ['add', 'hot.md']) },
+    });
+    assert.deepEqual(
+      r.pre.localOnly.map((v) => v.relPath).sort(),
+      ['projects/p/hot.md', 'projects/p/session-state.md'],
+      'there was something for the undo to take back',
+    );
+    assert.equal(r.pre.recordWritten, false);
+    assert.equal(r.pre.deferred, 'concurrent-change');
+    assert.equal(readRel(b, RECORD_REL), before);
+    assert.equal(existsSync(earlier.backupPath), true);
+  });
+});
+
+// Fails the `nth` rename onto `recordPath` (the archive record): 'before' throws without moving
+// it, 'after' throws once the new bytes are published, 'garbled' publishes other bytes and then
+// throws. `fn` gets `{fired}` to tell whether the fault was reached. Only that path is touched, so
+// the notice file and the backups behave as they do outside the test.
+function withRecordRenameFault(recordPath, { when, nth }, fn) {
+  const nodeFs = createRequire(import.meta.url)('node:fs');
+  const { renameSync } = nodeFs;
+  const state = { fired: false };
+  let seen = 0;
+  nodeFs.renameSync = (from, to) => {
+    if (String(to) !== recordPath || ++seen !== nth) return renameSync(from, to);
+    state.fired = true;
+    if (when !== 'before') {
+      renameSync(from, to);
+      if (when === 'garbled') nodeFs.writeFileSync(to, 'not the intended bytes\n');
+    }
+    throw Object.assign(new Error('injected rename fault'), { code: 'EIO' });
+  };
+  syncBuiltinESMExports();
+  try {
+    return fn(state);
+  } finally {
+    nodeFs.renameSync = renameSync;
+    syncBuiltinESMExports();
+  }
+}
+
+// An earlier merged record plus a new blocked view, so this run writes a record (its own rename is
+// the 1st onto the record) and a notice line naming the view's backup, and the checkout fails.
+function runUndoWithRecordFault(b, when) {
+  const earlier = earlierView(b);
+  seedRecord(b, { stage: 'merged', targetSha: headOf(b), views: [earlier] });
+  put(b, 'projects/p/hot.md', W1);
+  const noticeRel = '.cache/root-hot-projection-notice.json';
+  const seen = {};
+  let state;
+  const r = withRecordRenameFault(join(b, RECORD_REL), { when, nth: 2 }, (s) => {
+    state = s;
+    return fastForwardTo(b, '@{u}', {
+      testHooks: {
+        afterArchive: () => {
+          put(b, '.git/index.lock', '');
+          seen.record = readRel(b, RECORD_REL);
+          seen.notice = readRel(b, noticeRel);
+        },
+      },
+    });
+  });
+  const notice = existsSync(join(b, noticeRel)) ? readRel(b, noticeRel) : '';
+  return { r, earlier, seen, notice, state };
+}
+const VIEW_NOTICE = /projects\/p\/hot\.md의 이 기계 쪽 작업 트리본/;
+
+test('a failed rewrite of the archive record during undo keeps the record, its notice and every backup', () => {
+  withCatchUp(({ b }) => {
+    const { r, earlier, seen, notice, state } = runUndoWithRecordFault(b, 'before');
+    assert.match(seen.notice, VIEW_NOTICE, 'the notice for this run view was written first');
+    assert.equal(state.fired, true, 'the rewrite was the failing rename');
+    assert.equal(r.reason, 'checkout-failed');
+    assert.equal(r.pre.archived.length, 1);
+    assert.equal(readRel(b, 'projects/p/hot.md'), W1, 'the undo put the bytes back');
+    assert.equal(readRel(b, RECORD_REL), seen.record, 'the record is as this run wrote it');
+    assert.equal(existsSync(r.pre.archived[0].backupPath), true, 'this run backup stays');
+    assert.equal(existsSync(earlier.backupPath), true, 'the earlier backup stays');
+    assert.match(notice, VIEW_NOTICE, 'the notice naming the backup is not retracted');
+    assert.match(r.notice, /\.cache\/pull-archive\.json/);
+  });
+});
+
+test('an undo whose record rewrite throws after publishing goes on as written', () => {
+  withCatchUp(({ b }) => {
+    const { r, earlier, notice, state } = runUndoWithRecordFault(b, 'after');
+    assert.equal(state.fired, true, 'the rewrite threw after its rename');
+    assert.equal(r.reason, 'checkout-failed');
+    const rec = readRecord(b);
+    assert.equal(rec.stage, 'merged');
+    assert.deepEqual(
+      rec.views.map((v) => v.backupPath),
+      [earlier.backupPath],
+      'the record is what the undo meant to write: the earlier view only',
+    );
+    assert.equal(existsSync(r.pre.archived[0].backupPath), false, 'this run backup is deleted');
+    assert.equal(existsSync(earlier.backupPath), true, 'the earlier backup stays');
+    assert.doesNotMatch(notice, VIEW_NOTICE, 'this run notice line is retracted');
+    assert.doesNotMatch(r.notice ?? '', /pull-archive\.json/);
+  });
+});
+
+// The pair of this one is 'an undo whose record rewrite throws after publishing goes on as written'
+// and the first test of this file (a readable record is still trimmed to the earlier entries).
+test('an undo that finds the record unreadable keeps it, its notice and every backup and names it', () => {
+  withCatchUp(({ b }) => {
+    const earlier = earlierView(b);
+    seedRecord(b, { stage: 'merged', targetSha: headOf(b), views: [earlier] });
+    put(b, 'projects/p/hot.md', W1);
+    const noticeRel = '.cache/root-hot-projection-notice.json';
+    const garbage = '{"v":2,"stage":"merged","not":"a pull archive"}\n';
+    const r = fastForwardTo(b, '@{u}', {
+      testHooks: {
+        // between the clearing step and the undo: the record fails the shape check
+        afterArchive: () => {
+          put(b, '.git/index.lock', '');
+          put(b, RECORD_REL, garbage);
+        },
+      },
+    });
+    assert.equal(r.reason, 'checkout-failed');
+    assert.equal(r.pre.recordWritten, true);
+    assert.equal(r.pre.archived.length, 1, 'there was a view for the undo to take back');
+    assert.equal(readRel(b, RECORD_REL), garbage, 'the record is not deleted');
+    assert.equal(existsSync(r.pre.archived[0].backupPath), true, 'this run backup stays');
+    assert.equal(existsSync(earlier.backupPath), true, 'the earlier backup stays');
+    assert.match(readRel(b, noticeRel), VIEW_NOTICE, 'the notice naming the backup stays');
+    assert.equal(readRel(b, 'projects/p/hot.md'), W1, 'the undo put the bytes back');
+    assert.match(r.notice, /\.cache\/pull-archive\.json/);
+  });
+});
+
+// The clearing step's own record write is the 1st rename onto the record. An earlier merged record
+// plus a new blocked view means this run has something to set aside, so it writes a record.
+function runClearWithRecordFault(b, when) {
+  const earlier = earlierView(b);
+  seedRecord(b, { stage: 'merged', targetSha: headOf(b), views: [earlier] });
+  const startBytes = readRel(b, RECORD_REL);
+  put(b, 'projects/p/hot.md', W1);
+  let state;
+  const r = withRecordRenameFault(join(b, RECORD_REL), { when, nth: 1 }, (s) => {
+    state = s;
+    return fastForwardTo(b, '@{u}');
+  });
+  return { r, earlier, startBytes, state };
+}
+
+test('a record write that throws after publishing stops the run as written and undo keeps the earlier entries', () => {
+  withCatchUp(({ b }) => {
+    const { r, earlier, state } = runClearWithRecordFault(b, 'after');
+    assert.equal(state.fired, true, 'the clearing step write was the failing rename');
+    assert.equal(r.pre.reason, 'archive-write-failed');
+    assert.equal(r.pre.recordWritten, true, 'the disk held the bytes it meant to write');
+    assert.equal(r.pre.recordUncertain, false);
+    const rec = readRecord(b);
+    assert.equal(rec.stage, 'merged');
+    assert.deepEqual(
+      rec.views.map((v) => v.backupPath),
+      [earlier.backupPath],
+      'the undo took this run view out and kept the earlier one',
+    );
+    assert.equal(existsSync(earlier.backupPath), true, 'the earlier backup stays');
+    assert.equal(readRel(b, 'projects/p/hot.md'), W1);
+  });
+});
+
+test('a record write that throws before publishing leaves the earlier record byte for byte', () => {
+  withCatchUp(({ b }) => {
+    const { r, earlier, startBytes, state } = runClearWithRecordFault(b, 'before');
+    assert.equal(state.fired, true);
+    assert.equal(r.pre.reason, 'archive-write-failed');
+    assert.equal(r.pre.recordWritten, false);
+    assert.equal(r.pre.recordUncertain, false);
+    assert.equal(readRel(b, RECORD_REL), startBytes);
+    assert.equal(existsSync(earlier.backupPath), true, 'the earlier backup stays');
+  });
+});
+
+test('a record write whose outcome cannot be read keeps every backup and names the record', () => {
+  withCatchUp(({ b }) => {
+    const { r, earlier, state } = runClearWithRecordFault(b, 'garbled');
+    assert.equal(state.fired, true);
+    assert.equal(r.pre.reason, 'archive-write-failed');
+    assert.equal(r.pre.recordUncertain, true);
+    assert.equal(r.pre.recordWritten, false);
+    assert.equal(r.pre.archived.length, 1, 'there was a view for the undo to take back');
+    assert.equal(existsSync(r.pre.archived[0].backupPath), true, 'this run backup stays');
+    assert.equal(existsSync(earlier.backupPath), true, 'the earlier backup stays');
+    assert.equal(
+      readRel(b, RECORD_REL),
+      'not the intended bytes\n',
+      'the undo did not touch the record',
+    );
+    assert.equal(readRel(b, 'projects/p/hot.md'), W1, 'the undo put the bytes back');
+    assert.match(r.notice, /\.cache\/pull-archive\.json/);
+  });
+});
+
+test('a recovered record whose rewrite cannot be judged reaches undo and names the record', () => {
+  withCatchUp(({ b }) => {
+    // an earlier run stopped before its merge (target is not an ancestor of HEAD) with one view,
+    // and nothing blocks this run: the recovery alone carries the view into the lists
+    const earlier = earlierView(b);
+    seedRecord(b, {
+      stage: 'archived',
+      targetSha: cgitOk(b, ['rev-parse', '@{u}']).trim(),
+      views: [earlier],
+    });
+    const r = withRecordRenameFault(join(b, RECORD_REL), { when: 'garbled', nth: 1 }, () =>
+      fastForwardTo(b, '@{u}'),
+    );
+    assert.equal(r.pre.reason, 'archive-write-failed');
+    assert.equal(r.pre.archived.length, 1, 'the caller counts the carried view');
+    assert.equal(r.pre.recordUncertain, true);
+    assert.match(r.notice, /\.cache\/pull-archive\.json/);
+    assert.equal(existsSync(earlier.backupPath), true, 'the backup stays');
+  });
+});
+
+// A machine on the migrated side whose ignored `projects/p/hot.md` holds its own writing, and an
+// upstream rollback commit that tracks that path again: git overwrites an ignored untracked file
+// without a word when the merge lands, so the clearing step has to set the bytes aside first.
+// `untracked` leaves the local bytes untracked (ignored); `ita` registers them with `git add -N`.
+function withIgnoredViewUnderRollback(fn, { ita = false } = {}) {
+  withCatchUp(({ a, b }) => {
+    cgitOk(b, ['merge', '-q', '--ff-only', '@{u}']);
+    put(b, 'projects/p/hot.md', W1);
+    if (ita) cgitOk(b, ['add', '-N', '-f', 'projects/p/hot.md']);
+    put(a, '.gitignore', '.cache/\n');
+    put(a, 'projects/p/hot.md', 'ROLLED_BACK_HOT\n');
+    cgitOk(a, ['add', '-f', '.gitignore', 'projects/p/hot.md']);
+    cgitOk(a, ['commit', '-q', '-m', 'rollback']);
+    cgitOk(a, ['push', '-q']);
+    cgitOk(b, ['fetch', '-q']);
+    fn({ a, b });
+  });
+}
+
+test('a pull whose clearing step failed after moving bytes merges nothing and keeps the local bytes', () => {
+  withIgnoredViewUnderRollback(({ b }) => {
+    const head = headOf(b);
+    const faulted = withRecordRenameFault(join(b, RECORD_REL), { when: 'before', nth: 1 }, (s) => {
+      const res = pullRemote(b);
+      return { res, fired: s.fired };
+    });
+    assert.equal(faulted.fired, true, 'the record write was the failing rename');
+    const { res } = faulted;
+    assert.notEqual(res.pulled, true, JSON.stringify(res));
+    assert.equal(res.deferred, 'clear-failed');
+    assert.equal(headOf(b), head, 'nothing was merged');
+    assert.equal(readRel(b, 'projects/p/hot.md'), W1, 'the ignored local bytes are still on disk');
+    assert.ok(
+      res.notices.some(
+        (n) => n.includes('병합하지 않았습니다') && n.includes('archive-write-failed'),
+      ),
+      JSON.stringify(res.notices),
+    );
+    // the next pull retries and lands, with the local bytes kept in a backup
+    const again = pullRemote(b);
+    assert.equal(again.pulled, true, JSON.stringify(again));
+    assert.equal(readRel(b, 'projects/p/hot.md'), 'ROLLED_BACK_HOT\n');
+    assert.deepEqual(
+      backupsIn(b, 'projects/p/hot.md').map((rel) => readRel(b, rel)),
+      [W1],
+    );
+  });
+});
+
+test("a pull whose clearing step stopped on git's own error puts git's message in the notice and the record", () => {
+  withCatchUp(({ b }) => {
+    put(b, '.gitignore', '.cache/\nlocal-only/\n');
+    const head = headOf(b);
+    const res = pullRemote(b, { testHooks: holdIndex(b) });
+    assert.equal(res.deferred, 'clear-failed', JSON.stringify(res));
+    assert.equal(headOf(b), head, 'nothing was merged');
+    const note = res.notices.find((n) => n.includes('checkout-failed'));
+    assert.ok(note, JSON.stringify(res.notices));
+    assert.match(note, /index\.lock/, 'the notice carries git lock message');
+    assert.match(note, /직접 지운/, 'the notice says a stale lock can be removed by hand');
+    const failures = readFileSync(join(b, '.cache', 'sync-state.json'), 'utf-8')
+      .trim()
+      .split('\n')
+      .map((l) => JSON.parse(l));
+    const last = failures.at(-1);
+    assert.equal(last.op, 'pull');
+    assert.match(last.error, /index\.lock/, 'the recorded failure carries git lock message');
+  });
+});
+
+test('a pull whose clearing step succeeds still merges and keeps the local bytes in a backup', () => {
+  withIgnoredViewUnderRollback(({ b }) => {
+    const res = pullRemote(b);
+    assert.equal(res.pulled, true, JSON.stringify(res));
+    assert.equal(res.deferred, undefined);
+    assert.equal(readRel(b, 'projects/p/hot.md'), 'ROLLED_BACK_HOT\n');
+    assert.deepEqual(
+      backupsIn(b, 'projects/p/hot.md').map((rel) => readRel(b, rel)),
+      [W1],
+    );
+  });
+});
+
+test('an undo whose record removal cannot be synced keeps every backup and names the record', () => {
+  withCatchUp(({ b }) => {
+    put(b, 'projects/p/hot.md', W1);
+    const r = clear(b);
+    assert.equal(r.ok, true, JSON.stringify(r));
+    const record = join(b, RECORD_REL);
+    // Once the record is gone the visible state is the intended one; the directory sync after it
+    // fails with EIO, as a disk that lost the write would.
+    const nodeFs = createRequire(import.meta.url)('node:fs');
+    const { fsyncSync } = nodeFs;
+    nodeFs.fsyncSync = (fd) => {
+      if (fstatSync(fd).isDirectory() && !existsSync(record)) {
+        throw Object.assign(new Error('injected directory sync fault'), { code: 'EIO' });
+      }
+      return fsyncSync(fd);
+    };
+    syncBuiltinESMExports();
+    let undone;
+    try {
+      undone = undoClearedPaths(b, r);
+    } finally {
+      nodeFs.fsyncSync = fsyncSync;
+      syncBuiltinESMExports();
+    }
+    assert.equal(undone.ok, false, JSON.stringify(undone));
+    assert.ok(
+      undone.notices.some((n) => n.includes('.cache/pull-archive.json')),
+      JSON.stringify(undone.notices),
+    );
+    assert.equal(existsSync(r.backups[0]), true, 'the backup stays');
+    assert.equal(readRel(b, 'projects/p/hot.md'), W1, 'the bytes are back');
+  });
+});
+
+test('an undo whose record removal syncs deletes the record and the backups', () => {
+  withCatchUp(({ b }) => {
+    put(b, 'projects/p/hot.md', W1);
+    const r = clear(b);
+    assert.equal(r.ok, true, JSON.stringify(r));
+    const undone = undoClearedPaths(b, r);
+    assert.equal(undone.ok, true, JSON.stringify(undone));
+    assert.equal(existsSync(join(b, RECORD_REL)), false, 'the record is gone');
+    assert.equal(existsSync(r.backups[0]), false, 'the backup is deleted');
+  });
+});
+
+test('an intent-to-add entry on a blocked path defers up front on every attempt and is never a concurrent change', () => {
+  withIgnoredViewUnderRollback(
+    ({ b }) => {
+      assert.equal(cgitOk(b, ['diff', '--cached', '--name-only']).trim(), '', 'not staged');
+      assert.match(cgitOk(b, ['ls-files', '-s', '--', 'projects/p/hot.md']), /^100644 e69de29b/);
+      const head = headOf(b);
+      for (const attempt of [1, 2]) {
+        const r = clear(b);
+        assert.equal(r.ok, false, `attempt ${attempt}`);
+        assert.equal(r.deferred, 'intent-to-add', `attempt ${attempt}: ${JSON.stringify(r)}`);
+        assert.equal(r.reason, 'intent-to-add');
+        assert.notEqual(r.reason, 'changed-during-clear');
+        assert.match(r.notice, /projects\/p\/hot\.md/);
+        assert.match(r.notice, /git restore --staged/);
+        assert.deepEqual(r.backups, [], 'nothing was set aside');
+        assert.equal(readRel(b, 'projects/p/hot.md'), W1);
+        assert.equal(headOf(b), head);
+      }
+      // the person releases the entry: the clearing step goes through
+      cgitOk(b, ['restore', '--staged', '--', 'projects/p/hot.md']);
+      assert.equal(clear(b).ok, true);
+    },
+    { ita: true },
+  );
 });
 
 test('a user .gitignore rule that hides projects/*/sessions/ defers the move and touches nothing', () => {

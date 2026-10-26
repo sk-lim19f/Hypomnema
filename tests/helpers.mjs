@@ -57,9 +57,25 @@ const SESSION_TMP_HOME = mkdtempSync(join(tmpdir(), 'hypo-session-home-'));
 // window for writers we have not named.
 const RM_RETRY = { recursive: true, force: true, maxRetries: 10, retryDelay: 100 };
 
+// Node 18 to 22 (the CI matrix) retry only the final rmdir on ENOTEMPTY: the files a late writer
+// added after the children were removed are never removed again, so maxRetries alone fails there
+// every time the writer is still going. Run the whole removal again instead. Measured on PR #320,
+// where the late-writer test failed on all six Node 18/20/22 jobs and passed on Node 26 locally.
+const RM_AGAIN = ['ENOTEMPTY', 'EBUSY', 'EPERM'];
+function rmTree(path) {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return rmSync(path, RM_RETRY);
+    } catch (err) {
+      if (attempt >= 5 || !RM_AGAIN.includes(err.code)) throw err;
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, attempt * 200);
+    }
+  }
+}
+
 process.on('exit', () => {
   try {
-    rmSync(SESSION_TMP_HOME, RM_RETRY);
+    rmTree(SESSION_TMP_HOME);
   } catch {}
 });
 
@@ -105,7 +121,7 @@ function withTmpDir(fn) {
   try {
     fn(dir);
   } finally {
-    rmSync(dir, { recursive: true, force: true });
+    rmTree(dir);
   }
 }
 
@@ -114,7 +130,7 @@ function withTmpHome(fn) {
   try {
     fn(dir);
   } finally {
-    rmSync(dir, RM_RETRY);
+    rmTree(dir);
   }
 }
 
@@ -297,7 +313,7 @@ function withWiki(mutate, fn) {
     spawnSync('git', ['commit', '-m', 'init'], { cwd: dir, encoding: 'utf-8' });
     fn(dir, today);
   } finally {
-    rmSync(dir, { recursive: true, force: true });
+    rmTree(dir);
   }
 }
 
@@ -485,7 +501,7 @@ function withGrowthWiki(fn) {
     spawnSync('git', ['commit', '-q', '-m', 'init'], { cwd: dir });
     fn(dir);
   } finally {
-    rmSync(dir, { recursive: true, force: true });
+    rmTree(dir);
   }
 }
 
@@ -543,7 +559,7 @@ function withSyncedWiki(fn) {
     spawnSync('git', ['-C', dir, 'push', '-q', '-u', 'origin', 'HEAD']);
     fn(dir);
   } finally {
-    rmSync(base, { recursive: true, force: true });
+    rmTree(base);
   }
 }
 
@@ -668,8 +684,105 @@ function withFeedbackEnv(pages, fn, { claudeMd, memoryMd, projectId = 'proj' } =
       ]);
     fn({ base, wiki, claudeHome, projectId, memDir, runFb });
   } finally {
-    rmSync(base, { recursive: true, force: true });
+    rmTree(base);
   }
+}
+
+// Write-fault injection for child processes. Both preloads are CJS files loaded
+// with `node -r <preloadPath>`; they patch `fs` and then call
+// syncBuiltinESMExports() so ESM `import { writeFileSync } from 'node:fs'` sees
+// the patch. Each fires at most once per process and records that it fired in
+// `firedPath`, so a test can tell "the defense held" from "nothing was injected".
+
+// Tears the first raw write of a settings.json* path, but only when the env var
+// HYPO_TEST_FAULT_CALLER is set and that string appears in the call stack. That
+// lets a test arm one writer (`rawWriter`, `atomicWrite`) and leave the rest
+// alone. It writes the first half of the data, records the stack, and throws EIO.
+function settingsWriteFaultPreload(dir) {
+  const preloadPath = join(dir, 'settings-write-fault.cjs');
+  const firedPath = join(dir, 'settings-write-fault.fired');
+  writeFileSync(
+    preloadPath,
+    `'use strict';
+Error.stackTraceLimit = 100;
+const fs = require('node:fs');
+const path = require('node:path');
+const realWrite = fs.writeFileSync;
+const firedPath = ${JSON.stringify(firedPath)};
+let fired = false;
+fs.writeFileSync = function (target, data, options) {
+  const caller = process.env.HYPO_TEST_FAULT_CALLER;
+  if (!fired && caller && typeof target === 'string' && path.basename(target).startsWith('settings.json')) {
+    const stack = new Error().stack;
+    if (stack.includes(caller)) {
+      fired = true;
+      realWrite(target, data.slice(0, Math.floor(data.length / 2)), options);
+      realWrite(firedPath, stack);
+      const err = new Error('injected write failure');
+      err.code = 'EIO';
+      throw err;
+    }
+  }
+  return realWrite.apply(this, arguments);
+};
+require('node:module').syncBuiltinESMExports();
+`,
+  );
+  return { preloadPath, firedPath };
+}
+
+// Fails the git pre-commit hook publish step. HYPO_TEST_HOOK_FAULT=write tears
+// the first writeFileSync to a path whose basename starts with `pre-commit` and
+// has no `.bak` in it (half the data, then EIO). HYPO_TEST_HOOK_FAULT=rename
+// throws EIO from the first renameSync whose target basename is exactly
+// `pre-commit`, without moving anything. With the env var unset it does nothing.
+function hookWriteFaultPreload(dir) {
+  const preloadPath = join(dir, 'hook-write-fault.cjs');
+  const firedPath = join(dir, 'hook-write-fault.fired');
+  writeFileSync(
+    preloadPath,
+    `'use strict';
+const fs = require('node:fs');
+const path = require('node:path');
+const realWrite = fs.writeFileSync;
+const realRename = fs.renameSync;
+const firedPath = ${JSON.stringify(firedPath)};
+let fired = false;
+function fail(target) {
+  fired = true;
+  realWrite(firedPath, String(target));
+  const err = new Error('injected hook write failure');
+  err.code = 'EIO';
+  return err;
+}
+fs.writeFileSync = function (target, data, options) {
+  if (
+    !fired &&
+    process.env.HYPO_TEST_HOOK_FAULT === 'write' &&
+    typeof target === 'string' &&
+    path.basename(target).startsWith('pre-commit') &&
+    !target.includes('.bak')
+  ) {
+    realWrite(target, data.slice(0, Math.floor(data.length / 2)), options);
+    throw fail(target);
+  }
+  return realWrite.apply(this, arguments);
+};
+fs.renameSync = function (from, to) {
+  if (
+    !fired &&
+    process.env.HYPO_TEST_HOOK_FAULT === 'rename' &&
+    typeof to === 'string' &&
+    path.basename(to) === 'pre-commit'
+  ) {
+    throw fail(to);
+  }
+  return realRename.apply(this, arguments);
+};
+require('node:module').syncBuiltinESMExports();
+`,
+  );
+  return { preloadPath, firedPath };
 }
 
 const FB_GLOBAL_L1 = {
@@ -849,6 +962,7 @@ export {
   hasPendingBackgroundWork,
   hasSymlinkAncestor,
   hasTypedUserApproval,
+  hookWriteFaultPreload,
   hypoIsClean,
   injectedContext,
   isCaptureCandidate,
@@ -911,6 +1025,7 @@ export {
   scopeVisible,
   seedCloseTranscript,
   selectFormatter,
+  settingsWriteFaultPreload,
   sessionCloseFileStatus,
   sessionCloseGlobalStatus,
   sessionLogReadCandidates,
