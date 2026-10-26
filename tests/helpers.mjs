@@ -57,9 +57,25 @@ const SESSION_TMP_HOME = mkdtempSync(join(tmpdir(), 'hypo-session-home-'));
 // window for writers we have not named.
 const RM_RETRY = { recursive: true, force: true, maxRetries: 10, retryDelay: 100 };
 
+// Node 18 to 22 (the CI matrix) retry only the final rmdir on ENOTEMPTY: the files a late writer
+// added after the children were removed are never removed again, so maxRetries alone fails there
+// every time the writer is still going. Run the whole removal again instead. Measured on PR #320,
+// where the late-writer test failed on all six Node 18/20/22 jobs and passed on Node 26 locally.
+const RM_AGAIN = ['ENOTEMPTY', 'EBUSY', 'EPERM'];
+function rmTree(path) {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return rmSync(path, RM_RETRY);
+    } catch (err) {
+      if (attempt >= 5 || !RM_AGAIN.includes(err.code)) throw err;
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, attempt * 200);
+    }
+  }
+}
+
 process.on('exit', () => {
   try {
-    rmSync(SESSION_TMP_HOME, RM_RETRY);
+    rmTree(SESSION_TMP_HOME);
   } catch {}
 });
 
@@ -105,7 +121,7 @@ function withTmpDir(fn) {
   try {
     fn(dir);
   } finally {
-    rmSync(dir, RM_RETRY);
+    rmTree(dir);
   }
 }
 
@@ -114,7 +130,7 @@ function withTmpHome(fn) {
   try {
     fn(dir);
   } finally {
-    rmSync(dir, RM_RETRY);
+    rmTree(dir);
   }
 }
 
@@ -297,7 +313,7 @@ function withWiki(mutate, fn) {
     spawnSync('git', ['commit', '-m', 'init'], { cwd: dir, encoding: 'utf-8' });
     fn(dir, today);
   } finally {
-    rmSync(dir, RM_RETRY);
+    rmTree(dir);
   }
 }
 
@@ -485,7 +501,7 @@ function withGrowthWiki(fn) {
     spawnSync('git', ['commit', '-q', '-m', 'init'], { cwd: dir });
     fn(dir);
   } finally {
-    rmSync(dir, RM_RETRY);
+    rmTree(dir);
   }
 }
 
@@ -543,7 +559,7 @@ function withSyncedWiki(fn) {
     spawnSync('git', ['-C', dir, 'push', '-q', '-u', 'origin', 'HEAD']);
     fn(dir);
   } finally {
-    rmSync(base, RM_RETRY);
+    rmTree(base);
   }
 }
 
@@ -668,7 +684,7 @@ function withFeedbackEnv(pages, fn, { claudeMd, memoryMd, projectId = 'proj' } =
       ]);
     fn({ base, wiki, claudeHome, projectId, memDir, runFb });
   } finally {
-    rmSync(base, RM_RETRY);
+    rmTree(base);
   }
 }
 

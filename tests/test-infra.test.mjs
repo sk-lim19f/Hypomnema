@@ -96,15 +96,21 @@ try {
 });
 
 // The race test above shows the cleanup survives one late writer; it cannot show that ENOTEMPTY
-// happened, so a cleanup without retries could pass it on a quiet disk. This one pins the call
-// itself: each helper removes its directory with Node's retry options on.
-// Disabling the check: in helpers.mjs make `RM_RETRY` `{ recursive: true, force: true }`.
-test('the fixture cleanups remove their directory with retry options', () => {
+// happened, so a cleanup without retries could pass it on a quiet disk. This one makes the first
+// removal of each helper's directory fail the way Node 18 to 22 do when a late writer outlasts
+// their rmdir-only retries (ENOTEMPTY, directory untouched) and checks the helper removes it anyway.
+// Disabling the check: in helpers.mjs rmTree make `attempt >= 5` `attempt >= 1`.
+test('the fixture cleanups remove their directory again after an ENOTEMPTY removal', () => {
   const nodeFs = createRequire(import.meta.url)('node:fs');
   const { rmSync } = nodeFs;
   const calls = [];
   nodeFs.rmSync = (path, options) => {
     calls.push({ path, options });
+    if (calls.filter((c) => c.path === path).length === 1) {
+      throw Object.assign(new Error(`ENOTEMPTY: directory not empty, rmdir '${path}'`), {
+        code: 'ENOTEMPTY',
+      });
+    }
     return rmSync(path, options);
   };
   syncBuiltinESMExports();
@@ -118,8 +124,9 @@ test('the fixture cleanups remove their directory with retry options', () => {
   }
   assert.equal(dirs.length, 2);
   for (const dir of dirs) {
-    const call = calls.find((c) => c.path === dir);
-    assert.ok(call, `${dir}: the helper never removed its directory through rmSync`);
+    const mine = calls.filter((c) => c.path === dir);
+    assert.ok(mine.length >= 2, `${dir}: the helper did not try again after ENOTEMPTY`);
+    const call = mine[mine.length - 1];
     assert.equal(call.options.recursive, true, dir);
     assert.ok(call.options.maxRetries >= 3, `${dir}: ${JSON.stringify(call.options)}`);
     assert.ok(call.options.retryDelay > 0, `${dir}: ${JSON.stringify(call.options)}`);
