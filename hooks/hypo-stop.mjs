@@ -152,6 +152,9 @@ for (const stage of STAGES) {
       input: raw,
       encoding: 'utf-8',
       timeout: stage.timeoutMs,
+      // The stage's own budget, so a stage that caps its work by it reads the same number
+      // this table enforces instead of keeping a copy that can drift.
+      env: { ...process.env, HYPO_STAGE_TIMEOUT_MS: String(stage.timeoutMs) },
     });
   } catch (err) {
     process.stderr.write(`[hypo-stop] error: ${stage.file}: ${err?.message ?? String(err)}\n`);

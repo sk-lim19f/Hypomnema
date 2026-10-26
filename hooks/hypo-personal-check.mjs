@@ -202,7 +202,7 @@ process.stdin.on('end', () => {
     if (w.skippedForTime) {
       // No time left after the gate: not a failure of the sync, the next /compact repeats it.
       healNotices.push(
-        `[WIKI CHECK] feedback projection drift (${gate.driftTargets.join(', ')}) was not re-synced: the gate used up its ${GATE_DEADLINE_MS} ms deadline. The next /compact tries again.`,
+        `[WIKI CHECK] feedback projection drift (${gate.driftTargets.join(', ')}) was not re-synced: too little of the ${GATE_DEADLINE_MS} ms gate deadline was left to run the sync. The next /compact tries again.`,
       );
     } else if (w.error?.code === 'ETIMEDOUT') {
       // The write was started with the time that was left and ran out of it: the same

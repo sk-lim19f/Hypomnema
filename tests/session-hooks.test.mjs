@@ -460,6 +460,31 @@ test('hypo-auto-stage.mjs records the write when HYPO_DIR has a trailing separat
   });
 });
 
+// Distinguishes: the path git reports (the real one) from the spelling the tool was given. A
+// directory symlink inside the vault (latest -> proj) names the same file two ways, and the
+// session record is compared against `git status`, which prints proj/a.md. Disabling the fix: in
+// vaultRelatives (hooks/hypo-shared.mjs) change `pairs.unshift(` back to `pairs.push(`.
+test('hypo-auto-stage.mjs records a write through an in-vault directory symlink under the path git reports', () => {
+  withGrowthWiki((dir) => {
+    mkdirSync(join(dir, 'proj'), { recursive: true });
+    writeFileSync(join(dir, 'proj', 'a.md'), '# a\n');
+    symlinkSync(join(dir, 'proj'), join(dir, 'latest'));
+    const r = spawnSync(process.execPath, [join(HOOKS, 'hypo-auto-stage.mjs')], {
+      input: JSON.stringify({
+        session_id: 'sess-dirlink',
+        tool_name: 'Write',
+        tool_input: { file_path: join(dir, 'latest', 'a.md'), content: '# a\n' },
+      }),
+      encoding: 'utf-8',
+      env: { ...process.env, HOME: SESSION_TMP_HOME, HYPO_DIR: dir },
+    });
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    assert.deepEqual(JSON.parse(readFileSync(touchedPathsPath(dir, 'sess-dirlink'), 'utf-8')), [
+      'proj/a.md',
+    ]);
+  });
+});
+
 test('hypo-auto-stage.mjs does NOT accumulate a Read (non-mutating tool)', () => {
   withGrowthWiki((dir) => {
     mkdirSync(join(dir, 'pages'), { recursive: true });
@@ -943,6 +968,41 @@ test('hypo-stop.mjs: a stage that hangs past its budget is reported as timed out
     assert.ok(
       ran.includes('hypo-auto-commit.mjs') && ran.includes('hypo-auto-minimal-crystallize.mjs'),
       `the stages after a hung one must still run: ${ran}`,
+    );
+  });
+});
+
+// Distinguishes: a stage that is told the budget hypo-stop enforces on it (HYPO_STAGE_TIMEOUT_MS =
+// its own STAGES timeoutMs) from one that has to keep a copy of that number. The expected values
+// are read from the STAGES table in the source, so the table stays the one place they are written.
+// Disabling the pass-down: drop the `env:` line of the stage spawn in hypo-stop.mjs.
+test('hypo-stop.mjs: each stage is started with its own STAGES timeout in HYPO_STAGE_TIMEOUT_MS', () => {
+  const table = [
+    ...readFileSync(join(HOOKS, 'hypo-stop.mjs'), 'utf-8').matchAll(
+      /\{ file: '([^']+)', timeoutMs: (\d+) \}/g,
+    ),
+  ];
+  assert.equal(table.length, 4, 'the STAGES table has the four stages');
+  withTmpDir((dir) => {
+    const hooksDir = join(dir, 'hooks');
+    mkdirSync(hooksDir);
+    cpSync(join(HOOKS, 'hypo-stop.mjs'), join(hooksDir, 'hypo-stop.mjs'));
+    const seenPath = join(dir, 'seen.log');
+    const echo = (file) =>
+      `import { appendFileSync } from 'node:fs'; appendFileSync(${JSON.stringify(seenPath)}, ${JSON.stringify(file)} + '=' + process.env.HYPO_STAGE_TIMEOUT_MS + '\\n'); console.log(JSON.stringify({ continue: true, suppressOutput: true }));`;
+    for (const [, file] of table) writeFileSync(join(hooksDir, file), echo(file));
+    const r = spawnSync(process.execPath, [join(hooksDir, 'hypo-stop.mjs')], {
+      input: JSON.stringify({ session_id: 'sess-stop-budget-env' }),
+      encoding: 'utf-8',
+      // an inherited value must not leak through: each stage gets its own
+      env: { ...process.env, HOME: SESSION_TMP_HOME, HYPO_DIR: dir, HYPO_STAGE_TIMEOUT_MS: '1' },
+    });
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    const seen = readFileSync(seenPath, 'utf-8').trim().split('\n');
+    assert.deepEqual(
+      seen,
+      table.map(([, file, ms]) => `${file}=${ms}`),
+      'each stage sees its own timeoutMs, in table order',
     );
   });
 });
@@ -1897,6 +1957,53 @@ test('file-watch still injects non-ignored wiki file (e.g. hot.md)', () => {
       out.systemMessage && /active project state/.test(out.systemMessage),
       `expected hot.md injection via systemMessage, got: ${out.systemMessage}`,
     );
+  });
+});
+
+// Distinguishes: a vault named with a trailing separator, or reached through a symlink, is still
+// the vault for file-watch (a string prefix test misses both and the toast never shows), and the
+// .hypoignore guard still holds when the secret is named through the link or through the real
+// directory a link points to. Disabling the fix: in hooks/hypo-file-watch.mjs make `rels` the
+// empty list unless `givenPath.startsWith(HYPO_DIR + '/')`.
+test('file-watch recognizes the vault with a trailing separator or through a symlink, and still refuses ignored files there', () => {
+  withGrowthWiki((dir) => {
+    writeFileSync(join(dir, '.hypoignore'), '.env*\nsecret-dir/**\nplainlink/**\n');
+    writeFileSync(join(dir, 'hot.md'), '# hot\n\nactive project state\n');
+    mkdirSync(join(dir, 'secret-dir'));
+    writeFileSync(join(dir, 'secret-dir', 'k.md'), 'TOPSECRET\n');
+    writeFileSync(join(dir, '.env'), 'OPENAI_API_KEY=sk-leakedvalue\n');
+    const link = join(dirname(dir), `${basename(dir)}-fwlink`);
+    symlinkSync(dir, link);
+    symlinkSync(join(dir, 'secret-dir'), join(dir, 'alias'));
+    // a pattern that names only the link: the real spelling (plain/n.md) is not ignored
+    mkdirSync(join(dir, 'plain'));
+    writeFileSync(join(dir, 'plain', 'n.md'), 'LINKNAMED\n');
+    symlinkSync(join(dir, 'plain'), join(dir, 'plainlink'));
+    try {
+      const watch = (hypoDir, file) => {
+        const r = spawnSync(process.execPath, [join(HOOKS, 'hypo-file-watch.mjs')], {
+          input: JSON.stringify({ file_path: file }),
+          encoding: 'utf-8',
+          env: { ...process.env, HOME: SESSION_TMP_HOME, HYPO_DIR: hypoDir },
+        });
+        assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+        return JSON.parse(r.stdout).systemMessage || '';
+      };
+      assert.match(watch(dir + '/', join(dir, 'hot.md')), /active project state/, 'trailing slash');
+      assert.match(
+        watch(link, join(link, 'hot.md')),
+        /active project state/,
+        'link, given spelling',
+      );
+      assert.match(watch(link, join(dir, 'hot.md')), /active project state/, 'link, real spelling');
+      assert.equal(watch(dir, join(dirname(dir), 'elsewhere.md')), '', 'outside the vault');
+      assert.equal(watch(link, join(link, '.env')), '', 'ignored file through the link');
+      assert.equal(watch(dir, join(dir, 'alias', 'k.md')), '', 'ignored dir named through a link');
+      assert.equal(watch(dir, join(dir, 'plainlink', 'n.md')), '', 'pattern naming the link');
+      assert.ok(!/TOPSECRET|sk-leaked/.test(watch(dir + '/', join(dir, 'secret-dir', 'k.md'))));
+    } finally {
+      rmSync(link, { force: true });
+    }
   });
 });
 
@@ -5116,7 +5223,7 @@ performance.now = () => (existsSync(${JSON.stringify(checked)}) ? real() + 36000
       );
       assert.match(
         spent.msg,
-        /feedback projection drift \(claude\) was not re-synced: the gate used up its/,
+        /feedback projection drift \(claude\) was not re-synced: too little of the 7000 ms gate deadline was left to run the sync/,
       );
     });
   });

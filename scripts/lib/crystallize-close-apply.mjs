@@ -5224,8 +5224,9 @@ function printCloseReport({
               `    To fix: resolve the gate blocker the JSON's gateBlockers[] names (the\n` +
               `    uncommitted file this session recorded writing, or a flagged one: commit\n` +
               `    or revert it; or the cause of a skipped check), then re-run the same\n` +
-              `    close. No fresh close phrase is needed: a close signal is spent only\n` +
-              `    once the marker lands.\n`
+              `    close. Re-run with --json to see gateBlockers[]; this text output does\n` +
+              `    not print it. No fresh close phrase is needed: a close signal is spent\n` +
+              `    only once the marker lands.\n`
             : markerSkipReason === 'session-close-lock-timeout'
               ? `    The close files were applied and committed, but another close of this\n` +
                 `    session held its close lock past the timeout, so no receipt or marker\n` +

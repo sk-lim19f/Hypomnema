@@ -94,11 +94,16 @@ import { closeGateStatus } from './close-gate-store.mjs';
 import { atomicWrite } from './atomic-write.mjs';
 
 // This stage's own share of the Stop budget: the `timeoutMs` of this file in the STAGES
-// table of hypo-stop.mjs (hypo-stop runs on import, so it cannot be imported for it).
+// table of hypo-stop.mjs, which passes it down as HYPO_STAGE_TIMEOUT_MS (hypo-stop runs on
+// import, so it cannot be imported for it). 10000 is the fallback when the variable is
+// missing or not a positive integer, such as a run of this file on its own.
 // The gate deadline is capped at that budget minus a reserve for the work after the gate,
 // measured from this process's start (performance.now() counts from there), so a slow
 // start leaves the gate less time instead of letting the stage be killed mid-gate.
-const STAGE_BUDGET_MS = 10000;
+const STAGE_BUDGET_MS = (() => {
+  const n = Number(process.env.HYPO_STAGE_TIMEOUT_MS);
+  return Number.isInteger(n) && n > 0 ? n : 10000;
+})();
 const STAGE_RESERVE_MS = 1000;
 
 // Carrying a systemMessage does not turn this into a block: the session is

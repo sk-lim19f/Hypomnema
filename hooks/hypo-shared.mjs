@@ -8935,7 +8935,9 @@ export function precompactGateStatus(hypoDir, opts = {}) {
         blockers.push({
           type: 'git',
           reason: timedOut
-            ? `could not list the uncommitted files within the gate deadline (${GATE_DEADLINE_MS} ms) and this session has a record of writing (마감 안에 미커밋 파일을 열거하지 못함, 이 세션의 기록이 있다. 다시 시도하면 된다)`
+            ? isValidSessionId(opts.sessionId)
+              ? `could not list the uncommitted files within the gate deadline (${GATE_DEADLINE_MS} ms) and this session has a record of writing (마감 안에 미커밋 파일을 열거하지 못함, 이 세션의 기록이 있다. 다시 시도하면 된다)`
+              : `could not list the uncommitted files within the gate deadline (${GATE_DEADLINE_MS} ms), and with no session id this session's files cannot be told apart: pass --session-id, or retry (마감 안에 미커밋 파일을 열거하지 못함, 세션 ID가 없어 이 세션의 파일을 가를 수 없다. --session-id를 주거나 다시 시도하면 된다)`
             : git.reason,
         });
       }
@@ -11223,10 +11225,14 @@ export function isExcludedFromCommit(hypoDir, relPath, patterns = loadHypoIgnore
   return patterns.length > 0 && isIgnored(join(hypoDir, relPath), hypoDir, patterns);
 }
 
-// The vault-relative spellings of `filePath` that are inside `root`: the path as given and, when
-// the files exist, their real paths (a symlinked vault written through its real path). A string
-// prefix test is not used: a trailing separator on HYPO_DIR or a symlink would switch it off.
-// Shared by the close guard and the auto-stage hook, which must agree on what is in the vault.
+// The vault-relative spellings of `filePath` that are inside `root`: the real-path spelling first
+// (when the paths resolve) and the path as given second (so a symlinked vault, or a file reached
+// through a symlinked directory inside it, is still found). The order is a contract: git reports
+// the real spelling, so a caller that records one path takes `[0]`; a caller that only asks
+// whether any spelling matches iterates all of them. A string prefix test is not used: a trailing
+// separator on HYPO_DIR or a symlink would switch it off.
+// Shared by the close guard, the auto-stage hook and the file-watch hook, which must agree on what
+// is in the vault.
 export function vaultRelatives(root, filePath) {
   const real = (p) => {
     try {
@@ -11250,7 +11256,7 @@ export function vaultRelatives(root, filePath) {
   const pairs = [[root, filePath]];
   const realRoot = real(root);
   const realFile = realThroughAncestor(filePath);
-  if (realRoot !== null && realFile !== null) pairs.push([realRoot, realFile]);
+  if (realRoot !== null && realFile !== null) pairs.unshift([realRoot, realFile]);
   return pairs
     .map(([r, f]) => relative(r, f))
     .filter((rel) => rel !== '' && rel.split(sep)[0] !== '..' && !isAbsolute(rel))

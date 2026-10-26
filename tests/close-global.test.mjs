@@ -7832,6 +7832,83 @@ test('Stop: a finished close whose cwd proof was cut by the gate deadline contin
   });
 });
 
+// Distinguishes: a Stop gate deadline capped at what is left of the stage's own budget (the
+// stage's timeout minus a reserve, counted from process start) from the plain GATE_DEADLINE_MS
+// after a late start. A preload freezes performance.now(), so the clock at entry is exact whatever
+// the machine's speed, and the same finished-close fixture is run four ways:
+//   clock 0, no cap in play: the proof completes, no notice (control, the fixture is not cut by itself)
+//   clock 9500: the cap (9000) is already past, the proof is cut, Stop continues with the notice
+//   clock 9500 in a copy with the cap removed: a full 7000 ms is left, the proof completes, no notice
+//   clock 600 with HYPO_STAGE_TIMEOUT_MS=1500 (a smaller budget than the default 10000): cap is 500,
+//   past, so the notice; the same clock without the variable leaves the default budget and no notice
+// Disabling the cap: in hooks/hypo-auto-minimal-crystallize.mjs make the gate deadline `end` just
+// `performance.now() + GATE_DEADLINE_MS`. Disabling the env read: make STAGE_BUDGET_MS the literal
+// 10000. Either reddens the matching rows.
+test('Stop: the gate deadline is capped at the stage budget left, and the budget is the one hypo-stop passes down', () => {
+  const sid = 's-t10-stop-cap';
+  const NOTICE = /did not finish within the time limit/;
+  withResolvedClose(sid, { secondSignal: false, toolUseLines: [T10_EDIT_LINE] }, (dir) => {
+    withPackageCopy((root) => {
+      const freeze = (name, ms) => {
+        const f = join(root, name);
+        writeFileSync(f, `performance.now = () => ${ms};\n`);
+        return { NODE_OPTIONS: `--require ${f}` };
+      };
+      const stop = (env, rootDir = root) => {
+        const r = spawnSync(
+          process.execPath,
+          [join(rootDir, 'hooks', 'hypo-auto-minimal-crystallize.mjs')],
+          {
+            input: JSON.stringify({
+              session_id: sid,
+              transcript_path: t10Transcript(sid),
+              cwd: T10_CWD,
+            }),
+            encoding: 'utf-8',
+            env: { ...process.env, HOME: SESSION_TMP_HOME, HYPO_DIR: dir, ...env },
+            timeout: 60000,
+          },
+        );
+        assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+        const out = JSON.parse(r.stdout);
+        assert.notEqual(out.decision, 'block', `a time limit must not block Stop: ${r.stdout}`);
+        return out.systemMessage || '';
+      };
+      assert.ok(!NOTICE.test(stop(freeze('clock-0.cjs', 0))), 'control: clock 0, proof completes');
+      assert.match(stop(freeze('clock-9500.cjs', 9500)), NOTICE, 'the cap is past at entry');
+
+      withPackageCopy((uncapped) => {
+        const f = join(uncapped, 'hooks', 'hypo-auto-minimal-crystallize.mjs');
+        const src = readFileSync(f, 'utf-8');
+        const next = src.replace(
+          'end: Math.min(performance.now() + GATE_DEADLINE_MS, STAGE_BUDGET_MS - STAGE_RESERVE_MS),',
+          'end: performance.now() + GATE_DEADLINE_MS,',
+        );
+        assert.notEqual(next, src, 'the copy has the cap to remove');
+        writeFileSync(f, next);
+        const frozen = join(uncapped, 'clock-9500.cjs');
+        writeFileSync(frozen, 'performance.now = () => 9500;\n');
+        assert.ok(
+          !NOTICE.test(stop({ NODE_OPTIONS: `--require ${frozen}` }, uncapped)),
+          'without the cap the same clock leaves the full deadline',
+        );
+      });
+
+      const at600 = freeze('clock-600.cjs', 600);
+      assert.ok(!NOTICE.test(stop(at600)), 'default budget: 600 ms in leaves the full deadline');
+      assert.match(
+        stop({ ...at600, HYPO_STAGE_TIMEOUT_MS: '1500' }),
+        NOTICE,
+        'a smaller stage budget caps the deadline',
+      );
+      assert.ok(
+        !NOTICE.test(stop({ ...at600, HYPO_STAGE_TIMEOUT_MS: 'junk' })),
+        'a value that is not a positive integer falls back to the default budget',
+      );
+    });
+  });
+});
+
 // Distinguishes: a git blocker that names no file (the enumeration was cut by the deadline, the
 // session did record writing) from one that names a file: only the second says unsaved work is
 // waiting, so only the second asks to reconfirm. Disabling the fix: in
@@ -7893,6 +7970,12 @@ test('the gate: a listing cut by the deadline blocks a call with no session id, 
       none.blockers.some((b) => b.type === 'git'),
       `no session id: ${JSON.stringify(none.blockers)}`,
     );
+    // With no session id there is no record to claim, so the reason must not say there is one:
+    // it says the listing was cut and tells the caller to pass --session-id.
+    const noIdReason = none.blockers.find((b) => b.type === 'git').reason;
+    assert.match(noIdReason, /no session id/, noIdReason);
+    assert.match(noIdReason, /--session-id/, noIdReason);
+    assert.ok(!/has a record of writing/.test(noIdReason), noIdReason);
     const noRecord = precompactGateStatus(dir, { ...base, sessionId: 's-no-record' });
     assert.deepEqual(
       noRecord.blockers.filter((b) => b.type === 'git'),

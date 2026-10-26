@@ -20,6 +20,7 @@ import {
   currentDevice,
   scopeVisible,
   readVisibilityScope,
+  vaultRelatives,
 } from './hypo-shared.mjs';
 
 const MAX_CHARS = 2000;
@@ -34,12 +35,20 @@ process.stdin.on('end', () => {
       data = JSON.parse(raw);
     } catch {}
 
-    const filePath = data.file_path || data.path || '';
+    const givenPath = data.file_path || data.path || '';
 
-    if (!filePath.startsWith(HYPO_DIR + '/') && filePath !== HYPO_DIR) {
+    // Inside the vault by a path comparison on real paths, not a string prefix: a HYPO_DIR with a
+    // trailing separator, or a vault reached through a symlink, still counts. Every check below
+    // then uses the file spelled from HYPO_DIR. The .hypoignore guard checks every spelling
+    // (a pattern may name the symlink or the directory it points to); the real-path one is read.
+    const rels =
+      typeof givenPath === 'string' && givenPath ? vaultRelatives(HYPO_DIR, givenPath) : [];
+    if (rels.length === 0) {
       console.log(JSON.stringify({ continue: true, suppressOutput: true }));
       return;
     }
+    const rel = rels[0];
+    const filePath = join(HYPO_DIR, rel);
 
     // Privacy guard: refuse to emit .hypoignore-matched paths. Without this,
     // `.env*` or other secrets under HYPO_DIR are re-emitted in this hook's
@@ -48,7 +57,7 @@ process.stdin.on('end', () => {
     // FileChanged actually appears on a given machine is unmeasured, so the
     // only safe assumption is that a matched path must never be put in it.
     const patterns = loadHypoIgnore(HYPO_DIR);
-    if (patterns.length > 0 && isIgnored(filePath, HYPO_DIR, patterns)) {
+    if (patterns.length > 0 && rels.some((r) => isIgnored(join(HYPO_DIR, r), HYPO_DIR, patterns))) {
       console.log(JSON.stringify({ continue: true, suppressOutput: true }));
       return;
     }
@@ -71,7 +80,7 @@ process.stdin.on('end', () => {
     }
 
     const content = fileRaw.slice(0, MAX_CHARS);
-    const relPath = filePath.replace(HYPO_DIR + '/', '');
+    const relPath = rel;
 
     // Built inline rather than through buildOutput(): the hook reference's
     // FileChanged section documents the same two fields as its CwdChanged
@@ -95,12 +104,11 @@ process.stdin.on('end', () => {
     // this package returns watchPaths to seed that list. The watch list is
     // session-global though, not scoped to this plugin: if another hook or
     // plugin seeds it, this matcher-less group fires on every watched file,
-    // not just wiki ones. The HYPO_DIR check above (`filePath.startsWith(HYPO_DIR
-    // + '/')`, a string-prefix test that does not resolve symlinks) still
-    // returns immediately for any path that does not start with HYPO_DIR, so
-    // a watch seeded elsewhere cannot point this hook at a path outside the
-    // wiki. A symlink living inside the wiki is a separate case: its path
-    // still starts with HYPO_DIR and passes the check above, but
+    // not just wiki ones. The vaultRelatives check above still returns
+    // immediately for any path that is not inside HYPO_DIR (as given or by its
+    // real path), so a watch seeded elsewhere cannot point this hook at a path
+    // outside the wiki. A symlink living inside the wiki is a separate case:
+    // its path is inside HYPO_DIR as given and passes the check above, but
     // readFileSync follows it, so whatever that link points to, inside the
     // wiki or not, is what actually gets emitted.
     console.log(
