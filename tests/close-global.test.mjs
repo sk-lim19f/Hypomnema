@@ -43,6 +43,8 @@ import {
   isForeignUncommittedEntry,
   recordShardAppend,
   recordTouchedPaths,
+  migrationState,
+  stampSessionRecord,
   touchedPathsPath,
   rootLogHeadingKey,
   sessionClosedMarkerPath,
@@ -7415,6 +7417,82 @@ test("a project with today's session-log and no entry is a notice in a migrated 
   });
 });
 
+// Runs `fn` with a `git` first on PATH that logs each call and then runs the real one, and
+// returns how many calls it saw. The runner process is the only one that sees the changed PATH.
+function countGitCalls(fn) {
+  const realGit = spawnSync('which', ['git'], { encoding: 'utf-8' }).stdout.trim();
+  let calls = 0;
+  withTmpDir((shim) => {
+    const log = join(shim, 'calls.log');
+    writeFileSync(join(shim, 'git'), `#!/bin/sh\necho x >> '${log}'\nexec '${realGit}' "$@"\n`);
+    chmodSync(join(shim, 'git'), 0o755);
+    const savedPath = process.env.PATH;
+    process.env.PATH = `${shim}:${savedPath}`;
+    try {
+      fn();
+    } finally {
+      process.env.PATH = savedPath;
+    }
+    calls = existsSync(log) ? readFileSync(log, 'utf-8').split('\n').filter(Boolean).length : 0;
+  });
+  return calls;
+}
+
+// Distinguishes: a migration classification given the gate's deadline (an exhausted one starts no
+// git call, and the result is a notice that the classification did not finish, never a legacy
+// diagnosis and never a blocker) from the same state with time to spare (the legacy notice).
+// Disabling the fix: in migrationState (hooks/hypo-shared.mjs) make `git` ignore `deadline`
+// (`const t = undefined;`), or in sessionCloseFileStatus call `migrationState(hypoDir)` without it.
+test('the global close check hands the gate deadline to the migration classification', () => {
+  withMigratedLegacyVault(true, (dir) => {
+    const spent = { end: performance.now() - 1 };
+    let state;
+    const calls = countGitCalls(() => {
+      state = migrationState(dir, { deadline: spent });
+    });
+    assert.equal(state, 'unknown');
+    assert.equal(calls, 0, 'an exhausted deadline starts no git call');
+
+    let s;
+    const closeCalls = countGitCalls(() => {
+      s = sessionCloseGlobalStatus(dir, { deadline: spent });
+    });
+    assert.equal(s.ok, true, JSON.stringify(s));
+    assert.ok(
+      s.notices.some((n) => n.type === 'close-legacy-unclassified' && n.project === 'test-project'),
+      JSON.stringify(s.notices),
+    );
+    assert.ok(!s.notices.some((n) => n.type === 'close-legacy'), JSON.stringify(s.notices));
+    assert.equal(
+      closeCalls,
+      0,
+      'the global close check starts no git call once the deadline is spent',
+    );
+
+    const gate = precompactGateStatus(dir, {
+      claudeHome: join(dir, '.claude-none'),
+      deadline: spent,
+    });
+    assert.equal(
+      gate.blockers.some((b) => b.type === 'close'),
+      false,
+      JSON.stringify(gate.blockers),
+    );
+    assert.ok(
+      gate.notices.some((n) => n.type === 'close-legacy-unclassified'),
+      `the gate hands its own deadline down: ${JSON.stringify(gate.notices)}`,
+    );
+
+    // With time to spare the same state is the definitive legacy notice.
+    const roomy = sessionCloseGlobalStatus(dir, { deadline: { end: performance.now() + 60000 } });
+    assert.ok(
+      roomy.notices.some((n) => n.type === 'close-legacy'),
+      JSON.stringify(roomy.notices),
+    );
+    assert.equal(migrationState(dir, { deadline: { end: performance.now() + 60000 } }), 'migrated');
+  });
+});
+
 // Disabling the check: in crystallize-close-check.mjs make the `!entryOnDisk` notice
 // branch unreachable (`if (false)`). The test-project line gets a ✓ again.
 test('--check-session-close text: the entry line is ticked only when an entry is on disk, a heading-only close gets a notice line', () => {
@@ -8226,6 +8304,7 @@ test('an unrecorded valid foreign entry is a foreign-entry notice, not a git blo
 test("this session's recorded uncommitted entry, and another session's committed entry edited since, block as known-session-write, and are unresolved notices when unrecorded (pair)", () => {
   withWiki(anchorTestProject, (dir, today) => {
     const sid = 's-t10-own-entry';
+    stampSessionRecord(dir, sid);
     const gate = (sessionId) =>
       precompactGateStatus(dir, {
         claudeHome: join(dir, '.claude-none'),
@@ -8274,6 +8353,9 @@ function withCommittedShard(fn) {
       `---\ntitle: Session Log ${today} (test-project)\ntype: session-log\nupdated: ${today}\n---\n\n` +
       `# Session Log ${today} (test-project)\n\n## [${today}] own close\n`;
     writeFileSync(join(dir, rel), own);
+    // Both sessions began on a version that records every write.
+    stampSessionRecord(dir, S1_SID);
+    stampSessionRecord(dir, 's-t10-s1-fresh');
     recordTouchedPaths(dir, S1_SID, [rel]);
     const git = (...a) =>
       spawnSync('git', ['-C', dir, ...a], {
@@ -8522,6 +8604,7 @@ function withForeignEntry(fn) {
         }),
       );
     const probe = () => isForeignUncommittedEntry(dir, rel, FE_MINE);
+    stampSessionRecord(dir, FE_MINE);
     write();
     assert.equal(probe(), true, 'precondition: the entry its path names is foreign');
     fn({ dir, today, rel, write, probe });
@@ -8753,6 +8836,7 @@ function withFiveCallerVault(sid, { recorded, pathsUnknown, foreign, pinned }, f
       // The pin feeds --mark's proof of this close, not the git axis. apply opens its
       // own close, so it runs without one.
       if (pinned) pinCommittedClose(dir, sid);
+      stampSessionRecord(dir, sid);
       writeFileSync(join(dir, foreign), '# another session wrote this\n');
       if (pathsUnknown) fivePathsUnknownFlag(dir, sid);
       if (recorded) {

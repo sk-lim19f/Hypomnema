@@ -65,18 +65,22 @@ const givenPath = input.tool_input?.file_path ?? '';
 // trailing separator, or a vault reached through a symlink or a relative spelling, still counts.
 // A string test that misses leaves no touched-paths record and no failure flag for a write that
 // is really in the vault, and the close then does not see that uncommitted file as this session's.
-const rel =
-  typeof givenPath === 'string' && givenPath ? vaultRelatives(HYPO_DIR, givenPath)[0] : undefined;
+const rels = typeof givenPath === 'string' && givenPath ? vaultRelatives(HYPO_DIR, givenPath) : [];
+const rel = rels[0];
 // The same file spelled from HYPO_DIR, for every git and ignore call below.
 const filePath = rel === undefined ? givenPath : join(HYPO_DIR, rel);
 
 if (rel !== undefined) {
   const patterns = loadHypoIgnore(HYPO_DIR);
+  // A pattern may name the symlink or the directory it points to, so every spelling is checked
+  // (hypo-file-watch does the same). Staging and recording use the real path, so an ignored alias
+  // would otherwise bring an ignored directory's content into the commit through its other name.
+  const ignoredSpellings =
+    patterns.length === 0
+      ? []
+      : rels.filter((r) => isIgnored(join(HYPO_DIR, r), HYPO_DIR, patterns));
   // Only a write stages: a Read of a vault file must not change the index.
-  if (
-    WRITE_TOOLS.has(input.tool_name) &&
-    (patterns.length === 0 || !isIgnored(filePath, HYPO_DIR, patterns))
-  ) {
+  if (WRITE_TOOLS.has(input.tool_name) && ignoredSpellings.length === 0) {
     // Under the vault commit lock, like every other writer of the index: the catch-up pre-step
     // (clearGeneratedPathsBlockingPull) reads and releases the index while it holds that lock, and
     // an add landing in between would stage bytes it is about to set aside. A lock that cannot be
@@ -153,9 +157,15 @@ if (rel !== undefined) {
     // working tree, so another session's concurrent writes to this vault
     // never land in THIS session's commit.
     // The record and a failure flag may use everything up to the report share.
-    const recorded = recordTouchedPaths(HYPO_DIR, input.session_id, rel, {
-      deadline: until(REPORT_SHARE_MS),
-    });
+    // A path that is ignored only under another spelling is not recorded: the commit would
+    // check the real path alone and take it. One ignored under its real path is still recorded
+    // (the commit leaves it out and the close gate reports it).
+    const aliasOnlyIgnored = ignoredSpellings.length > 0 && !ignoredSpellings.includes(rel);
+    const recorded =
+      aliasOnlyIgnored ||
+      recordTouchedPaths(HYPO_DIR, input.session_id, rel, {
+        deadline: until(REPORT_SHARE_MS),
+      });
     if (!recorded) {
       // A lock-timeout or write failure here leaves the file just written
       // with nothing in ANY session's touched-paths set to bring it into an

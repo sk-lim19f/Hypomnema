@@ -60,8 +60,9 @@ import {
   readTouchedPathsStrict,
   commitTouchedPaths,
   touchedHashesPath,
-  touchedPathsFailedPath,
+  readTouchedPathsFailed,
   recordTouchedPaths,
+  stampSessionRecord,
   writeClosePin,
   sessionProofCloseId,
   rootLogEntry,
@@ -1604,7 +1605,7 @@ test("ensureProjectIndex: another session's index.md (EEXIST) is not recorded in
     const sid = newPinSession('idx-second');
     assert.equal(ensureProjectIndex(dir, 'rec-project', rel, '2026-06-01', sid), null);
     assert.equal(readTouchedPathsStrict(dir, sid).state, 'empty');
-    assert.equal(existsSync(touchedPathsFailedPath(dir, sid)), false, 'no failure flag');
+    assert.equal(readTouchedPathsFailed(dir, sid).failed, false, 'no failure flag');
   });
 });
 
@@ -2567,6 +2568,7 @@ test("apply: another session's dirty file in the project folder being closed doe
     writeFileSync(join(dir, 'projects', 'test-project', 'scratch.txt'), 'unsaved work\n');
     const payload = payloadForCleanWiki(dir, today);
     const sessionId = 's-folder-other-session';
+    stampSessionRecord(dir, sessionId);
     const r = runApply(dir, payload, { sessionId });
     const out = JSON.parse(r.stdout);
     assert.equal(out.committed, true, `the close itself committed: ${r.stdout}`);
@@ -4956,6 +4958,7 @@ async function closeTwiceInParallel(staggerMs) {
 
     const spawnClose = (label, trackId) => {
       const sessionId = newPinSession(label);
+      stampSessionRecord(dir, sessionId);
       const cleanup = seedCloseTranscript(sessionId);
       const payloadPath = join(tmpdir(), `hypo-payload-${sessionId}.json`);
       writeFileSync(
@@ -7605,7 +7608,9 @@ test("an uncommitted index.md that is not this close's seed stays out of its com
       join(dir, rel),
       `---\ntitle: test-project\ntype: project-index\n---\n# hand made\n`,
     );
-    const { out } = applyJson(dir, v2Payload(today), newPinSession('index-hand'));
+    const sid = newPinSession('index-hand');
+    stampSessionRecord(dir, sid);
+    const { out } = applyJson(dir, v2Payload(today), sid);
     assert.equal(out.markerWritten, true, JSON.stringify(out));
     assert.ok(
       (out.gateNotices || []).some((n) => n.type === 'unresolved' && n.file === rel),
@@ -7664,7 +7669,9 @@ test("another session's committed entry edited since its commit is an unresolved
       tracks: [{ id: 'other-track', new: true }],
     });
     appendFileSync(join(dir, file), '\nedited after its commit\n');
-    const { out } = applyJson(dir, v2Payload(today), newPinSession('mine-m'));
+    const sid = newPinSession('mine-m');
+    stampSessionRecord(dir, sid);
+    const { out } = applyJson(dir, v2Payload(today), sid);
     assert.equal(out.markerWritten, true, JSON.stringify(out));
     assert.ok(
       (out.gateNotices || []).some((n) => n.type === 'unresolved' && n.file === file),

@@ -1834,13 +1834,15 @@ export function listSessionProjects(hypoDir) {
  * `git ls-tree -r HEAD`. Filtered by `isGeneratedViewPath`, never by a pathspec (`*` crosses `/`).
  * Throws when git cannot answer: an empty list must always mean "nothing tracked".
  */
-export function listTrackedGeneratedViews(hypoDir, { source = 'index' } = {}) {
+export function listTrackedGeneratedViews(hypoDir, { source = 'index', deadline } = {}) {
   if (source !== 'head' && source !== 'index') {
     throw new Error(`listTrackedGeneratedViews: source must be 'head' or 'index', got ${source}`);
   }
   const args =
     source === 'head' ? ['ls-tree', '-r', '-z', '--name-only', 'HEAD'] : ['ls-files', '-z'];
-  const r = vaultGit(hypoDir, args);
+  const timeout = remainingSpawnTimeoutMs(deadline);
+  if (timeout === 0) throw new Error(`git ${args[0]} not started: no time left`);
+  const r = vaultGit(hypoDir, args, timeout ? { timeout } : {});
   if (r.status !== 0) throw new Error(`git ${args[0]} failed: ${String(r.stderr).trim()}`);
   return r.stdout.split('\0').filter((p) => isGeneratedViewPath(p));
 }
@@ -1910,22 +1912,46 @@ export function vaultHasNoGit(hypoDir) {
  * no `.git` entry in it or any parent (`hasGitEntry`) tracks nothing and counts as `migrated`: when
  * git cannot say whether the directory is a work tree (not installed, dubious ownership, a timeout,
  * a broken config) but the entry is there, the vault may well track views, so it is `not-migrated`.
+ *
+ * `deadline` (`{end}` as `remainingSpawnTimeoutMs` reads it) bounds every git call by the time
+ * left. A classification the deadline cut short is `'unknown'`, a fifth answer only a call with a
+ * `deadline` can get: the calls that did not answer say nothing about the vault, so it is neither
+ * `migrated` nor `not-migrated`.
  */
-export function migrationState(hypoDir) {
-  if (vaultGit(hypoDir, ['rev-parse', '--is-inside-work-tree']).status !== 0) {
-    return hasGitEntry(hypoDir) ? 'not-migrated' : 'migrated';
-  }
-  if (pathInHead(hypoDir, SESSION_ENTRIES_OFF_MARKER)) return 'opted-out';
-  const shown = vaultGit(hypoDir, ['show', revPathArg('HEAD', '.gitignore')]);
-  const missing = shown.status === 0 ? missingBlockLines(shown.stdout, GITIGNORE_BLOCK) : null;
-  if (missing === null) return 'not-migrated';
-  if (missing.length) return 'incomplete-block';
+export function migrationState(hypoDir, { deadline } = {}) {
+  // With a `deadline` every git call is cut to the time left, and a call that has no time left
+  // (or is cut by the timeout) is not an answer: the whole classification becomes 'unknown', never
+  // a guess from a failed call. Without one, the 30 second default of `vaultGit` stands.
+  const CUT = Symbol('cut');
+  const git = (args) => {
+    const timeout = remainingSpawnTimeoutMs(deadline);
+    if (timeout === 0) throw CUT;
+    const r = vaultGit(hypoDir, args, timeout ? { timeout } : {});
+    if (timeout && r.error?.code === 'ETIMEDOUT') throw CUT;
+    return r;
+  };
   try {
-    return listTrackedGeneratedViews(hypoDir, { source: 'head' }).length === 0
-      ? 'migrated'
-      : 'not-migrated';
-  } catch {
-    return 'not-migrated';
+    if (git(['rev-parse', '--is-inside-work-tree']).status !== 0) {
+      return hasGitEntry(hypoDir) ? 'not-migrated' : 'migrated';
+    }
+    const head = headPathState(hypoDir, SESSION_ENTRIES_OFF_MARKER, { deadline });
+    if (deadline && remainingSpawnTimeoutMs(deadline) === 0) throw CUT;
+    if (head === 'present') return 'opted-out';
+    const shown = git(['show', revPathArg('HEAD', '.gitignore')]);
+    const missing = shown.status === 0 ? missingBlockLines(shown.stdout, GITIGNORE_BLOCK) : null;
+    if (missing === null) return 'not-migrated';
+    if (missing.length) return 'incomplete-block';
+    try {
+      return listTrackedGeneratedViews(hypoDir, { source: 'head', deadline }).length === 0
+        ? 'migrated'
+        : 'not-migrated';
+    } catch (err) {
+      if (deadline && remainingSpawnTimeoutMs(deadline) === 0) throw CUT;
+      return 'not-migrated';
+    }
+  } catch (err) {
+    if (err === CUT) return 'unknown';
+    throw err;
   }
 }
 
@@ -3996,6 +4022,9 @@ function checkCloseLogs(hypoDir, project, dates, stale, missing) {
 /** Notice for a project whose session-log shows a close today but whose `sessions/` has no entry for it. */
 export const LEGACY_CLOSE_NOTICE_TYPE = 'close-legacy';
 
+/** The same situation when the gate deadline ran out before the vault could be classified: not a legacy diagnosis, only a notice. */
+export const LEGACY_CLOSE_UNCLASSIFIED_NOTICE_TYPE = 'close-legacy-unclassified';
+
 /**
  * Notice, on a session-scope check, that the project has no session-log heading or log.md line
  * under the entry's date. It is a notice and not a gap: the heading and line carry no close id,
@@ -4133,13 +4162,23 @@ export function sessionCloseFileStatus(hypoDir, opts) {
     sessionLogEvidence = checkCloseLogs(hypoDir, project, dates, stale, missing);
     if (!entry) {
       if (sessionLogEvidence) {
-        if (migrationState(hypoDir) === 'migrated') {
+        const migration = migrationState(hypoDir, { deadline: opts.deadline });
+        if (migration === 'migrated') {
           notices.push({
             type: LEGACY_CLOSE_NOTICE_TYPE,
             project,
             reason:
               `${project}: today's session-log has a close heading but projects/${project}/sessions/ ` +
               `has no entry dated today. 구버전 Hypomnema나 손으로 쓴 close로 보입니다. 그 기계를 업그레이드하세요.`,
+          });
+        } else if (migration === 'unknown') {
+          notices.push({
+            type: LEGACY_CLOSE_UNCLASSIFIED_NOTICE_TYPE,
+            project,
+            reason:
+              `${project}: today's session-log has a close heading but projects/${project}/sessions/ ` +
+              `has no entry dated today, and whether this vault already uses session entries was not ` +
+              `decided within the time limit (판정이 시간 안에 끝나지 않았다). 구버전 close인지는 다시 확인하면 됩니다.`,
           });
         }
       } else {
@@ -4307,6 +4346,9 @@ function hasTodayCloseActivity(hypoDir, project, dates) {
  * aliases need no project prefix and a single-project session is byte-identical
  * to sessionCloseFileStatus (back-compat for the flat-field readers).
  *
+ * `opts.deadline` (`{end}`) bounds the migration classification a legacy-close notice needs: one
+ * the deadline cut short is a `close-legacy-unclassified` notice, never a blocker.
+ *
  * @param {string} hypoDir
  * @returns {{ok: boolean, projects: Array<{project:string, ok:boolean, stale:string[], missing:string[]}>,
  *            dates: string[], fallback: boolean, primary: string|null,
@@ -4334,6 +4376,7 @@ export function sessionCloseGlobalStatus(hypoDir, opts = {}) {
     const s = sessionCloseFileStatus(hypoDir, {
       scope: 'global',
       projectOverride: opts.projectOverride,
+      deadline: opts.deadline,
     });
     return {
       ok: s.ok,
@@ -4382,7 +4425,7 @@ export function sessionCloseGlobalStatus(hypoDir, opts = {}) {
   // `verified_scope` names the recency project instead of the requested one is
   // unreachable, not merely fail-safe — do not write code defending that state.
   if (activeCandidates.length === 0) {
-    const legacy = sessionCloseFileStatus(hypoDir, { scope: 'global' });
+    const legacy = sessionCloseFileStatus(hypoDir, { scope: 'global', deadline: opts.deadline });
     return {
       ok: legacy.ok,
       projects: legacy.project
@@ -4411,7 +4454,11 @@ export function sessionCloseGlobalStatus(hypoDir, opts = {}) {
 
   const notices = [];
   const projects = ordered.map((p) => {
-    const s = sessionCloseFileStatus(hypoDir, { scope: 'global', projectOverride: p });
+    const s = sessionCloseFileStatus(hypoDir, {
+      scope: 'global',
+      projectOverride: p,
+      deadline: opts.deadline,
+    });
     notices.push(...s.notices);
     return { project: p, ok: s.ok, stale: s.stale, missing: s.missing };
   });
@@ -5944,6 +5991,61 @@ export function touchedPathsFailedPath(hypoDir, sessionId) {
   return join(sessionCacheDir(hypoDir, sessionId), 'touched-paths-failed.json');
 }
 
+// ── record stamp (which sessions began on a version that records every write) ────────────────
+// A session on an older version can keep running its old hooks, which fail to record a write
+// without leaving a flag, and it can reload into this version later. Its record is then empty or
+// short with nothing to say so, and a gate that trusts "the record is complete" would let its
+// dirty file through. Only a session that STARTED on a version that records completely is
+// trusted: SessionStart writes the stamp once per session id, and never for an id that already
+// has a base snapshot or record on disk (it began under an older version).
+const RECORD_STAMP_SCHEMA = 1;
+
+/** @returns {string} path to a session's record stamp. */
+export function sessionRecordStampPath(hypoDir, sessionId) {
+  return join(sessionCacheDir(hypoDir, sessionId), 'record-stamp.json');
+}
+
+/** Whether the session began on a version that records every write (it has a record stamp). */
+export function sessionRecordStamped(hypoDir, sessionId) {
+  try {
+    const parsed = JSON.parse(readFileSync(sessionRecordStampPath(hypoDir, sessionId), 'utf-8'));
+    return Number.isInteger(parsed?.schema) && parsed.schema >= RECORD_STAMP_SCHEMA;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Stamp a session as complete-record, from SessionStart before anything else of the session is
+ * written. Not stamped when the id is invalid, or when the session already has a base snapshot, a
+ * touched-paths set or hashes, or a failure flag: it began under an older version. Best-effort
+ * (never throws); a session that fails to get its stamp only keeps the stricter gate.
+ *
+ * @returns {'stamped'|'already-stamped'|'older-session'|'invalid-session'|'failed'}
+ */
+export function stampSessionRecord(hypoDir, sessionId) {
+  if (!isValidSessionId(sessionId)) return 'invalid-session';
+  try {
+    if (sessionRecordStamped(hypoDir, sessionId)) return 'already-stamped';
+    const dir = sessionCacheDir(hypoDir, sessionId);
+    const earlier = [
+      'base.json',
+      'touched-paths.json',
+      'touched-hashes.json',
+      'touched-paths-failed.json',
+      'touched-paths-failed.d',
+    ];
+    if (earlier.some((name) => existsSync(join(dir, name)))) return 'older-session';
+    atomicWrite(
+      sessionRecordStampPath(hypoDir, sessionId),
+      JSON.stringify({ v: 1, schema: RECORD_STAMP_SCHEMA }),
+    );
+    return 'stamped';
+  } catch {
+    return 'failed';
+  }
+}
+
 // How much of a caller's time budget `recordTouchedPaths` leaves for writing the failure flag, so a
 // record that waited out its lock still has time to say it failed.
 const TOUCHED_FLAG_SHARE_MS = 1000;
@@ -5976,41 +6078,104 @@ function emptyNewIndexHint(hypoDir, relPath, { deadline } = {}) {
   return headBlobState(hypoDir, relPath, { deadline }).state === 'absent';
 }
 
-/**
- * Read a session's failure flag (`touched-paths-failed.json`):
- * `{v: 1, entries: {<path>: {headSha256?: string|null}}, pathsUnknown, reasons}`.
- * `failed` is false only when there is no flag. A flag that exists but cannot be read is a failure
- * with the lost paths unknown, never "no flag".
- *
- * @returns {{failed: boolean, entries: Record<string, {headSha256?: string|null}>, pathsUnknown: boolean, reasons: string[]}}
- */
-function readTouchedPathsFailed(hypoDir, sessionId) {
-  const path = touchedPathsFailedPath(hypoDir, sessionId);
-  if (!existsSync(path)) return { failed: false, entries: {}, pathsUnknown: false, reasons: [] };
+// The failure flag is a set of immutable attempt files, one per failed record, in
+// `touched-paths-failed.d/`. A single file updated by read-modify-replace lost a path when two
+// writers raced (each read the same prior flag, added its own path, and replaced the file), and
+// the flag exists exactly for the moments a lock does not hold, so it cannot take one. A writer
+// only ever adds a file with a unique name; dropping a path removes the files that name it, or
+// writes a new file for what is left and then removes the old one. The reader takes the union.
+// `touched-paths-failed.json`, the single file older versions wrote, is still read as the oldest
+// attempt, and a drop moves what is left of it into an attempt file.
+const FAILED_ATTEMPT_ORDER_WIDTH = 15;
+
+/** @returns {string} directory of a session's failure-flag attempt files. */
+export function touchedPathsFailedDir(hypoDir, sessionId) {
+  return join(sessionCacheDir(hypoDir, sessionId), 'touched-paths-failed.d');
+}
+
+/** An attempt file's name: a fixed-width time first, so the names sort oldest to newest. */
+function failedAttemptName(order = String(Date.now()).padStart(FAILED_ATTEMPT_ORDER_WIDTH, '0')) {
+  return `${order}-${process.pid}-${randomBytes(4).toString('hex')}.json`;
+}
+
+/** One flag file: `{entries, pathsUnknown, reasons}`, `null` when it cannot be read as one, and
+ * `undefined` when it is gone (a concurrent drop removed it between the listing and the read). */
+function parseFailedFlagFile(path) {
   try {
     const parsed = JSON.parse(readFileSync(path, 'utf-8'));
     const entries = parsed?.entries;
-    if (!entries || typeof entries !== 'object' || Array.isArray(entries)) throw new Error('shape');
+    if (!entries || typeof entries !== 'object' || Array.isArray(entries)) return null;
     return {
-      failed: true,
       entries,
       pathsUnknown: parsed.pathsUnknown === true,
       reasons: Array.isArray(parsed.reasons)
         ? parsed.reasons.filter((r) => typeof r === 'string')
         : [],
     };
-  } catch {
-    return { failed: true, entries: {}, pathsUnknown: true, reasons: [] };
+  } catch (err) {
+    return err?.code === 'ENOENT' ? undefined : null;
   }
+}
+
+/** Every flag file of a session, oldest first, as `{path, order, parsed}` (`path` null for a
+ * directory that cannot be listed, which reads as an unreadable flag). */
+function failedFlagSources(hypoDir, sessionId) {
+  const sources = [];
+  const legacy = touchedPathsFailedPath(hypoDir, sessionId);
+  if (existsSync(legacy)) {
+    const parsed = parseFailedFlagFile(legacy);
+    if (parsed !== undefined) {
+      sources.push({ path: legacy, order: '0'.repeat(FAILED_ATTEMPT_ORDER_WIDTH), parsed });
+    }
+  }
+  const dir = touchedPathsFailedDir(hypoDir, sessionId);
+  let names = [];
+  try {
+    names = readdirSync(dir)
+      .filter((n) => n.endsWith('.json'))
+      .sort();
+  } catch (err) {
+    if (err?.code !== 'ENOENT') sources.push({ path: null, order: '', parsed: null });
+  }
+  for (const name of names) {
+    const path = join(dir, name);
+    const parsed = parseFailedFlagFile(path);
+    if (parsed !== undefined) {
+      sources.push({ path, order: name.slice(0, FAILED_ATTEMPT_ORDER_WIDTH), parsed });
+    }
+  }
+  return sources;
+}
+
+/**
+ * Read a session's failure flag (the attempt files, plus the single file older versions wrote):
+ * `{entries: {<path>: {headSha256?: string|null}}, pathsUnknown, reasons}` as the union of them.
+ * A path named twice takes its newest entry. `failed` is false only when there is no flag. A flag
+ * file that exists but cannot be read is a failure with the lost paths unknown, never "no flag".
+ *
+ * @returns {{failed: boolean, entries: Record<string, {headSha256?: string|null}>, pathsUnknown: boolean, reasons: string[]}}
+ */
+export function readTouchedPathsFailed(hypoDir, sessionId) {
+  const sources = failedFlagSources(hypoDir, sessionId);
+  const out = { failed: sources.length > 0, entries: {}, pathsUnknown: false, reasons: [] };
+  for (const { parsed } of sources) {
+    if (!parsed) {
+      out.pathsUnknown = true;
+      continue;
+    }
+    Object.assign(out.entries, parsed.entries);
+    out.pathsUnknown ||= parsed.pathsUnknown;
+    for (const r of parsed.reasons) if (!out.reasons.includes(r)) out.reasons.push(r);
+  }
+  return out;
 }
 
 /**
  * Leave a mark that a touched-paths record did not land, so a gate that reads the set cannot take
  * the missing path for "not this session's". Best-effort and lock-free on purpose: a lock failure is
- * one of the causes it exists for. Merges into an existing flag (a path takes its newest entry,
- * `pathsUnknown` is a logical or, reasons accumulate). An unreadable existing flag is replaced by a
- * `pathsUnknown` one. Each entry holds HEAD's blob hash for the path as of now: `null` when HEAD has
- * none, no `headSha256` key when git could not say (the gate then always blocks on it).
+ * one of the causes it exists for. Writes one new attempt file and reads nothing, so concurrent
+ * marks cannot erase each other. Each entry holds HEAD's blob hash for the path as of now: `null`
+ * when HEAD has none, no `headSha256` key when git could not say (the gate then always blocks on it).
  *
  * @param {string[]} paths vault-relative paths whose record did not land
  * @param {string} reason why (an error code, or a fixed label)
@@ -6020,8 +6185,7 @@ function readTouchedPathsFailed(hypoDir, sessionId) {
 function markTouchedPathsFailed(hypoDir, sessionId, paths, reason, opts = {}) {
   const { pathsUnknown = false, deadline } = opts;
   try {
-    const prior = readTouchedPathsFailed(hypoDir, sessionId);
-    const entries = { ...prior.entries };
+    const entries = {};
     for (const p of paths) {
       const head = headBlobState(hypoDir, p, { deadline });
       entries[p] =
@@ -6031,15 +6195,9 @@ function markTouchedPathsFailed(hypoDir, sessionId, paths, reason, opts = {}) {
             ? { headSha256: null }
             : {};
     }
-    const reasons = prior.reasons.includes(reason) ? prior.reasons : [...prior.reasons, reason];
     atomicWrite(
-      touchedPathsFailedPath(hypoDir, sessionId),
-      JSON.stringify({
-        v: 1,
-        entries,
-        pathsUnknown: prior.pathsUnknown || pathsUnknown,
-        reasons,
-      }),
+      join(touchedPathsFailedDir(hypoDir, sessionId), failedAttemptName()),
+      JSON.stringify({ v: 1, entries, pathsUnknown, reasons: [reason] }),
     );
   } catch {
     // Nothing more to fall back on: see the double-failure limit in the plan.
@@ -6047,23 +6205,30 @@ function markTouchedPathsFailed(hypoDir, sessionId, paths, reason, opts = {}) {
 }
 
 /** A record of `paths` landed: they no longer need a flag entry. `pathsUnknown` stays, since the
- * paths it stands for are not named. The flag file goes once it holds nothing. Best-effort. */
+ * paths it stands for are not named. Only the flag files that name one of `paths` are touched: one
+ * left with nothing goes, one with other entries (or `pathsUnknown`) is replaced by a new file with
+ * the same place in the order, written before the old one is removed. Two drops racing on one file
+ * may each leave the other's path in their copy; a leftover entry only keeps blocking, the safe
+ * direction. Best-effort. */
 function dropTouchedPathsFailedEntries(hypoDir, sessionId, paths) {
-  const path = touchedPathsFailedPath(hypoDir, sessionId);
-  if (!existsSync(path)) return;
   try {
-    const prior = readTouchedPathsFailed(hypoDir, sessionId);
-    if (!prior.failed || !paths.some((p) => Object.hasOwn(prior.entries, p))) return;
-    const entries = { ...prior.entries };
-    for (const p of paths) delete entries[p];
-    if (Object.keys(entries).length === 0 && !prior.pathsUnknown) {
+    for (const { path, order, parsed } of failedFlagSources(hypoDir, sessionId)) {
+      if (!path || !parsed || !paths.some((p) => Object.hasOwn(parsed.entries, p))) continue;
+      const entries = { ...parsed.entries };
+      for (const p of paths) delete entries[p];
+      if (Object.keys(entries).length > 0 || parsed.pathsUnknown) {
+        atomicWrite(
+          join(touchedPathsFailedDir(hypoDir, sessionId), failedAttemptName(order)),
+          JSON.stringify({
+            v: 1,
+            entries,
+            pathsUnknown: parsed.pathsUnknown,
+            reasons: parsed.reasons,
+          }),
+        );
+      }
       rmSync(path, { force: true });
-      return;
     }
-    atomicWrite(
-      path,
-      JSON.stringify({ v: 1, entries, pathsUnknown: prior.pathsUnknown, reasons: prior.reasons }),
-    );
   } catch {
     // best-effort: a leftover entry only keeps blocking, the safe direction
   }
@@ -6138,7 +6303,7 @@ function readTouchedPathsFile(path) {
  * @returns {boolean} true when the accumulation is durably recorded (or there
  *   was nothing to record); false when a lock-timeout or write failure means
  *   the caller cannot assume this path is in ANY session's touched-paths set.
- *   A false also leaves `touched-paths-failed.json` naming the paths, whether or
+ *   A false also leaves a failure flag (`touched-paths-failed.d/`) naming the paths, whether or
  *   not the caller looks at the return value.
  */
 /**
@@ -6173,10 +6338,10 @@ function mergeIncomingTouchedPaths(hypoDir, sessionId, incoming, hashFor, deadli
     merged.add(p);
   }
   // Hashes first, the set second. A failure between the two leaves a hash
-  // for a path the set may not hold (never read: only paths in the set are
-  // looked up) or the previous hash of a path the set already held (at worst
-  // a false drift, which keeps the path out of the commit and blocks, never
-  // one that sweeps foreign bytes in).
+  // for a path the set may not hold (readTouchedClaims reads it as a claim of
+  // this session, so a kill here does not lose the write) or the previous hash
+  // of a path the set already held (at worst a false drift, which keeps the
+  // path out of the commit and blocks, never one that sweeps foreign bytes in).
   const hashPath = touchedHashesPath(hypoDir, sessionId);
   const hashes = readTouchedHashesFile(hashPath);
   for (const p of incoming) {
@@ -6219,6 +6384,24 @@ function readTouchedHashesFile(path) {
   }
 }
 
+/**
+ * The paths a session claims: the touched-paths set plus every path that has a hash entry but no
+ * entry in the set. A record writes the hash file first and the set second, so a process killed
+ * between the two (no catch runs, so no failure flag either) leaves a path with a hash and no set
+ * entry. That hash is the only trace of the write, so it counts as a claim until the path is
+ * committed or matches HEAD, retired by the same rules as a recorded path. `null` when the set
+ * exists but cannot be read (see `readTouchedPathsFile`). The caller holds the per-session lock.
+ */
+function readTouchedClaims(hypoDir, sessionId) {
+  const current = readTouchedPathsFile(touchedPathsPath(hypoDir, sessionId));
+  if (current === null) return null;
+  const known = new Set(current);
+  const orphans = Object.keys(readTouchedHashesFile(touchedHashesPath(hypoDir, sessionId))).filter(
+    (p) => p && !known.has(p),
+  );
+  return orphans.length === 0 ? current : [...current, ...orphans];
+}
+
 /** sha256 of a vault file's bytes, `null` when it does not exist, `undefined`
  * when it exists but cannot be read (nothing trustworthy to record). */
 function vaultFileHash(hypoDir, relPath) {
@@ -6257,9 +6440,9 @@ function recordedHashDrifted(hypoDir, hashes, relPath) {
   return Object.hasOwn(hashes, relPath) && vaultFileHash(hypoDir, relPath) !== hashes[relPath];
 }
 
-/** Drop hash entries for paths no longer in the set. Best-effort: a leftover
- * entry is never read (lookups are by paths in the set) and is overwritten
- * the next time that path is recorded. */
+/** Drop hash entries for paths no longer claimed (`remaining` is the claim list, set and hash-only
+ * paths alike). Best-effort: a leftover entry reads as a claim (readTouchedClaims) until the path
+ * is committed or matches HEAD, which retires it like a recorded path. */
 function pruneTouchedHashes(hypoDir, sessionId, remaining) {
   const hashPath = touchedHashesPath(hypoDir, sessionId);
   try {
@@ -6349,7 +6532,7 @@ export function drainTouchedPaths(hypoDir, sessionId) {
   const path = touchedPathsPath(hypoDir, sessionId);
   try {
     return withFileLock(path, () => {
-      const result = readTouchedPathsFile(path);
+      const result = readTouchedClaims(hypoDir, sessionId);
       if (result === null) return []; // corrupt/unreadable: leave the file for inspection, never delete
       try {
         rmSync(path, { force: true });
@@ -6385,7 +6568,7 @@ export function peekTouchedPaths(hypoDir, sessionId) {
   const path = touchedPathsPath(hypoDir, sessionId);
   try {
     return withFileLock(path, () => {
-      const result = readTouchedPathsFile(path);
+      const result = readTouchedClaims(hypoDir, sessionId);
       return result === null ? [] : result;
     });
   } catch {
@@ -6409,7 +6592,7 @@ export function peekTouchedPaths(hypoDir, sessionId) {
  * @param {string|null|undefined} sessionId
  * @param {{timeoutMs?: number}} [opts] cap on the lock wait (default: the lock's own)
  * @returns {{state: 'ok'|'empty'|'unreadable'|'locked', paths: string[], cause?: 'corrupt'|'lock-failed'}}
- *   'ok': a non-empty set was read. 'empty': no session_id, or the file is
+ *   'ok': a non-empty set was read (the set plus any hash-only path). 'empty': no session_id, or the file is
  *   absent/genuinely empty. 'unreadable': the file exists but is corrupt
  *   (`cause: 'corrupt'`), or the lock could not be taken for a reason other
  *   than a timeout, an unwritable directory (`cause: 'lock-failed'`). Deleting
@@ -6424,7 +6607,7 @@ export function readTouchedPathsStrict(hypoDir, sessionId, opts = {}) {
     return withFileLock(
       path,
       () => {
-        const result = readTouchedPathsFile(path);
+        const result = readTouchedClaims(hypoDir, sessionId);
         if (result === null) return { state: 'unreadable', paths: [], cause: 'corrupt' };
         return result.length === 0 ? { state: 'empty', paths: [] } : { state: 'ok', paths: result };
       },
@@ -6470,7 +6653,7 @@ export function readTouchedPathsDrifted(hypoDir, sessionId, opts = {}) {
     return withFileLock(
       path,
       () => {
-        const current = readTouchedPathsFile(path) || [];
+        const current = readTouchedClaims(hypoDir, sessionId) || [];
         const hashes = readTouchedHashesFile(touchedHashesPath(hypoDir, sessionId));
         return current.filter((p) => recordedHashDrifted(hypoDir, hashes, p));
       },
@@ -6527,7 +6710,7 @@ export function clearTouchedPaths(hypoDir, sessionId, paths) {
   const path = touchedPathsPath(hypoDir, sessionId);
   try {
     withFileLock(path, () => {
-      const current = readTouchedPathsFile(path);
+      const current = readTouchedClaims(hypoDir, sessionId);
       if (current === null) return; // FIX 1: never delete/write on a read failure
       const remaining = current.filter((p) => !toRemove.has(p));
       if (remaining.length === 0) {
@@ -6616,7 +6799,7 @@ export function commitTouchedPaths(hypoDir, sessionId, commitFn) {
   const path = touchedPathsPath(hypoDir, sessionId);
   try {
     return withFileLock(path, () => {
-      const current = readTouchedPathsFile(path);
+      const current = readTouchedClaims(hypoDir, sessionId);
       if (current === null) {
         // FIX 1: a read/parse failure is not "empty" — commit nothing this
         // round (a safe no-op scope) and leave the corrupt file untouched,
@@ -8972,7 +9155,7 @@ export function precompactGateStatus(hypoDir, opts = {}) {
           });
         }
         // A record that failed to land leaves a failure flag
-        // (touched-paths-failed.json, see markTouchedPathsFailed). A flagged
+        // (touched-paths-failed.d/, see markTouchedPathsFailed). A flagged
         // path blocks wherever it sits until its record lands, HEAD moves
         // past it, or the flag is removed. A flag that lost paths it cannot
         // name (pathsUnknown), or an unreadable record, makes the whole
@@ -8987,14 +9170,20 @@ export function precompactGateStatus(hypoDir, opts = {}) {
         const flagged = (pf) =>
           Object.hasOwn(failed.entries, pf) &&
           flaggedPathStillPending(hypoDir, pf, failed.entries[pf], { deadline });
-        const folderWide = !hasSession || failed.pathsUnknown || touched.state === 'unreadable';
+        // A session that began on an older version has no stamp (see stampSessionRecord): its
+        // record may be missing writes without a flag to say so, so it gets the rule main used
+        // before records decided ownership: every uncommitted file in the project folder being
+        // closed blocks. Only a stamped session's silence is trusted.
+        const legacySession = hasSession && !sessionRecordStamped(hypoDir, opts.sessionId);
+        const folderWide =
+          !hasSession || legacySession || failed.pathsUnknown || touched.state === 'unreadable';
         const cacheDir = hasSession ? `.cache/sessions/${sanitizeSessionId(opts.sessionId)}` : '';
         const folderWideExit = [
           !hasSession
             ? '이 호출에는 세션 id 가 없어 쓰기 기록을 읽지 못했다. 세션 id 를 알려 주면(--session-id) 이 세션이 쓴 파일만 막는다'
             : null,
           failed.pathsUnknown
-            ? `${cacheDir}/touched-paths-failed.json 을 지우면 이 세션의 표시가 풀린다. 지우기 전에 잃은 경로가 이미 커밋됐는지 git status 로 확인한다`
+            ? `${cacheDir}/touched-paths-failed.d/ 와 ${cacheDir}/touched-paths-failed.json 을 지우면 이 세션의 표시가 풀린다. 지우기 전에 잃은 경로가 이미 커밋됐는지 git status 로 확인한다`
             : null,
           touched.state === 'unreadable' && touched.cause === 'corrupt'
             ? `손상된 ${cacheDir}/touched-paths.json 을 살펴보고 지우면 풀린다. 지우기 전에 이 세션이 쓴 파일이 이미 커밋됐는지 git status 로 확인한다`
@@ -9039,7 +9228,7 @@ export function precompactGateStatus(hypoDir, opts = {}) {
             blockers.push({
               type: 'known-session-write',
               file: f,
-              reason: `이 세션의 쓰기 기록이 실패한 파일이 아직 미커밋이다: ${f} (기록 실패 표시 ${cacheDir}/touched-paths-failed.json 이 이 경로를 가리킨다. 커밋하거나 되돌리면 풀린다)`,
+              reason: `이 세션의 쓰기 기록이 실패한 파일이 아직 미커밋이다: ${f} (기록 실패 표시 ${cacheDir}/touched-paths-failed.json 또는 ${cacheDir}/touched-paths-failed.d/ 가 이 경로를 가리킨다. 커밋하거나 되돌리면 풀린다)`,
             });
             continue;
           }
@@ -9100,7 +9289,11 @@ export function precompactGateStatus(hypoDir, opts = {}) {
                 closeSlug
                   ? `uncommitted file in the project folder being closed: ${f}`
                   : `uncommitted file under projects/ and this close names no project: ${f}`
-              } (이 세션의 쓰기 기록이 불완전해서(잃은 경로를 모름) close 하는 프로젝트 폴더의 미커밋 파일을 모두 막는다. ${folderWideExit}. 커밋하거나 되돌려도 풀린다)`,
+              } (${
+                legacySession && !failed.pathsUnknown && touched.state !== 'unreadable'
+                  ? '이 세션은 쓰기를 빠짐없이 기록하는 버전에서 시작하지 않았다(기록 보증 표시가 없다). 그래서 기록에 없어도 close 하는 프로젝트 폴더의 미커밋 파일을 모두 막는다'
+                  : `이 세션의 쓰기 기록이 불완전해서(잃은 경로를 모름) close 하는 프로젝트 폴더의 미커밋 파일을 모두 막는다. ${folderWideExit}`
+              }. 커밋하거나 되돌려도 풀린다)`,
             });
           } else {
             notices.push({
@@ -9157,6 +9350,7 @@ export function precompactGateStatus(hypoDir, opts = {}) {
     // looked at, which is the false-green this ordering exists to stop.
     const attributedScope = resolveCloseScope(hypoDir, opts, marker);
     close = sessionCloseGlobalStatus(hypoDir, {
+      deadline,
       projectOverride: opts.projectOverride,
       // direct only: a past marker's projects must not become mandatory
       // evaluation targets (codex round 2). They stay in attributedScope so the

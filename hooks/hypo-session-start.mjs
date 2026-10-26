@@ -53,6 +53,7 @@ import {
   setAsideNotices,
   upstreamIsMigrated,
   vaultHasNoGit,
+  stampSessionRecord,
 } from './hypo-shared.mjs';
 import { buildInjection, entryVisible, isBaselineId, nextUpItems } from './session-entries.mjs';
 import {
@@ -1268,6 +1269,9 @@ process.stdin.on('end', () => {
     // `data.session_id` is used raw rather than the 'default' fallback above. A session with no id
     // has no base and closes down the legacy direct-write path.
     if (data.session_id) {
+      // Before the base snapshot: a session whose base already exists began under an older
+      // version and is not stamped (see stampSessionRecord).
+      stampSessionRecord(HYPO_DIR, data.session_id);
       snapshotBase(HYPO_DIR, data.session_id, overwriteTargets(null));
       // Bumps the observed generation on EVERY SessionStart (first run and resume/compact alike),
       // before the injections below record into it. A resume that ends up injecting nothing still
