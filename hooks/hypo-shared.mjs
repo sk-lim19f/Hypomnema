@@ -8917,13 +8917,15 @@ export function precompactGateStatus(hypoDir, opts = {}) {
       // porcelain status): "cannot attribute" is not "clean", so fail closed.
       // One exception: the gate deadline ran out, so there is no file list to
       // judge. That blocks only when this session has a record of writing
-      // anything (touched-paths or a failure flag), else it is a notice.
+      // anything (touched-paths or a failure flag), else it is a notice. A call
+      // with no valid session id has no record to read, which the block-everything
+      // rule below treats as "cannot tell", so the cut counts as recorded.
       const timedOut = cut();
       const recorded =
-        isValidSessionId(opts.sessionId) &&
-        (readTouchedPathsStrict(hypoDir, opts.sessionId, touchedLockBudget(deadline)).state !==
+        !isValidSessionId(opts.sessionId) ||
+        readTouchedPathsStrict(hypoDir, opts.sessionId, touchedLockBudget(deadline)).state !==
           'empty' ||
-          readTouchedPathsFailed(hypoDir, opts.sessionId).failed);
+        readTouchedPathsFailed(hypoDir, opts.sessionId).failed;
       if (timedOut && !recorded) {
         notices.push({
           type: 'unresolved',
@@ -9292,6 +9294,10 @@ export function precompactGateStatus(hypoDir, opts = {}) {
         blockers.push({
           type: 'close-cwd',
           project: cwdProject,
+          // Set when the proof was cut by the gate deadline: the close did not fail, so
+          // Stop must not read this blocker as an unfinished close (it only notes it).
+          // Writers still refuse on it like any blocker.
+          ...(s.incomplete ? { incomplete: s.incomplete } : {}),
           reason: s.incomplete
             ? `could not finish proving this session's close of '${cwdProject}' within the gate deadline (${GATE_DEADLINE_MS} ms, slow git). The close did not fail; try again (마감 안에 이 세션의 close 증명을 마치지 못함)`
             : `session cwd project '${cwdProject}' has an incomplete session close: ${[
@@ -11215,6 +11221,40 @@ function _globToRegex(glob) {
  */
 export function isExcludedFromCommit(hypoDir, relPath, patterns = loadHypoIgnore(hypoDir)) {
   return patterns.length > 0 && isIgnored(join(hypoDir, relPath), hypoDir, patterns);
+}
+
+// The vault-relative spellings of `filePath` that are inside `root`: the path as given and, when
+// the files exist, their real paths (a symlinked vault written through its real path). A string
+// prefix test is not used: a trailing separator on HYPO_DIR or a symlink would switch it off.
+// Shared by the close guard and the auto-stage hook, which must agree on what is in the vault.
+export function vaultRelatives(root, filePath) {
+  const real = (p) => {
+    try {
+      return realpathSync(p);
+    } catch {
+      return null;
+    }
+  };
+  // The real path of the nearest ancestor that exists, with the segments below it put back: a file
+  // that does not exist yet, in a directory that does not either, still resolves. `dirname` reaches
+  // a fixed point at the filesystem root, which ends the walk (`null` when not even that resolves).
+  const realThroughAncestor = (p) => {
+    const rest = [];
+    for (let d = p; ; d = dirname(d)) {
+      const r = real(d);
+      if (r !== null) return join(r, ...rest);
+      if (dirname(d) === d) return null;
+      rest.unshift(basename(d));
+    }
+  };
+  const pairs = [[root, filePath]];
+  const realRoot = real(root);
+  const realFile = realThroughAncestor(filePath);
+  if (realRoot !== null && realFile !== null) pairs.push([realRoot, realFile]);
+  return pairs
+    .map(([r, f]) => relative(r, f))
+    .filter((rel) => rel !== '' && rel.split(sep)[0] !== '..' && !isAbsolute(rel))
+    .map((rel) => rel.replace(/\\/g, '/'));
 }
 
 /**

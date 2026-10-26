@@ -49,9 +49,8 @@
  * before anything else runs.
  */
 
-import { realpathSync } from 'fs';
-import { basename, dirname, isAbsolute, join, relative, sep } from 'path';
-import { HYPO_DIR, isGateSkipped } from './hypo-shared.mjs';
+import { isAbsolute } from 'path';
+import { HYPO_DIR, isGateSkipped, vaultRelatives } from './hypo-shared.mjs';
 import { isGeneratedViewPath, isSessionEntryPath } from './session-entries.mjs';
 
 // Mirrors hypo-auto-stage.mjs's WRITE_TOOLS: the tools that replace file bytes.
@@ -60,39 +59,6 @@ const WRITE_TOOLS = new Set(['Write', 'Edit', 'MultiEdit']);
 const GENERATED_DENY =
   '생성 파일입니다. close payload의 summary/tracks로 기록하세요 (직접 쓰면 다음 close가 덮어씁니다).';
 const ENTRY_DENY = '원본 항목은 close apply만 만들고 고치지 않습니다.';
-
-// The vault-relative spellings of `filePath` that are inside `root`: the path as given and, when
-// the files exist, their real paths (a symlinked vault written through its real path). A string
-// prefix test is not used: a trailing separator on HYPO_DIR or a symlink would switch it off.
-function insideRelatives(root, filePath) {
-  const real = (p) => {
-    try {
-      return realpathSync(p);
-    } catch {
-      return null;
-    }
-  };
-  // The real path of the nearest ancestor that exists, with the segments below it put back: a file
-  // that does not exist yet, in a directory that does not either, still resolves. `dirname` reaches
-  // a fixed point at the filesystem root, which ends the walk (`null` when not even that resolves).
-  const realThroughAncestor = (p) => {
-    const rest = [];
-    for (let d = p; ; d = dirname(d)) {
-      const r = real(d);
-      if (r !== null) return join(r, ...rest);
-      if (dirname(d) === d) return null;
-      rest.unshift(basename(d));
-    }
-  };
-  const pairs = [[root, filePath]];
-  const realRoot = real(root);
-  const realFile = realThroughAncestor(filePath);
-  if (realRoot !== null && realFile !== null) pairs.push([realRoot, realFile]);
-  return pairs
-    .map(([r, f]) => relative(r, f))
-    .filter((rel) => rel !== '' && rel.split(sep)[0] !== '..' && !isAbsolute(rel))
-    .map((rel) => rel.replace(/\\/g, '/'));
-}
 
 let input = {};
 try {
@@ -120,7 +86,7 @@ try {
   const root = HYPO_DIR.replace(/[\\/]+$/, '') || HYPO_DIR;
   let rel = null;
   let reason = null;
-  for (const candidate of insideRelatives(root, filePath)) {
+  for (const candidate of vaultRelatives(root, filePath)) {
     const spellings = [candidate, candidate.toLowerCase()];
     reason = spellings.some(isGeneratedViewPath)
       ? GENERATED_DENY

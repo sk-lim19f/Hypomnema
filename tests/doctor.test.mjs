@@ -1325,6 +1325,51 @@ test('doctor: a marker whose receipt fails the evidence check does not cover its
   });
 });
 
+// Distinguishes: one warning for a receipt whose evidence mismatch the marker walk already names,
+// from the receipt check staying the only warning when the marker walk names nothing (it found no
+// close artifact, so it passed). Disabling the dedupe: in scripts/doctor.mjs make
+// `namedByMarkerWalk.has(sessionId)` read `false`. Disabling the other half: make the marker walk
+// return an empty set.
+test('doctor: a receipt evidence mismatch with a marker is warned once, and still warned when the marker walk is silent', () => {
+  const mismatch = (r) => {
+    r.entries[0].expected.bytesSha256 = WRONG_SHA;
+  };
+  withTmpDir((dir) => {
+    baseWiki(dir);
+    fileEvidenceReceipt(dir, 'sessgen', { mutate: mismatch });
+    demoCloseArtifactWithMarker(dir, { receipt_generation: 'gen-evidence' });
+    const { out } = runDoctorJson(dir);
+    const walk = out.find((c) => c.label === 'Session-close artifacts');
+    assert.equal(walk?.status, 'warn', 'precondition: the marker walk names the mismatch');
+    assert.match(walk.detail, /receipt evidence mismatch/);
+    assert.equal(
+      out.find((c) => c.label === 'Session-close receipt evidence'),
+      undefined,
+      'the receipt check does not repeat it',
+    );
+  });
+  withTmpDir((dir) => {
+    baseWiki(dir);
+    fileEvidenceReceipt(dir, 'sessgen', { mutate: mismatch });
+    // a marker, but no close artifact for the marker walk to judge: it passes and names nothing
+    mkdirSync(join(dir, '.cache'), { recursive: true });
+    writeFileSync(
+      join(dir, '.cache', 'session-closed-sessgen.marker'),
+      JSON.stringify({
+        session_id: 'sessgen',
+        projects: ['demo'],
+        closed_at: recentUtcIso(1),
+        receipt_generation: 'gen-evidence',
+      }),
+    );
+    const { out } = runDoctorJson(dir);
+    assert.equal(out.find((c) => c.label === 'Session-close artifacts')?.status, 'pass');
+    const check = out.find((c) => c.label === 'Session-close receipt evidence');
+    assert.equal(check?.status, 'warn', 'the receipt check is the only warning here');
+    assert.match(check.detail, /sessgen/);
+  });
+});
+
 test('doctor: a marker beside a sound evidence receipt covers its close artifacts', () => {
   withTmpDir((dir) => {
     baseWiki(dir);

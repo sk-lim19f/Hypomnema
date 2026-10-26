@@ -6,7 +6,7 @@
  */
 
 import { spawnSync } from 'child_process';
-import { relative } from 'path';
+import { join } from 'path';
 import {
   HYPO_DIR,
   loadHypoIgnore,
@@ -17,6 +17,7 @@ import {
   readAutoStagedRecord,
   recordAutoStagedBlob,
   recordTouchedPaths,
+  vaultRelatives,
   remainingSpawnTimeoutMs,
   vaultCommitLockTarget,
   withFileLock,
@@ -59,9 +60,17 @@ try {
   process.exit(0);
 }
 
-const filePath = input.tool_input?.file_path ?? '';
+const givenPath = input.tool_input?.file_path ?? '';
+// Inside the vault by a path comparison on real paths, not a string prefix: a HYPO_DIR with a
+// trailing separator, or a vault reached through a symlink or a relative spelling, still counts.
+// A string test that misses leaves no touched-paths record and no failure flag for a write that
+// is really in the vault, and the close then does not see that uncommitted file as this session's.
+const rel =
+  typeof givenPath === 'string' && givenPath ? vaultRelatives(HYPO_DIR, givenPath)[0] : undefined;
+// The same file spelled from HYPO_DIR, for every git and ignore call below.
+const filePath = rel === undefined ? givenPath : join(HYPO_DIR, rel);
 
-if (filePath.startsWith(HYPO_DIR + '/') || filePath === HYPO_DIR) {
+if (rel !== undefined) {
   const patterns = loadHypoIgnore(HYPO_DIR);
   // Only a write stages: a Read of a vault file must not change the index.
   if (
@@ -84,7 +93,6 @@ if (filePath.startsWith(HYPO_DIR + '/') || filePath === HYPO_DIR) {
         withFileLock(
           vaultCommitLockTarget(HYPO_DIR),
           () => {
-            const rel = relative(HYPO_DIR, filePath);
             // A merge in progress (open conflict, or a resolution waiting for its commit): staging
             // now would change that resolution. The path is still in the session's touched set
             // below, so Stop commits it once the merge is done. A check that got no answer in time
@@ -139,8 +147,6 @@ if (filePath.startsWith(HYPO_DIR + '/') || filePath === HYPO_DIR) {
   }
 
   if (WRITE_TOOLS.has(input.tool_name)) {
-    const rel = relative(HYPO_DIR, filePath);
-
     // Accumulate this write into the session's scoped auto-commit
     // set, keyed by session_id (no-op without one; never a shared bucket).
     // hypo-auto-commit.mjs drains this at Stop instead of sweeping the whole

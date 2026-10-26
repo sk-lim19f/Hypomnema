@@ -40,6 +40,10 @@ import {
 import { closeCheckpointState, isCloseComplete } from './close-receipt.mjs';
 import { closeGateStatus } from './close-gate-store.mjs';
 
+// The least time the drift self-heal --write is started with (ms): a node start plus the
+// write needs about this much, and a child given less only dies by its timeout.
+const MIN_HEAL_WRITE_MS = 1500;
+
 const WARNING_FILE = join(homedir(), '.claude', 'state', 'wiki-context-warning.json');
 
 let raw = '';
@@ -173,8 +177,10 @@ process.stdin.on('end', () => {
   if (gate.ok && gate.driftTargets.length > 0) {
     const feedbackPath = PKG_ROOT ? join(PKG_ROOT, 'scripts', 'feedback-sync.mjs') : null;
     const writeLeft = remainingSpawnTimeoutMs(deadline);
+    // Below the floor a node start plus a write cannot finish, so the child would only be
+    // killed by its timeout and the kill read as a failed sync.
     const w =
-      writeLeft === 0
+      writeLeft < MIN_HEAL_WRITE_MS
         ? { skippedForTime: true }
         : feedbackPath
           ? spawnSync(
@@ -197,6 +203,12 @@ process.stdin.on('end', () => {
       // No time left after the gate: not a failure of the sync, the next /compact repeats it.
       healNotices.push(
         `[WIKI CHECK] feedback projection drift (${gate.driftTargets.join(', ')}) was not re-synced: the gate used up its ${GATE_DEADLINE_MS} ms deadline. The next /compact tries again.`,
+      );
+    } else if (w.error?.code === 'ETIMEDOUT') {
+      // The write was started with the time that was left and ran out of it: the same
+      // time limit, not a sync that failed.
+      healNotices.push(
+        `[WIKI CHECK] feedback projection drift (${gate.driftTargets.join(', ')}) was not re-synced: the sync was still running when the ${GATE_DEADLINE_MS} ms gate deadline ran out. The next /compact tries again.`,
       );
     } else if (w.error || w.status === null || w.status !== 0) {
       gate.ok = false;

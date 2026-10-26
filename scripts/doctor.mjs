@@ -1322,14 +1322,12 @@ function checkSessionCloseArtifacts(hypoDir) {
     .map((a) => `${a.where}${a.date ? ` (${a.date})` : ''}`)
     .join(', ');
   const extra = unmatched.length > 5 ? ` (+${unmatched.length - 5} more)` : '';
+  const namedBrokenMarkers = brokenMarkers.slice(0, 3);
   const brokenNote =
     brokenMarkers.length > 0
       ? `. ${brokenMarkers.length} session-closed marker(s) did not count because their close ` +
         `checkpoint is broken: ` +
-        brokenMarkers
-          .slice(0, 3)
-          .map((b) => `${b.sessionId} (${b.reason})`)
-          .join('; ')
+        namedBrokenMarkers.map((b) => `${b.sessionId} (${b.reason})`).join('; ')
       : '';
   // Not necessarily UNAPPROVED — an approved log-only marker (deliberately
   // empty `projects`) or one scoped to a different project would ALSO land
@@ -1341,6 +1339,14 @@ function checkSessionCloseArtifacts(hypoDir) {
     `${unmatched.length} close artifact(s) with no session-closed marker covering their ` +
       `date and project scope — may be an unapproved hand-made close, or an approved close ` +
       `whose marker doesn't attribute this project: ${sample}${extra}${brokenNote}`,
+  );
+  // The sessions whose receipt evidence mismatch the line above names, so the receipt check
+  // does not warn about the same receipt a second time. Only what was named counts: a marker
+  // walk that passes, or names no more than three, leaves the rest to the receipt check.
+  return new Set(
+    namedBrokenMarkers
+      .filter((b) => b.reason.startsWith('receipt evidence mismatch'))
+      .map((b) => b.sessionId),
   );
 }
 
@@ -1369,7 +1375,7 @@ function describeMismatches(mismatches) {
 // does not hold (a forged or hand-edited receipt, an older writer's defect, a
 // damaged git object). Silent when every receipt checks out, like
 // checkHalfClosedReceipts.
-function checkReceiptEvidence(hypoDir) {
+function checkReceiptEvidence(hypoDir, namedByMarkerWalk = new Set()) {
   const sessionsDir = join(hypoDir, '.cache', 'sessions');
   let dirs = [];
   try {
@@ -1386,6 +1392,7 @@ function checkReceiptEvidence(hypoDir) {
       const body = JSON.parse(readFileSync(file, 'utf-8'));
       const sessionId =
         typeof body?.sessionId === 'string' && body.sessionId ? body.sessionId : name;
+      if (namedByMarkerWalk.has(sessionId)) continue; // already warned by the marker walk
       const read = readReceiptStrict(hypoDir, sessionId);
       if (read.status !== 'valid') continue; // checkHalfClosedReceipts and the marker walk own these
       const mismatches = receiptEvidenceMismatches(hypoDir, read.receipt);
@@ -3258,9 +3265,9 @@ if (args.codex) checkCodexPaths();
 if (rootOk) checkExtensions(args.hypoDir, args.claudeHome, 'claude');
 if (rootOk && args.codex) checkExtensions(args.hypoDir, args.claudeHome, 'codex');
 if (rootOk) checkProjectIndexAnchors(args.hypoDir);
-if (rootOk) checkSessionCloseArtifacts(args.hypoDir);
+const namedByMarkerWalk = rootOk ? checkSessionCloseArtifacts(args.hypoDir) : undefined;
 if (rootOk) checkHalfClosedReceipts(args.hypoDir);
-if (rootOk) checkReceiptEvidence(args.hypoDir);
+if (rootOk) checkReceiptEvidence(args.hypoDir, namedByMarkerWalk);
 if (rootOk) checkBaselineIntegrity(args.hypoDir);
 if (rootOk) checkSessionEntries(args.hypoDir);
 if (rootOk) checkSyncState(args.hypoDir);

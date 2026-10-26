@@ -5221,9 +5221,9 @@ function printCloseReport({
               `    refused the per-session Stop-chain marker because a gate blocker\n` +
               `    remains. The session is NOT fully closed: the Stop hook will re-prompt\n` +
               `    until the marker is present. This is not a --session-id problem.\n` +
-              `    To fix: resolve the gate blocker (run git status in the vault: commit\n` +
-              `    or revert an uncommitted file in the project folder being closed, or\n` +
-              `    clear whichever other blocker the gate names), then re-run the same\n` +
+              `    To fix: resolve the gate blocker the JSON's gateBlockers[] names (the\n` +
+              `    uncommitted file this session recorded writing, or a flagged one: commit\n` +
+              `    or revert it; or the cause of a skipped check), then re-run the same\n` +
               `    close. No fresh close phrase is needed: a close signal is spent only\n` +
               `    once the marker lands.\n`
             : markerSkipReason === 'session-close-lock-timeout'

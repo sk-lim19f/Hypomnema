@@ -6041,6 +6041,11 @@ test('a session close proof cut by the deadline is an incomplete close-cwd block
     const b = cut.blockers.find((x) => x.type === 'close-cwd');
     assert.ok(b, `the unfinished proof blocks: ${JSON.stringify(cut.blockers)}`);
     assert.equal(b.project, 'cwd-proj');
+    assert.equal(
+      b.incomplete,
+      'deadline',
+      'the blocker says it is a time limit, not a failed close',
+    );
     assert.ok(b.reason.includes('증명을 마치지 못함'), b.reason);
     assert.ok(!/\((missing|stale)\)/.test(b.reason), `no file list: ${b.reason}`);
     assert.ok(
@@ -7740,6 +7745,13 @@ test('the copied Stop stage returns within its 10-second budget when lint would 
     const ok = 'console.log(JSON.stringify({ continue: true, suppressOutput: true }));\n';
     for (const stub of ['hypo-hot-rebuild', 'hypo-session-record', 'hypo-auto-commit'])
       writeFileSync(join(root, 'hooks', `${stub}.mjs`), ok);
+    // The last stub stamps when it ended, so the real stage's own time can be told from the
+    // supervisor's and the stubs' (node start-up of four processes under load).
+    const stubEnded = join(root, 'stub-ended');
+    writeFileSync(
+      join(root, 'hooks', 'hypo-auto-commit.mjs'),
+      `import { writeFileSync } from 'node:fs'; writeFileSync(${JSON.stringify(stubEnded)}, String(Date.now()));\n${ok}`,
+    );
     const started = join(root, 'lint-started');
     writeFileSync(
       join(root, 'scripts', 'lint.mjs'),
@@ -7761,11 +7773,136 @@ test('the copied Stop stage returns within its 10-second budget when lint would 
         assert.ok(existsSync(started), `precondition, the gate started lint: ${r.stdout}`);
         assert.ok(!/timed out/.test(reply.systemMessage || ''), `a stage timed out: ${r.stdout}`);
         assert.equal(reply.decision, 'block', `the crystallize stage answered: ${r.stdout}`);
-        assert.ok(ms < 10000, `the whole Stop chain took ${ms} ms`);
+        const stageMs = Date.now() - Number(readFileSync(stubEnded, 'utf-8'));
+        assert.ok(
+          stageMs < 10000,
+          `the crystallize stage took ${stageMs} ms (whole chain ${ms} ms)`,
+        );
       } finally {
         cleanup();
       }
     });
+  });
+});
+
+// Distinguishes: a finished close whose cwd proof the deadline cut (Stop continues and says the
+// check will be repeated) from a cwd project that really has no close of this session (Stop
+// blocks, the X1 pair). A deadline of 0 ms in the copied package is spent before the gate starts,
+// so the cut does not depend on the machine's speed.
+// Disabling the fix: in hooks/hypo-auto-minimal-crystallize.mjs make
+// `cwdBlockers.some((b) => !b.incomplete)` read `cwdBlockers.length > 0`: the first half goes red.
+test('Stop: a finished close whose cwd proof was cut by the gate deadline continues with a notice; a cwd project with no close still blocks', () => {
+  const stop = (root, dir, sid) =>
+    spawnFromCopy(
+      root,
+      'hooks/hypo-auto-minimal-crystallize.mjs',
+      [],
+      dir,
+      JSON.stringify({ session_id: sid, transcript_path: t10Transcript(sid), cwd: T10_CWD }),
+    );
+  const sid = 's-t10-stop-cut-proof';
+  withResolvedClose(sid, { secondSignal: false, toolUseLines: [T10_EDIT_LINE] }, (dir) => {
+    withPackageCopy((root) => {
+      shrinkGateDeadline(root, 0);
+      const gate = precompactGateStatus(dir, {
+        claudeHome: join(dir, '.claude-none'),
+        sessionCwd: T10_CWD,
+        sessionId: sid,
+        closeOpen: false,
+        resolvedAtIndex: null,
+        deadline: { end: 0 },
+      });
+      assert.ok(
+        gate.blockers.some((b) => b.type === 'close-cwd' && b.incomplete === 'deadline'),
+        `precondition, the spent deadline cuts the proof: ${JSON.stringify(gate.blockers)}`,
+      );
+      const r = stop(root, dir, sid);
+      const out = JSON.parse(r.stdout);
+      assert.notEqual(out.decision, 'block', `a time limit must not block Stop: ${r.stdout}`);
+      assert.equal(out.continue, true, r.stdout);
+      assert.match(out.systemMessage || '', /did not finish within the time limit/, r.stdout);
+    });
+  });
+  const open = 's-t10-stop-cut-proof-open';
+  withResolvedClose(open, { secondSignal: true, toolUseLines: [T10_EDIT_LINE] }, (dir) => {
+    withPackageCopy((root) => {
+      const r = stop(root, dir, open);
+      assert.equal(JSON.parse(r.stdout).decision, 'block', r.stdout);
+    });
+  });
+});
+
+// Distinguishes: a git blocker that names no file (the enumeration was cut by the deadline, the
+// session did record writing) from one that names a file: only the second says unsaved work is
+// waiting, so only the second asks to reconfirm. Disabling the fix: in
+// hooks/hypo-auto-minimal-crystallize.mjs drop `&& b.file` from the workIncomplete test.
+test('Stop: a git blocker with no file (listing cut by the deadline) does not ask to reconfirm the close', () => {
+  withGrowthWiki((dir) => {
+    mkdirSync(join(dir, 'pages'), { recursive: true });
+    writeFileSync(join(dir, 'pages', 'x.md'), '# wip\n');
+    recordTouchedPaths(dir, 's-reconfirm-cut', ['pages/x.md']);
+    const transcript = writeTranscript(dir, [
+      {
+        type: 'assistant',
+        message: {
+          content: [
+            { type: 'tool_use', name: 'Edit', input: { file_path: join(dir, 'pages', 'x.md') } },
+          ],
+        },
+      },
+      { type: 'user', message: { role: 'user', content: '구현 완료하면 세션 마무리하자' } },
+    ]);
+    const gate = precompactGateStatus(dir, {
+      claudeHome: join(dir, '.claude-none'),
+      sessionId: 's-reconfirm-cut',
+      deadline: { end: 0 },
+    });
+    const git = gate.blockers.filter((b) => b.type === 'git');
+    assert.ok(
+      git.length > 0 && git.every((b) => !b.file),
+      `precondition, a fileless git blocker: ${JSON.stringify(gate.blockers)}`,
+    );
+    withPackageCopy((root) => {
+      shrinkGateDeadline(root, 0);
+      const r = spawnFromCopy(
+        root,
+        'hooks/hypo-auto-minimal-crystallize.mjs',
+        [],
+        dir,
+        JSON.stringify({ session_id: 's-reconfirm-cut', transcript_path: transcript }),
+      );
+      const out = JSON.parse(r.stdout);
+      assert.equal(out.decision, 'block', r.stdout);
+      assert.ok(!/AskUserQuestion/.test(out.reason), `no reconfirm: ${out.reason}`);
+      assert.match(out.reason, /crystallize/, out.reason);
+    });
+  });
+});
+
+// Distinguishes: a check run with no usable session id, whose listing of uncommitted files the
+// deadline cut (the whole folder blocks by rule, so the cut blocks too) from a call that does
+// have a session id and no record of writing (a notice). Disabling the fix: in
+// precompactGateStatus make `recorded` start with `isValidSessionId(opts.sessionId) &&` again.
+test('the gate: a listing cut by the deadline blocks a call with no session id, and stays a notice for a session with no record', () => {
+  withGrowthWiki((dir) => {
+    mkdirSync(join(dir, 'pages'), { recursive: true });
+    writeFileSync(join(dir, 'pages', 'x.md'), '# wip\n');
+    const base = { claudeHome: join(dir, '.claude-none'), deadline: { end: 0 } };
+    const none = precompactGateStatus(dir, base);
+    assert.ok(
+      none.blockers.some((b) => b.type === 'git'),
+      `no session id: ${JSON.stringify(none.blockers)}`,
+    );
+    const noRecord = precompactGateStatus(dir, { ...base, sessionId: 's-no-record' });
+    assert.deepEqual(
+      noRecord.blockers.filter((b) => b.type === 'git'),
+      [],
+      JSON.stringify(noRecord.blockers),
+    );
+    assert.ok(
+      noRecord.notices.some((n) => n.type === 'unresolved'),
+      JSON.stringify(noRecord.notices),
+    );
   });
 });
 

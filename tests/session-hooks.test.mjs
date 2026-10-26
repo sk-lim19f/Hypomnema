@@ -416,6 +416,50 @@ test('hypo-auto-stage.mjs accumulates a Write/Edit/MultiEdit target into the ses
   });
 });
 
+// Distinguishes: a vault named with a trailing separator, or reached through a symlink (either
+// spelling of the file), is still the vault, from a string prefix test that misses and leaves the
+// write unrecorded. Disabling the fix: in hooks/hypo-auto-stage.mjs make `rel` the old
+// `givenPath.startsWith(HYPO_DIR + '/') ? relative(HYPO_DIR, givenPath) : undefined`.
+test('hypo-auto-stage.mjs records the write when HYPO_DIR has a trailing separator or is a symlink', () => {
+  withGrowthWiki((dir) => {
+    mkdirSync(join(dir, 'pages'), { recursive: true });
+    writeFileSync(join(dir, 'pages', 'note.md'), '# note\n');
+    const link = join(dirname(dir), `${basename(dir)}-link`);
+    symlinkSync(dir, link);
+    try {
+      const stage = (sid, hypoDir, file) => {
+        const r = spawnSync(process.execPath, [join(HOOKS, 'hypo-auto-stage.mjs')], {
+          input: JSON.stringify({
+            session_id: sid,
+            tool_name: 'Write',
+            tool_input: { file_path: file, content: '# note\n' },
+          }),
+          encoding: 'utf-8',
+          env: { ...process.env, HOME: SESSION_TMP_HOME, HYPO_DIR: hypoDir },
+        });
+        assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+        const p = touchedPathsPath(dir, sid);
+        return existsSync(p) ? JSON.parse(readFileSync(p, 'utf-8')) : null;
+      };
+      const real = join(dir, 'pages', 'note.md');
+      assert.deepEqual(stage('sess-slash', dir + '/', real), ['pages/note.md'], 'trailing slash');
+      assert.deepEqual(
+        stage('sess-link-given', link, join(link, 'pages', 'note.md')),
+        ['pages/note.md'],
+        'symlinked vault, file named through the link',
+      );
+      assert.deepEqual(
+        stage('sess-link-real', link, real),
+        ['pages/note.md'],
+        'symlinked vault, file named by its real path',
+      );
+      assert.equal(stage('sess-outside', dir, join(dirname(dir), 'elsewhere.md')), null);
+    } finally {
+      rmSync(link, { force: true });
+    }
+  });
+});
+
 test('hypo-auto-stage.mjs does NOT accumulate a Read (non-mutating tool)', () => {
   withGrowthWiki((dir) => {
     mkdirSync(join(dir, 'pages'), { recursive: true });
@@ -5074,6 +5118,78 @@ performance.now = () => (existsSync(${JSON.stringify(checked)}) ? real() + 36000
         spent.msg,
         /feedback projection drift \(claude\) was not re-synced: the gate used up its/,
       );
+    });
+  });
+});
+
+// Distinguishes: a self-heal --write started with a sliver of the deadline left (it would only be
+// killed by its timeout and reported as "auto-sync failed") from one started with enough time, and
+// a --write that does run out of time (a notice, gate stays ok) from one that fails (a blocker).
+// The clock is frozen by a preload (0 until the check stand-in has finished, then a chosen value),
+// so the time left is exact whatever the machine's speed.
+// Disabling the floor: in hypo-personal-check.mjs make `writeLeft < MIN_HEAL_WRITE_MS` read
+// `writeLeft === 0`. Disabling the timeout route: make `w.error?.code === 'ETIMEDOUT'` `false`.
+test('PreCompact skips the drift self-heal --write when under 1500 ms is left, and reports a --write cut by its timeout as a time limit', () => {
+  const run = (root, dir, { after, writeSleepMs = 0 }) => {
+    const log = join(root, 'feedback.log');
+    const checked = join(root, 'checked');
+    writeFileSync(
+      join(root, 'scripts', 'feedback-sync.mjs'),
+      `import { appendFileSync, writeFileSync } from 'node:fs';
+const write = process.argv.includes('--write');
+appendFileSync(${JSON.stringify(log)}, (write ? 'write' : 'check') + '\\n');
+if (write) {
+  await new Promise((r) => setTimeout(r, ${writeSleepMs}));
+  console.log(JSON.stringify({ mode: 'write', targets: {}, warnings: [] }));
+} else {
+  console.log(JSON.stringify({ mode: 'check', targets: { claude: { dirty: true } }, warnings: [] }));
+  writeFileSync(${JSON.stringify(checked)}, 'done');
+  process.exitCode = 1;
+}
+`,
+    );
+    const preload = join(root, 'freeze-clock.cjs');
+    writeFileSync(
+      preload,
+      `const { existsSync } = require('node:fs');
+performance.now = () => (existsSync(${JSON.stringify(checked)}) ? ${after} : 0);
+`,
+    );
+    const r = spawnFromCopy(root, 'hooks/hypo-personal-check.mjs', [], dir, {
+      input: JSON.stringify(preCompactPayload),
+      env: { NODE_OPTIONS: `--require ${preload}` },
+    });
+    const runs = existsSync(log) ? readFileSync(log, 'utf-8').split('\n').filter(Boolean) : [];
+    const out = JSON.parse(r.stdout);
+    return { msg: out.systemMessage || '', runs, out };
+  };
+  withCleanWiki((dir) => {
+    // 500 ms left of the 7000: under the floor, no --write, a notice
+    withPackageCopy((root) => {
+      writeFileSync(join(root, 'scripts', 'lint.mjs'), LINT_FINE);
+      const low = run(root, dir, { after: 6500 });
+      assert.deepEqual(low.runs, ['check'], `no --write under the floor: ${low.msg}`);
+      assert.match(low.msg, /feedback projection drift \(claude\) was not re-synced/);
+      assert.ok(!/auto-sync failed/.test(low.msg), low.msg);
+    });
+    // 1600 ms left: over the floor, the write runs
+    withPackageCopy((root) => {
+      writeFileSync(join(root, 'scripts', 'lint.mjs'), LINT_FINE);
+      const ok = run(root, dir, { after: 5400 });
+      assert.deepEqual(ok.runs, ['check', 'write'], `the write runs over the floor: ${ok.msg}`);
+    });
+    // a --write that outlives its time: ends by ETIMEDOUT, a time-limit notice, not a blocker
+    withPackageCopy((root) => {
+      shrinkGateDeadline(root, 2500);
+      writeFileSync(join(root, 'scripts', 'lint.mjs'), LINT_FINE);
+      const cut = run(root, dir, { after: 0, writeSleepMs: 20000 });
+      assert.deepEqual(cut.runs, ['check', 'write'], `the write was started: ${cut.msg}`);
+      assert.match(
+        cut.msg,
+        /was not re-synced: the sync was still running when the 2500 ms gate deadline ran out/,
+      );
+      assert.ok(!/auto-sync failed/.test(cut.msg), `not a failed sync: ${cut.msg}`);
+      assert.notEqual(cut.out.decision, 'block', 'a time limit does not block /compact');
     });
   });
 });
