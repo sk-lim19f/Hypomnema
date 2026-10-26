@@ -35,7 +35,18 @@
  */
 
 import { execFileSync } from 'child_process';
-import { existsSync, lstatSync, readFileSync, realpathSync, statSync } from 'fs';
+import { randomBytes } from 'crypto';
+import {
+  chmodSync,
+  existsSync,
+  lstatSync,
+  readFileSync,
+  realpathSync,
+  renameSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from 'fs';
 import { basename, dirname, isAbsolute, join, resolve, sep } from 'path';
 
 // ── shared install/uninstall markers ────────────────────────────────────────
@@ -175,20 +186,36 @@ const LINT_SUFFIX = '/scripts/lint.mjs';
 // applied to the finished script as a whole, so any single quote inside such a
 // value is escaped once, at the one place that can actually do it safely.
 //
-// Resolution order (must match the resolution chain commands/*.md already
-// documents for resolving CLAUDE_PLUGIN_ROOT by hand):
-//   1. ~/.claude/hypo-pkg.json's `pkgRoot`, but only when it is usable (see
-//      below). A stale/wrong/relative pkgRoot must not be trusted just
-//      because the file parses.
-//   2. ~/.claude/plugins/installed_plugins.json's `hypo@hypomnema` AND the
-//      legacy pre-rename `hypomnema@hypomnema` entries, searched TOGETHER as
-//      one combined list: every user-scope row first, then any usable row.
-//      A prior version searched `hypo@hypomnema` alone and only fell back to
-//      the legacy key when that key was entirely absent, so a `hypo@hypomnema`
-//      array present but full of unusable rows (a half-migrated registry)
-//      hid a perfectly good `hypomnema@hypomnema` row forever (codex
-//      reproduction, 2026-09-11: exit 1 with a real legacy row on disk).
-//   3. Neither resolves: print what was checked and how to fix it, then exit 1.
+// Resolution order. commands/*.md read ${CLAUDE_PLUGIN_ROOT} first and the
+// sidecar second, but CLAUDE_PLUGIN_ROOT does not exist at commit time, so this
+// script asks the settings and the plugin registry for the enabled plugin
+// instead (the same choice resolveCommitTimeRoot in plugin-detect.mjs makes):
+//   1. The enabled plugin's root: the first `enabledPlugins` key in
+//      ~/.claude/settings.json that is exactly `true`, shaped `name@marketplace`
+//      and named `hypo` or `hypomnema`; then that key's row in
+//      ~/.claude/plugins/installed_plugins.json (a user-scope row first, then
+//      any usable row).
+//   2. ~/.claude/hypo-pkg.json's `pkgRoot` (the sidecar), but only when it is
+//      usable (see below). A stale/wrong/relative pkgRoot must not be trusted
+//      just because the file parses.
+//   When both 1 and 2 resolve, the higher package.json version wins and the
+//   plugin root wins a tie. The sidecar can be the newer one: SessionStart
+//   rewrites it to the running install, and a second profile that shares the
+//   settings but not the registry may sit on a newer release than the default
+//   profile's registry row. The comparison is the one hooks/version-check.mjs
+//   compareSemver makes (leading `v` allowed, `+build` ignored, prerelease
+//   ordered per SemVer section 11), copied below because this script runs
+//   standalone. A root whose version does not parse is not a candidate.
+//   3. Neither resolved: ~/.claude/plugins/installed_plugins.json's
+//      `hypo@hypomnema` AND the legacy pre-rename `hypomnema@hypomnema`
+//      entries, searched TOGETHER as one combined list: every user-scope row
+//      first, then any usable row. A prior version searched `hypo@hypomnema`
+//      alone and only fell back to the legacy key when that key was entirely
+//      absent, so a `hypo@hypomnema` array present but full of unusable rows (a
+//      half-migrated registry) hid a perfectly good `hypomnema@hypomnema` row
+//      forever (codex reproduction, 2026-09-11: exit 1 with a real legacy row
+//      on disk).
+//   4. Nothing resolves: print what was checked and how to fix it, then exit 1.
 //      A commit that silently skips the .hypoignore guard is worse than one
 //      that refuses outright.
 //
@@ -207,6 +234,108 @@ const LINT_SUFFIX = '/scripts/lint.mjs';
 // is skipped in favor of the registry, and if nothing else resolves the
 // commit is refused (exit 1) rather than silently let through.
 function buildPreCommitResolverJs(targetSuffix, extraArgvJs = '') {
+  return (
+    'var fs=require("fs"),os=require("os"),cp=require("child_process"),path=require("path");' +
+    'function usable(r){' +
+    'if(typeof r!=="string"||!r||!path.isAbsolute(r))return false;' +
+    // name AND version. This one runs at commit time in the user's vault and
+    // EXECUTES whatever it adopts, so version alone was not enough: any
+    // absolute directory carrying a package.json and the target path was
+    // accepted, and its script ran. The name check closes that.
+    //
+    // Not every root judgment here checks the name, and the difference is
+    // what each one licenses. isRealOldFormInstallRoot and
+    // isRewritableOldFormInstallRoot (below) and hypo-shared.mjs's sidecar
+    // proof do check it — they gate deleting, rewriting, executing.
+    // plugin-detect.mjs's usablePkgRoot does NOT (it answers the narrower
+    // "can scripts be resolved through this pointer at all"), which is why
+    // that file now also exports isHypomnemaInstallRoot, the strong form that
+    // DOES check the name. Its callers split accordingly: init.mjs's
+    // resolveDurableRoot and selectEntry (the registry-row picker behind
+    // resolveEnabledPluginEntry) RECORD what they accept, so both moved onto
+    // the strong predicate; doctor.mjs's per-row leaf-drift scan only reads
+    // for display and deliberately stays on the weak one (narrowing it would
+    // silence a foreign registry row doctor exists to surface). Do not cite
+    // this comment as proof the name is checked everywhere; check the
+    // specific predicate.
+    'try{var p=JSON.parse(fs.readFileSync(r+"/package.json","utf-8"));' +
+    'if(p.name!=="hypomnema")return false;' +
+    'if(typeof p.version!=="string"||!p.version)return false}catch(e){return false}' +
+    'try{return fs.existsSync(r+"' +
+    targetSuffix +
+    '")}catch(e){return false}' +
+    '}' +
+    'function readJson(p){try{return JSON.parse(fs.readFileSync(p,"utf-8"))}catch(e){return null}}' +
+    // Version helpers: a copy of hooks/version-check.mjs parseSemver and
+    // compareSemver (see the resolution order above). Only the regex and the
+    // comparison are copied, no comments, because a comment here could carry a
+    // single quote.
+    'function sv(v){var m=typeof v==="string"?v.trim().replace(/^v/,"").match(/^(\\d+)\\.(\\d+)\\.(\\d+)(?:-([0-9A-Za-z.-]+))?(?:\\+[0-9A-Za-z.-]+)?$/):null;return m?{c:[m[1],m[2],m[3]],pre:m[4]||""}:null}' +
+    'function nid(x,y){if(x.length!==y.length)return x.length<y.length?-1:1;return x===y?0:(x<y?-1:1)}' +
+    'function cpre(a,b){var ai=a.split("."),bi=b.split(".");var n=Math.max(ai.length,bi.length);' +
+    'for(var i=0;i<n;i++){if(i>=ai.length)return -1;if(i>=bi.length)return 1;' +
+    'var x=ai[i],y=bi[i],xn=/^\\d+$/.test(x),yn=/^\\d+$/.test(y);' +
+    'if(xn&&yn){var c=nid(x,y);if(c!==0)return c}' +
+    'else if(xn!==yn){return xn?-1:1}' +
+    'else if(x!==y){return x<y?-1:1}}return 0}' +
+    'function cmp(a,b){var pa=sv(a),pb=sv(b);if(!pa||!pb)return null;' +
+    'for(var k=0;k<3;k++){var c=nid(pa.c[k],pb.c[k]);if(c!==0)return c}' +
+    'if(pa.pre===pb.pre)return 0;if(!pa.pre)return 1;if(!pb.pre)return -1;return cpre(pa.pre,pb.pre)}' +
+    'function ver(r){return readJson(r+"/package.json").version}' +
+    'var home=os.homedir();var root=null;' +
+    'var reg=readJson(home+"/.claude/plugins/installed_plugins.json");' +
+    'var plugins=reg&&reg.plugins;' +
+    'var set=readJson(home+"/.claude/settings.json");var ep=set&&set.enabledPlugins;var key=null;' +
+    'if(ep&&typeof ep==="object"&&!Array.isArray(ep)){var ks=Object.keys(ep);' +
+    'for(var i=0;i<ks.length;i++){var k=ks[i],at=k.indexOf("@");' +
+    'if(ep[k]!==true||at<=0||at===k.length-1)continue;' +
+    'var nm=k.slice(0,at);if(nm==="hypo"||nm==="hypomnema"){key=k;break}}}' +
+    'var pr=null;' +
+    'if(key&&plugins&&Array.isArray(plugins[key])){var rows=plugins[key];' +
+    'var row=rows.find(function(e){return e&&e.scope==="user"&&usable(e.installPath)})||' +
+    'rows.find(function(e){return e&&usable(e.installPath)});' +
+    'if(row&&sv(ver(row.installPath)))pr=row.installPath}' +
+    'var pkg=readJson(home+"/.claude/hypo-pkg.json");' +
+    'var sc=pkg&&usable(pkg.pkgRoot)&&sv(ver(pkg.pkgRoot))?pkg.pkgRoot:null;' +
+    'if(pr&&sc){var sidecarNewer=cmp(ver(pr),ver(sc))<0;root=sidecarNewer?sc:pr}else{root=pr||sc}' +
+    'if(!root){' +
+    'var arr=[];' +
+    'if(plugins&&Array.isArray(plugins["hypo@hypomnema"]))arr=arr.concat(plugins["hypo@hypomnema"]);' +
+    'if(plugins&&Array.isArray(plugins["hypomnema@hypomnema"]))arr=arr.concat(plugins["hypomnema@hypomnema"]);' +
+    'var entry=arr.find(function(e){return e&&e.scope==="user"&&usable(e.installPath)})||' +
+    'arr.find(function(e){return e&&usable(e.installPath)});' +
+    'if(entry){root=entry.installPath}' +
+    '}' +
+    'if(!root){' +
+    'console.error("hypomnema: could not resolve the install root for ' +
+    targetSuffix +
+    '.");' +
+    'console.error("Checked ~/.claude/settings.json (enabledPlugins), ~/.claude/hypo-pkg.json (pkgRoot) and ~/.claude/plugins/installed_plugins.json (hypo@hypomnema installPath, legacy hypomnema@hypomnema).");' +
+    'console.error("Fix: run `hypomnema upgrade --apply` (or `/hypo:upgrade` on a plugin install), or reinstall Hypomnema.");' +
+    // A 1.10.0 uninstaller does not recognize this hook body and keeps it, so once the
+    // plugin is gone every commit lands here. Name the file and say how to remove it.
+    // git is asked for the path because the hook may live under core.hooksPath; if that
+    // fails the text says where to look instead. No single quote may appear in this text.
+    'var hp="";try{var g=cp.spawnSync("git",["rev-parse","--git-path","hooks/pre-commit"],{encoding:"utf-8"});' +
+    'if(g.status===0&&g.stdout.trim())hp=path.resolve(g.stdout.trim())}catch(e){}' +
+    'console.error("If Hypomnema was uninstalled, this hook can be removed by deleting "+(hp||"the pre-commit file in this repository hooks directory")+" (or by running uninstall from Hypomnema 1.10.1 or newer).");' +
+    'process.exit(1)' +
+    '}' +
+    'var r=cp.spawnSync(process.execPath,[root+"' +
+    targetSuffix +
+    '"' +
+    extraArgvJs +
+    '],{stdio:"inherit"});' +
+    'if(r.error){console.error(String(r.error.message||r.error))}' +
+    'process.exit(r.status===null?1:r.status)'
+  );
+}
+
+// Frozen, byte-for-byte copy of buildPreCommitResolverJs as it shipped before the
+// enabled plugin root was consulted ahead of the sidecar. Hooks already
+// installed in vaults embed this exact script, so ownership recognition has to
+// keep reproducing it after the live builder moves on. Do not edit the body.
+function buildPreviousPreCommitResolverJs(targetSuffix, extraArgvJs = '') {
   return (
     'var fs=require("fs"),os=require("os"),cp=require("child_process"),path=require("path");' +
     'function usable(r){' +
@@ -301,11 +430,12 @@ function extractLintHypoDir(js) {
 // (not a substring/suffix check) because the worker step has no dynamic
 // input at all — anything less than byte-identical is not a script this
 // writer could have produced, and per the module comment above an
-// unrecognized shape must never be treated as "close enough".
-function isNewFormWorkerStep(step) {
+// unrecognized shape must never be treated as "close enough". `build` picks the
+// resolver shape: the live one, or the frozen one an earlier release shipped.
+function isNewFormWorkerStep(step, build = buildPreCommitResolverJs) {
   const m = PRE_COMMIT_RESOLVER_LINE.exec(step);
   if (!m) return false;
-  return unescapeShellSingleQuoted(m[1]) === buildPreCommitResolverJs(WORKER_SUFFIX);
+  return unescapeShellSingleQuoted(m[1]) === build(WORKER_SUFFIX);
 }
 
 // Is `root` a real, on-disk Hypomnema install that could actually have
@@ -385,13 +515,13 @@ export function isRewritableOldFormInstallRoot(root) {
 // Extracts the embedded --hypo-dir, rebuilds the expected script around it,
 // and compares byte-for-byte — the only way to validate a script with one
 // dynamic input without loosening the check into a substring match.
-function isNewFormLintStep(step) {
+function isNewFormLintStep(step, build = buildPreCommitResolverJs) {
   const m = PRE_COMMIT_RESOLVER_LINE.exec(step);
   if (!m) return false;
   const js = unescapeShellSingleQuoted(m[1]);
   const hypoDir = extractLintHypoDir(js);
   if (hypoDir === null) return false;
-  return js === buildPreCommitResolverJs(LINT_SUFFIX, lintExtraArgvJs(hypoDir));
+  return js === build(LINT_SUFFIX, lintExtraArgvJs(hypoDir));
 }
 
 /**
@@ -411,7 +541,8 @@ function isNewFormLintStep(step) {
  *   or COULD HAVE WRITTEN in an older release (the version-pinned form) — see
  *   the module comment above PRE_COMMIT_WORKER_LINE for both shapes. A body
  *   that mixes the two (one step old-form, the other new-form) is never
- *   ours: no writer this codebase has ever shipped produces that.
+ *   ours: no writer this codebase has ever shipped produces that. The same
+ *   goes for one step on the previous resolver and the other on the current.
  */
 export function isOwnedWikiPreCommitBody(
   content,
@@ -437,7 +568,8 @@ export function isOwnedWikiPreCommitBody(
       : null;
   const workerIsOld = oldWorkerRoot !== null && isValidOldFormRoot(oldWorkerRoot);
   const workerIsNew = isNewFormWorkerStep(steps[0]);
-  if (!workerIsOld && !workerIsNew) return false;
+  const workerIsPrevious = isNewFormWorkerStep(steps[0], buildPreviousPreCommitResolverJs);
+  if (!workerIsOld && !workerIsNew && !workerIsPrevious) return false;
 
   if (steps.length === 2) {
     if (workerIsOld) {
@@ -455,7 +587,12 @@ export function isOwnedWikiPreCommitBody(
       if (!lint || unescapeShellSingleQuoted(lint[1]) !== oldWorkerRoot + LINT_SUFFIX) {
         return false;
       }
-    } else if (!isNewFormLintStep(steps[1])) {
+    } else if (
+      !isNewFormLintStep(
+        steps[1],
+        workerIsPrevious ? buildPreviousPreCommitResolverJs : buildPreCommitResolverJs,
+      )
+    ) {
       return false;
     }
   }
@@ -499,14 +636,53 @@ export function shellSingleQuote(p) {
 // hypo-config.md scan) and may silently lint an unrelated vault. That is a
 // vault path, not an install path, so unlike the root above it never goes
 // stale across a release — it only needs resolving once, here.
-export function wikiPreCommitContent(hypoDir, lintStrict) {
+export function wikiPreCommitContent(hypoDir, lintStrict, build = buildPreCommitResolverJs) {
   const absHypoDir = resolve(hypoDir);
-  const steps = [`node -e ${shellSingleQuote(buildPreCommitResolverJs(WORKER_SUFFIX))} || exit 1`];
+  const steps = [`node -e ${shellSingleQuote(build(WORKER_SUFFIX))} || exit 1`];
   if (lintStrict) {
-    const lintJs = buildPreCommitResolverJs(LINT_SUFFIX, lintExtraArgvJs(absHypoDir));
+    const lintJs = build(LINT_SUFFIX, lintExtraArgvJs(absHypoDir));
     steps.push(`node -e ${shellSingleQuote(lintJs)} || exit 1`);
   }
   return `#!/bin/sh\n${WIKI_PRE_COMMIT_MARKER_START}\n${steps.join('\n')}\nexit 0\n${WIKI_PRE_COMMIT_MARKER_END}\n`;
+}
+
+// The exact bytes a hook written with the previous commit-time resolver holds
+// (what v1.10.0 shipped). upgrade compares a file on disk against this before
+// it rewrites the whole file, for the same reason oldFormPreCommitContent
+// exists: the marker span says nothing about what sits around it.
+export function previousFormPreCommitContent(hypoDir, lintStrict) {
+  return wikiPreCommitContent(hypoDir, lintStrict, buildPreviousPreCommitResolverJs);
+}
+
+// Publishes `content` as the executable hook at `hookPath` through a complete
+// candidate file: write the candidate beside the hook, mark it executable, then
+// rename it over the hook. Git runs the hook at every commit, so a write torn
+// halfway through the live file would leave a hook that fails or half-runs
+// until someone repairs it by hand. With the rename as the only step that
+// touches the live path, a failure anywhere leaves the previous hook whole.
+// Ownership checks and the .bak copy are the caller's job.
+//
+// Returns `{ ok: true }`, or `{ ok: false, error, candidatePath, cleaned }`.
+// `cleaned` is false when the candidate could not be removed after a failure; a
+// leftover `pre-commit.<pid>.<rand>.tmp` is never run by git, so the caller
+// reports its path rather than treating it as a second failure.
+export function publishHookFile(hookPath, content) {
+  const candidatePath = `${hookPath}.${process.pid}.${randomBytes(4).toString('hex')}.tmp`;
+  try {
+    writeFileSync(candidatePath, content, { flag: 'wx' });
+    chmodSync(candidatePath, 0o755);
+    renameSync(candidatePath, hookPath);
+    return { ok: true };
+  } catch (error) {
+    let cleaned = false;
+    try {
+      rmSync(candidatePath, { force: true });
+      cleaned = true;
+    } catch {
+      // Reported through `cleaned: false`, not thrown over the original error.
+    }
+    return { ok: false, error, candidatePath, cleaned };
+  }
 }
 
 // Rebuilds the exact bytes an OLD-form (version-pinned) pre-commit hook holds
@@ -607,6 +783,11 @@ export function parseWikiPreCommitRoot(content) {
   if (lintStrict) {
     const js = unescapeShellSingleQuoted(PRE_COMMIT_RESOLVER_LINE.exec(steps[1])[1]);
     hypoDir = extractLintHypoDir(js);
+  }
+  // A body on the previous resolver also has no baked root, but it still needs
+  // upgrade to rewrite it, so it says so instead of looking like the live form.
+  if (isNewFormWorkerStep(steps[0], buildPreviousPreCommitResolverJs)) {
+    return { ok: true, hasMarker: true, root: null, previousResolver: true, lintStrict, hypoDir };
   }
   return { ok: true, hasMarker: true, root: null, lintStrict, hypoDir };
 }
@@ -787,22 +968,37 @@ export function resolveGitHooksDir(repoRoot, { timeoutMs = 5000 } = {}) {
  * @returns {null | string} null when writing is safe, else a reason to log
  */
 export function unsafeHookTargetReason(hookPath) {
+  return unsafeHookTarget(hookPath)?.reason ?? null;
+}
+
+/**
+ * Same probe as unsafeHookTargetReason, with `operational` telling a refusal on purpose
+ * (a symlink, a non-regular file) from a probe that failed with an errno (EACCES, EIO, ...)
+ * and so says nothing about whether the entry is safe. Callers that must not carry on past a
+ * failed probe read this field instead of parsing the message.
+ *
+ * @returns {null | {reason: string, operational: boolean}}
+ */
+export function unsafeHookTarget(hookPath) {
   let st;
   try {
     st = lstatSync(hookPath);
   } catch (e) {
     if (e && e.code === 'ENOENT') return null; // genuinely absent — safe to create
-    return `cannot stat (${e.code || e.message})`;
+    return { reason: `cannot stat (${e.code || e.message})`, operational: true };
   }
-  if (st.isSymbolicLink()) return 'is a symlink — refusing to write through it';
-  if (!st.isFile()) return 'exists but is not a regular file';
+  if (st.isSymbolicLink()) {
+    return { reason: 'is a symlink — refusing to write through it', operational: false };
+  }
+  if (!st.isFile()) return { reason: 'exists but is not a regular file', operational: false };
   return null;
 }
 
 /**
  * Write-side wrapper: the hooks directory only if it is safe to install into.
  * Returns `{dir}` when installing is allowed, otherwise `{skip}` carrying a
- * human-readable reason for the caller to log.
+ * human-readable reason for the caller to log. `operational: true` marks a skip that is a
+ * failed probe (git could not resolve the hooks dir), not a deliberate refusal.
  */
 export function hooksDirForInstall(repoRoot, opts) {
   const r = resolveGitHooksDir(repoRoot, opts);
@@ -815,7 +1011,8 @@ export function hooksDirForInstall(repoRoot, opts) {
       return { skip: `hooks path is not a directory, so git runs no hooks (${r.path})` };
     }
     if (r.reason === 'git-unavailable') return { skip: 'git not available on PATH' };
-    return { skip: `could not resolve hooks dir (${r.detail || r.reason})` };
+    // operational: git or the filesystem failed, which is not a decision to leave the hook alone
+    return { skip: `could not resolve hooks dir (${r.detail || r.reason})`, operational: true };
   }
   if (!r.owned) {
     return {

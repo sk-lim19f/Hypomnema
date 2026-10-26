@@ -50,7 +50,7 @@ hypomnema/
 │   └── lib/                      ← helpers that scripts import (shipped set: `files` in package.json; one hook, hypo-pre-commit.mjs, also imports from here)
 ├── skills/                   ← directory-form Agent Skills (skills/<name>/SKILL.md)
 ├── templates/                ← baseline files copied on init
-│   ├── hypo-config.md, index.md, log.md, SCHEMA.md, hypo-guide.md, session-state.md
+│   ├── hypo-config.md, index.md, log.md, SCHEMA.md, hypo-guide.md
 │   ├── Home.md, Overview.md, hypo-automation.md, hypo-help.md
 │   ├── .hypoignore, .hyposcanignore, gitignore, gitattributes
 │   ├── pages/_index.md, pages/observability/_index.md
@@ -276,7 +276,7 @@ The consequence for releases: on the plugin channel a fix reaches nobody until t
 
 1. `[both]` Wizard collects: wiki path, hook scope (`~/.claude` and/or `~/.codex`), git remote URL.
 2. `[both]` Creates the vault directory structure: `pages/`, `pages/observability/`, `projects/`, `sources/`, `journal/{daily,weekly,monthly}/`, and `extensions/{hooks,commands,skills,agents}/` (each with a `.gitkeep`).
-3. `[both]` Copies `templates/` files: `index.md`, a generated root `hot.md`, `log.md`, `SCHEMA.md`, `hypo-guide.md`, the helpers `Home.md`, `Overview.md`, `hypo-help.md`, `hypo-automation.md`, a root `session-state.md`, `pages/_index.md`, `pages/observability/_index.md`, and `projects/_template/` (`index.md`, `prd.md`, `decisions/`, `session-log/`). It then writes `hypo-config.md`, `.hypoignore`, `.hyposcanignore`, `.gitignore` and `.gitattributes`.
+3. `[both]` Copies `templates/` files: `index.md`, a generated root `hot.md`, `log.md`, `SCHEMA.md`, `hypo-guide.md`, the helpers `Home.md`, `Overview.md`, `hypo-help.md`, `hypo-automation.md`, `pages/_index.md`, `pages/observability/_index.md`, and `projects/_template/` (`index.md`, `prd.md`, `decisions/`, `session-log/`). It then writes `hypo-config.md`, `.hypoignore`, `.hyposcanignore`, `.gitignore` and `.gitattributes`.
 4. `[npm only]` Copies the hooks and shared modules to `~/.claude/hooks/`, installs the commands under `~/.claude/commands/hypo/`, and merges entries into `~/.claude/settings.json` (idempotent; preserves non-hypo hooks). `[plugin: skipped]` when the plugin is enabled.
 5. `[both]` Writes `~/.claude/hypo-pkg.json` with `pkgRoot` for upgrade tracking (skipped when the
    plugin channel judgment fails; see `init.mjs`'s `resolveDurableRoot`).
