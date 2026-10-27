@@ -916,6 +916,20 @@ test('plugin mode: check reports core surfaces as plugin-managed, not missing', 
   });
 });
 
+// Distinguishes: a reload hint that also says a session already open keeps the old close rule until
+// a new session starts (a reload does not stamp it) from one that leaves a person thinking
+// /reload-plugins switched every open session over.
+test('upgrade: the reload hint says an open session needs a new session for the new close rule', () => {
+  withFakeUpgradeInstall(true, ({ upgrade, home, wiki }) => {
+    const r = runUpgrade(upgrade, [`--hypo-dir=${wiki}`], home);
+    assert.match(
+      r.stdout,
+      /then `\/reload-plugins`\.\n\s+A session that was already open before this upgrade keeps the old project-folder close rule until you start a new session; `\/reload-plugins` alone does not switch it\./,
+      r.stdout,
+    );
+  });
+});
+
 test('plugin mode: --json sets pluginMode true', () => {
   withFakeUpgradeInstall(true, ({ upgrade, home, wiki }) => {
     const r = runUpgrade(upgrade, [`--hypo-dir=${wiki}`, '--json'], home);

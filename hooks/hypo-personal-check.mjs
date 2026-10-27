@@ -44,6 +44,20 @@ import { closeGateStatus } from './close-gate-store.mjs';
 // write needs about this much, and a child given less only dies by its timeout.
 const MIN_HEAL_WRITE_MS = 1500;
 
+// The drift self-heal --write runs after the gate on a share of this hook's own limit, not on what
+// the gate left of GATE_DEADLINE_MS (a value set by Stop's 10 second limit): hooks.json gives
+// PreCompact 30 seconds, and a large vault whose gate takes most of 7000 ms would otherwise skip the
+// self-heal on every /compact. The share is what is left of the limit after the gate and the
+// report's own second, capped at HEAL_WRITE_CAP_MS. performance.now() counts from the process
+// start, the closest this hook gets to when the harness started its limit.
+const HOOK_LIMIT_MS = 30000;
+const REPORT_SHARE_MS = 1000;
+const HEAL_WRITE_CAP_MS = 20000;
+const hookDeadline = { end: HOOK_LIMIT_MS - REPORT_SHARE_MS };
+
+// A path for a command line a person copies: quoted when it holds anything a shell would split.
+const shellArg = (s) => (/^[\w@%+=:,./-]+$/.test(s) ? s : `'${s.replace(/'/g, `'\\''`)}'`);
+
 const WARNING_FILE = join(homedir(), '.claude', 'state', 'wiki-context-warning.json');
 
 let raw = '';
@@ -125,8 +139,9 @@ process.stdin.on('end', () => {
   const attributionScope = resolveGateProjectOverride(HYPO_DIR, { sessionCwd });
 
   let gate;
-  // One deadline for the gate and for the feedback follow-up calls below, so a slow gate leaves
-  // them less time instead of stacking a second full budget on top of it.
+  // One deadline for the gate and for the feedback notice check below, so a slow gate leaves it
+  // less time instead of stacking a second full budget on top of it. The drift self-heal --write
+  // has its own share of the hook limit (hookDeadline).
   const deadline = { end: performance.now() + GATE_DEADLINE_MS };
   try {
     // The marker only scopes this gate (log-only mode, attribution) when
@@ -176,7 +191,12 @@ process.stdin.on('end', () => {
   const healNotices = [];
   if (gate.ok && gate.driftTargets.length > 0) {
     const feedbackPath = PKG_ROOT ? join(PKG_ROOT, 'scripts', 'feedback-sync.mjs') : null;
-    const writeLeft = remainingSpawnTimeoutMs(deadline);
+    const writeLeft = Math.min(remainingSpawnTimeoutMs(hookDeadline), HEAL_WRITE_CAP_MS);
+    // The same write a person runs by hand when this one is cut: the arguments that decide what is
+    // written (the hook's own --json, --no-input and --ack-notices only shape its report).
+    const manualWrite = feedbackPath
+      ? `node ${shellArg(feedbackPath)} --write --hypo-dir=${shellArg(HYPO_DIR)} --claude-home=${shellArg(join(homedir(), '.claude'))}`
+      : 'hypomnema feedback-sync --write';
     // Below the floor a node start plus a write cannot finish, so the child would only be
     // killed by its timeout and the kill read as a failed sync.
     const w =
@@ -196,19 +216,19 @@ process.stdin.on('end', () => {
                 `--hypo-dir=${HYPO_DIR}`,
                 `--claude-home=${join(homedir(), '.claude')}`,
               ],
-              { encoding: 'utf-8', timeout: Math.min(30000, writeLeft) },
+              { encoding: 'utf-8', timeout: writeLeft },
             )
           : { status: 1 };
     if (w.skippedForTime) {
       // No time left after the gate: not a failure of the sync, the next /compact repeats it.
       healNotices.push(
-        `[WIKI CHECK] feedback projection drift (${gate.driftTargets.join(', ')}) was not re-synced: too little of the ${GATE_DEADLINE_MS} ms gate deadline was left to run the sync. The next /compact tries again.`,
+        `[WIKI CHECK] feedback projection drift (${gate.driftTargets.join(', ')}) was not re-synced: the gate left too little of the ${HOOK_LIMIT_MS} ms PreCompact hook limit to run the sync. The next /compact tries again, or run it now: ${manualWrite}`,
       );
     } else if (w.error?.code === 'ETIMEDOUT') {
       // The write was started with the time that was left and ran out of it: the same
       // time limit, not a sync that failed.
       healNotices.push(
-        `[WIKI CHECK] feedback projection drift (${gate.driftTargets.join(', ')}) was not re-synced: the sync was still running when the ${GATE_DEADLINE_MS} ms gate deadline ran out. The next /compact tries again.`,
+        `[WIKI CHECK] feedback projection drift (${gate.driftTargets.join(', ')}) was not re-synced: the sync was still running when its ${writeLeft} ms share of the ${HOOK_LIMIT_MS} ms PreCompact hook limit ran out. The next /compact tries again, or run it now: ${manualWrite}`,
       );
     } else if (w.error || w.status === null || w.status !== 0) {
       gate.ok = false;
@@ -418,13 +438,14 @@ process.stdin.on('end', () => {
 
   // What was skipped and why, from the gate's own `skippedWhy` (a missing tool, a time limit, an
   // error). A check that ended by an error already has a `check-skipped` blocker whose reason
-  // says so, so it is not listed twice.
+  // says so, so it is not listed twice. The cause follows a comma, not a parenthesis: both places
+  // that print these lines already wrap the whole list in one.
   const skipLines = Object.entries({ lint: 'lint', feedback: 'feedback-sync' })
     .filter(
       ([c]) =>
         gate.skipped[c] && !gate.blockers.some((b) => b.type === 'check-skipped' && b.check === c),
     )
-    .map(([c, name]) => `${name} skipped (${gate.skippedWhy[c]})`);
+    .map(([c, name]) => `${name} skipped, ${gate.skippedWhy[c]}`);
 
   // ── Bypass 3: HYPO_SKIP_GATE ──
   if (isGateSkipped()) {

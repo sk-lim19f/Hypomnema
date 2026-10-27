@@ -6887,6 +6887,45 @@ export function clearTouchedPaths(hypoDir, sessionId, paths) {
 }
 
 /**
+ * Take back claims a caller recorded a moment ago for bytes it then did not write (the create
+ * lost to another writer). Removes each path from the set and from the hash file, but only while
+ * the hash recorded for it is still the one given: any other hash means a later record of the path
+ * (an edit after it, or a different claim) and is left as it is. Both files go together, since a
+ * hash left behind still reads as a claim (`readTouchedClaims`). Under the per-session lock. Nothing
+ * is removed when either file cannot be read or the lock is not taken.
+ *
+ * @param {Record<string, string|null>} expected vault-relative path to the hash recorded for it
+ * @returns {boolean} whether the record was read and rewritten (also true with nothing to remove)
+ */
+export function retractTouchedPaths(hypoDir, sessionId, expected) {
+  if (!sessionId || !expected) return false;
+  const path = touchedPathsPath(hypoDir, sessionId);
+  try {
+    return withFileLock(path, () => {
+      const set = readTouchedPathsFile(path);
+      const hashPath = touchedHashesPath(hypoDir, sessionId);
+      const hashes = readTouchedHashesFile(hashPath);
+      if (set === null || hashes === null) return false;
+      const drop = new Set(
+        Object.keys(expected).filter((p) => Object.hasOwn(hashes, p) && hashes[p] === expected[p]),
+      );
+      if (drop.size === 0) return true;
+      for (const p of drop) delete hashes[p];
+      const remaining = set.filter((p) => !drop.has(p));
+      // The set first, then the hash: a kill between the two leaves a hash-only claim, which
+      // still reads as this session's (the over-retaining direction).
+      if (remaining.length === 0) rmSync(path, { force: true });
+      else atomicWrite(path, JSON.stringify(remaining));
+      if (Object.keys(hashes).length === 0) rmSync(hashPath, { force: true });
+      else atomicWrite(hashPath, JSON.stringify(hashes));
+      return true;
+    });
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Peek a session's touched paths, run `commitFn(paths)` (expected to be
  * `commitWikiChanges` or an equivalent), and — only when it reports
  * `committed: true` — clear `paths` from the touched-paths set, ALL under

@@ -50,6 +50,7 @@ import {
   readTouchedPathsDrifted,
   readTouchedPathsFailed,
   readSessionRecord,
+  retractTouchedPaths,
   touchedPathsFailedDir,
   touchedHashesPath,
   stampSessionRecord,
@@ -627,6 +628,76 @@ test('auto-stage: with no lock held, the write is recorded and no flag is left',
       'the add ran',
     );
   });
+});
+
+// The hook with `git` on PATH replaced by a stub, so the staging step (the hook's first git call)
+// runs a script instead of git. HOME and HYPO_DIR are pinned to temp dirs.
+function runAutoStageWithGitStub(dir, binDir, stub, sid, rel) {
+  writeFileSync(join(binDir, 'git'), stub);
+  chmodSync(join(binDir, 'git'), 0o755);
+  return spawnSync(process.execPath, [join(HOOKS, 'hypo-auto-stage.mjs')], {
+    input: JSON.stringify({
+      session_id: sid,
+      tool_name: 'Write',
+      tool_input: { file_path: join(dir, rel), content: 'z\n' },
+    }),
+    encoding: 'utf-8',
+    timeout: 10000,
+    env: {
+      ...process.env,
+      HOME: SESSION_TMP_HOME,
+      HYPO_DIR: dir,
+      PATH: `${binDir}:${process.env.PATH}`,
+    },
+  });
+}
+
+// Distinguishes: the record written before staging (a hook killed at its first git call has
+// already recorded the write) from the record written after it (the kill leaves the write staged
+// or dirty with no claim of this session). The stub kills the hook process itself.
+test('auto-stage: a kill between the record and the staging leaves the record', () => {
+  withSyncedWiki((dir) =>
+    withTmpDir((binDir) => {
+      mkdirSync(join(dir, 'pages'), { recursive: true });
+      writeFileSync(join(dir, 'pages', 'killed.md'), 'z\n');
+      const r = runAutoStageWithGitStub(
+        dir,
+        binDir,
+        '#!/bin/sh\nkill -9 $PPID\nexit 1\n',
+        'sess-killed',
+        'pages/killed.md',
+      );
+      assert.equal(r.signal, 'SIGKILL', `the stub must have killed the hook: ${r.status}`);
+      const read = readTouchedPathsStrict(dir, 'sess-killed');
+      assert.equal(read.state, 'ok');
+      assert.deepEqual(read.paths, ['pages/killed.md']);
+    }),
+  );
+});
+
+// Distinguishes the same two orders from the other side: what the record holds at the moment git
+// is first called. The stub writes that down and fails, so git add never succeeds and the record is
+// still left with no failure flag.
+test('auto-stage: the record lands before git add runs', () => {
+  withSyncedWiki((dir) =>
+    withTmpDir((binDir) => {
+      mkdirSync(join(dir, 'pages'), { recursive: true });
+      writeFileSync(join(dir, 'pages', 'order.md'), 'z\n');
+      const sid = 'sess-order';
+      const log = join(binDir, 'seen.log');
+      const record = touchedPathsPath(dir, sid);
+      const stub =
+        '#!/bin/sh\n' +
+        `if grep -q 'pages/order.md' '${record}' 2>/dev/null; then echo recorded >> '${log}'; ` +
+        `else echo missing >> '${log}'; fi\nexit 1\n`;
+      const r = runAutoStageWithGitStub(dir, binDir, stub, sid, 'pages/order.md');
+      assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+      const seen = readFileSync(log, 'utf-8').trim().split('\n');
+      assert.equal(seen[0], 'recorded', `the first git call saw: ${seen.join(', ')}`);
+      assert.deepEqual(readTouchedPathsStrict(dir, sid).paths, ['pages/order.md']);
+      assert.ok(!readTouchedPathsFailed(dir, sid).failed, 'a failed add leaves no record flag');
+    }),
+  );
 });
 
 test('hypo-auto-commit.mjs: missing session_id → scoped commit SKIPPED, no whole-tree fallback', () => {
@@ -1657,6 +1728,36 @@ test('readSessionRecord: a missing hashes file is a complete empty record', () =
     assert.deepEqual(rec.paths, []);
     assert.deepEqual(rec.hashes, {});
     assert.equal(rec.stamped, true);
+  });
+});
+
+// Distinguishes: a path whose recorded hash is still the given one is taken out of the set and the
+// hash file together, while another claimed path stays, from a retraction that leaves the hash (a
+// hash-only claim) or takes more than it was given.
+test('retractTouchedPaths: removes a path only while its recorded hash is the given one', () => {
+  withSyncedWiki((dir) => {
+    const sid = 'sess-retract';
+    const [h1, h2] = ['1'.repeat(64), '2'.repeat(64)];
+    recordTouchedPaths(dir, sid, ['pages/a.md', 'pages/b.md'], {
+      expectedHashes: { 'pages/a.md': h1, 'pages/b.md': h2 },
+    });
+    assert.equal(retractTouchedPaths(dir, sid, { 'pages/a.md': h1 }), true);
+    const rec = readSessionRecord(dir, sid);
+    assert.deepEqual(rec.paths, ['pages/b.md']);
+    assert.deepEqual(rec.hashes, { 'pages/b.md': h2 });
+  });
+});
+
+// Pair of the one above: a hash other than the given one is a later record of the path, kept.
+test('retractTouchedPaths: leaves a path recorded with another hash', () => {
+  withSyncedWiki((dir) => {
+    const sid = 'sess-retract-other';
+    const [h1, h2] = ['1'.repeat(64), '2'.repeat(64)];
+    recordTouchedPaths(dir, sid, ['pages/a.md'], { expectedHashes: { 'pages/a.md': h1 } });
+    assert.equal(retractTouchedPaths(dir, sid, { 'pages/a.md': h2 }), true);
+    const rec = readSessionRecord(dir, sid);
+    assert.deepEqual(rec.paths, ['pages/a.md']);
+    assert.deepEqual(rec.hashes, { 'pages/a.md': h1 });
   });
 });
 
@@ -5125,7 +5226,7 @@ test('SessionStart stamps a new session and leaves a session with an earlier rec
     recordTouchedPaths(dir, 'sess-older', 'pages/a.md');
     snapshotBase(dir, 'sess-older-base', ['hot.md']);
     for (const sid of ['sess-new', 'sess-older', 'sess-older-base']) {
-      const r = runSessionStartFor(dir, dir, sid);
+      const r = runSessionStartFor(dir, dir, sid, { source: 'startup' });
       assert.equal(r.status, 0, `stderr: ${r.stderr}`);
     }
     assert.ok(existsSync(sessionRecordStampPath(dir, 'sess-new')), 'a new session is stamped');
@@ -5135,6 +5236,34 @@ test('SessionStart stamps a new session and leaves a session with an earlier rec
     // A second start of the same session (resume) keeps the stamp and writes nothing new over it.
     assert.equal(stampSessionRecord(dir, 'sess-new'), 'already-stamped');
     assert.equal(stampSessionRecord(dir, 'bad id!'), 'invalid-session');
+  });
+});
+
+// Distinguishes: a SessionStart that begins a session (`startup`, or `clear`, which comes with a
+// new session id) stamps it, from one that continues a session (`resume`), which may have run on
+// older hooks that kept no complete record, and does not.
+test('SessionStart: a resume does not stamp the session record', () => {
+  withSyncedWiki((dir) => {
+    const r = runSessionStartFor(dir, dir, 'sess-resumed', { source: 'resume' });
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    assert.equal(existsSync(sessionRecordStampPath(dir, 'sess-resumed')), false);
+  });
+});
+
+test('SessionStart: a clear does', () => {
+  withSyncedWiki((dir) => {
+    const r = runSessionStartFor(dir, dir, 'sess-after-clear', { source: 'clear' });
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    assert.equal(sessionRecordStamped(dir, 'sess-after-clear'), true);
+  });
+});
+
+// A payload with no `source` cannot say it begins the session, so it is treated like a resume.
+test('SessionStart: a payload without source does not stamp', () => {
+  withSyncedWiki((dir) => {
+    const r = runSessionStartFor(dir, dir, 'sess-no-source');
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    assert.equal(existsSync(sessionRecordStampPath(dir, 'sess-no-source')), false);
   });
 });
 
@@ -5804,84 +5933,17 @@ test('PreCompact skips its feedback follow-up when the gate used up the deadline
   });
 });
 
-// Distinguishes: pure drift found with the deadline already used up (the --write self-heal is not
-// started and a notice says so) from the same drift with time left (the --write runs once). The
-// deadline is spent by a preload that moves performance.now() far ahead once the check stand-in
-// has finished, so the outcome does not depend on how fast the machine is.
-// Disabling the check: in hypo-personal-check.mjs make `writeLeft === 0` `false`.
-test('PreCompact skips the drift self-heal --write when the gate used up the deadline, and says so', () => {
-  const run = (root, dir, spend) => {
-    const log = join(root, 'feedback.log');
-    const checked = join(root, 'checked');
-    writeFileSync(
-      join(root, 'scripts', 'feedback-sync.mjs'),
-      `import { appendFileSync, writeFileSync } from 'node:fs';
-const write = process.argv.includes('--write');
-appendFileSync(${JSON.stringify(log)}, (write ? 'write' : 'check') + '\\n');
-if (write) {
-  console.log(JSON.stringify({ mode: 'write', targets: {}, warnings: [] }));
-} else {
-  console.log(JSON.stringify({ mode: 'check', targets: { claude: { dirty: true } }, warnings: [] }));
-  writeFileSync(${JSON.stringify(checked)}, 'done');
-  process.exitCode = 1;
-}
-`,
-    );
-    const preload = join(root, 'spend-deadline.cjs');
-    writeFileSync(
-      preload,
-      `const { existsSync } = require('node:fs');
-const real = performance.now.bind(performance);
-performance.now = () => (existsSync(${JSON.stringify(checked)}) ? real() + 3600000 : real());
-`,
-    );
-    const r = spawnFromCopy(root, 'hooks/hypo-personal-check.mjs', [], dir, {
-      input: JSON.stringify(preCompactPayload),
-      env: spend ? { NODE_OPTIONS: `--require ${preload}` } : {},
-    });
-    const runs = existsSync(log) ? readFileSync(log, 'utf-8').split('\n').filter(Boolean) : [];
-    return { msg: JSON.parse(r.stdout).systemMessage || '', runs };
-  };
-  withCleanWiki((dir) => {
-    withPackageCopy((root) => {
-      writeFileSync(join(root, 'scripts', 'lint.mjs'), LINT_FINE);
-      const roomy = run(root, dir, false);
-      assert.deepEqual(
-        roomy.runs,
-        ['check', 'write'],
-        `with time left the drift is re-synced: ${roomy.msg}`,
-      );
-    });
-    withPackageCopy((root) => {
-      writeFileSync(join(root, 'scripts', 'lint.mjs'), LINT_FINE);
-      const spent = run(root, dir, true);
-      assert.deepEqual(
-        spent.runs,
-        ['check'],
-        `no --write once the deadline is used up: ${spent.msg}`,
-      );
-      assert.match(
-        spent.msg,
-        /feedback projection drift \(claude\) was not re-synced: too little of the 7000 ms gate deadline was left to run the sync/,
-      );
-    });
-  });
-});
-
-// Distinguishes: a self-heal --write started with a sliver of the deadline left (it would only be
-// killed by its timeout and reported as "auto-sync failed") from one started with enough time, and
-// a --write that does run out of time (a notice, gate stays ok) from one that fails (a blocker).
-// The clock is frozen by a preload (0 until the check stand-in has finished, then a chosen value),
-// so the time left is exact whatever the machine's speed.
-// Disabling the floor: in hypo-personal-check.mjs make `writeLeft < MIN_HEAL_WRITE_MS` read
-// `writeLeft === 0`. Disabling the timeout route: make `w.error?.code === 'ETIMEDOUT'` `false`.
-test('PreCompact skips the drift self-heal --write when under 1500 ms is left, and reports a --write cut by its timeout as a time limit', () => {
-  const run = (root, dir, { after, writeSleepMs = 0 }) => {
-    const log = join(root, 'feedback.log');
-    const checked = join(root, 'checked');
-    writeFileSync(
-      join(root, 'scripts', 'feedback-sync.mjs'),
-      `import { appendFileSync, writeFileSync } from 'node:fs';
+// The PreCompact hook from a package copy, with a feedback-sync stand-in that finds pure drift on
+// --check and writes nothing on --write (after sleeping `writeSleepMs`), and a preload that changes
+// performance.now() once the check has run: `clock` is its body, given `real` (the true clock) and
+// `checked` (whether the check has finished). The time the self-heal gets is then exact whatever the
+// machine's speed. Returns which runs happened, in order.
+function runDriftHeal(root, dir, { clock = null, writeSleepMs = 0 } = {}) {
+  const log = join(root, 'feedback.log');
+  const checked = join(root, 'checked');
+  writeFileSync(
+    join(root, 'scripts', 'feedback-sync.mjs'),
+    `import { appendFileSync, writeFileSync } from 'node:fs';
 const write = process.argv.includes('--write');
 appendFileSync(${JSON.stringify(log)}, (write ? 'write' : 'check') + '\\n');
 if (write) {
@@ -5893,27 +5955,85 @@ if (write) {
   process.exitCode = 1;
 }
 `,
-    );
-    const preload = join(root, 'freeze-clock.cjs');
-    writeFileSync(
-      preload,
-      `const { existsSync } = require('node:fs');
-performance.now = () => (existsSync(${JSON.stringify(checked)}) ? ${after} : 0);
+  );
+  const preload = join(root, 'clock.cjs');
+  writeFileSync(
+    preload,
+    `const { existsSync } = require('node:fs');
+const real = performance.now.bind(performance);
+performance.now = () => { const checked = existsSync(${JSON.stringify(checked)}); return ${clock}; };
 `,
-    );
-    const r = spawnFromCopy(root, 'hooks/hypo-personal-check.mjs', [], dir, {
-      input: JSON.stringify(preCompactPayload),
-      env: { NODE_OPTIONS: `--require ${preload}` },
-    });
-    const runs = existsSync(log) ? readFileSync(log, 'utf-8').split('\n').filter(Boolean) : [];
-    const out = JSON.parse(r.stdout);
-    return { msg: out.systemMessage || '', runs, out };
-  };
+  );
+  const r = spawnFromCopy(root, 'hooks/hypo-personal-check.mjs', [], dir, {
+    input: JSON.stringify(preCompactPayload),
+    env: clock ? { NODE_OPTIONS: `--require ${preload}` } : {},
+  });
+  const runs = existsSync(log) ? readFileSync(log, 'utf-8').split('\n').filter(Boolean) : [];
+  const out = JSON.parse(r.stdout);
+  return { msg: out.systemMessage || '', runs, out };
+}
+
+// Distinguishes: pure drift found with both the gate deadline and the hook limit used up (the
+// --write self-heal is not started, and the notice gives the command to run by hand) from the same
+// drift with time left (the --write runs once). The clock jumps an hour once the check stand-in has
+// finished. Disabling the check: in hypo-personal-check.mjs make `writeLeft < MIN_HEAL_WRITE_MS`
+// `false`.
+test('PreCompact: with the gate deadline and the hook limit both spent, the drift self-heal is skipped and the notice names the command', () => {
   withCleanWiki((dir) => {
-    // 500 ms left of the 7000: under the floor, no --write, a notice
     withPackageCopy((root) => {
       writeFileSync(join(root, 'scripts', 'lint.mjs'), LINT_FINE);
-      const low = run(root, dir, { after: 6500 });
+      const roomy = runDriftHeal(root, dir);
+      assert.deepEqual(
+        roomy.runs,
+        ['check', 'write'],
+        `with time left the drift is re-synced: ${roomy.msg}`,
+      );
+    });
+    withPackageCopy((root) => {
+      writeFileSync(join(root, 'scripts', 'lint.mjs'), LINT_FINE);
+      const spent = runDriftHeal(root, dir, { clock: 'checked ? real() + 3600000 : real()' });
+      assert.deepEqual(spent.runs, ['check'], `no --write once the limit is used up: ${spent.msg}`);
+      assert.match(
+        spent.msg,
+        /feedback projection drift \(claude\) was not re-synced: the gate left too little of the 30000 ms PreCompact hook limit to run the sync/,
+      );
+      assert.match(
+        spent.msg,
+        /or run it now: node \S+\/scripts\/feedback-sync\.mjs --write --hypo-dir=\S+ --claude-home=\S+/,
+      );
+      assert.ok(spent.msg.includes(`--hypo-dir=${dir} `), spent.msg);
+    });
+  });
+});
+
+// Pair of the one above: the gate deadline (7000 ms) is spent, the 30000 ms hook limit is not, so
+// the self-heal still runs on its own share. Before the share it was skipped here on every /compact
+// of a large vault. Disabling the share: in hypo-personal-check.mjs make `hookDeadline` `deadline`.
+test('PreCompact: with the gate deadline spent and the hook limit not, the drift self-heal still runs', () => {
+  withCleanWiki((dir) => {
+    withPackageCopy((root) => {
+      writeFileSync(join(root, 'scripts', 'lint.mjs'), LINT_FINE);
+      const late = runDriftHeal(root, dir, { clock: 'checked ? 8000 : 0' });
+      assert.deepEqual(late.runs, ['check', 'write'], `the write still runs: ${late.msg}`);
+      assert.ok(!/was not re-synced/.test(late.msg), late.msg);
+      assert.match(late.msg, /feedback projection re-synced \(claude\)/);
+    });
+  });
+});
+
+// Distinguishes: a self-heal --write started with a sliver of its share left (it would only be
+// killed by its timeout and reported as "auto-sync failed") from one started with enough time, and
+// a --write that does run out of time (a notice, gate stays ok) from one that fails (a blocker).
+// The clock is frozen by a preload (0 until the check stand-in has finished, then a chosen value).
+// The share ends at 29000 ms (the 30000 ms limit less the report's second).
+// Disabling the floor: in hypo-personal-check.mjs make `writeLeft < MIN_HEAL_WRITE_MS` read
+// `writeLeft === 0`. Disabling the timeout route: make `w.error?.code === 'ETIMEDOUT'` `false`.
+test('PreCompact skips the drift self-heal --write when under 1500 ms of its share is left, and reports a --write cut by its timeout as a time limit', () => {
+  withCleanWiki((dir) => {
+    // 500 ms left of the share: under the floor, no --write, a notice
+    withPackageCopy((root) => {
+      writeFileSync(join(root, 'scripts', 'lint.mjs'), LINT_FINE);
+      const low = runDriftHeal(root, dir, { clock: 'checked ? 28500 : 0' });
       assert.deepEqual(low.runs, ['check'], `no --write under the floor: ${low.msg}`);
       assert.match(low.msg, /feedback projection drift \(claude\) was not re-synced/);
       assert.ok(!/auto-sync failed/.test(low.msg), low.msg);
@@ -5921,18 +6041,17 @@ performance.now = () => (existsSync(${JSON.stringify(checked)}) ? ${after} : 0);
     // 1600 ms left: over the floor, the write runs
     withPackageCopy((root) => {
       writeFileSync(join(root, 'scripts', 'lint.mjs'), LINT_FINE);
-      const ok = run(root, dir, { after: 5400 });
+      const ok = runDriftHeal(root, dir, { clock: 'checked ? 27400 : 0' });
       assert.deepEqual(ok.runs, ['check', 'write'], `the write runs over the floor: ${ok.msg}`);
     });
-    // a --write that outlives its time: ends by ETIMEDOUT, a time-limit notice, not a blocker
+    // a --write that outlives its 1600 ms: ends by ETIMEDOUT, a time-limit notice, not a blocker
     withPackageCopy((root) => {
-      shrinkGateDeadline(root, 2500);
       writeFileSync(join(root, 'scripts', 'lint.mjs'), LINT_FINE);
-      const cut = run(root, dir, { after: 0, writeSleepMs: 20000 });
+      const cut = runDriftHeal(root, dir, { clock: 'checked ? 27400 : 0', writeSleepMs: 10000 });
       assert.deepEqual(cut.runs, ['check', 'write'], `the write was started: ${cut.msg}`);
       assert.match(
         cut.msg,
-        /was not re-synced: the sync was still running when the 2500 ms gate deadline ran out/,
+        /was not re-synced: the sync was still running when its 1600 ms share of the 30000 ms PreCompact hook limit ran out/,
       );
       assert.ok(!/auto-sync failed/.test(cut.msg), `not a failed sync: ${cut.msg}`);
       assert.notEqual(cut.out.decision, 'block', 'a time limit does not block /compact');
@@ -5968,18 +6087,20 @@ test('PreCompact names the real skip cause, not a missing hypo-pkg.json', () => 
       );
       assert.match(
         advisory,
-        /lint skipped \(time limit: it was still running after \d+ ms/,
+        /lint skipped, time limit: it was still running after \d+ ms/,
         advisory,
       );
-      assert.match(advisory, /feedback-sync skipped \(time limit: the gate deadline/, advisory);
+      assert.match(advisory, /feedback-sync skipped, time limit: the gate deadline/, advisory);
       assert.ok(
-        !/skipped \([^()]*\(/.test(advisory),
-        `no parenthesis inside the skip one: ${advisory}`,
+        !/(lint|feedback-sync) skipped \((time limit|tool missing|error|not actionable):/.test(
+          advisory,
+        ),
+        `the skip cause opens no parenthesis inside the list's own: ${advisory}`,
       );
       const bypass = messages(root, dir, { HYPO_SKIP_GATE: '1' });
       assert.match(
         bypass,
-        /gate bypassed via HYPO_SKIP_GATE=1 \(incomplete: .*lint skipped \(time limit/,
+        /gate bypassed via HYPO_SKIP_GATE=1 \(incomplete: .*lint skipped, time limit/,
         bypass,
       );
       for (const m of [advisory, bypass])
@@ -5991,11 +6112,13 @@ test('PreCompact names the real skip cause, not a missing hypo-pkg.json', () => 
     withPackageCopy((root) => {
       rmSync(join(root, 'scripts', 'lint.mjs'));
       const advisory = messages(root, dir);
-      assert.match(advisory, /lint skipped \(tool missing: scripts\/lint\.mjs not found/, advisory);
-      assert.match(advisory, /run `hypomnema init` or reinstall the plugin\)/, advisory);
+      assert.match(advisory, /lint skipped, tool missing: scripts\/lint\.mjs not found/, advisory);
+      assert.match(advisory, /run `hypomnema init` or reinstall the plugin[,)]/, advisory);
       assert.ok(
-        !/skipped \([^()]*\(/.test(advisory),
-        `no parenthesis inside the skip one: ${advisory}`,
+        !/(lint|feedback-sync) skipped \((time limit|tool missing|error|not actionable):/.test(
+          advisory,
+        ),
+        `the skip cause opens no parenthesis inside the list's own: ${advisory}`,
       );
     });
   });
@@ -9069,9 +9192,9 @@ function withTwoProjectWiki(fn) {
   });
 }
 
-function runSessionStartFor(dir, cwd, sessionId) {
+function runSessionStartFor(dir, cwd, sessionId, extra = {}) {
   return spawnSync(process.execPath, [join(HOOKS, 'hypo-session-start.mjs')], {
-    input: JSON.stringify({ cwd, session_id: sessionId }),
+    input: JSON.stringify({ cwd, session_id: sessionId, ...extra }),
     encoding: 'utf-8',
     env: { ...process.env, HOME: SESSION_TMP_HOME, HYPO_DIR: dir },
   });

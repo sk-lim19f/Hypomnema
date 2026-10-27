@@ -115,6 +115,12 @@ const PKG_INTEGRITY_HINT =
 // the same reason; kept as a separate local constant here rather than an
 // import, since that file is not this task's to change.
 const DOCTOR_HINT = '`/hypo:doctor` in Claude Code, or `hypomnema doctor` with the npm CLI';
+// Said wherever this report tells a person to /reload-plugins: a reload swaps the hooks of an open
+// session, but a session that began before the upgrade has no record stamp, so the close gate
+// keeps the old project-folder rule for it (commands/upgrade.md and hypo-guide.md say the same).
+const NEW_SESSION_HINT =
+  'A session that was already open before this upgrade keeps the old project-folder close rule ' +
+  'until you start a new session; `/reload-plugins` alone does not switch it.';
 const HOOKS_SRC = join(PKG_ROOT, 'hooks');
 const COMMANDS_SRC = join(PKG_ROOT, 'commands');
 const TEMPLATES = join(PKG_ROOT, 'templates');
@@ -947,8 +953,9 @@ This report was generated during an upgrade apply. ${
         pluginMode
           ? 'You are on a **plugin install**, so the core hook files and settings.json hook ' +
             'registrations were NOT touched — the Claude Code plugin loader owns them (upgrade the ' +
-            'plugin via `/plugin marketplace update hypomnema` then `/reload-plugins`). Vault ' +
-            'extensions, if any, were still synced.'
+            'plugin via `/plugin marketplace update hypomnema` then `/reload-plugins`). ' +
+            NEW_SESSION_HINT +
+            ' Vault extensions, if any, were still synced.'
           : 'Hook files and settings.json entries were applied by that run (or skipped with a ' +
             'warning if the target was malformed — see the upgrade output).'
       } \`SCHEMA.md\` is intentionally **not** overwritten by upgrade — the
@@ -2015,6 +2022,7 @@ if (pluginMode) {
     '  plugin loader, so `/hypo:upgrade` does NOT manage them (and `--apply` will',
     '  not copy/register them — that would double-register every hook).',
     '  → To upgrade the plugin: `/plugin marketplace update hypomnema` then `/reload-plugins`.',
+    `    ${NEW_SESSION_HINT}`,
     '  → `/hypo:upgrade` (apply step confirmed) here applies vault-side migrations (SCHEMA,',
     '    .hypoignore), refreshes package metadata, and still syncs any vault',
     '    extensions — but does NOT install the core hooks/commands/settings.',
@@ -2034,6 +2042,7 @@ if (dualSkip) {
     '  → Recommended: pick ONE install. To keep the plugin, remove the npm/manual copy',
     '    (`npm uninstall -g hypomnema`) and upgrade via `/plugin marketplace update',
     '    hypomnema` + `/reload-plugins`. Vault extensions + codex (if any) are still synced.',
+    `    ${NEW_SESSION_HINT}`,
     '  → To register the core surface here anyway (knowingly accept the double-register',
     '    risk), re-run with `--allow-dual-install`.',
     '',
@@ -2062,6 +2071,7 @@ if (dualSkip) {
       '  → Fix: repair or refresh ~/.claude/plugins/installed_plugins.json (reinstall the plugin,',
       '    or run `/plugin marketplace update hypomnema` then `/reload-plugins`),',
       '    then re-run `hypomnema upgrade --apply` to record the confirmed root.',
+      `    ${NEW_SESSION_HINT}`,
       '',
     );
   }

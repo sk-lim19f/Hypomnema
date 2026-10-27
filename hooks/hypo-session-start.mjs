@@ -1270,8 +1270,13 @@ process.stdin.on('end', () => {
     // has no base and closes down the legacy direct-write path.
     if (data.session_id) {
       // Before the base snapshot: a session whose base already exists began under an older
-      // version and is not stamped (see stampSessionRecord).
-      stampSessionRecord(HYPO_DIR, data.session_id);
+      // version and is not stamped (see stampSessionRecord). Only a session that starts here is
+      // stamped: `startup`, or `clear` (a new session id). A `resume` or `compact` start, or a
+      // payload with no `source`, may continue a session that ran on older hooks for a while, so it
+      // gets no stamp; one stamped when it started keeps its stamp file.
+      if (data.source === 'startup' || data.source === 'clear') {
+        stampSessionRecord(HYPO_DIR, data.session_id);
+      }
       snapshotBase(HYPO_DIR, data.session_id, overwriteTargets(null));
       // Bumps the observed generation on EVERY SessionStart (first run and resume/compact alike),
       // before the injections below record into it. A resume that ends up injecting nothing still

@@ -53,6 +53,8 @@ import {
   headPathState,
   revPathArg,
   recordTouchedPaths,
+  readSessionRecord,
+  retractTouchedPaths,
   recordShardAppend,
   removeShardAppend,
   loadHypoIgnore,
@@ -1910,24 +1912,44 @@ export function ensureProjectIndex(hypoDir, project, relPath, today, sessionId) 
   const dest = join(hypoDir, relPath);
   const content = projectIndexSeed(project, today);
   if (content === null) return null; // template missing: nothing to scaffold from
+  // The close gate has to know the file is this session's before it exists: a death between the
+  // create and the write leaves a zero-byte index.md that nothing else would claim. So the record
+  // comes first, with the seed's hash rather than the empty file's, so the Stop auto-commit does
+  // not retire it. A record that fails stops here, before the create: its failure flag holds the
+  // seed hash (`expectedSha256`) and the folder rule blocks the path.
+  const seedHash = bytesSha256(content);
+  let prior = null;
+  if (sessionId) {
+    // What the record held for this path before this call, so a lost create takes back only the
+    // claim this call added.
+    prior = readSessionRecord(hypoDir, sessionId);
+    if (
+      !recordTouchedPaths(hypoDir, sessionId, [relPath], {
+        expectedHashes: { [relPath]: seedHash },
+      })
+    )
+      return null;
+  }
   mkdirSync(dirname(dest), { recursive: true });
   let fd;
   try {
     fd = openSync(dest, 'wx');
   } catch (e) {
-    if (e && e.code === 'EEXIST') return null; // another writer already created it
+    // Another writer already created it: the file is not this session's, so the claim just
+    // recorded goes. One the record already held before this call (an earlier close of this
+    // session) is put back as it was, and an unreadable earlier record is left alone.
+    if (e && e.code === 'EEXIST' && sessionId && prior.complete) {
+      if (!prior.paths.includes(relPath)) {
+        retractTouchedPaths(hypoDir, sessionId, { [relPath]: seedHash });
+      } else {
+        // `undefined` (the path had no hash) removes the seed hash again.
+        recordTouchedPaths(hypoDir, sessionId, [relPath], {
+          expectedHashes: { [relPath]: prior.hashes[relPath] },
+        });
+      }
+    }
+    if (e && e.code === 'EEXIST') return null;
     throw e;
-  }
-  // The create is ours from here, so the close gate has to know the file is this
-  // session's before the bytes land: a death between the empty create and the
-  // write leaves a zero-byte index.md that nothing else would claim. The record
-  // carries the seed's hash, not the empty file's, so the Stop auto-commit does
-  // not retire it. A `false` return is not fatal: the failure flag recordTouchedPaths
-  // leaves on its own blocks this path. EEXIST above never reaches this record.
-  if (sessionId) {
-    recordTouchedPaths(hypoDir, sessionId, [relPath], {
-      expectedHashes: { [relPath]: bytesSha256(content) },
-    });
   }
   try {
     writeSync(fd, content);
@@ -5045,6 +5067,15 @@ function printGateNotices(notices) {
   for (const n of notices) console.log(`  · ${n.reason}`);
 }
 
+// The gate's blockers in the text report, one ✗ line each with its type, its file when it names
+// one, and its reason. JSON carries them as `gateBlockers`; without these lines the text report
+// named no blocker at all and sent the reader to --json to find out what to fix.
+function printGateBlockers(blockers) {
+  if (!blockers || blockers.length === 0) return;
+  console.log('  Gate blockers:');
+  for (const b of blockers) console.log(`  ✗ ${b.type}${b.file ? ` ${b.file}` : ''}: ${b.reason}`);
+}
+
 // The human-readable (non --json) rendering of the same settled state.
 function printCloseReport({
   project,
@@ -5071,6 +5102,7 @@ function printCloseReport({
   obsoleteNotices,
   hostTagWarning,
   gateNotices,
+  gateBlockers,
 }) {
   console.log(`Session-close apply (project: ${project}, date: ${date}):`);
   for (const a of applied) console.log(`  ✓ wrote ${a}`);
@@ -5082,6 +5114,7 @@ function printCloseReport({
   // What the verification saw but did not gate on (this close has no log lines under its date).
   for (const n of verification?.notices || []) console.log(`  · ${n.reason}`);
   printGateNotices(gateNotices);
+  printGateBlockers(gateBlockers);
   // Surfaced unconditionally, success or failure. `restructure: true` no
   // longer waives the guard: the target below is still WITHHELD
   // and shows up in the conflicts loop right after this one. This line only
@@ -5232,11 +5265,13 @@ function printCloseReport({
               `    refused the per-session Stop-chain marker because a gate blocker\n` +
               `    remains. The session is NOT fully closed: the Stop hook will re-prompt\n` +
               `    until the marker is present. This is not a --session-id problem.\n` +
-              `    To fix: resolve the gate blocker the JSON's gateBlockers[] names (the\n` +
-              `    uncommitted file this session recorded writing, or a flagged one: commit\n` +
-              `    or revert it; or the cause of a skipped check), then re-run the same\n` +
-              `    close. Re-run with --json to see gateBlockers[]; this text output does\n` +
-              `    not print it. No fresh close phrase is needed: a close signal is spent\n` +
+              `    To fix: resolve each gate blocker (the ✗ lines above name each blocker,\n` +
+              `    as gateBlockers[] does in --json): the uncommitted file this session\n` +
+              `    recorded writing, or a flagged one: commit or revert it; a project folder\n` +
+              `    blocked as a whole (type git: no record stamp, an incomplete record, or\n` +
+              `    no session id), which its reason says how to clear, since a file in it\n` +
+              `    may be another session's; or the cause of a skipped check. Then re-run\n` +
+              `    the same close. No fresh close phrase is needed: a close signal is spent\n` +
               `    only once the marker lands.\n`
             : markerSkipReason === 'session-close-lock-timeout'
               ? `    The close files were applied and committed, but another close of this\n` +
@@ -5899,6 +5934,7 @@ export function applySessionClose(args, testHooks = null) {
       obsoleteNotices: [...obsoleteNotices, ...notices],
       hostTagWarning: hostTagNotice,
       gateNotices,
+      gateBlockers,
     });
   }
   process.exit(ok ? 0 : 1);

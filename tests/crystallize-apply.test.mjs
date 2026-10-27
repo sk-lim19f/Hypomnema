@@ -60,6 +60,7 @@ import {
   recordShardAppend,
   readClosePin,
   readTouchedPathsStrict,
+  readSessionRecord,
   commitTouchedPaths,
   touchedHashesPath,
   readTouchedPathsFailed,
@@ -1649,6 +1650,79 @@ test("ensureProjectIndex: another session's index.md (EEXIST) is not recorded in
   });
 });
 
+// Distinguishes: the record made before the create (a death between the create and the seed write
+// leaves an empty file that is already claimed) from one made after it. The create itself is where
+// the claim is read, so the order is seen directly, not inferred from the end state.
+test('ensureProjectIndex: the seed hash is recorded before the file exists', () => {
+  withTmpDir((dir) => {
+    const rel = join('projects', 'rec-project', 'index.md');
+    const dest = join(dir, rel);
+    const sid = newPinSession('idx-order');
+    const realOpenSync = nodeFs.openSync;
+    let atCreate = null;
+    nodeFs.openSync = function (path, flags, ...rest) {
+      if (atCreate === null && path === dest && flags === 'wx') {
+        atCreate = { exists: existsSync(dest), record: readSessionRecord(dir, sid) };
+      }
+      return realOpenSync.call(this, path, flags, ...rest);
+    };
+    syncBuiltinESMExports();
+    try {
+      assert.equal(ensureProjectIndex(dir, 'rec-project', rel, '2026-06-01', sid), rel);
+    } finally {
+      nodeFs.openSync = realOpenSync;
+      syncBuiltinESMExports();
+    }
+    assert.ok(atCreate, 'the create must have run');
+    assert.equal(atCreate.exists, false, 'the file did not exist yet');
+    assert.deepEqual(atCreate.record.paths, [rel]);
+    assert.equal(
+      atCreate.record.hashes[rel],
+      createHash('sha256').update(readFileSync(dest)).digest('hex'),
+      'the claim carries the seed hash, not the empty file',
+    );
+  });
+});
+
+// Distinguishes: a create lost to another writer takes back the claim this call recorded, set
+// entry and hash alike (a hash left alone still reads as a claim), from one that leaves either
+// behind. A claim of another path recorded earlier stays.
+test("ensureProjectIndex: another session's index.md leaves no claim behind", () => {
+  withTmpDir((dir) => {
+    const rel = join('projects', 'rec-project', 'index.md');
+    const sid = newPinSession('idx-lost');
+    mkdirSync(join(dir, 'pages'), { recursive: true });
+    writeFileSync(join(dir, 'pages', 'other.md'), 'other\n');
+    assert.equal(recordTouchedPaths(dir, sid, ['pages/other.md']), true);
+    mkdirSync(join(dir, 'projects', 'rec-project'), { recursive: true });
+    writeFileSync(join(dir, rel), 'another session wrote this\n');
+    assert.equal(ensureProjectIndex(dir, 'rec-project', rel, '2026-06-01', sid), null);
+    const record = readSessionRecord(dir, sid);
+    assert.equal(record.complete, true, JSON.stringify(record.incompleteWhy));
+    assert.deepEqual(record.paths, ['pages/other.md']);
+    const hashes = JSON.parse(readFileSync(touchedHashesPath(dir, sid), 'utf-8'));
+    assert.ok(!Object.hasOwn(hashes, rel), `no hash left for ${rel}: ${JSON.stringify(hashes)}`);
+    assert.equal(readFileSync(join(dir, rel), 'utf-8'), 'another session wrote this\n');
+  });
+});
+
+// Pair of the one above: the same path already claimed by an earlier close of this session, with
+// another hash, keeps that claim and that hash through a lost create.
+test('ensureProjectIndex: a claim an earlier close recorded for the same path survives a retraction', () => {
+  withTmpDir((dir) => {
+    const rel = join('projects', 'rec-project', 'index.md');
+    const sid = newPinSession('idx-earlier');
+    const earlier = 'a'.repeat(64);
+    assert.equal(recordTouchedPaths(dir, sid, [rel], { expectedHashes: { [rel]: earlier } }), true);
+    mkdirSync(join(dir, 'projects', 'rec-project'), { recursive: true });
+    writeFileSync(join(dir, rel), 'another session wrote this\n');
+    assert.equal(ensureProjectIndex(dir, 'rec-project', rel, '2026-06-01', sid), null);
+    const record = readSessionRecord(dir, sid);
+    assert.deepEqual(record.paths, [rel]);
+    assert.equal(record.hashes[rel], earlier, 'the earlier hash is back, not the seed hash');
+  });
+});
+
 // Pair of the next test: the create died between the empty create and the write, so the record
 // holds the seed hash and the disk holds nothing. Stop's retirement keeps it. A create that
 // finished and was committed matches HEAD and is retired.
@@ -2714,6 +2788,33 @@ test('the console report for compact-gate-not-ok names the gate blocker, not --s
       'a gate refusal is not the ok:true policy withhold',
     );
     assert.doesNotMatch(r.stderr, /--session-id=<main-conversation-id>/);
+  });
+});
+
+// Distinguishes: the text report naming each gate blocker on its own ✗ line (type, file, reason)
+// from one that names none and sends the reader to --json for gateBlockers[].
+test('apply (text): a gate blocker is printed as a ✗ line with its reason', () => {
+  withWiki(null, (dir, today) => {
+    writeFileSync(join(dir, 'projects', 'test-project', 'scratch.txt'), 'unsaved work\n');
+    const payload = payloadForCleanWiki(dir, today);
+    const sessionId = `s-gate-blocker-line-${process.pid}`;
+    recordTouchedPaths(dir, sessionId, ['projects/test-project/scratch.txt']);
+    const cleanup = seedCloseTranscript(sessionId);
+    let r;
+    try {
+      r = runApplyConsole(dir, payload, sessionId);
+    } finally {
+      cleanup();
+    }
+    assert.match(r.stderr, /reason: compact-gate-not-ok/, `stderr: ${r.stderr}`);
+    assert.match(
+      r.stdout,
+      /^ {2}✗ known-session-write projects\/test-project\/scratch\.txt: \S.*$/m,
+      `stdout: ${r.stdout}`,
+    );
+    assert.match(r.stderr, /the ✗ lines above name each blocker/);
+    assert.match(r.stderr, /type git: no record stamp, an incomplete record, or\s+no session id/);
+    assert.doesNotMatch(r.stderr, /this text output does\s+not print it/);
   });
 });
 
@@ -6725,7 +6826,13 @@ test('a close that committed and failed at the receipt keeps its entry when retr
       JSON.stringify(retry.out.notices),
     );
     assert.ok(existsSync(receiptPath(dir, sid)), 'the receipt was issued');
-    assert.equal(gitHead(dir), head, 'no new commit');
+    // The blocked session directory also failed the first attempt's record of the project index,
+    // so that attempt did not create index.md (a create is never left unclaimed). The retry seeds
+    // it, and that is all it commits: the entry itself is not committed again.
+    const since = spawnSync('git', ['-C', dir, 'diff', '--name-only', head, 'HEAD'], {
+      encoding: 'utf-8',
+    }).stdout.trim();
+    assert.equal(since, 'projects/test-project/index.md', 'only the skipped index seed is new');
   });
 });
 
