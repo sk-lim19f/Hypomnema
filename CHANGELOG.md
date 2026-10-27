@@ -5,6 +5,25 @@ All notable changes to Hypomnema are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.10.1] - 2026-10-27
+
+### Bug Fixes
+#### English
+- The 1.10.0 migration no longer loses a `.gitignore` or staged change made during its window, keeps an earlier run's archive record on undo, and reports git's own error when it stops. The vault pre-commit hook now runs the enabled plugin's worker over a stale sidecar (`hypomnema upgrade --apply` rewrites older hooks). `settings.json` stays a symlink, keeps its mode and survives a failed write. init no longer pushes without the hook guard and no longer copies a root `session-state.md`. ([#320](https://github.com/sk-lim19f/Hypomnema/pull/320))
+#### 한국어
+- 1.10.0 이행이 그 사이에 생긴 `.gitignore` 변경과 stage 변경을 잃지 않고, 되돌릴 때 앞 실행의 보관 기록을 남기며, 멈추면 git 의 오류를 그대로 알립니다. 볼트 pre-commit 훅이 오래된 sidecar 대신 켜진 플러그인의 worker 를 돌립니다(옛 훅은 `hypomnema upgrade --apply` 가 새로 씁니다). `settings.json` 이 symlink 로 남고 mode 를 지키며 쓰기가 실패해도 온전합니다. init 이 훅 가드 없이 push 하지 않고 루트 `session-state.md` 를 복사하지 않습니다. ([#320](https://github.com/sk-lim19f/Hypomnema/pull/320))
+
+### Chores
+#### English
+- The vault guide template is now version 4, and `hypomnema upgrade` reports an older guide until you merge it by hand and raise its `version:` stamp (`--apply` never overwrites it). The architecture and contributor guides now describe both install channels. ([#319](https://github.com/sk-lim19f/Hypomnema/pull/319))
+#### 한국어
+- 볼트 안내 템플릿이 버전 4 가 됐습니다. 예전 안내는 손으로 병합하고 `version:` 스탬프를 올릴 때까지 `hypomnema upgrade` 가 경고합니다(`--apply` 는 덮어쓰지 않습니다). 아키텍처 문서와 기여자 문서가 두 설치 채널을 설명합니다. ([#319](https://github.com/sk-lim19f/Hypomnema/pull/319))
+
+### Changelog
+- [#320](https://github.com/sk-lim19f/Hypomnema/pull/320) fix: keep local changes through the 1.10.0 migration, run the enabled plugin's hook worker, write settings.json through links
+- [#319](https://github.com/sk-lim19f/Hypomnema/pull/319) docs: bring the architecture, contributor and vault guides in line with 1.10.0
+Contributors: @sk-lim19f
+
 ## [1.10.0] - 2026-10-15
 
 > [!IMPORTANT]
