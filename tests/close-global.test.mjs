@@ -6002,8 +6002,8 @@ test('P2: a complete cwd project close adds no blocker', () => {
 
 // A deadline that reads as ample for its first `n` reads of `end` and as spent after, so one
 // stage of the gate runs out while the stages before it finish (the same helper as in
-// session-hooks.test.mjs: one area each, nothing shared). On a clean tree hypoIsClean reads
-// twice, so `deadlineAfterReads(2)` is spent when the close proof starts.
+// session-hooks.test.mjs: one area each, nothing shared). On a clean tree the gate's one git
+// status run reads once, so `deadlineAfterReads(1)` is spent when the close proof starts.
 function deadlineAfterReads(n) {
   let reads = 0;
   return {
@@ -6039,7 +6039,7 @@ test('a session close proof cut by the deadline is an incomplete close-cwd block
       false,
       `a finished proof of a committed close adds no blocker: ${JSON.stringify(roomy.blockers)}`,
     );
-    const cut = precompactGateStatus(dir, { ...base, deadline: deadlineAfterReads(2) });
+    const cut = precompactGateStatus(dir, { ...base, deadline: deadlineAfterReads(1) });
     const b = cut.blockers.find((x) => x.type === 'close-cwd');
     assert.ok(b, `the unfinished proof blocks: ${JSON.stringify(cut.blockers)}`);
     assert.equal(b.project, 'cwd-proj');

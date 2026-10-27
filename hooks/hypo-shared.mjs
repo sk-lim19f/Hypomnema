@@ -504,8 +504,9 @@ function porcelainHasDirt(stdout) {
 // `opts.deadline` is optional (session-close-scope-boundary spec §5): when
 // omitted, both spawns run exactly as before, no timeout, no status/error
 // check on the second one. hypo-compact-guard.mjs is the only caller that
-// passes one; precompactGateStatus (`:3872`) and all six direct test call
-// sites still pass a bare `dir` and must see byte-identical behavior.
+// passes one; the direct test call sites pass a bare `dir` and must see
+// byte-identical behavior. precompactGateStatus does not call this: it reads
+// dirt and ahead from one status run (gateGitState).
 export function hypoIsClean(dir = HYPO_DIR, opts = {}) {
   const { deadline } = opts;
   try {
@@ -610,8 +611,9 @@ export function hypoIsClean(dir = HYPO_DIR, opts = {}) {
  * `opts.deadline` (session-close-scope-boundary spec §5): the SAME shared
  * deadline object passed to hypoIsClean, so the two functions' spawns split
  * one budget instead of each getting their own (which would let the pair
- * together run twice as long as intended). Omitted, both spawns run exactly
- * as before — precompactGateStatus's own call (`:3874`) does not pass one.
+ * together run twice as long as intended). hypo-compact-guard.mjs passes one;
+ * omitted (the Stop hook's caller), both spawns run with no timeout.
+ * precompactGateStatus does not call this (gateGitState).
  */
 // Read-only status calls here pass --no-optional-locks: a plain `git status` may take
 // .git/index.lock to refresh the index, and outside the vault commit lock that collides
@@ -640,8 +642,15 @@ export function gitDirtyFiles(dir = HYPO_DIR, opts = {}) {
     t2 === undefined ? { encoding: 'utf-8' } : { encoding: 'utf-8', timeout: t2 },
   );
   if (porcelain.error || porcelain.status !== 0) return [];
+  return porcelainDirtyPaths(porcelain.stdout, prefix);
+}
+
+// The `dir`-relative dirty paths in `git status --porcelain -z` output with no branch header,
+// for a vault whose `rev-parse --show-prefix` is `prefix`: the parser of gitDirtyFiles, shared
+// with gateGitState.
+function porcelainDirtyPaths(stdout, prefix) {
   const out = [];
-  const records = (porcelain.stdout || '').split('\0');
+  const records = (stdout || '').split('\0');
   const toDirRelative = (f) => {
     if (!f) return null;
     if (!prefix) return f; // dir IS the repo top level, nothing to strip
@@ -666,6 +675,77 @@ export function gitDirtyFiles(dir = HYPO_DIR, opts = {}) {
   return out;
 }
 
+/**
+ * The close gate's git state from ONE `git status` run, so a big vault does not walk its tree
+ * three times inside the gate deadline (hypoIsClean's two runs, then gitDirtyFiles' third), and
+ * a first run that finished can no longer be followed by a later one that the deadline cut.
+ * `status --porcelain -b -uall -z` answers dirt and ahead together: its first record is the branch
+ * header (`## main`, or `## main...origin/main [ahead 1]`), never a file, and the rest is the
+ * record list the other two parse (porcelainHasDirt, porcelainDirtyPaths). `rev-parse
+ * --show-prefix` runs only when something is dirty, to make the paths vault-relative.
+ *
+ * @returns {{uncommitted: boolean, ahead: boolean, dirty: string[], timedOut: boolean, reason?: string}}
+ *   `timedOut`: the deadline ran out before or during a spawn, so nothing is known (and
+ *   `uncommitted` is true). A git failure is `uncommitted: true` with no dirty files and no time
+ *   limit, which the gate blocks on. `dirty` is `dir`-relative, like gitDirtyFiles.
+ */
+export function gateGitState(dir, { deadline } = {}) {
+  const spawn = (args) => {
+    const t = remainingSpawnTimeoutMs(deadline);
+    if (t === 0) return { timedOut: true };
+    const r = spawnSync(
+      'git',
+      args,
+      t === undefined ? { encoding: 'utf-8' } : { encoding: 'utf-8', timeout: t },
+    );
+    if (r.error?.code === 'ETIMEDOUT') return { timedOut: true };
+    return r.error || r.status !== 0 ? { failed: true } : { stdout: r.stdout || '' };
+  };
+  const cutShort = {
+    uncommitted: true,
+    ahead: false,
+    dirty: [],
+    timedOut: true,
+    reason: `git check deadline exhausted in ${dir}`,
+  };
+  const failed = {
+    uncommitted: true,
+    ahead: false,
+    dirty: [],
+    timedOut: false,
+    reason: `git check failed in ${dir}`,
+  };
+  const status = spawn([
+    '--no-optional-locks',
+    '-C',
+    dir,
+    'status',
+    '--porcelain',
+    '-b',
+    '-uall',
+    '-z',
+  ]);
+  if (status.timedOut) return cutShort;
+  if (status.failed) return failed;
+  const out = status.stdout;
+  const headerEnd = out.startsWith('## ') ? out.indexOf('\0') + 1 || out.length : 0;
+  // The same test as hypoIsClean's, so the two read one header the same way.
+  const ahead = /\[ahead \d+\]/.test(out.slice(0, headerEnd));
+  const body = out.slice(headerEnd);
+  const uncommitted = porcelainHasDirt(body);
+  const reasons = [];
+  if (uncommitted) reasons.push(`uncommitted changes in ${dir}`);
+  if (ahead) reasons.push(`unpushed commits in ${dir}`);
+  const reason = reasons.length ? reasons.join('; ') : undefined;
+  if (!uncommitted) return { uncommitted, ahead, dirty: [], timedOut: false, reason };
+  const prefixRes = spawn(['-C', dir, 'rev-parse', '--show-prefix']);
+  if (prefixRes.timedOut) return cutShort;
+  if (prefixRes.failed) return failed;
+  // Only the line ending is git's framing (see gitDirtyFiles).
+  const prefix = prefixRes.stdout.replace(/\r?\n$/, '');
+  return { uncommitted, ahead, dirty: porcelainDirtyPaths(body, prefix), timedOut: false, reason };
+}
+
 // session-close-scope-boundary spec §2b/§5: the ONE path-prefix rule that
 // decides a dirty file structurally belongs to a DIFFERENT eligible project
 // than the one this call is scoped to. Extracted from precompactGateStatus's
@@ -682,24 +762,12 @@ export function gitDirtyFiles(dir = HYPO_DIR, opts = {}) {
 // subdirectory) must not be reinterpreted as living under `projects/other/`
 // just because posixPath() would rewrite it that way — testing the raw
 // string means it never matches the regex below and falls through to
-// "not foreign", the fail-closed default. `transcriptTouched` IS keyed by
-// posix paths (it comes from extractTouchedWikiFiles), so that one check
-// still normalizes `f` before the lookup. No caller passes it any more (the
-// gate was the only one that did), so it always takes its empty default.
+// "not foreign", the fail-closed default.
 //
 // @param {string} f - a raw dirty path from gitDirtyFiles/git porcelain
-// @param {{eligibleSlugs: Set<string>|null, effectiveOverride: string|null,
-//   transcriptTouched?: Set<string>}} ctx
+// @param {{eligibleSlugs: Set<string>|null, effectiveOverride: string|null}} ctx
 // @returns {boolean}
-export function isForeignProjectFile(
-  f,
-  { eligibleSlugs, effectiveOverride, transcriptTouched = new Set() },
-) {
-  // Transcript evidence outranks the path-prefix heuristic below: it PROVES
-  // this session edited f, whatever its path prefix says. The heuristic only
-  // exists to cover files an untrusted (or absent) transcript could not
-  // vouch for either way.
-  if (transcriptTouched.has(posixPath(f))) return false;
+export function isForeignProjectFile(f, { eligibleSlugs, effectiveOverride }) {
   if (!eligibleSlugs) return false;
   const m = /^projects\/([^/]+)\/.+$/.exec(f);
   if (!m) return false;
@@ -3946,7 +4014,7 @@ export function isForeignAppendOnlyShard(hypoDir, relPath, sessionId, { deadline
   let own = null;
   if (touched.paths.map(posixPath).includes(relPath)) {
     const hashes = readTouchedHashesFile(touchedHashesPath(hypoDir, sessionId));
-    if (!Object.hasOwn(hashes, relPath)) return false;
+    if (!hashes || !Object.hasOwn(hashes, relPath)) return false;
     own = hashes[relPath];
     let committed = sha256Hex(head) === own;
     // One hash per line end: a day's shard is a few hundred lines at most.
@@ -6007,11 +6075,23 @@ export function sessionRecordStampPath(hypoDir, sessionId) {
 
 /** Whether the session began on a version that records every write (it has a record stamp). */
 export function sessionRecordStamped(hypoDir, sessionId) {
+  return readRecordStamp(hypoDir, sessionId) === true;
+}
+
+/** A session's stamp: `true` stamped, `false` no stamp (absent, or a schema this version does not
+ * vouch for), `null` a stamp file that exists but cannot be read. */
+function readRecordStamp(hypoDir, sessionId) {
+  let text;
   try {
-    const parsed = JSON.parse(readFileSync(sessionRecordStampPath(hypoDir, sessionId), 'utf-8'));
+    text = readFileSync(sessionRecordStampPath(hypoDir, sessionId), 'utf-8');
+  } catch (err) {
+    return err?.code === 'ENOENT' ? false : null;
+  }
+  try {
+    const parsed = JSON.parse(text);
     return Number.isInteger(parsed?.schema) && parsed.schema >= RECORD_STAMP_SCHEMA;
   } catch {
-    return false;
+    return null;
   }
 }
 
@@ -6051,7 +6131,7 @@ export function stampSessionRecord(hypoDir, sessionId) {
 const TOUCHED_FLAG_SHARE_MS = 1000;
 
 /**
- * HEAD's state for one vault path, for the failure flag: `{state: 'present', sha256}`,
+ * HEAD's state for one vault path, for the empty-index hint: `{state: 'present', sha256}`,
  * `{state: 'absent'}` (HEAD has no such path, or no commit yet) or `{state: 'error'}` when git could
  * not answer (including no time left on `deadline`, or a blob that will not read). Built on
  * `headPathState`, which keeps absent and error apart; `headBlob` alone returns `null` for both.
@@ -6082,24 +6162,29 @@ function emptyNewIndexHint(hypoDir, relPath, { deadline } = {}) {
 // `touched-paths-failed.d/`. A single file updated by read-modify-replace lost a path when two
 // writers raced (each read the same prior flag, added its own path, and replaced the file), and
 // the flag exists exactly for the moments a lock does not hold, so it cannot take one. A writer
-// only ever adds a file with a unique name; dropping a path removes the files that name it, or
-// writes a new file for what is left and then removes the old one. The reader takes the union.
-// `touched-paths-failed.json`, the single file older versions wrote, is still read as the oldest
-// attempt, and a drop moves what is left of it into an attempt file.
+// only ever adds a file with a unique name, and nothing in this module rewrites or removes one:
+// an entry stops blocking on its own once its bytes are committed or replaced (see
+// flaggedPathStillPending), and the directory goes only when a person removes it. The reader takes
+// the union. `touched-paths-failed.json`, the single file an earlier build wrote, is still read as
+// the oldest attempt.
 const FAILED_ATTEMPT_ORDER_WIDTH = 15;
+let failedAttemptSeq = 0;
 
 /** @returns {string} directory of a session's failure-flag attempt files. */
 export function touchedPathsFailedDir(hypoDir, sessionId) {
   return join(sessionCacheDir(hypoDir, sessionId), 'touched-paths-failed.d');
 }
 
-/** An attempt file's name: a fixed-width time first, so the names sort oldest to newest. */
-function failedAttemptName(order = String(Date.now()).padStart(FAILED_ATTEMPT_ORDER_WIDTH, '0')) {
-  return `${order}-${process.pid}-${randomBytes(4).toString('hex')}.json`;
+/** An attempt file's name: a fixed-width time first, so the names sort oldest to newest, then the
+ * pid and a per-process counter, so two attempts in one millisecond never share a name. */
+function failedAttemptName() {
+  const order = String(Date.now()).padStart(FAILED_ATTEMPT_ORDER_WIDTH, '0');
+  failedAttemptSeq += 1;
+  return `${order}-${process.pid}-${failedAttemptSeq}-${randomBytes(4).toString('hex')}.json`;
 }
 
 /** One flag file: `{entries, pathsUnknown, reasons}`, `null` when it cannot be read as one, and
- * `undefined` when it is gone (a concurrent drop removed it between the listing and the read). */
+ * `undefined` when it is gone (a person removed it between the listing and the read). */
 function parseFailedFlagFile(path) {
   try {
     const parsed = JSON.parse(readFileSync(path, 'utf-8'));
@@ -6117,16 +6202,14 @@ function parseFailedFlagFile(path) {
   }
 }
 
-/** Every flag file of a session, oldest first, as `{path, order, parsed}` (`path` null for a
+/** Every flag file of a session, oldest first, as `{path, parsed}` (`path` null for a
  * directory that cannot be listed, which reads as an unreadable flag). */
 function failedFlagSources(hypoDir, sessionId) {
   const sources = [];
   const legacy = touchedPathsFailedPath(hypoDir, sessionId);
   if (existsSync(legacy)) {
     const parsed = parseFailedFlagFile(legacy);
-    if (parsed !== undefined) {
-      sources.push({ path: legacy, order: '0'.repeat(FAILED_ATTEMPT_ORDER_WIDTH), parsed });
-    }
+    if (parsed !== undefined) sources.push({ path: legacy, parsed });
   }
   const dir = touchedPathsFailedDir(hypoDir, sessionId);
   let names = [];
@@ -6135,25 +6218,25 @@ function failedFlagSources(hypoDir, sessionId) {
       .filter((n) => n.endsWith('.json'))
       .sort();
   } catch (err) {
-    if (err?.code !== 'ENOENT') sources.push({ path: null, order: '', parsed: null });
+    if (err?.code !== 'ENOENT') sources.push({ path: null, parsed: null });
   }
   for (const name of names) {
     const path = join(dir, name);
     const parsed = parseFailedFlagFile(path);
-    if (parsed !== undefined) {
-      sources.push({ path, order: name.slice(0, FAILED_ATTEMPT_ORDER_WIDTH), parsed });
-    }
+    if (parsed !== undefined) sources.push({ path, parsed });
   }
   return sources;
 }
 
 /**
  * Read a session's failure flag (the attempt files, plus the single file older versions wrote):
- * `{entries: {<path>: {headSha256?: string|null}}, pathsUnknown, reasons}` as the union of them.
+ * `{entries: {<path>: {diskSha256?: string|null, expectedSha256?: string}}, pathsUnknown, reasons}`
+ * as the union of them (an entry from an earlier build may hold `headSha256` instead, which reads
+ * as no `diskSha256`).
  * A path named twice takes its newest entry. `failed` is false only when there is no flag. A flag
  * file that exists but cannot be read is a failure with the lost paths unknown, never "no flag".
  *
- * @returns {{failed: boolean, entries: Record<string, {headSha256?: string|null}>, pathsUnknown: boolean, reasons: string[]}}
+ * @returns {{failed: boolean, entries: Record<string, {diskSha256?: string|null, expectedSha256?: string}>, pathsUnknown: boolean, reasons: string[]}}
  */
 export function readTouchedPathsFailed(hypoDir, sessionId) {
   const sources = failedFlagSources(hypoDir, sessionId);
@@ -6173,78 +6256,59 @@ export function readTouchedPathsFailed(hypoDir, sessionId) {
 /**
  * Leave a mark that a touched-paths record did not land, so a gate that reads the set cannot take
  * the missing path for "not this session's". Best-effort and lock-free on purpose: a lock failure is
- * one of the causes it exists for. Writes one new attempt file and reads nothing, so concurrent
- * marks cannot erase each other. Each entry holds HEAD's blob hash for the path as of now: `null`
- * when HEAD has none, no `headSha256` key when git could not say (the gate then always blocks on it).
+ * one of the causes it exists for. Writes one new attempt file and reads no other flag file, so
+ * concurrent marks cannot erase each other, and it only ever adds. Each entry holds the sha256 of
+ * the path's bytes on disk as the flag is written (`diskSha256`, `null` when the file does not
+ * exist), with no git lookup: those are the bytes the failed record was about. A file that cannot be
+ * read gets no `diskSha256` key, and the gate then blocks on it whenever it is dirty. A path recorded
+ * before its bytes are written (`expectedHashes`) also keeps the hash it was given
+ * (`expectedSha256`), since the bytes on disk are not yet the ones this session writes.
  *
  * @param {string[]} paths vault-relative paths whose record did not land
  * @param {string} reason why (an error code, or a fixed label)
- * @param {{pathsUnknown?: boolean, deadline?: {end: number}}} [opts] `pathsUnknown`: paths were
- *   lost that this call cannot name
+ * @param {{pathsUnknown?: boolean, expectedHashes?: Record<string, string>}} [opts]
+ *   `pathsUnknown`: paths were lost that this call cannot name
+ * @returns {boolean} whether the flag file landed
  */
 function markTouchedPathsFailed(hypoDir, sessionId, paths, reason, opts = {}) {
-  const { pathsUnknown = false, deadline } = opts;
+  const { pathsUnknown = false, expectedHashes } = opts;
   try {
     const entries = {};
     for (const p of paths) {
-      const head = headBlobState(hypoDir, p, { deadline });
-      entries[p] =
-        head.state === 'present'
-          ? { headSha256: head.sha256 }
-          : head.state === 'absent'
-            ? { headSha256: null }
-            : {};
+      const entry = {};
+      const disk = vaultFileHash(hypoDir, p);
+      if (disk !== undefined) entry.diskSha256 = disk;
+      if (expectedHashes && typeof expectedHashes[p] === 'string') {
+        entry.expectedSha256 = expectedHashes[p];
+      }
+      entries[p] = entry;
     }
     atomicWrite(
       join(touchedPathsFailedDir(hypoDir, sessionId), failedAttemptName()),
       JSON.stringify({ v: 1, entries, pathsUnknown, reasons: [reason] }),
     );
+    return true;
   } catch {
-    // Nothing more to fall back on: see the double-failure limit in the plan.
-  }
-}
-
-/** A record of `paths` landed: they no longer need a flag entry. `pathsUnknown` stays, since the
- * paths it stands for are not named. Only the flag files that name one of `paths` are touched: one
- * left with nothing goes, one with other entries (or `pathsUnknown`) is replaced by a new file with
- * the same place in the order, written before the old one is removed. Two drops racing on one file
- * may each leave the other's path in their copy; a leftover entry only keeps blocking, the safe
- * direction. Best-effort. */
-function dropTouchedPathsFailedEntries(hypoDir, sessionId, paths) {
-  try {
-    for (const { path, order, parsed } of failedFlagSources(hypoDir, sessionId)) {
-      if (!path || !parsed || !paths.some((p) => Object.hasOwn(parsed.entries, p))) continue;
-      const entries = { ...parsed.entries };
-      for (const p of paths) delete entries[p];
-      if (Object.keys(entries).length > 0 || parsed.pathsUnknown) {
-        atomicWrite(
-          join(touchedPathsFailedDir(hypoDir, sessionId), failedAttemptName(order)),
-          JSON.stringify({
-            v: 1,
-            entries,
-            pathsUnknown: parsed.pathsUnknown,
-            reasons: parsed.reasons,
-          }),
-        );
-      }
-      rmSync(path, { force: true });
-    }
-  } catch {
-    // best-effort: a leftover entry only keeps blocking, the safe direction
+    // Nothing more to fall back on here. The caller decides what a missing flag means.
+    return false;
   }
 }
 
 /**
- * Whether a failure-flag entry still points at this session's uncommitted write. The entry holds
- * HEAD's blob hash at flag time; HEAD still at that value means the flagged write was never
- * committed, HEAD moved means it was (what is dirty now may be another writer's). A flag entry
- * with no hash, or a HEAD lookup that fails now, is no evidence of a move, so it stays pending.
+ * Whether a failure-flag entry still points at this session's uncommitted write. The caller asks
+ * only for a path git lists as dirty. The entry holds the bytes on disk when the flag was written:
+ * the same bytes now mean the flagged write is still what sits there; other bytes mean a later write
+ * replaced it (what is dirty now may be another session's), unless they are the bytes a record made
+ * before its write said it would write (`expectedSha256`). An entry with no `diskSha256` (the file
+ * could not be read when flagged, or an entry from an earlier build) stays pending, and so does a
+ * `null` one: the file did not exist yet, so bytes that appear later may be this session's own
+ * write landing after its record. A file that cannot be read now is no evidence of a change either.
  */
-function flaggedPathStillPending(hypoDir, relPath, entry, { deadline } = {}) {
-  if (!entry || !Object.hasOwn(entry, 'headSha256')) return true;
-  const now = headBlobState(hypoDir, relPath, { deadline });
-  if (now.state === 'error') return true;
-  return (now.state === 'present' ? now.sha256 : null) === entry.headSha256;
+function flaggedPathStillPending(hypoDir, relPath, entry) {
+  if (!entry || !Object.hasOwn(entry, 'diskSha256') || entry.diskSha256 === null) return true;
+  const now = vaultFileHash(hypoDir, relPath);
+  if (now === undefined) return true;
+  return now === entry.diskSha256 || now === entry.expectedSha256;
 }
 
 /**
@@ -6299,7 +6363,7 @@ function readTouchedPathsFile(path) {
  * @param {{expectedHashes?: Record<string, string>, deadline?: {end: number}}} [opts]
  *   `expectedHashes`: record this sha256 for a path instead of the bytes on disk (for a path
  *   recorded before its bytes are written). `deadline`: a `{end}` budget (see
- *   `remainingSpawnTimeoutMs`) that caps the lock wait and the failure flag's git lookups.
+ *   `remainingSpawnTimeoutMs`) that caps the lock wait, leaving time to write the failure flag.
  * @returns {boolean} true when the accumulation is durably recorded (or there
  *   was nothing to record); false when a lock-timeout or write failure means
  *   the caller cannot assume this path is in ANY session's touched-paths set.
@@ -6310,25 +6374,40 @@ function readTouchedPathsFile(path) {
  * Shared read-merge-write body for accumulating touched paths. Runs OUTSIDE
  * any lock; every caller wraps it in `withFileLock(path, ...)`.
  *
- * A corrupt/unreadable file (`readTouchedPathsFile` returns `null`) is
- * recovered from here, not preserved: an accumulate is additive by nature
- * (there is nothing salvageable to merge with), so starting fresh from
- * `incoming` is the correct best-effort behavior, unlike `clearTouchedPaths`,
- * where the same `null` MUST NOT be treated as empty (see
- * `readTouchedPathsFile`).
+ * A corrupt/unreadable set (`readTouchedPathsFile` returns `null`) is
+ * recovered from here once a paths-unknown failure flag has landed: an
+ * accumulate is additive by nature (there is nothing salvageable to merge
+ * with), so starting fresh from `incoming` is the correct best-effort
+ * behavior, unlike `clearTouchedPaths`, where the same `null` MUST NOT be
+ * treated as empty (see `readTouchedPathsFile`). Without that flag, or with
+ * an unreadable hash file, this throws and nothing is written.
  *
  * @returns {{added: boolean}} whether at least one of `incoming` was NOT
  *   already present in the set before this call.
  */
-function mergeIncomingTouchedPaths(hypoDir, sessionId, incoming, hashFor, deadline) {
+function mergeIncomingTouchedPaths(hypoDir, sessionId, incoming, hashFor) {
   const path = touchedPathsPath(hypoDir, sessionId);
+  // An unreadable hash file is left as it is: replacing it with this call's hashes would drop the
+  // claims it holds. The record fails instead, and the caller's catch flags `incoming`.
+  const hashPath = touchedHashesPath(hypoDir, sessionId);
+  const hashes = readTouchedHashesFile(hashPath);
+  if (hashes === null) {
+    throw Object.assign(new Error('touched-hashes.json cannot be read'), {
+      code: 'hashes-unreadable',
+    });
+  }
   const current = readTouchedPathsFile(path);
   // Starting over from `incoming` drops whatever the unreadable file held, and a later read says
-  // `ok`. The lost paths are not known, so the flag says so.
-  if (current === null) {
-    markTouchedPathsFailed(hypoDir, sessionId, incoming, 'prior-record-unreadable', {
+  // `ok`. The lost paths are not known, so the flag must say so before the file is replaced. A flag
+  // that did not land leaves the corrupt file in place, which still reads as unreadable.
+  if (
+    current === null &&
+    !markTouchedPathsFailed(hypoDir, sessionId, incoming, 'prior-record-unreadable', {
       pathsUnknown: true,
-      deadline,
+    })
+  ) {
+    throw Object.assign(new Error('the failure flag for an unreadable record did not land'), {
+      code: 'prior-record-unreadable',
     });
   }
   const merged = new Set(current === null ? [] : current);
@@ -6342,8 +6421,6 @@ function mergeIncomingTouchedPaths(hypoDir, sessionId, incoming, hashFor, deadli
   // this session, so a kill here does not lose the write) or the previous hash
   // of a path the set already held (at worst a false drift, which keeps the
   // path out of the commit and blocks, never one that sweeps foreign bytes in).
-  const hashPath = touchedHashesPath(hypoDir, sessionId);
-  const hashes = readTouchedHashesFile(hashPath);
   for (const p of incoming) {
     const h = hashFor(p);
     if (h === undefined) delete hashes[p];
@@ -6373,14 +6450,21 @@ export function touchedHashesPath(hypoDir, sessionId) {
   return join(sessionCacheDir(hypoDir, sessionId), 'touched-hashes.json');
 }
 
-/** Absent, corrupt, or not an object all read as `{}`: no hash recorded for
- * any path, which is exactly how a set from before hashes existed behaves. */
+/** Absent reads as `{}`: no hash recorded for any path, which is exactly how a set from before
+ * hashes existed behaves. A file that exists but cannot be read, or is not an object, is `null`:
+ * not the same as empty, so no caller overwrites, prunes or trusts it as "no drift". */
 function readTouchedHashesFile(path) {
+  let text;
   try {
-    const parsed = JSON.parse(readFileSync(path, 'utf-8'));
-    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
+    text = readFileSync(path, 'utf-8');
+  } catch (err) {
+    return err?.code === 'ENOENT' ? {} : null;
+  }
+  try {
+    const parsed = JSON.parse(text);
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : null;
   } catch {
-    return {};
+    return null;
   }
 }
 
@@ -6389,17 +6473,87 @@ function readTouchedHashesFile(path) {
  * entry in the set. A record writes the hash file first and the set second, so a process killed
  * between the two (no catch runs, so no failure flag either) leaves a path with a hash and no set
  * entry. That hash is the only trace of the write, so it counts as a claim until the path is
- * committed or matches HEAD, retired by the same rules as a recorded path. `null` when the set
- * exists but cannot be read (see `readTouchedPathsFile`). The caller holds the per-session lock.
+ * committed or matches HEAD, retired by the same rules as a recorded path. `null` when the set or
+ * the hash file exists but cannot be read (see `readRecordFiles`). The caller holds the per-session
+ * lock.
  */
 function readTouchedClaims(hypoDir, sessionId) {
-  const current = readTouchedPathsFile(touchedPathsPath(hypoDir, sessionId));
-  if (current === null) return null;
-  const known = new Set(current);
-  const orphans = Object.keys(readTouchedHashesFile(touchedHashesPath(hypoDir, sessionId))).filter(
-    (p) => p && !known.has(p),
-  );
-  return orphans.length === 0 ? current : [...current, ...orphans];
+  const files = readRecordFiles(hypoDir, sessionId);
+  return files.why.length === 0 ? files.paths : null;
+}
+
+/**
+ * The touched-paths set and the hash file of a session, read by the one rule every reader follows:
+ * a file that is absent is empty, a file that exists but cannot be read is not. The caller holds
+ * the per-session lock. `paths` is the claim list (see `readTouchedClaims`), `null` when the set
+ * cannot be read, and the set alone when only the hash file cannot. `hashes` is `null` when the
+ * hash file cannot be read. `why` names each unreadable file as `{source, cause}`.
+ *
+ * @returns {{paths: string[]|null, hashes: Record<string, string|null>|null, why: {source: 'set'|'hashes', cause: string}[]}}
+ */
+function readRecordFiles(hypoDir, sessionId) {
+  const set = readTouchedPathsFile(touchedPathsPath(hypoDir, sessionId));
+  const hashes = readTouchedHashesFile(touchedHashesPath(hypoDir, sessionId));
+  const why = [];
+  if (set === null) why.push({ source: 'set', cause: 'corrupt' });
+  if (hashes === null) why.push({ source: 'hashes', cause: 'corrupt' });
+  let paths = set;
+  if (set !== null && hashes !== null) {
+    const known = new Set(set);
+    const orphans = Object.keys(hashes).filter((p) => p && !known.has(p));
+    if (orphans.length > 0) paths = [...set, ...orphans];
+  }
+  return { paths, hashes, why };
+}
+
+/**
+ * Everything the close gate reads about one session's record, read by one rule: a file that is
+ * absent is empty (no set is an empty record, no stamp is `stamped: false`), a file that exists but
+ * cannot be read (bad JSON, permissions, a lock that cannot be taken or timed out) makes the record
+ * incomplete, with its source and cause in `incompleteWhy`. Nothing here reads "cannot read" as
+ * "nothing there". Takes the per-session lock for the set and the hashes, under `timeoutMs` when
+ * given, else under the time left on `deadline`. The failure flag and the stamp are lock-free.
+ *
+ * `paths` and `hashes` are the claims: each claimed path, and the hash recorded for it where one
+ * was (`null` meaning the file did not exist when recorded). A path with no recorded hash is in
+ * `paths` and not in `hashes`, which keeps it apart from one recorded as absent.
+ *
+ * @param {{deadline?: {end: number}, timeoutMs?: number}} [opts]
+ * @returns {{paths: string[], hashes: Record<string, string|null>, flags: {entries: Record<string, object>, pathsUnknown: boolean}, stamped: boolean, complete: boolean, incompleteWhy: {source: 'set'|'hashes'|'flags'|'stamp', cause: string}[]}}
+ */
+export function readSessionRecord(hypoDir, sessionId, { deadline, timeoutMs } = {}) {
+  const incompleteWhy = [];
+  let files;
+  try {
+    files = withFileLock(
+      touchedPathsPath(hypoDir, sessionId),
+      () => readRecordFiles(hypoDir, sessionId),
+      Number.isFinite(timeoutMs) ? lockWaitOpts({ timeoutMs }) : touchedLockBudget(deadline),
+    );
+  } catch (err) {
+    const cause = err?.code === 'ELOCKTIMEOUT' ? 'locked' : 'lock-failed';
+    files = { paths: null, hashes: null, why: [{ source: 'set', cause }] };
+  }
+  incompleteWhy.push(...files.why);
+  const flags = { entries: {}, pathsUnknown: false };
+  for (const { parsed } of failedFlagSources(hypoDir, sessionId)) {
+    if (!parsed) {
+      incompleteWhy.push({ source: 'flags', cause: 'unreadable' });
+      continue;
+    }
+    Object.assign(flags.entries, parsed.entries);
+    flags.pathsUnknown ||= parsed.pathsUnknown;
+  }
+  const stamp = readRecordStamp(hypoDir, sessionId);
+  if (stamp === null) incompleteWhy.push({ source: 'stamp', cause: 'unreadable' });
+  return {
+    paths: files.paths ?? [],
+    hashes: files.hashes ?? {},
+    flags,
+    stamped: stamp === true,
+    complete: incompleteWhy.length === 0,
+    incompleteWhy,
+  };
 }
 
 /** sha256 of a vault file's bytes, `null` when it does not exist, `undefined`
@@ -6446,11 +6600,13 @@ function recordedHashDrifted(hypoDir, hashes, relPath) {
 function pruneTouchedHashes(hypoDir, sessionId, remaining) {
   const hashPath = touchedHashesPath(hypoDir, sessionId);
   try {
+    // An unreadable hash file is left exactly as it is: neither removed nor rewritten.
+    const hashes = readTouchedHashesFile(hashPath);
+    if (hashes === null) return;
     if (remaining.length === 0) {
       rmSync(hashPath, { force: true });
       return;
     }
-    const hashes = readTouchedHashesFile(hashPath);
     const kept = {};
     for (const p of remaining) if (Object.hasOwn(hashes, p)) kept[p] = hashes[p];
     atomicWrite(hashPath, JSON.stringify(kept));
@@ -6477,15 +6633,10 @@ export function recordTouchedPaths(hypoDir, sessionId, relPaths, opts = {}) {
     withFileLock(
       path,
       () =>
-        mergeIncomingTouchedPaths(
-          hypoDir,
-          sessionId,
-          incoming,
-          (p) =>
-            expectedHashes && Object.hasOwn(expectedHashes, p)
-              ? expectedHashes[p]
-              : vaultFileHash(hypoDir, p),
-          deadline,
+        mergeIncomingTouchedPaths(hypoDir, sessionId, incoming, (p) =>
+          expectedHashes && Object.hasOwn(expectedHashes, p)
+            ? expectedHashes[p]
+            : vaultFileHash(hypoDir, p),
         ),
       lockOpts,
     );
@@ -6495,11 +6646,13 @@ export function recordTouchedPaths(hypoDir, sessionId, relPaths, opts = {}) {
     // false return is what lets a caller decide whether to trust this write
     // as accounted for, and the failure flag is what tells a gate that reads
     // the set later, whether or not the caller looked at the return.
-    markTouchedPathsFailed(hypoDir, sessionId, incoming, err?.code || 'write-failed', { deadline });
+    markTouchedPathsFailed(hypoDir, sessionId, incoming, err?.code || 'write-failed', {
+      expectedHashes,
+    });
     return false;
   }
-  // The record now covers these paths, so an earlier failure flag entry for them is spent.
-  dropTouchedPathsFailedEntries(hypoDir, sessionId, incoming);
+  // An earlier flag entry for these paths stays: the flag only ever adds (see
+  // flaggedPathStillPending for when an entry stops blocking).
   return true;
 }
 
@@ -6653,9 +6806,10 @@ export function readTouchedPathsDrifted(hypoDir, sessionId, opts = {}) {
     return withFileLock(
       path,
       () => {
-        const current = readTouchedClaims(hypoDir, sessionId) || [];
-        const hashes = readTouchedHashesFile(touchedHashesPath(hypoDir, sessionId));
-        return current.filter((p) => recordedHashDrifted(hypoDir, hashes, p));
+        const { paths, hashes } = readRecordFiles(hypoDir, sessionId);
+        // No readable hashes: no drift can be shown, and the gate blocks on the unreadable file.
+        if (!paths || !hashes) return [];
+        return paths.filter((p) => recordedHashDrifted(hypoDir, hashes, p));
       },
       lockWaitOpts(opts),
     );
@@ -6799,14 +6953,18 @@ export function commitTouchedPaths(hypoDir, sessionId, commitFn) {
   const path = touchedPathsPath(hypoDir, sessionId);
   try {
     return withFileLock(path, () => {
-      const current = readTouchedClaims(hypoDir, sessionId);
-      if (current === null) {
+      const files = readRecordFiles(hypoDir, sessionId);
+      if (files.why.length > 0) {
         // FIX 1: a read/parse failure is not "empty" — commit nothing this
         // round (a safe no-op scope) and leave the corrupt file untouched,
         // rather than let a downstream clear compute "nothing left" and
-        // delete it.
+        // delete it. An unreadable hash file is the same: no path can be
+        // shown to still hold this session's bytes, so reading it as "no
+        // drift" would commit whatever is on disk under this session's
+        // claim. Every path stays recorded and out of this commit.
         return commitFn([]);
       }
+      const current = files.paths;
       // Content check before the commit, for every path that has a recorded
       // hash (see touchedHashesPath). Bytes still equal to what this session
       // recorded go into the scope. Anything else is left out of THIS commit,
@@ -6820,9 +6978,9 @@ export function commitTouchedPaths(hypoDir, sessionId, commitFn) {
       //     path. Kept, so the checkpoint gate still blocks on it and says
       //     why (readTouchedPathsDrifted), instead of the path reading as
       //     ownerless.
-      // A path with no recorded hash (a set from before hashes existed, an
-      // unreadable file) goes into the scope as before.
-      const hashes = readTouchedHashesFile(touchedHashesPath(hypoDir, sessionId));
+      // A path with no recorded hash (a set from before hashes existed) goes
+      // into the scope as before.
+      const hashes = files.hashes;
       const scope = [];
       const driftKept = [];
       for (const p of current) {
@@ -8897,9 +9055,10 @@ function spawnEndKind(res) {
   return res.status === 0 ? 'ok' : 'exit';
 }
 
-// The lint and feedback-sync runner of the gate. `opts.runCheck` replaces it in tests.
-const defaultRunCheck = (name, args, spawnOpts) =>
-  spawnSync(name === 'lint' ? 'node' : process.execPath, args, spawnOpts);
+// The lint and feedback-sync runner of the gate. `opts.runCheck` replaces it in tests. Both run
+// under this process's own node: a spawn error is a `check-skipped` blocker, so a `node` that PATH
+// lacks (or resolves to another install) must not be the one asked.
+const defaultRunCheck = (_name, args, spawnOpts) => spawnSync(process.execPath, args, spawnOpts);
 
 /**
  * The full PreCompact gate decision as a READ-ONLY status. This is the single
@@ -8995,8 +9154,8 @@ export function precompactGateStatus(hypoDir, opts = {}) {
     skipped[check] = true;
     const why =
       run.kind === 'deadline'
-        ? `the gate deadline (${GATE_DEADLINE_MS} ms) was used up before it could start`
-        : `it was still running after ${run.ms} ms (gate deadline ${GATE_DEADLINE_MS} ms)`;
+        ? `the gate deadline, ${GATE_DEADLINE_MS} ms, was used up before it could start`
+        : `it was still running after ${run.ms} ms, gate deadline ${GATE_DEADLINE_MS} ms`;
     skippedWhy[check] = `time limit: ${why}`;
     notices.push({ type: check, reason: `${check} skipped (time limit, fail-open): ${why}` });
   };
@@ -9008,7 +9167,11 @@ export function precompactGateStatus(hypoDir, opts = {}) {
     blockers.push({
       type: 'check-skipped',
       check,
-      reason: `${check} check could not run to a result: ${msg} (${check === 'lint' ? 'lint' : '`feedback-sync --check`'} 를 직접 돌려 원인을 고친 뒤 close 를 다시 하면 된다. 영수증이 없으면 Stop 이 계속 close 를 요구한다)`,
+      reason: `${check} check could not run to a result: ${msg} (${
+        check === 'lint'
+          ? `/hypo:lint 또는 \`node ${join(PKG_ROOT || '<pkg>', 'scripts', 'lint.mjs')} --hypo-dir=${hypoDir}\` 로 lint`
+          : '`feedback-sync --check`'
+      } 를 직접 돌려 원인을 고친 뒤 close 를 다시 하면 된다. 영수증이 없으면 Stop 이 계속 close 를 요구한다)`,
     });
   };
 
@@ -9077,7 +9240,7 @@ export function precompactGateStatus(hypoDir, opts = {}) {
   //    here (the shared gate) keeps the marker == compact-ready invariant:
   //    a committed-but-unpushed close marks AND compacts, instead of the close writer
   //    committing its own payload and then being blocked by its own (unpushed) commit.
-  const git = hypoIsClean(hypoDir, { deadline });
+  const git = gateGitState(hypoDir, { deadline });
   // One git axis for every caller (Stop, PreCompact, check, --mark, apply): the
   // question is "is there an uncommitted write THIS session recorded (or failed
   // to record)". The project folder being closed blocks only what the record
@@ -9094,21 +9257,26 @@ export function precompactGateStatus(hypoDir, opts = {}) {
       reason: 'checkpointMode requires a validated sessionId',
     });
   } else if (git.uncommitted) {
-    const dirty = gitDirtyFiles(hypoDir, { deadline });
+    const dirty = git.dirty;
     if (dirty.length === 0) {
       // Enumeration itself failed (or nothing is actually dirty despite the
       // porcelain status): "cannot attribute" is not "clean", so fail closed.
-      // One exception: the gate deadline ran out, so there is no file list to
-      // judge. That blocks only when this session has a record of writing
-      // anything (touched-paths or a failure flag), else it is a notice. A call
-      // with no valid session id has no record to read, which the block-everything
-      // rule below treats as "cannot tell", so the cut counts as recorded.
-      const timedOut = cut();
+      // One exception: the gate deadline ran out before the one status run
+      // finished, so there is no file list to judge. That blocks only when this
+      // session has a record of writing anything (touched-paths or a failure
+      // flag), else it is a notice. A call with no valid session id has no
+      // record to read, which the block-everything rule below treats as "cannot
+      // tell", so the cut counts as recorded.
+      const timedOut = git.timedOut;
+      const rec = isValidSessionId(opts.sessionId)
+        ? readSessionRecord(hypoDir, opts.sessionId, { deadline })
+        : null;
       const recorded =
-        !isValidSessionId(opts.sessionId) ||
-        readTouchedPathsStrict(hypoDir, opts.sessionId, touchedLockBudget(deadline)).state !==
-          'empty' ||
-        readTouchedPathsFailed(hypoDir, opts.sessionId).failed;
+        !rec ||
+        !rec.complete ||
+        rec.paths.length > 0 ||
+        rec.flags.pathsUnknown ||
+        Object.keys(rec.flags.entries).length > 0;
       if (timedOut && !recorded) {
         notices.push({
           type: 'unresolved',
@@ -9129,16 +9297,28 @@ export function precompactGateStatus(hypoDir, opts = {}) {
       // record to read, so nothing can be told apart as this session's and
       // the project folder rule below applies to every file in it.
       const hasSession = isValidSessionId(opts.sessionId);
-      const touched = hasSession
-        ? readTouchedPathsStrict(hypoDir, opts.sessionId, touchedLockBudget(deadline))
-        : { state: 'empty', paths: [] };
-      if (touched.state === 'locked') {
+      // The whole record (set, hashes, failure flag, stamp) by one reading rule: a file that is
+      // there but cannot be read makes it incomplete, never empty (readSessionRecord).
+      const record = hasSession
+        ? readSessionRecord(hypoDir, opts.sessionId, { deadline })
+        : {
+            paths: [],
+            hashes: {},
+            flags: { entries: {}, pathsUnknown: false },
+            stamped: false,
+            complete: true,
+            incompleteWhy: [],
+          };
+      const whyOf = (source, cause) =>
+        record.incompleteWhy.some((w) => w.source === source && (!cause || w.cause === cause));
+      if (whyOf('set', 'locked')) {
         // Another writer holds this session's touched-paths lock right now
         // (usually this session's own Stop auto-commit). Transient, so
         // block: the retry reads the real set instead of guessing.
         blockers.push({
           type: 'known-session-write',
-          reason: 'touched-paths lock timed out (다른 쓰기가 끝난 뒤 다시 시도하면 된다)',
+          reason:
+            "this session's write record lock timed out (다른 쓰기가 끝난 뒤 다시 시도하면 된다)",
         });
       } else {
         // An unreadable set reads as "no record" and would read the same on
@@ -9147,65 +9327,79 @@ export function precompactGateStatus(hypoDir, opts = {}) {
         // (folderWide below): the record can no longer say which files in the
         // folder are this session's, so all of them block, with the way out
         // in the reason.
-        if (touched.state === 'unreadable') {
+        if (whyOf('set') || whyOf('hashes')) {
           notices.push({
             type: 'touched-paths-unreadable',
             reason:
-              'touched-paths unreadable: ownership of dirty files outside the project folder being closed was not judged (touched-paths 기록을 읽지 못해 프로젝트 폴더 밖 파일의 소유를 판정하지 못했다)',
+              "this session's write record unreadable: ownership of dirty files outside the project folder being closed was not judged; the project-folder block above says how to clear it (이 세션의 쓰기 기록을 읽지 못해 프로젝트 폴더 밖 파일의 소유를 판정하지 못했다)",
           });
         }
         // A record that failed to land leaves a failure flag
         // (touched-paths-failed.d/, see markTouchedPathsFailed). A flagged
-        // path blocks wherever it sits until its record lands, HEAD moves
-        // past it, or the flag is removed. A flag that lost paths it cannot
+        // path blocks wherever it sits while its bytes are still the ones the
+        // flag recorded and it is uncommitted (flaggedPathStillPending), or
+        // until the flag is removed. A flag that lost paths it cannot
         // name (pathsUnknown), or an unreadable record, makes the whole
         // project folder being closed block (folderWide): another session's
         // dirty file there stays a notice only while the record is complete.
         // With no project named (a --mark without --project), whose folder
         // it is cannot be told, so every projects/ file counts. A log-only
         // close names no project by design, so none does.
-        const failed = hasSession
-          ? readTouchedPathsFailed(hypoDir, opts.sessionId)
-          : { failed: false, entries: {}, pathsUnknown: false, reasons: [] };
+        const failed = record.flags;
         const flagged = (pf) =>
           Object.hasOwn(failed.entries, pf) &&
-          flaggedPathStillPending(hypoDir, pf, failed.entries[pf], { deadline });
+          flaggedPathStillPending(hypoDir, pf, failed.entries[pf]);
         // A session that began on an older version has no stamp (see stampSessionRecord): its
         // record may be missing writes without a flag to say so, so it gets the rule main used
         // before records decided ownership: every uncommitted file in the project folder being
-        // closed blocks. Only a stamped session's silence is trusted.
-        const legacySession = hasSession && !sessionRecordStamped(hypoDir, opts.sessionId);
-        const folderWide =
-          !hasSession || legacySession || failed.pathsUnknown || touched.state === 'unreadable';
-        const cacheDir = hasSession ? `.cache/sessions/${sanitizeSessionId(opts.sessionId)}` : '';
-        const folderWideExit = [
-          !hasSession
-            ? '이 호출에는 세션 id 가 없어 쓰기 기록을 읽지 못했다. 세션 id 를 알려 주면(--session-id) 이 세션이 쓴 파일만 막는다'
+        // closed blocks. Only a stamped session's silence is trusted, and only while the record
+        // is complete (every file of it read) and its flag lost no path it cannot name.
+        const legacySession = hasSession && !record.stamped;
+        const folderWide = !hasSession || legacySession || !record.complete || failed.pathsUnknown;
+        // Absolute, so the way out can be followed from any working directory.
+        const cacheDir = hasSession ? sessionCacheDir(hypoDir, opts.sessionId) : '';
+        // How to clear an incomplete record, one sentence per cause that applies.
+        const recordExit = [
+          failed.pathsUnknown || whyOf('flags')
+            ? `git status 의 미커밋 파일 가운데 이 세션이 쓴 것이 남아 있지 않은지 확인한 뒤 ${join(cacheDir, 'touched-paths-failed.d')}/ 를 통째로 지운다`
             : null,
-          failed.pathsUnknown
-            ? `${cacheDir}/touched-paths-failed.d/ 와 ${cacheDir}/touched-paths-failed.json 을 지우면 이 세션의 표시가 풀린다. 지우기 전에 잃은 경로가 이미 커밋됐는지 git status 로 확인한다`
+          whyOf('set', 'corrupt')
+            ? `손상된 ${join(cacheDir, 'touched-paths.json')} 을 살펴보고 지우면 풀린다. 지우기 전에 이 세션이 쓴 파일이 이미 커밋됐는지 git status 로 확인한다`
             : null,
-          touched.state === 'unreadable' && touched.cause === 'corrupt'
-            ? `손상된 ${cacheDir}/touched-paths.json 을 살펴보고 지우면 풀린다. 지우기 전에 이 세션이 쓴 파일이 이미 커밋됐는지 git status 로 확인한다`
+          whyOf('hashes')
+            ? `손상된 ${join(cacheDir, 'touched-hashes.json')} 을 살펴보고 지우면 풀린다. 지우기 전에 이 세션이 쓴 파일이 이미 커밋됐는지 git status 로 확인한다`
             : null,
-          touched.state === 'unreadable' && touched.cause === 'lock-failed'
+          whyOf('set', 'lock-failed')
             ? `${cacheDir}/ 디렉터리의 권한과 디스크 공간을 점검한다 (파일을 지워도 고쳐지지 않는다)`
             : null,
         ]
           .filter(Boolean)
           .join('. ');
         const closeSlug = opts.projectOverride || opts.attributionScope || null;
+        // The folder rule's reason says one cause, the first that applies: no session id, then
+        // no stamp, then an incomplete record. Each has its own way out, and only one is said.
+        const folderReason = (f) => {
+          const head = closeSlug
+            ? `uncommitted file in the project folder being closed: ${f}`
+            : `uncommitted file under projects/ and this close names no project: ${f}`;
+          if (!hasSession) {
+            return `${head} (이 호출에는 세션 id 가 없어 이 세션 파일을 가를 수 없다. --session-id 를 주면 이 세션이 쓴 파일만 막는다)`;
+          }
+          if (legacySession) {
+            const stamp = whyOf('stamp')
+              ? 'record-stamp.json 을 읽지 못함'
+              : 'record-stamp.json 없음';
+            return `${head} (이 세션은 쓰기를 빠짐없이 기록하는 버전에서 시작하지 않았다(${stamp}). 그래서 기록에 없어도 이 폴더의 미커밋 파일을 모두 막는다. 이 파일은 다른 세션의 작업일 수 있다. 다른 터미널의 작업이면 되돌리지 않는다. 이 세션 것임을 확인한 파일만 커밋하거나 되돌리고, 아니면 새 세션을 열어 거기서 close 한다)`;
+          }
+          return `${head} (이 세션의 쓰기 기록이 불완전해 잃은 경로를 모르므로 close 하는 프로젝트 폴더의 미커밋 파일을 모두 막는다. ${recordExit}. 이 세션 것임을 확인한 파일은 커밋하거나 되돌려도 풀린다)`;
+        };
         const inClosedProject = (f) =>
           closeSlug
             ? f.startsWith(`projects/${closeSlug}/`)
             : !logOnly && f.startsWith('projects/');
-        const touchedSet = new Set((touched.paths || []).map(posixPath));
+        const touchedSet = new Set(record.paths.map(posixPath));
         const driftedSet = new Set(
-          hasSession
-            ? readTouchedPathsDrifted(hypoDir, opts.sessionId, touchedLockBudget(deadline)).map(
-                posixPath,
-              )
-            : [],
+          record.paths.filter((p) => recordedHashDrifted(hypoDir, record.hashes, p)).map(posixPath),
         );
         const ignorePatterns = loadHypoIgnore(hypoDir);
         // A session entry of a `.hypoignore` project is never committed by
@@ -9228,7 +9422,7 @@ export function precompactGateStatus(hypoDir, opts = {}) {
             blockers.push({
               type: 'known-session-write',
               file: f,
-              reason: `이 세션의 쓰기 기록이 실패한 파일이 아직 미커밋이다: ${f} (기록 실패 표시 ${cacheDir}/touched-paths-failed.json 또는 ${cacheDir}/touched-paths-failed.d/ 가 이 경로를 가리킨다. 커밋하거나 되돌리면 풀린다)`,
+              reason: `uncommitted file this session recorded with a failure flag: ${f} (이 세션의 쓰기 기록이 실패했고, ${join(cacheDir, 'touched-paths-failed.d')}/ 의 표시가 이 경로를 가리킨다. 커밋하거나 되돌리면 풀린다)`,
             });
             continue;
           }
@@ -9282,19 +9476,7 @@ export function precompactGateStatus(hypoDir, opts = {}) {
             // is published and its commit has not landed yet.
             notices.push({ type: 'foreign-entry', file: f, reason: FOREIGN_ENTRY_NOTICE(f) });
           } else if (folderWide && inClosedProject(posixPath(f))) {
-            blockers.push({
-              type: 'git',
-              file: f,
-              reason: `${
-                closeSlug
-                  ? `uncommitted file in the project folder being closed: ${f}`
-                  : `uncommitted file under projects/ and this close names no project: ${f}`
-              } (${
-                legacySession && !failed.pathsUnknown && touched.state !== 'unreadable'
-                  ? '이 세션은 쓰기를 빠짐없이 기록하는 버전에서 시작하지 않았다(기록 보증 표시가 없다). 그래서 기록에 없어도 close 하는 프로젝트 폴더의 미커밋 파일을 모두 막는다'
-                  : `이 세션의 쓰기 기록이 불완전해서(잃은 경로를 모름) close 하는 프로젝트 폴더의 미커밋 파일을 모두 막는다. ${folderWideExit}`
-              }. 커밋하거나 되돌려도 풀린다)`,
-            });
+            blockers.push({ type: 'git', file: f, reason: folderReason(f) });
           } else {
             notices.push({
               type: 'unresolved',
@@ -9535,7 +9717,8 @@ export function precompactGateStatus(hypoDir, opts = {}) {
   const lintPath = PKG_ROOT ? join(PKG_ROOT, 'scripts', 'lint.mjs') : null;
   if (!lintPath || !existsSync(lintPath)) {
     skipped.lint = true; // no package → fail-open (never block on missing tooling)
-    skippedWhy.lint = 'tool missing: scripts/lint.mjs not found (no package root or no such file)';
+    skippedWhy.lint =
+      'tool missing: scripts/lint.mjs not found, no package root or no such file; run `hypomnema init` or reinstall the plugin';
   } else {
     try {
       // Pass --hypo-dir explicitly: lint.mjs resolves the vault via HYPO_DIR /
@@ -9635,7 +9818,7 @@ export function precompactGateStatus(hypoDir, opts = {}) {
   if (!feedbackPath || !existsSync(feedbackPath)) {
     skipped.feedback = true;
     skippedWhy.feedback =
-      'tool missing: scripts/feedback-sync.mjs not found (no package root or no such file)';
+      'tool missing: scripts/feedback-sync.mjs not found, no package root or no such file; run `hypomnema init` or reinstall the plugin';
   } else {
     try {
       const run = startCheck(
@@ -11451,10 +11634,13 @@ export function vaultRelatives(root, filePath) {
   const realRoot = real(root);
   const realFile = realThroughAncestor(filePath);
   if (realRoot !== null && realFile !== null) pairs.unshift([realRoot, realFile]);
-  return pairs
-    .map(([r, f]) => relative(r, f))
-    .filter((rel) => rel !== '' && rel.split(sep)[0] !== '..' && !isAbsolute(rel))
-    .map((rel) => rel.replace(/\\/g, '/'));
+  return (
+    pairs
+      .map(([r, f]) => relative(r, f))
+      .filter((rel) => rel !== '' && rel.split(sep)[0] !== '..' && !isAbsolute(rel))
+      // Only the platform separator becomes `/`: on POSIX a backslash is part of a file name.
+      .map((rel) => rel.split(sep).join('/'))
+  );
 }
 
 /**

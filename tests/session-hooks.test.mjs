@@ -49,12 +49,15 @@ import {
   readTouchedPathsStrict,
   readTouchedPathsDrifted,
   readTouchedPathsFailed,
+  readSessionRecord,
   touchedPathsFailedDir,
   touchedHashesPath,
   stampSessionRecord,
   sessionRecordStamped,
   sessionRecordStampPath,
   gitDirtyFiles,
+  gateGitState,
+  vaultRelatives,
   recordShardAppend,
   writeClosePin,
   migrationState,
@@ -1363,7 +1366,8 @@ function breakHashWrite(dir, sid) {
 }
 
 // Distinguishes: a record that lost its lock to a live holder (returns false, flag names the path
-// with HEAD's blob hash) from a record that lands (returns true, set holds the path, no flag).
+// with the hash of its bytes on disk) from a record that lands (returns true, set holds the path,
+// no flag).
 test('recordTouchedPaths: a lock timeout leaves a failure flag naming the path', () => {
   withSyncedWiki((dir) => {
     commitVaultFile(dir, 'pages/a.md', 'in head\n');
@@ -1377,7 +1381,7 @@ test('recordTouchedPaths: a lock timeout leaves a failure flag naming the path',
     });
     assert.equal(ok, false, 'a record that lost its lock reports false');
     const flag = readFailedFlag(dir, 'sess-flag-lock');
-    assert.deepEqual(flag.entries, { 'pages/a.md': { headSha256: sha256('in head\n') } });
+    assert.deepEqual(flag.entries, { 'pages/a.md': { diskSha256: sha256('in head\n') } });
     assert.equal(flag.pathsUnknown, false);
     assert.deepEqual(flag.reasons, ['ELOCKTIMEOUT']);
   });
@@ -1394,9 +1398,9 @@ test('recordTouchedPaths: a record that lands leaves no failure flag', () => {
   });
 });
 
-// Distinguishes: a spent budget (no time to ask git, so no hash is written and the gate always
-// blocks on the path) from a flag written with time left (the hash above).
-test('recordTouchedPaths: an exhausted deadline still flags the path, with no hash', () => {
+// Distinguishes: a spent budget still writing the flag with the disk hash (the flag asks no git, so
+// the time left does not change what it records) from a flag that drops the hash when time is out.
+test('recordTouchedPaths: an exhausted deadline still flags the path, with its disk hash', () => {
   withSyncedWiki((dir) => {
     commitVaultFile(dir, 'pages/a.md', 'in head\n');
     const tp = touchedPathsPath(dir, 'sess-flag-spent');
@@ -1406,13 +1410,16 @@ test('recordTouchedPaths: an exhausted deadline still flags the path, with no ha
       deadline: { end: performance.now() - 1 },
     });
     assert.equal(ok, false);
-    assert.deepEqual(readFailedFlag(dir, 'sess-flag-spent').entries, { 'pages/a.md': {} });
+    assert.deepEqual(readFailedFlag(dir, 'sess-flag-spent').entries, {
+      'pages/a.md': { diskSha256: sha256('in head\n') },
+    });
   });
 });
 
-// Distinguishes: a later successful record of the SAME path (its entry goes, and with no entry left
-// the file goes) from a successful record of ANOTHER path (the entry stays).
-test('recordTouchedPaths: a later successful record of a flagged path drops its flag entry', () => {
+// Distinguishes: the flag only ever adds, so a later successful record of the SAME path leaves its
+// entry (the entry stops blocking once its bytes are committed or replaced, see the checkpointMode
+// flag tests) from a record that removes or rewrites flag files.
+test('recordTouchedPaths: a later successful record of a flagged path keeps its flag entry', () => {
   withSyncedWiki((dir) => {
     const heal = breakHashWrite(dir, 'sess-flag-drop');
     assert.equal(recordTouchedPaths(dir, 'sess-flag-drop', 'pages/a.md'), false);
@@ -1420,8 +1427,8 @@ test('recordTouchedPaths: a later successful record of a flagged path drops its 
     heal();
     assert.equal(recordTouchedPaths(dir, 'sess-flag-drop', 'pages/a.md'), true);
     assert.ok(
-      !readTouchedPathsFailed(dir, 'sess-flag-drop').failed,
-      'the only entry went with its record, so the flag file is gone',
+      'pages/a.md' in readTouchedPathsFailed(dir, 'sess-flag-drop').entries,
+      'the entry stays: nothing removes a flag file',
     );
 
     // A pathsUnknown flag keeps pathsUnknown when a path inside it records fine.
@@ -1452,11 +1459,11 @@ test('recordTouchedPaths: a successful record of another path leaves a flag entr
 });
 
 // Distinguishes: failure flags that are one immutable file per failed record (a second flag adds a
-// file and rewrites nothing, so two writers racing cannot erase each other, and a drop touches only
-// the files naming its path) from one shared flag file that every writer reads, edits and replaces.
+// file and rewrites nothing, so two writers racing cannot erase each other, and a later record
+// removes nothing) from one shared flag file that every writer reads, edits and replaces.
 // Disabling the fix: in markTouchedPathsFailed (hooks/hypo-shared.mjs) write to a fixed name
 // (`join(dir, 'fixed.json')`) after merging the `readTouchedPathsFailed` entries in.
-test('failure flags: each failed record adds its own file, and a drop only touches the files naming its path', () => {
+test('failure flags: each failed record adds its own file, and a later record removes none', () => {
   withSyncedWiki((dir) => {
     const sid = 'sess-flag-immutable';
     const flagDir = touchedPathsFailedDir(dir, sid);
@@ -1477,29 +1484,63 @@ test('failure flags: each failed record adds its own file, and a drop only touch
     ]);
     heal();
     assert.equal(recordTouchedPaths(dir, sid, 'pages/a.md'), true);
-    assert.deepEqual(Object.keys(readFailedFlag(dir, sid).entries), ['pages/b.md']);
-    assert.equal(readdirSync(flagDir).length, 1, "a's file went, b's stayed");
     assert.equal(recordTouchedPaths(dir, sid, 'pages/b.md'), true);
-    assert.equal(readFailedFlag(dir, sid).failed, false);
+    assert.equal(readdirSync(flagDir).length, 2, 'both flag files stay');
+    assert.equal(readFileSync(join(flagDir, first), 'utf-8'), firstBytes, 'and stay unedited');
+    assert.deepEqual(Object.keys(readFailedFlag(dir, sid).entries).sort(), [
+      'pages/a.md',
+      'pages/b.md',
+    ]);
   });
 });
 
-test('failure flags: one flag file naming two paths keeps the other when one record lands', () => {
+test('failure flags: one flag file naming two paths is left as it is when one record lands', () => {
   withSyncedWiki((dir) => {
     const sid = 'sess-flag-split';
     const heal = breakHashWrite(dir, sid);
     assert.equal(recordTouchedPaths(dir, sid, ['pages/a.md', 'pages/b.md']), false);
+    const flagDir = touchedPathsFailedDir(dir, sid);
+    const [only] = readdirSync(flagDir);
+    const bytes = readFileSync(join(flagDir, only), 'utf-8');
     heal();
     assert.equal(recordTouchedPaths(dir, sid, 'pages/a.md'), true);
-    const flag = readFailedFlag(dir, sid);
-    assert.deepEqual(Object.keys(flag.entries), ['pages/b.md']);
-    assert.equal(readdirSync(touchedPathsFailedDir(dir, sid)).length, 1, 'rewritten, not doubled');
+    assert.deepEqual(Object.keys(readFailedFlag(dir, sid).entries).sort(), [
+      'pages/a.md',
+      'pages/b.md',
+    ]);
+    assert.deepEqual(readdirSync(flagDir), [only], 'not rewritten, not doubled');
+    assert.equal(readFileSync(join(flagDir, only), 'utf-8'), bytes);
   });
 });
 
-// Distinguishes: a flag the previous version wrote (one touched-paths-failed.json) still counting
-// and still being dropped path by path, from a reader that only looks at the new directory.
-test('failure flags: a flag file written by the previous version still counts and still drops', () => {
+// Distinguishes: an attempt name unique within one millisecond (both flags survive) from a name
+// built from the time and the pid alone, where the second write replaces the first.
+test('markTouchedPathsFailed: two failures in the same millisecond both survive', () => {
+  withSyncedWiki((dir) => {
+    const sid = 'sess-flag-same-ms';
+    breakHashWrite(dir, sid);
+    const realNow = Date.now;
+    const frozen = realNow();
+    Date.now = () => frozen;
+    try {
+      assert.equal(recordTouchedPaths(dir, sid, 'pages/a.md'), false);
+      assert.equal(recordTouchedPaths(dir, sid, 'pages/b.md'), false);
+    } finally {
+      Date.now = realNow;
+    }
+    const names = readdirSync(touchedPathsFailedDir(dir, sid));
+    assert.equal(names.length, 2, names.join(', '));
+    assert.equal(new Set(names.map((n) => n.split('-')[0])).size, 1, 'precondition: same ms');
+    assert.deepEqual(Object.keys(readFailedFlag(dir, sid).entries).sort(), [
+      'pages/a.md',
+      'pages/b.md',
+    ]);
+  });
+});
+
+// Distinguishes: a flag an earlier build wrote (one touched-paths-failed.json) still counting and
+// left as it is, from a reader that only looks at the new directory.
+test('failure flags: a flag file written by an earlier build still counts and is never rewritten', () => {
   withSyncedWiki((dir) => {
     const sid = 'sess-flag-legacy';
     recordTouchedPaths(dir, sid, 'pages/seed.md');
@@ -1517,9 +1558,13 @@ test('failure flags: a flag file written by the previous version still counts an
       'pages/x.md',
       'pages/y.md',
     ]);
+    const legacyBytes = readFileSync(legacy, 'utf-8');
     assert.equal(recordTouchedPaths(dir, sid, 'pages/x.md'), true);
-    assert.ok(!existsSync(legacy), 'the old file is replaced, not edited in place');
-    assert.deepEqual(Object.keys(readFailedFlag(dir, sid).entries), ['pages/y.md']);
+    assert.equal(readFileSync(legacy, 'utf-8'), legacyBytes, 'the old file is left as it is');
+    assert.deepEqual(Object.keys(readFailedFlag(dir, sid).entries).sort(), [
+      'pages/x.md',
+      'pages/y.md',
+    ]);
     assert.deepEqual(readFailedFlag(dir, sid).reasons, ['ELOCKTIMEOUT']);
   });
 });
@@ -1540,6 +1585,107 @@ test('recordTouchedPaths over a corrupt set leaves a paths-unknown failure flag'
     const flag = readFailedFlag(dir, sid);
     assert.equal(flag.pathsUnknown, true);
     assert.deepEqual(flag.reasons, ['prior-record-unreadable']);
+  });
+});
+
+// A read-only directory is what the permission fixtures below use to make one write fail. Root
+// writes through it and win32 ignores the mode, so there they are skipped.
+const canMakeReadOnly = process.platform !== 'win32' && process.getuid?.() !== 0;
+
+// Distinguishes: a corrupt record whose paths-unknown flag cannot be written (the record is left
+// corrupt, so it still reads unreadable, and the call reports false) from one whose flag lands
+// (the record starts over and reads ok). Before the fix the first replaced the corrupt record with
+// no flag, so the lost paths vanished with nothing to say so.
+test('recordTouchedPaths: a corrupt record stays when the failure flag cannot be written', () => {
+  if (!canMakeReadOnly) {
+    console.log('  (skipped: a read-only directory is writable here)');
+    return;
+  }
+  withSyncedWiki((dir) => {
+    const sid = 'sess-corrupt-noflag';
+    assert.equal(stampSessionRecord(dir, sid), 'stamped');
+    writeFileSync(touchedPathsPath(dir, sid), '{corrupt');
+    const flagDir = touchedPathsFailedDir(dir, sid);
+    mkdirSync(flagDir, { recursive: true });
+    chmodSync(flagDir, 0o555);
+    try {
+      assert.equal(recordTouchedPaths(dir, sid, ['projects/p/b.md']), false);
+      assert.equal(readFileSync(touchedPathsPath(dir, sid), 'utf-8'), '{corrupt');
+      assert.equal(readTouchedPathsStrict(dir, sid).state, 'unreadable');
+    } finally {
+      chmodSync(flagDir, 0o755);
+    }
+  });
+});
+
+test('recordTouchedPaths: a corrupt record is replaced once the flag lands', () => {
+  withSyncedWiki((dir) => {
+    const sid = 'sess-corrupt-flagged';
+    assert.equal(stampSessionRecord(dir, sid), 'stamped');
+    writeFileSync(touchedPathsPath(dir, sid), '{corrupt');
+    assert.equal(recordTouchedPaths(dir, sid, ['projects/p/b.md']), true);
+    assert.deepEqual(readTouchedPathsStrict(dir, sid), { state: 'ok', paths: ['projects/p/b.md'] });
+    assert.equal(readFailedFlag(dir, sid).pathsUnknown, true);
+  });
+});
+
+// Distinguishes: a hash file that exists and cannot be read (the record is incomplete, with the
+// source named) from one that is absent (a complete record with nothing in it). The old reader
+// read both as `{}`.
+test('readSessionRecord: an unreadable hashes file makes the record incomplete', () => {
+  withSyncedWiki((dir) => {
+    const sid = 'sess-rec-badhash';
+    assert.equal(stampSessionRecord(dir, sid), 'stamped');
+    assert.equal(recordTouchedPaths(dir, sid, ['pages/a.md']), true);
+    writeFileSync(touchedHashesPath(dir, sid), '{bad');
+    const rec = readSessionRecord(dir, sid);
+    assert.equal(rec.complete, false);
+    assert.deepEqual(rec.incompleteWhy, [{ source: 'hashes', cause: 'corrupt' }]);
+    assert.deepEqual(rec.paths, ['pages/a.md'], 'the readable set still names its paths');
+    assert.equal(rec.stamped, true);
+  });
+});
+
+test('readSessionRecord: a missing hashes file is a complete empty record', () => {
+  withSyncedWiki((dir) => {
+    const sid = 'sess-rec-nohash';
+    assert.equal(stampSessionRecord(dir, sid), 'stamped');
+    assert.ok(!existsSync(touchedHashesPath(dir, sid)), 'precondition: no hash file');
+    const rec = readSessionRecord(dir, sid);
+    assert.equal(rec.complete, true);
+    assert.deepEqual(rec.incompleteWhy, []);
+    assert.deepEqual(rec.paths, []);
+    assert.deepEqual(rec.hashes, {});
+    assert.equal(rec.stamped, true);
+  });
+});
+
+// Distinguishes: a hash file that cannot be read (nothing can show which paths still hold this
+// session's bytes, so the commit gets an empty scope and the record and the hash file stay as they
+// are) from a readable one (the recorded path goes into the scope, the claim is retired).
+test('commitTouchedPaths: an unreadable hashes file commits nothing and keeps the record', () => {
+  withSyncedWiki((dir) => {
+    const sid = 'sess-ct-badhash';
+    writeFileSync(join(dir, 'pages-a.md'), 'mine\n');
+    assert.equal(recordTouchedPaths(dir, sid, ['pages-a.md']), true);
+    writeFileSync(touchedHashesPath(dir, sid), '{bad');
+    let scope;
+    commitTouchedPaths(dir, sid, (paths) => {
+      scope = paths;
+      return { committed: true };
+    });
+    assert.deepEqual(scope, []);
+    assert.deepEqual(JSON.parse(readFileSync(touchedPathsPath(dir, sid), 'utf-8')), ['pages-a.md']);
+    assert.equal(readFileSync(touchedHashesPath(dir, sid), 'utf-8'), '{bad');
+
+    rmSync(touchedHashesPath(dir, sid));
+    assert.equal(recordTouchedPaths(dir, sid, ['pages-a.md']), true);
+    commitTouchedPaths(dir, sid, (paths) => {
+      scope = paths;
+      return { committed: true };
+    });
+    assert.deepEqual(scope, ['pages-a.md']);
+    assert.ok(!existsSync(touchedPathsPath(dir, sid)), 'the readable claim is retired');
   });
 });
 
@@ -1571,22 +1717,28 @@ test('recordTouchedPaths with expectedHashes records the given hash', () => {
   });
 });
 
-// Distinguishes: a HEAD lookup that failed (the tree names the path, its blob object is gone, so
-// the entry has no headSha256 key) from a path HEAD does not have (headSha256: null, a confirmed
-// absence). A gate treats the first as always-pending and the second as "HEAD has nothing yet".
-test('markTouchedPathsFailed: a failed HEAD lookup records the path with no hash, an absent path records null', () => {
+// Distinguishes: a file that cannot be read when flagged (no diskSha256 key, so the gate blocks on
+// it whenever it is dirty) from a file that does not exist (diskSha256: null, a confirmed absence).
+test('markTouchedPathsFailed: a file that cannot be read records the path with no hash, an absent path records null', () => {
+  if (!canMakeReadOnly) {
+    console.log('  (skipped: an unreadable file is readable here)');
+    return;
+  }
   withSyncedWiki((dir) => {
     commitVaultFile(dir, 'pages/a.md', 'in head\n');
-    const blob = spawnSync('git', ['-C', dir, 'rev-parse', 'HEAD:pages/a.md'], {
-      encoding: 'utf-8',
-    }).stdout.trim();
-    rmSync(join(dir, '.git', 'objects', blob.slice(0, 2), blob.slice(2)), { force: true });
-    breakHashWrite(dir, 'sess-flag-head');
-    assert.equal(recordTouchedPaths(dir, 'sess-flag-head', ['pages/a.md', 'pages/new.md']), false);
+    chmodSync(join(dir, 'pages/a.md'), 0o000);
+    try {
+      breakHashWrite(dir, 'sess-flag-head');
+      assert.equal(
+        recordTouchedPaths(dir, 'sess-flag-head', ['pages/a.md', 'pages/new.md']),
+        false,
+      );
+    } finally {
+      chmodSync(join(dir, 'pages/a.md'), 0o644);
+    }
     const { entries } = readFailedFlag(dir, 'sess-flag-head');
-    assert.deepEqual(entries['pages/a.md'], {}, 'lookup failed: no headSha256 key');
-    assert.ok(!('headSha256' in entries['pages/a.md']));
-    assert.deepEqual(entries['pages/new.md'], { headSha256: null }, 'confirmed absent: null');
+    assert.deepEqual(entries['pages/a.md'], {}, 'unreadable: no diskSha256 key');
+    assert.deepEqual(entries['pages/new.md'], { diskSha256: null }, 'absent: null');
   });
 });
 
@@ -4097,6 +4249,63 @@ test('hypoIsClean: uncommitted working-tree change → uncommitted:true', () => 
   });
 });
 
+// The first NUL record of `git status --porcelain -b -z`, as git itself prints it.
+const statusHeader = (dir) =>
+  spawnSync('git', ['-C', dir, 'status', '--porcelain', '-b', '-uall', '-z'], {
+    encoding: 'utf-8',
+  }).stdout.split('\0')[0];
+
+// Distinguishes: one status run reading the ahead header and the dirt together (a clean tree one
+// commit ahead is not uncommitted and is ahead) from a dirty tree in the same run (uncommitted, with
+// its file listed). The raw header is checked as git prints it, so the parser is held to git's own
+// shape rather than a guess.
+test('gate: one status call judges dirt and ahead together', () => {
+  withSyncedWiki((dir) => {
+    assert.match(statusHeader(dir), /^## \S+\.\.\.origin\/\S+$/, 'precondition: an upstream');
+    commitVaultFile(dir, 'pages/a.md', 'a\n');
+    assert.match(statusHeader(dir), /^## \S+\.\.\.origin\/\S+ \[ahead 1\]$/);
+    assert.deepEqual(gateGitState(dir), {
+      uncommitted: false,
+      ahead: true,
+      dirty: [],
+      timedOut: false,
+      reason: `unpushed commits in ${dir}`,
+    });
+  });
+});
+
+test('gate: a dirty file in the same call', () => {
+  withSyncedWiki((dir) => {
+    commitVaultFile(dir, 'pages/a.md', 'a\n');
+    writeFileSync(join(dir, 'pages/b.md'), 'b\n');
+    const st = gateGitState(dir);
+    assert.equal(st.uncommitted, true);
+    assert.equal(st.ahead, true);
+    assert.deepEqual(st.dirty, ['pages/b.md']);
+    assert.equal(st.timedOut, false);
+  });
+});
+
+// Distinguishes: the branch header (`## main`, `## No commits yet on main`, with no upstream) taken
+// off before the records are parsed, from a parser that reads it as one more `XY path` record and
+// lists a file named after the branch.
+test('gate: the status header record is never listed as a dirty file', () => {
+  withTmpDir((dir) => {
+    spawnSync('git', ['init', '-q', dir]);
+    writeFileSync(join(dir, 'x.md'), 'x\n');
+    assert.match(statusHeader(dir), /^## No commits yet on \S+$/, 'precondition: no commit yet');
+    assert.deepEqual(gateGitState(dir).dirty, ['x.md']);
+  });
+  withSyncedWiki((dir) => {
+    spawnSync('git', ['-C', dir, 'branch', '--unset-upstream']);
+    writeFileSync(join(dir, 'x.md'), 'x\n');
+    assert.match(statusHeader(dir), /^## [^.\s]+$/, 'precondition: a branch with no upstream');
+    const st = gateGitState(dir);
+    assert.deepEqual(st.dirty, ['x.md']);
+    assert.equal(st.ahead, false);
+  });
+});
+
 test('precompactGateStatus: ahead-only → NO git blocker, has git-sync notice', () => {
   withSyncedWiki((dir) => {
     writeFileSync(join(dir, 'ahead.md'), '# ahead\n');
@@ -4525,7 +4734,9 @@ test('checkpointMode: a corrupt touched-paths file → the closed project folder
     writeFileSync(join(dir, 'unrelated-session.md'), '# dirty\n');
     mkdirSync(join(dir, 'projects', 'demo'), { recursive: true });
     writeFileSync(join(dir, 'projects', 'demo', 'note.md'), '# unrecorded\n');
-    mkdirSync(dirname(touchedPathsPath(dir, 'sess-checkpoint-c')), { recursive: true });
+    // Stamped, so the reason is the incomplete-record one (an unstamped session names its
+    // missing stamp first).
+    assert.equal(stampSessionRecord(dir, 'sess-checkpoint-c'), 'stamped');
     writeFileSync(touchedPathsPath(dir, 'sess-checkpoint-c'), '{not json');
     const gate = precompactGateStatus(dir, {
       claudeHome: join(dir, '.claude-none'),
@@ -4552,8 +4763,8 @@ test('checkpointMode: a corrupt touched-paths file → the closed project folder
     );
     const corruptBlocker = (gate.blockers || []).find((b) => b.file === 'projects/demo/note.md');
     assert.ok(
-      corruptBlocker.reason.includes('.cache/sessions/sess-checkpoint-c/touched-paths.json') &&
-        !corruptBlocker.reason.includes('touched-paths-failed.json'),
+      corruptBlocker.reason.includes(touchedPathsPath(dir, 'sess-checkpoint-c')) &&
+        !corruptBlocker.reason.includes('touched-paths-failed'),
       `the reason must carry the corrupt-record exit, not the flag one: ${corruptBlocker.reason}`,
     );
     assert.ok(
@@ -4562,10 +4773,13 @@ test('checkpointMode: a corrupt touched-paths file → the closed project folder
       ),
       `the root file must demote to an unresolved notice: ${JSON.stringify(gate.notices)}`,
     );
+    const unreadable = (gate.notices || []).find((n) => n.type === 'touched-paths-unreadable');
     assert.ok(
-      (gate.notices || []).some((n) => n.type === 'touched-paths-unreadable'),
+      unreadable,
       `the unjudged ownership must be said in a notice: ${JSON.stringify(gate.notices)}`,
     );
+    assert.match(unreadable.reason, /^this session's write record unreadable: /);
+    assert.match(unreadable.reason, /the project-folder block above says how to clear it/);
   });
 });
 
@@ -4590,9 +4804,58 @@ test('checkpointMode: a touched-paths lock timeout blocks (transient, unlike a c
     });
     assert.ok(
       (gate.blockers || []).some(
-        (b) => b.type === 'known-session-write' && /lock timed out/.test(b.reason),
+        (b) =>
+          b.type === 'known-session-write' &&
+          /^this session's write record lock timed out /.test(b.reason),
       ),
       `a lock timeout must block: ${JSON.stringify(gate.blockers)}`,
+    );
+  });
+});
+
+// Distinguishes: a hash file that exists and cannot be read (the record is incomplete, so every
+// dirty file in the project folder being closed blocks) from one that is absent (a complete record:
+// another session's file there is a notice). The old reader took the first for the second.
+test('checkpointMode: an unreadable hashes file blocks the closed project folder', () => {
+  withSyncedWiki((dir) => {
+    const sid = 'sess-cp-badhash';
+    assert.equal(stampSessionRecord(dir, sid), 'stamped');
+    mkdirSync(join(dir, 'projects', 'demo'), { recursive: true });
+    writeFileSync(join(dir, 'projects', 'demo', 'note.md'), '# nobody recorded this\n');
+    writeFileSync(touchedHashesPath(dir, sid), '{bad');
+    const gate = precompactGateStatus(dir, {
+      claudeHome: join(dir, '.claude-none'),
+      checkpointMode: true,
+      sessionId: sid,
+      attributionScope: 'demo',
+    });
+    const b = (gate.blockers || []).find((x) => x.file === 'projects/demo/note.md');
+    assert.equal(b?.type, 'git', JSON.stringify(gate.blockers));
+    assert.ok(b.reason.includes('touched-hashes.json'), b.reason);
+  });
+});
+
+test('checkpointMode: a missing hashes file does not', () => {
+  withSyncedWiki((dir) => {
+    const sid = 'sess-cp-nohash';
+    assert.equal(stampSessionRecord(dir, sid), 'stamped');
+    mkdirSync(join(dir, 'projects', 'demo'), { recursive: true });
+    writeFileSync(join(dir, 'projects', 'demo', 'note.md'), '# nobody recorded this\n');
+    const gate = precompactGateStatus(dir, {
+      claudeHome: join(dir, '.claude-none'),
+      checkpointMode: true,
+      sessionId: sid,
+      attributionScope: 'demo',
+    });
+    assert.ok(
+      !(gate.blockers || []).some((x) => x.file === 'projects/demo/note.md'),
+      JSON.stringify(gate.blockers),
+    );
+    assert.ok(
+      (gate.notices || []).some(
+        (n) => n.type === 'unresolved' && n.file === 'projects/demo/note.md',
+      ),
+      JSON.stringify(gate.notices),
     );
   });
 });
@@ -4603,7 +4866,7 @@ test('checkpointMode: a touched-paths lock timeout blocks (transient, unlike a c
 // when the record lost paths it cannot name (a paths-unknown flag) or cannot be read at all.
 
 // Fails this session's record of `paths` the way a busy session lock does (a live holder, a short
-// deadline), so the failure flag names them with HEAD's hash at flag time. Drops the holder after,
+// deadline), so the failure flag names them with their disk hash at flag time. Drops the holder after,
 // so the gate under test reads the set instead of timing out on the lock.
 function failRecordByLock(dir, sid, paths) {
   const tp = touchedPathsPath(dir, sid);
@@ -4657,6 +4920,8 @@ test("checkpointMode: another session's unrecorded file in the closed project fo
 test('checkpointMode: a paths-unknown failure flag makes the closed project folder block', () => {
   for (const key of ['attributionScope', 'projectOverride']) {
     withSyncedWiki((dir) => {
+      // Stamped first, so the reason is the incomplete-record one.
+      assert.equal(stampSessionRecord(dir, 'sess-checkpoint-proj'), 'stamped');
       pathsUnknownFlag(dir, 'sess-checkpoint-proj');
       mkdirSync(join(dir, 'projects', 'demo'), { recursive: true });
       writeFileSync(join(dir, 'projects', 'demo', 'index.md'), '');
@@ -4668,8 +4933,9 @@ test('checkpointMode: a paths-unknown failure flag makes the closed project fold
         `${key}: a paths-unknown flag must block the folder: ${JSON.stringify(gate.blockers)}`,
       );
       assert.ok(
-        b.reason.includes('.cache/sessions/sess-checkpoint-proj/touched-paths-failed.json') &&
-          b.reason.includes('git status'),
+        b.reason.includes(
+          `${touchedPathsFailedDir(dir, 'sess-checkpoint-proj')}/ 를 통째로 지운다`,
+        ) && b.reason.includes('git status'),
         `${key}: the reason must carry the flag's way out: ${b.reason}`,
       );
       assert.ok(
@@ -4792,8 +5058,61 @@ test('checkpointMode: an unstamped session blocks on any file in the closed proj
       folder && folder.type === 'git' && /project folder being closed/.test(folder.reason),
       `an unstamped session must block on the folder rule: ${JSON.stringify(old.blockers)}`,
     );
-    assert.match(folder.reason, /기록 보증 표시가 없다/);
+    assert.match(folder.reason, /\(record-stamp\.json 없음\)/);
     assert.equal(blockerOn(old, 'pages-note.md'), undefined, 'the rule stays inside the folder');
+  });
+});
+
+// Distinguishes the three causes of the folder rule, each saying its own way out and none of the
+// others': no session id (pass --session-id), no stamp (record-stamp.json missing, and the file may
+// be another session's), and an incomplete record (the flag directory to delete, by absolute
+// path). Where causes overlap the first in that order is the one said.
+test('checkpointMode: the folder rule names one cause, no session id over no stamp over an incomplete record', () => {
+  const NO_ID = /세션 id 가 없어 이 세션 파일을 가를 수 없다\. --session-id 를 주면/;
+  const NO_STAMP =
+    /\(record-stamp\.json 없음\)\. 그래서 기록에 없어도 이 폴더의 미커밋 파일을 모두 막는다\. 이 파일은 다른 세션의 작업일 수 있다/;
+  const INCOMPLETE = /쓰기 기록이 불완전해 잃은 경로를 모르므로/;
+  const folder = (gate) => blockerOn(gate, 'projects/demo/note.md');
+  const says = (b, own, label) => {
+    assert.ok(b && b.type === 'git', `${label}: ${JSON.stringify(b)}`);
+    for (const re of [NO_ID, NO_STAMP, INCOMPLETE]) {
+      assert.equal(re.test(b.reason), re === own, `${label} ${re}: ${b.reason}`);
+    }
+  };
+  withSyncedWiki((dir) => {
+    mkdirSync(join(dir, 'projects', 'demo'), { recursive: true });
+    writeFileSync(join(dir, 'projects', 'demo', 'note.md'), '# nobody recorded this\n');
+    says(
+      folder(
+        precompactGateStatus(dir, {
+          claudeHome: join(dir, '.claude-none'),
+          attributionScope: 'demo',
+        }),
+      ),
+      NO_ID,
+      'no session id',
+    );
+
+    pathsUnknownFlag(dir, 'sess-cause-unstamped');
+    says(
+      folder(cpGate(dir, 'sess-cause-unstamped', { attributionScope: 'demo' })),
+      NO_STAMP,
+      'no stamp',
+    );
+
+    const sid = 'sess-cause-incomplete';
+    assert.equal(stampSessionRecord(dir, sid), 'stamped');
+    pathsUnknownFlag(dir, sid);
+    const b = folder(cpGate(dir, sid, { attributionScope: 'demo' }));
+    says(b, INCOMPLETE, 'incomplete record');
+    assert.ok(
+      b.reason.includes(
+        `git status 의 미커밋 파일 가운데 이 세션이 쓴 것이 남아 있지 않은지 확인한 뒤 ${touchedPathsFailedDir(dir, sid)}/ 를 통째로 지운다`,
+      ),
+      b.reason,
+    );
+    assert.ok(!b.reason.includes('touched-paths-failed.json'), b.reason);
+    assert.ok(!/잃은 경로가 이미 커밋됐는지/.test(b.reason), b.reason);
   });
 });
 
@@ -4829,7 +5148,11 @@ test('checkpointMode: a flagged root log.md blocks a log-only close', () => {
     const gate = cpGate(dir, 'sess-flag-log', { logOnly: true });
     const b = blockerOn(gate, 'log.md');
     assert.equal(b?.type, 'known-session-write', JSON.stringify(gate.blockers));
-    assert.ok(b.reason.includes('touched-paths-failed.json'), b.reason);
+    assert.match(
+      b.reason,
+      /^uncommitted file this session recorded with a failure flag: log\.md \(/,
+    );
+    assert.ok(b.reason.includes(`${touchedPathsFailedDir(dir, 'sess-flag-log')}/`), b.reason);
   });
 });
 
@@ -4843,16 +5166,28 @@ test('checkpointMode: the same unrecorded root log.md is a notice without a flag
   });
 });
 
-// Distinguishes: HEAD still at the flagged value (the flagged write was never committed, it
-// blocks) from HEAD moved since the flag (the flagged write landed in a commit, so what is dirty
-// now is a later edit, possibly another session's: a notice).
-test('checkpointMode: a flagged write still uncommitted blocks', () => {
+// Distinguishes: the bytes on disk still the ones the flag recorded (the flagged write is what sits
+// there uncommitted, it blocks) from bytes another write put there after the flag (what is dirty
+// now may be another session's: a notice).
+test("checkpointMode: a flagged path whose bytes are still this session's blocks", () => {
   withSyncedWiki((dir) => {
     commitVaultFile(dir, 'pages/a.md', 'v0\n');
-    failRecordByLock(dir, 'sess-flag-pending', ['pages/a.md']);
     writeFileSync(join(dir, 'pages/a.md'), 'v1, this session\n');
+    failRecordByLock(dir, 'sess-flag-pending', ['pages/a.md']);
     const gate = cpGate(dir, 'sess-flag-pending');
     assert.equal(blockerOn(gate, 'pages/a.md')?.type, 'known-session-write', JSON.stringify(gate));
+  });
+});
+
+test('checkpointMode: a flagged path whose bytes another session overwrote is a notice', () => {
+  withSyncedWiki((dir) => {
+    commitVaultFile(dir, 'pages/a.md', 'v0\n');
+    writeFileSync(join(dir, 'pages/a.md'), 'v1, this session\n');
+    failRecordByLock(dir, 'sess-flag-overwritten', ['pages/a.md']);
+    writeFileSync(join(dir, 'pages/a.md'), "v2, another session's edit\n");
+    const gate = cpGate(dir, 'sess-flag-overwritten');
+    assert.equal(blockerOn(gate, 'pages/a.md'), undefined, JSON.stringify(gate.blockers));
+    assert.ok(noticeOn(gate, 'unresolved', 'pages/a.md'), JSON.stringify(gate.notices));
   });
 });
 
@@ -4868,40 +5203,75 @@ test("checkpointMode: a flagged path committed since the flag does not block ano
   });
 });
 
-// Distinguishes: a HEAD lookup that fails now (no evidence HEAD moved, so the flag holds) from a
-// confirmed HEAD move. The second side flags a path HEAD did not have yet (null), so it covers the
-// absent-to-present move the test above does not.
-test('checkpointMode: a flagged path whose HEAD lookup fails still blocks', () => {
+// Distinguishes: an entry with no disk hash (the file could not be read when flagged) blocking
+// whatever bytes the dirty file holds now, from an entry with a hash, which other bytes make a
+// notice (the overwrite test above).
+test('checkpointMode: a flagged path whose bytes could not be read at flag time still blocks', () => {
+  if (!canMakeReadOnly) {
+    console.log('  (skipped: an unreadable file is readable here)');
+    return;
+  }
   withSyncedWiki((dir) => {
     commitVaultFile(dir, 'pages/a.md', 'v0\n');
-    failRecordByLock(dir, 'sess-flag-lookup', ['pages/a.md']);
-    assert.equal(
-      readFailedFlag(dir, 'sess-flag-lookup').entries['pages/a.md'].headSha256,
-      sha256('v0\n'),
-    );
-    const blob = spawnSync('git', ['-C', dir, 'rev-parse', 'HEAD:pages/a.md'], {
-      encoding: 'utf-8',
-    }).stdout.trim();
-    rmSync(join(dir, '.git', 'objects', blob.slice(0, 2), blob.slice(2)), { force: true });
-    writeFileSync(join(dir, 'pages/a.md'), 'v1\n');
-    assert.ok(
-      gitDirtyFiles(dir).includes('pages/a.md'),
-      'precondition: the dirty file is still listed with its HEAD blob gone',
-    );
+    writeFileSync(join(dir, 'pages/a.md'), 'v1, this session\n');
+    chmodSync(join(dir, 'pages/a.md'), 0o000);
+    try {
+      failRecordByLock(dir, 'sess-flag-lookup', ['pages/a.md']);
+    } finally {
+      chmodSync(join(dir, 'pages/a.md'), 0o644);
+    }
+    assert.deepEqual(readFailedFlag(dir, 'sess-flag-lookup').entries['pages/a.md'], {});
+    writeFileSync(join(dir, 'pages/a.md'), 'v2\n');
     const gate = cpGate(dir, 'sess-flag-lookup');
     assert.equal(blockerOn(gate, 'pages/a.md')?.type, 'known-session-write', JSON.stringify(gate));
   });
 });
 
-test('checkpointMode: a flagged path whose HEAD blob changed does not', () => {
+// Distinguishes: a flag written while the file did not exist (null) blocking once any bytes appear,
+// since a record can fail before its own write lands, from a hashed entry, which other bytes make a
+// notice (the overwrite test above).
+test('markTouchedPathsFailed: a flag written while the file is absent records null and blocks once the file appears with any bytes', () => {
   withSyncedWiki((dir) => {
-    failRecordByLock(dir, 'sess-flag-changed', ['pages/new.md']);
-    assert.equal(readFailedFlag(dir, 'sess-flag-changed').entries['pages/new.md'].headSha256, null);
-    commitVaultFile(dir, 'pages/new.md', 'committed by someone\n');
-    writeFileSync(join(dir, 'pages/new.md'), 'edited again\n');
-    const gate = cpGate(dir, 'sess-flag-changed');
-    assert.equal(blockerOn(gate, 'pages/new.md'), undefined, JSON.stringify(gate.blockers));
-    assert.ok(noticeOn(gate, 'unresolved', 'pages/new.md'), JSON.stringify(gate.notices));
+    failRecordByLock(dir, 'sess-flag-absent', ['pages/new.md']);
+    assert.deepEqual(readFailedFlag(dir, 'sess-flag-absent').entries['pages/new.md'], {
+      diskSha256: null,
+    });
+    mkdirSync(join(dir, 'pages'), { recursive: true });
+    writeFileSync(join(dir, 'pages/new.md'), 'any bytes\n');
+    const gate = cpGate(dir, 'sess-flag-absent');
+    assert.equal(
+      blockerOn(gate, 'pages/new.md')?.type,
+      'known-session-write',
+      JSON.stringify(gate.blockers),
+    );
+  });
+});
+
+// Distinguishes: a record made before its write (expectedHashes) whose flag keeps the hash it was
+// given, so the bytes that land after the failed record still block, from a flag with the disk hash
+// alone, where those bytes would read as someone else's.
+test('markTouchedPathsFailed: a failed record made before its write still blocks on the bytes it expected', () => {
+  withSyncedWiki((dir) => {
+    const sid = 'sess-flag-expected';
+    mkdirSync(join(dir, 'pages'), { recursive: true });
+    writeFileSync(join(dir, 'pages/seed.md'), '');
+    const tp = touchedPathsPath(dir, sid);
+    mkdirSync(dirname(tp), { recursive: true });
+    writeFileSync(`${tp}.lock`, String(process.pid));
+    const ok = recordTouchedPaths(dir, sid, ['pages/seed.md'], {
+      expectedHashes: { 'pages/seed.md': sha256('the seed\n') },
+      deadline: { end: performance.now() + 1200 },
+    });
+    rmSync(`${tp}.lock`, { force: true });
+    assert.equal(ok, false, 'precondition: the record lost its lock');
+    assert.deepEqual(readFailedFlag(dir, sid).entries['pages/seed.md'], {
+      diskSha256: sha256(''),
+      expectedSha256: sha256('the seed\n'),
+    });
+    writeFileSync(join(dir, 'pages/seed.md'), 'the seed\n');
+    assert.equal(blockerOn(cpGate(dir, sid), 'pages/seed.md')?.type, 'known-session-write');
+    writeFileSync(join(dir, 'pages/seed.md'), 'someone else\n');
+    assert.equal(blockerOn(cpGate(dir, sid), 'pages/seed.md'), undefined);
   });
 });
 
@@ -5000,9 +5370,9 @@ const t7Skipped = (gate, check) =>
   (gate.blockers || []).find((b) => b.type === 'check-skipped' && b.check === check);
 // A deadline that reads as ample for its first `n` reads and as spent after: one stage of the
 // gate runs out while the stages before it finish. `n` counts reads of `end` (each
-// remainingSpawnTimeoutMs call is one): the enumeration of a dirty tree takes 6 (two for
-// hypoIsClean, two for gitDirtyFiles, one for the touched-paths lock, one for the drift lock),
-// so `deadlineAfterReads(6)` is spent when the first file is judged.
+// remainingSpawnTimeoutMs call is one): the enumeration of a dirty tree takes 3 (the one git
+// status run, the rev-parse for the vault prefix, the session record's lock), so
+// `deadlineAfterReads(3)` is spent when the first file is judged.
 function deadlineAfterReads(n) {
   let reads = 0;
   return {
@@ -5012,6 +5382,32 @@ function deadlineAfterReads(n) {
   };
 }
 const T7_PAST = { end: 0 };
+
+// Distinguishes: lint and feedback-sync started under this process's own node (a PATH with git and
+// no node still runs them) from a lint started as `node` off PATH, which fails to spawn there and
+// reads as a check-skipped blocker the user did nothing to cause.
+test('gate: lint runs under this process node when PATH has no node', () => {
+  withTmpDir((shimDir) => {
+    const realGit = spawnSync('which', ['git'], { encoding: 'utf-8' }).stdout.trim();
+    symlinkSync(realGit, join(shimDir, 'git'));
+    withSyncedWiki((dir) => {
+      const oldPath = process.env.PATH;
+      process.env.PATH = shimDir;
+      let gate;
+      try {
+        gate = precompactGateStatus(dir, { claudeHome: join(dir, '.claude-none') });
+      } finally {
+        process.env.PATH = oldPath;
+      }
+      for (const check of ['lint', 'feedback']) {
+        assert.ok(
+          !(gate.blockers || []).some((b) => b.type === 'check-skipped' && b.check === check),
+          `${check}: ${JSON.stringify(gate.blockers)}`,
+        );
+      }
+    });
+  });
+});
 
 // Distinguishes: a lint run that died by an error (no result to trust) from one that
 // finished. A close with no lint verdict gets no receipt, for a marker writer
@@ -5027,6 +5423,11 @@ test('a lint check that crashes adds a check-skipped blocker, for a writer and a
           `${label}, checkpointMode=${checkpointMode}: ${JSON.stringify(gate.blockers)}`,
         );
         assert.match(b.reason, /lint/);
+        assert.ok(
+          b.reason.includes('/hypo:lint 또는 `node ') &&
+            b.reason.includes(`scripts/lint.mjs --hypo-dir=${dir}\``),
+          `the reason names the command to run: ${b.reason}`,
+        );
         assert.equal(gate.skipped.lint, true, label);
         assert.match(gate.skippedWhy.lint, /^error:/, label);
         assert.ok(
@@ -5174,7 +5575,7 @@ test('a feedback-sync that hit its own timeout (ETIMEDOUT) is a notice, not a bl
 test('a dirty file whose ownership cannot be judged before the deadline blocks if this session recorded it, else is a notice', () => {
   withAppendedShard((dir, rel) => {
     stampSessionRecord(dir, T7_SID);
-    const gate = t7Gate(dir, { deadline: deadlineAfterReads(6) });
+    const gate = t7Gate(dir, { deadline: deadlineAfterReads(3) });
     // the enumeration finished: no enumeration blocker or file-less notice, the shard is listed
     assert.ok(
       !(gate.blockers || []).some((b) => b.type === 'git' && !b.file) &&
@@ -5199,7 +5600,7 @@ test('a dirty file whose ownership cannot be judged before the deadline blocks i
 test('a dirty file whose ownership cannot be judged before the deadline blocks when this session recorded it', () => {
   withAppendedShard((dir, rel) => {
     assert.equal(recordTouchedPaths(dir, T7_SID, [rel]), true);
-    const gate = t7Gate(dir, { deadline: deadlineAfterReads(6) });
+    const gate = t7Gate(dir, { deadline: deadlineAfterReads(3) });
     assert.equal(blockerOn(gate, rel)?.type, 'known-session-write', JSON.stringify(gate.blockers));
     assert.ok(!noticeOn(gate, 'foreign-append', rel), JSON.stringify(gate.notices));
   });
@@ -5259,7 +5660,7 @@ test('the gate bounds hypoIsClean, gitDirtyFiles and the shard check by its dead
         t7Gate(dir, { deadline: T7_PAST });
         assert.equal(count(axis), 0, 'a spent deadline starts no git call of the git axis');
         rmSync(log, { force: true });
-        t7Gate(dir, { deadline: deadlineAfterReads(6) });
+        t7Gate(dir, { deadline: deadlineAfterReads(3) });
         assert.ok(count(/\bstatus\b/) >= 1, 'precondition: the enumeration ran');
         assert.equal(
           count(/\b(cat-file|ls-tree)\b/),
@@ -5571,6 +5972,10 @@ test('PreCompact names the real skip cause, not a missing hypo-pkg.json', () => 
         advisory,
       );
       assert.match(advisory, /feedback-sync skipped \(time limit: the gate deadline/, advisory);
+      assert.ok(
+        !/skipped \([^()]*\(/.test(advisory),
+        `no parenthesis inside the skip one: ${advisory}`,
+      );
       const bypass = messages(root, dir, { HYPO_SKIP_GATE: '1' });
       assert.match(
         bypass,
@@ -5587,6 +5992,11 @@ test('PreCompact names the real skip cause, not a missing hypo-pkg.json', () => 
       rmSync(join(root, 'scripts', 'lint.mjs'));
       const advisory = messages(root, dir);
       assert.match(advisory, /lint skipped \(tool missing: scripts\/lint\.mjs not found/, advisory);
+      assert.match(advisory, /run `hypomnema init` or reinstall the plugin\)/, advisory);
+      assert.ok(
+        !/skipped \([^()]*\(/.test(advisory),
+        `no parenthesis inside the skip one: ${advisory}`,
+      );
     });
   });
 });
@@ -5668,6 +6078,8 @@ test('checkpointMode: a session cache directory that cannot take a lock blocks t
     return;
   }
   withSyncedWiki((dir) => {
+    // Stamped first, so the reason is the incomplete-record one.
+    assert.equal(stampSessionRecord(dir, 'sess-cp-lockfail'), 'stamped');
     recordTouchedPaths(dir, 'sess-cp-lockfail', 'pages/a.md');
     mkdirSync(join(dir, 'projects', 'demo'), { recursive: true });
     writeFileSync(join(dir, 'projects', 'demo', 'note.md'), '# unrecorded\n');
@@ -7746,6 +8158,36 @@ test('precompactGateStatus: projectOverride + no transcript + an unregistered pr
 // One root-level file NAMED `projects\\mine\\x.md` would normalise into
 // `projects/mine/x.md`, look like a leftover of the scoped project, and drop to
 // a notice — a dirty file at the vault root silently stops blocking the marker.
+// Distinguishes: a literal backslash in a POSIX file name kept as part of the name (the path is
+// recorded the way git lists it) from a conversion that reads it as a directory separator and
+// records a path that does not exist. The win32 test below is the other side: there the backslash
+// is the separator and must become `/`.
+test('vaultRelatives: a literal backslash in a POSIX filename is kept', () => {
+  if (process.platform === 'win32') {
+    console.log('  (skipped: a backslash is the path separator on win32)');
+    return;
+  }
+  withTmpDir((dir) => {
+    mkdirSync(join(dir, 'projects', 'p'), { recursive: true });
+    const file = join(dir, 'projects', 'p', 'a\\b.md');
+    writeFileSync(file, 'x\n');
+    const rels = vaultRelatives(dir, file);
+    assert.ok(rels.length > 0, 'precondition: inside the vault');
+    for (const rel of rels) assert.equal(rel, 'projects/p/a\\b.md');
+  });
+});
+
+test('vaultRelatives: the platform separator becomes a slash', () => {
+  withTmpDir((dir) => {
+    mkdirSync(join(dir, 'projects', 'p', 'a'), { recursive: true });
+    const file = join(dir, 'projects', 'p', 'a', 'b.md');
+    writeFileSync(file, 'x\n');
+    const rels = vaultRelatives(dir, file);
+    assert.ok(rels.length > 0, 'precondition: inside the vault');
+    for (const rel of rels) assert.equal(rel, 'projects/p/a/b.md');
+  });
+});
+
 test('precompactGateStatus: projectOverride + a literal-backslash filename matching the OWN slug -> still a git blocker', () => {
   withSyncedWiki((dir) => {
     registerEligibleProject(dir, 'mine');
@@ -7866,13 +8308,15 @@ test("isForeignProjectFile: the override's own project is never foreign", () => 
   assert.equal(isForeignProjectFile('projects/mine/session-state.md', ctx), false);
 });
 
-test('isForeignProjectFile: transcriptTouched proof outranks the path heuristic', () => {
+// The transcript argument is gone (its one caller never passed it): only the path decides, so a
+// leftover key in the context changes nothing.
+test('isForeignProjectFile: only the path decides, a transcript key is not consulted', () => {
   const ctx = {
     eligibleSlugs: new Set(['mine', 'other']),
     effectiveOverride: 'mine',
     transcriptTouched: new Set(['projects/other/hot.md']),
   };
-  assert.equal(isForeignProjectFile('projects/other/hot.md', ctx), false);
+  assert.equal(isForeignProjectFile('projects/other/hot.md', ctx), true);
 });
 
 test('classifyForeignOnlyDirty: dirty.length===0 is NOT vacuous-true (fails closed, never "foreign-only")', () => {
@@ -8166,7 +8610,7 @@ test('Stop: a touched-paths lock timeout alone does not ask to reconfirm', () =>
     const out = stopWithDirtyPage(dir, 's-stop-locked', { recorded: false, lockRecord: true });
     assert.equal(out.decision, 'block', JSON.stringify(out));
     assert.ok(
-      out.reason.includes('touched-paths lock timed out'),
+      out.reason.includes("this session's write record lock timed out"),
       `precondition: the lock timeout is the blocker: ${out.reason}`,
     );
     assert.notEqual(out.stopReason, STOP_RECONFIRM, JSON.stringify(out));
