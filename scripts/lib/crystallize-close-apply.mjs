@@ -53,8 +53,6 @@ import {
   headPathState,
   revPathArg,
   recordTouchedPaths,
-  readSessionRecord,
-  retractTouchedPaths,
   recordShardAppend,
   removeShardAppend,
   loadHypoIgnore,
@@ -1915,39 +1913,24 @@ export function ensureProjectIndex(hypoDir, project, relPath, today, sessionId) 
   // The close gate has to know the file is this session's before it exists: a death between the
   // create and the write leaves a zero-byte index.md that nothing else would claim. So the record
   // comes first, with the seed's hash rather than the empty file's, so the Stop auto-commit does
-  // not retire it. A record that fails stops here, before the create: its failure flag holds the
-  // seed hash (`expectedSha256`) and the folder rule blocks the path.
+  // not retire it (nor does it retire a claim whose file does not exist yet). A record that fails
+  // stops here, before the create: its failure flag names the path, and the gate blocks it.
   const seedHash = bytesSha256(content);
-  let prior = null;
-  if (sessionId) {
-    // What the record held for this path before this call, so a lost create takes back only the
-    // claim this call added.
-    prior = readSessionRecord(hypoDir, sessionId);
-    if (
-      !recordTouchedPaths(hypoDir, sessionId, [relPath], {
-        expectedHashes: { [relPath]: seedHash },
-      })
-    )
-      return null;
-  }
+  if (
+    sessionId &&
+    !recordTouchedPaths(hypoDir, sessionId, [relPath], {
+      expectedHashes: { [relPath]: seedHash },
+    })
+  )
+    return null;
   mkdirSync(dirname(dest), { recursive: true });
   let fd;
   try {
     fd = openSync(dest, 'wx');
   } catch (e) {
-    // Another writer already created it: the file is not this session's, so the claim just
-    // recorded goes. One the record already held before this call (an earlier close of this
-    // session) is put back as it was, and an unreadable earlier record is left alone.
-    if (e && e.code === 'EEXIST' && sessionId && prior.complete) {
-      if (!prior.paths.includes(relPath)) {
-        retractTouchedPaths(hypoDir, sessionId, { [relPath]: seedHash });
-      } else {
-        // `undefined` (the path had no hash) removes the seed hash again.
-        recordTouchedPaths(hypoDir, sessionId, [relPath], {
-          expectedHashes: { [relPath]: prior.hashes[relPath] },
-        });
-      }
-    }
+    // Another writer already created it. The claim just recorded stays: taking it back cannot tell
+    // this call's claim from a same-session one that overlaps it, so the coarse rule keeps it. The
+    // gate then blocks the file as this session's until it is committed, which retires the claim.
     if (e && e.code === 'EEXIST') return null;
     throw e;
   }

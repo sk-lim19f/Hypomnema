@@ -266,7 +266,7 @@ Hypomnema는 청크가 아니라 페이지를 지식 단위로 봅니다. 새 �
 | `hypo-cwd-change.mjs` | `CwdChanged` | cwd에 맞는 프로젝트 `hot.md`로 알림을 만든다(아래 전송 안내 참조) |
 | `hypo-file-watch.mjs` | `FileChanged` | 바뀐 위키 파일로 알림을 만든다(`.hypoignore` 준수). 이 패키지는 감시 경로를 등록하지 않아 기본 설치에서는 이벤트가 발생할 계기 자체가 없다(아래 전송 안내 참조) |
 | `hypo-auto-stage.mjs` | `PostToolUse(Write/Edit/MultiEdit)` | 위키 파일 자동 stage |
-| `hypo-stop.mjs` | `Stop` | 등록된 유일한 `Stop` 훅이다. 네 단계를 병렬이 아니라 순서대로 돌린다: 세션 현황 파일 재생성(`SessionStart`도 같은 생성기를 부른다), observability 점수와 auto-resume 신호용 세션 메타데이터 기록, commit + pull + push, 그리고 사용자가 마무리를 신호한 뒤 의미 있는 작업을 했는데 마무리가 확인되지 않으면 Stop을 막고 `crystallize.mjs --mark-session-closed` 명령을 돌려준다(이 세션이 쓴 미커밋 파일이나 진행 중인 작업이 있으면 명령 대신 지금 닫을지 되묻는다. 다른 세션의 미커밋 파일로는 묻지 않는다. 업그레이드 전에 연 세션이나 기록이 경로를 잃은 세션은 예외다) |
+| `hypo-stop.mjs` | `Stop` | 등록된 유일한 `Stop` 훅이다. 네 단계를 병렬이 아니라 순서대로 돌린다: 세션 현황 파일 재생성(`SessionStart`도 같은 생성기를 부른다), observability 점수와 auto-resume 신호용 세션 메타데이터 기록, commit + pull + push, 그리고 사용자가 마무리를 신호한 뒤 의미 있는 작업을 했는데 마무리가 확인되지 않으면 Stop을 막고 `crystallize.mjs --mark-session-closed` 명령을 돌려준다(이 세션이 쓴 미커밋 파일이나 진행 중인 작업이 있으면 명령 대신 지금 닫을지 되묻는다. 다른 세션의 미커밋 파일로는 묻지 않는다. 업그레이드 전에 연 세션이나, 쓰기 기록이 한 번이라도 실패했거나 경로를 잃은 세션은 예외다) |
 | `hypo-personal-check.mjs` | `PreCompact` | session-close 미완, 위키 커밋/푸시 누락, hot.md 구조 위반, lint 블로커를 `systemMessage`로 알린다. `/compact`는 여기서 막지 않는다. 세션 마무리 강제는 다른 자리에 남아 있다: `hypo-stop.mjs`의 crystallize 단계가 마무리 확인 없는 의미 있는 세션을 막고, `--mark-session-closed`는 여전히 red 게이트에서 마커를 거부한다 |
 | `hypo-session-end.mjs` | `SessionEnd` | SessionEnd 마커를 기록해 다음 SessionStart가 `source=clear` 복구를 감지하게 한다 |
 | `hypo-web-fetch-ingest.mjs` | `PostToolUse(WebFetch/WebSearch)` | WebFetch/WebSearch 뒤 `additionalContext`에 `/hypo:ingest` 권유를 주입한다(URL의 query/hash/userinfo는 제거) |

@@ -1637,15 +1637,16 @@ test('ensureProjectIndex: without a session id records nothing', () => {
   });
 });
 
-// Pair of the one above: a file this session created is recorded, a file another session got to
-// first (EEXIST) is not, and it leaves no failure flag either.
-test("ensureProjectIndex: another session's index.md (EEXIST) is not recorded in this session's touched-paths", () => {
+// Pair of the one above: a file this session created is recorded, and so is the seed claim of a
+// create another session got to first (EEXIST). Since 2026-10-28 (the coarse rule) that claim is
+// not taken back: it stays until the file is committed. It leaves no failure flag.
+test("ensureProjectIndex: another session's index.md (EEXIST) keeps this call's seed claim", () => {
   withTmpDir((dir) => {
     const rel = join('projects', 'rec-project', 'index.md');
     ensureProjectIndex(dir, 'rec-project', rel, '2026-06-01', newPinSession('idx-first'));
     const sid = newPinSession('idx-second');
     assert.equal(ensureProjectIndex(dir, 'rec-project', rel, '2026-06-01', sid), null);
-    assert.equal(readTouchedPathsStrict(dir, sid).state, 'empty');
+    assert.deepEqual(readTouchedPathsStrict(dir, sid).paths, [rel]);
     assert.equal(readTouchedPathsFailed(dir, sid).failed, false, 'no failure flag');
   });
 });
@@ -1684,10 +1685,10 @@ test('ensureProjectIndex: the seed hash is recorded before the file exists', () 
   });
 });
 
-// Distinguishes: a create lost to another writer takes back the claim this call recorded, set
-// entry and hash alike (a hash left alone still reads as a claim), from one that leaves either
-// behind. A claim of another path recorded earlier stays.
-test("ensureProjectIndex: another session's index.md leaves no claim behind", () => {
+// A create lost to another writer returns null and leaves the other writer's bytes as they are.
+// The claim this call recorded stays (2026-10-28, the coarse rule: no retraction), and a claim of
+// another path recorded earlier stays too.
+test("ensureProjectIndex: another session's index.md is left byte-for-byte, and the claim stays", () => {
   withTmpDir((dir) => {
     const rel = join('projects', 'rec-project', 'index.md');
     const sid = newPinSession('idx-lost');
@@ -1699,16 +1700,14 @@ test("ensureProjectIndex: another session's index.md leaves no claim behind", ()
     assert.equal(ensureProjectIndex(dir, 'rec-project', rel, '2026-06-01', sid), null);
     const record = readSessionRecord(dir, sid);
     assert.equal(record.complete, true, JSON.stringify(record.incompleteWhy));
-    assert.deepEqual(record.paths, ['pages/other.md']);
-    const hashes = JSON.parse(readFileSync(touchedHashesPath(dir, sid), 'utf-8'));
-    assert.ok(!Object.hasOwn(hashes, rel), `no hash left for ${rel}: ${JSON.stringify(hashes)}`);
+    assert.deepEqual(record.paths.slice().sort(), ['pages/other.md', rel].sort());
     assert.equal(readFileSync(join(dir, rel), 'utf-8'), 'another session wrote this\n');
   });
 });
 
-// Pair of the one above: the same path already claimed by an earlier close of this session, with
-// another hash, keeps that claim and that hash through a lost create.
-test('ensureProjectIndex: a claim an earlier close recorded for the same path survives a retraction', () => {
+// The same path already claimed by an earlier close of this session, with another hash: a lost
+// create keeps the claim and records the seed hash over the earlier one (nothing is taken back).
+test('ensureProjectIndex: a claim an earlier close recorded for the same path takes the seed hash', () => {
   withTmpDir((dir) => {
     const rel = join('projects', 'rec-project', 'index.md');
     const sid = newPinSession('idx-earlier');
@@ -1719,7 +1718,59 @@ test('ensureProjectIndex: a claim an earlier close recorded for the same path su
     assert.equal(ensureProjectIndex(dir, 'rec-project', rel, '2026-06-01', sid), null);
     const record = readSessionRecord(dir, sid);
     assert.deepEqual(record.paths, [rel]);
-    assert.equal(record.hashes[rel], earlier, 'the earlier hash is back, not the seed hash');
+    // The seed's bytes, from the same create in a vault with no session.
+    let seed;
+    withTmpDir((other) => {
+      ensureProjectIndex(other, 'rec-project', rel, '2026-06-01');
+      seed = readFileSync(join(other, rel));
+    });
+    assert.notEqual(record.hashes[rel], earlier, 'the earlier hash is replaced');
+    assert.equal(
+      record.hashes[rel],
+      createHash('sha256').update(seed).digest('hex'),
+      'by the seed hash',
+    );
+  });
+});
+
+// Distinguishes: a Stop auto-commit that runs between the record and the create (nothing on disk,
+// nothing in HEAD yet) keeping the claim, so the create that follows lands claimed with the bytes
+// the record names, from a commit that reads "nothing anywhere" as clean and retires it.
+test('ensureProjectIndex: a Stop commit between the record and the create does not lose the claim', () => {
+  withTmpDir((dir) => {
+    const rel = join('projects', 'rec-project', 'index.md');
+    const dest = join(dir, rel);
+    const sid = newPinSession('idx-stop-between');
+    const realOpenSync = nodeFs.openSync;
+    let between = null;
+    nodeFs.openSync = function (path, flags, ...rest) {
+      if (between === null && path === dest && flags === 'wx') {
+        let scope;
+        commitTouchedPaths(dir, sid, (paths) => {
+          scope = paths;
+          return { committed: true };
+        });
+        between = { scope, paths: readSessionRecord(dir, sid).paths };
+      }
+      return realOpenSync.call(this, path, flags, ...rest);
+    };
+    syncBuiltinESMExports();
+    try {
+      assert.equal(ensureProjectIndex(dir, 'rec-project', rel, '2026-06-01', sid), rel);
+    } finally {
+      nodeFs.openSync = realOpenSync;
+      syncBuiltinESMExports();
+    }
+    assert.ok(between, 'the commit ran between the record and the create');
+    assert.deepEqual(between.scope, [], 'nothing to commit yet');
+    assert.deepEqual(between.paths, [rel], 'the claim survived the commit');
+    const record = readSessionRecord(dir, sid);
+    assert.deepEqual(record.paths, [rel]);
+    assert.equal(
+      record.hashes[rel],
+      createHash('sha256').update(readFileSync(dest)).digest('hex'),
+      'the created file is the bytes the claim names',
+    );
   });
 });
 
@@ -5193,7 +5244,10 @@ await testAsync(
 // The pair of the one above with two sessions that began before the upgrade: with the stamp
 // the other close's dirty files could also pass as ordinary unresolved notices, so the test above
 // stays green if the foreign-entry or foreign-append exception breaks. Here the folder rule would
-// block them, and only those exceptions let both closes land their marker.
+// block them, and only those exceptions let both closes land their marker. This is a sample test
+// that does not force the overlap: nothing makes either gate read while the other close's entry or
+// append is still uncommitted, so a schedule where one close commits first passes with those
+// exceptions removed. A red here is evidence, a green is not proof.
 await testAsync(
   'two unstamped sessions closing the same project at the same moment both succeed and both write their marker',
   () => closeTwiceInParallel(0, { stamp: false }),
