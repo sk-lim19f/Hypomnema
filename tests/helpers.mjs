@@ -688,6 +688,17 @@ function withFeedbackEnv(pages, fn, { claudeMd, memoryMd, projectId = 'proj' } =
   }
 }
 
+// The preload source line that replaces performance.now() with `fnSrc` (a function expression)
+// in a child process. Plain assignment does not do it on Node 18: there `now` is a non-writable
+// property of Performance.prototype, so `performance.now = fn` in a sloppy-mode .cjs preload is
+// dropped without an error and the child keeps the real clock. That made every frozen-clock test
+// read the machine's speed on Node 18 only. An own property defined on the instance shadows the
+// prototype on every version, and the hooks read the global `performance`, which is the same
+// object `node:perf_hooks` exports.
+export function nowPatchSrc(fnSrc) {
+  return `Object.defineProperty(performance, 'now', { value: ${fnSrc}, configurable: true, writable: true });`;
+}
+
 // Write-fault injection for child processes. Both preloads are CJS files loaded
 // with `node -r <preloadPath>`; they patch `fs` and then call
 // syncBuiltinESMExports() so ESM `import { writeFileSync } from 'node:fs'` sees

@@ -48,6 +48,7 @@ import {
   runHook,
   withFeedbackEnv,
   withWiki,
+  nowPatchSrc,
 } from './helpers.mjs';
 
 // where --bootstrap and --import-target-change write their drafts
@@ -62,7 +63,7 @@ function runPreCompact(dir, home, env = {}) {
   const f = join(home, 'frozen-clock.cjs');
   writeFileSync(
     f,
-    "if ((process.argv[1] || '').endsWith('hypo-personal-check.mjs')) performance.now = () => 0;\n",
+    `if ((process.argv[1] || '').endsWith('hypo-personal-check.mjs')) ${nowPatchSrc('() => 0')}\n`,
   );
   return runHook('hypo-personal-check.mjs', '', {
     HYPO_DIR: dir,

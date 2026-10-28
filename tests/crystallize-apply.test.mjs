@@ -1735,9 +1735,11 @@ test('ensureProjectIndex: a claim an earlier close recorded for the same path ta
 
 // Distinguishes: a Stop auto-commit that runs between the record and the create (nothing on disk,
 // nothing in HEAD yet) keeping the claim, so the create that follows lands claimed with the bytes
-// the record names, from a commit that reads "nothing anywhere" as clean and retires it.
+// the record names, from a commit that reads "nothing anywhere" as clean and retires it. The vault
+// is a git repo with a commit: outside one, git cannot read the index, and the commit keeps the
+// claim for that reason alone, so this passed with the nothing-anywhere check removed.
 test('ensureProjectIndex: a Stop commit between the record and the create does not lose the claim', () => {
-  withTmpDir((dir) => {
+  withWiki(null, (dir) => {
     const rel = join('projects', 'rec-project', 'index.md');
     const dest = join(dir, rel);
     const sid = newPinSession('idx-stop-between');

@@ -5,7 +5,15 @@
 
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync } from 'node:fs';
+import {
+  existsSync,
+  mkdtempSync,
+  mkdirSync,
+  rmSync,
+  writeFileSync,
+  readFileSync,
+  symlinkSync,
+} from 'node:fs';
 import { join, dirname } from 'node:path';
 import { tmpdir } from 'node:os';
 import { parseSchemaVocab, appendPendingTags } from '../scripts/lib/schema-vocab.mjs';
@@ -3487,6 +3495,21 @@ test('any `_`-prefixed project directory is excluded from the W12 scan', () => {
 // W8 before W12). Both crash on the identical dangling-symlink shape,
 // independent of any fix here, so no fixture reaches W12's code at all while
 // they stay unguarded. See out_of_scope.
+
+// Distinguishes: an entry readdir lists but stat cannot find (a dangling symlink stands in for
+// another session's atomic-write temp file renamed away mid-scan) is skipped vs. killing the scan.
+test('lint skips a page entry that vanishes between readdir and stat instead of dying', () => {
+  withTmpDir((root) => {
+    mkdirSync(join(root, 'pages'), { recursive: true });
+    writeFileSync(join(root, 'pages', 'real.md'), '---\ntitle: Real\ntype: concept\n---\n# Real\n');
+    symlinkSync(join(root, 'pages', 'gone.md.123.tmp'), join(root, 'pages', 'ghost.md'));
+    const r = run('lint.mjs', [`--hypo-dir=${root}`, '--json']);
+    assert.equal(r.status, 0, `lint must survive the vanished entry: ${r.stderr}`);
+    const parsed = JSON.parse(r.stdout);
+    assert.equal(parsed.ok, true);
+    assert.doesNotMatch(r.stderr, /ENOENT/, 'no ENOENT crash in stderr');
+  });
+});
 
 test('--strict does not promote W12 (stays a warn, exit 0)', () => {
   withTmpDir((root) => {

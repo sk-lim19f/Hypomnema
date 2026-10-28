@@ -115,6 +115,7 @@ import {
   withWiki,
   writeMarker,
   makeMultiProjectWiki,
+  nowPatchSrc,
 } from './helpers.mjs';
 
 // mkdtempSync leaves its directory behind, and five transcript fixtures in this
@@ -6099,7 +6100,7 @@ function frozenGateClock(root, entry, afterLintMs = 0) {
     }
   };
   require('node:module').syncBuiltinESMExports();
-  performance.now = () => (lintDone ? ${afterLintMs} : 0);
+  ${nowPatchSrc(`() => (lintDone ? ${afterLintMs} : 0)`)}
 }
 `,
   );
@@ -6233,7 +6234,7 @@ if (write) {
     preload,
     `const { existsSync } = require('node:fs');
 const real = performance.now.bind(performance);
-performance.now = () => { const checked = existsSync(${JSON.stringify(checked)}); return ${clock}; };
+${nowPatchSrc(`() => { const checked = existsSync(${JSON.stringify(checked)}); return ${clock}; }`)}
 `,
   );
   const r = spawnFromCopy(root, 'hooks/hypo-personal-check.mjs', [], dir, {

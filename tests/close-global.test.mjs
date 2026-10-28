@@ -112,6 +112,7 @@ import {
   withTmpDir,
   withWiki,
   writeSessionClosedMarker,
+  nowPatchSrc,
 } from './helpers.mjs';
 
 // A session entry of `slug` dated `date` at `projects/<slug>/sessions/`, as a close
@@ -7769,7 +7770,7 @@ function frozenGateClock(root, entry, afterLintMs = 0) {
     }
   };
   require('node:module').syncBuiltinESMExports();
-  performance.now = () => (lintDone ? ${afterLintMs} : 0);
+  ${nowPatchSrc(`() => (lintDone ? ${afterLintMs} : 0)`)}
 }
 `,
   );
@@ -8035,7 +8036,7 @@ test('Stop: the gate deadline is capped at the stage budget left, and the budget
     withPackageCopy((root) => {
       const freeze = (name, ms) => {
         const f = join(root, name);
-        writeFileSync(f, `performance.now = () => ${ms};\n`);
+        writeFileSync(f, `${nowPatchSrc(`() => ${ms}`)}\n`);
         return { NODE_OPTIONS: `--require ${f}` };
       };
       const stop = (env, rootDir = root) => {
@@ -8071,7 +8072,7 @@ test('Stop: the gate deadline is capped at the stage budget left, and the budget
         assert.notEqual(next, src, 'the copy has the cap to remove');
         writeFileSync(f, next);
         const frozen = join(uncapped, 'clock-9500.cjs');
-        writeFileSync(frozen, 'performance.now = () => 9500;\n');
+        writeFileSync(frozen, `${nowPatchSrc('() => 9500')}\n`);
         assert.ok(
           !NOTICE.test(stop({ NODE_OPTIONS: `--require ${frozen}` }, uncapped)),
           'without the cap the same clock leaves the full deadline',
