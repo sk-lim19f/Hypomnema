@@ -164,8 +164,9 @@ Ask: *"이 작업이 마무리되었나요? 세션을 정리(crystallize)할까�
    names blocks whenever it is uncommitted, whatever its bytes: commit or revert it if it
    is this session's, and if it may be another session's, leave it and clear the flag
    instead. An empty `index.md` this session's close made: fill it in or delete it and
-   close again. One another session made: wait for that session, or close from a new
-   session. Lint or feedback that could not run
+   close again. One another session left half made (that session died): delete the file. A new
+   session sees the same empty file and blocks again. An `index.md` with content is
+   not blocked. Lint or feedback that could not run
    because of an error blocks as `check-skipped` (run it by hand, fix the cause, close
    again), while one that only ran out of time adds a notice and does not block.
    Every other check (close files, hot.md, lint, feedback) is the same as step 6.

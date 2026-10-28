@@ -1915,6 +1915,14 @@ export function ensureProjectIndex(hypoDir, project, relPath, today, sessionId) 
   // comes first, with the seed's hash rather than the empty file's, so the Stop auto-commit does
   // not retire it (nor does it retire a claim whose file does not exist yet). A record that fails
   // stops here, before the create: its failure flag names the path, and the gate blocks it.
+  //
+  // Only when the file is absent now: recordTouchedPaths overwrites the hash of a claim that is
+  // already there, and a file that exists may carry this session's own edit. Replacing that claim
+  // with the seed hash lets the Stop commit retire it when HEAD holds the seed (another session
+  // committed it), leaving the edit dirty and unclaimed. A file created between this check and the
+  // `wx` open below leaves the seed claim behind, which the coarse rule accepts: this session had
+  // no claim on it before.
+  if (existsSync(dest)) return null;
   const seedHash = bytesSha256(content);
   if (
     sessionId &&

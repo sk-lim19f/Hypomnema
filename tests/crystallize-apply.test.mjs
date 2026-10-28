@@ -1637,15 +1637,40 @@ test('ensureProjectIndex: without a session id records nothing', () => {
   });
 });
 
+// A create another writer wins after ensureProjectIndex's existence check: the file appears just
+// before the `wx` open, so the open fails with EEXIST. `fn` runs with that race in place.
+function withLostCreate(dest, bytes, fn) {
+  const realOpenSync = nodeFs.openSync;
+  let raced = false;
+  nodeFs.openSync = function (path, flags, ...rest) {
+    if (!raced && path === dest && flags === 'wx') {
+      raced = true;
+      mkdirSync(dirname(dest), { recursive: true });
+      writeFileSync(dest, bytes);
+    }
+    return realOpenSync.call(this, path, flags, ...rest);
+  };
+  syncBuiltinESMExports();
+  try {
+    fn();
+  } finally {
+    nodeFs.openSync = realOpenSync;
+    syncBuiltinESMExports();
+  }
+  assert.ok(raced, 'the other writer must have created the file before the open');
+}
+
 // Pair of the one above: a file this session created is recorded, and so is the seed claim of a
-// create another session got to first (EEXIST). Since 2026-10-28 (the coarse rule) that claim is
-// not taken back: it stays until the file is committed. It leaves no failure flag.
+// create another session got to first, between the existence check and the open (EEXIST). Since
+// 2026-10-28 (the coarse rule) that claim is not taken back: it stays until the file is committed.
+// It leaves no failure flag.
 test("ensureProjectIndex: another session's index.md (EEXIST) keeps this call's seed claim", () => {
   withTmpDir((dir) => {
     const rel = join('projects', 'rec-project', 'index.md');
-    ensureProjectIndex(dir, 'rec-project', rel, '2026-06-01', newPinSession('idx-first'));
     const sid = newPinSession('idx-second');
-    assert.equal(ensureProjectIndex(dir, 'rec-project', rel, '2026-06-01', sid), null);
+    withLostCreate(join(dir, rel), 'another session wrote this\n', () => {
+      assert.equal(ensureProjectIndex(dir, 'rec-project', rel, '2026-06-01', sid), null);
+    });
     assert.deepEqual(readTouchedPathsStrict(dir, sid).paths, [rel]);
     assert.equal(readTouchedPathsFailed(dir, sid).failed, false, 'no failure flag');
   });
@@ -1695,9 +1720,9 @@ test("ensureProjectIndex: another session's index.md is left byte-for-byte, and 
     mkdirSync(join(dir, 'pages'), { recursive: true });
     writeFileSync(join(dir, 'pages', 'other.md'), 'other\n');
     assert.equal(recordTouchedPaths(dir, sid, ['pages/other.md']), true);
-    mkdirSync(join(dir, 'projects', 'rec-project'), { recursive: true });
-    writeFileSync(join(dir, rel), 'another session wrote this\n');
-    assert.equal(ensureProjectIndex(dir, 'rec-project', rel, '2026-06-01', sid), null);
+    withLostCreate(join(dir, rel), 'another session wrote this\n', () => {
+      assert.equal(ensureProjectIndex(dir, 'rec-project', rel, '2026-06-01', sid), null);
+    });
     const record = readSessionRecord(dir, sid);
     assert.equal(record.complete, true, JSON.stringify(record.incompleteWhy));
     assert.deepEqual(record.paths.slice().sort(), ['pages/other.md', rel].sort());
@@ -1705,31 +1730,72 @@ test("ensureProjectIndex: another session's index.md is left byte-for-byte, and 
   });
 });
 
-// The same path already claimed by an earlier close of this session, with another hash: a lost
-// create keeps the claim and records the seed hash over the earlier one (nothing is taken back).
-test('ensureProjectIndex: a claim an earlier close recorded for the same path takes the seed hash', () => {
+// Pair of the seed-claim test above (an absent index.md gets the seed claim before the create):
+// an index.md that is already on disk is not this call's to claim. This session's own edit to it
+// is recorded with its own hash, and that claim must not be replaced by the seed hash: with HEAD
+// holding the seed (another session committed it), the Stop commit would read "HEAD equals the
+// recorded hash" and retire the claim of a file that is still dirty.
+test('ensureProjectIndex: an index.md this session already wrote keeps its own claim hash', () => {
   withTmpDir((dir) => {
     const rel = join('projects', 'rec-project', 'index.md');
     const sid = newPinSession('idx-earlier');
-    const earlier = 'a'.repeat(64);
-    assert.equal(recordTouchedPaths(dir, sid, [rel], { expectedHashes: { [rel]: earlier } }), true);
     mkdirSync(join(dir, 'projects', 'rec-project'), { recursive: true });
-    writeFileSync(join(dir, rel), 'another session wrote this\n');
+    const edited = 'this session edited the index\n';
+    writeFileSync(join(dir, rel), edited);
+    const editedHash = createHash('sha256').update(edited).digest('hex');
+    assert.equal(
+      recordTouchedPaths(dir, sid, [rel], { expectedHashes: { [rel]: editedHash } }),
+      true,
+    );
     assert.equal(ensureProjectIndex(dir, 'rec-project', rel, '2026-06-01', sid), null);
     const record = readSessionRecord(dir, sid);
     assert.deepEqual(record.paths, [rel]);
-    // The seed's bytes, from the same create in a vault with no session.
-    let seed;
-    withTmpDir((other) => {
-      ensureProjectIndex(other, 'rec-project', rel, '2026-06-01');
-      seed = readFileSync(join(other, rel));
-    });
-    assert.notEqual(record.hashes[rel], earlier, 'the earlier hash is replaced');
+    assert.equal(record.hashes[rel], editedHash, 'the hash of the edit is not replaced');
+    assert.equal(readFileSync(join(dir, rel), 'utf-8'), edited);
+  });
+});
+
+// The schedule the test above guards, end to end. Session A's preflight saw no index.md. Session B
+// then created and committed the seed. A edited the file and recorded it, then its close called
+// ensureProjectIndex. The seed hash must not replace A's claim: with it, HEAD (the seed) equals the
+// recorded hash, the Stop commit retires the claim, and the edit that is still dirty reaches the
+// gate as an unclaimed file, a notice.
+test("close: a session's edit to index.md is still blocked after another session committed the seed", () => {
+  withWiki(null, (dir, today) => {
+    const rel = join('projects', 'fresh-project', 'index.md');
+    const env = { ...process.env, HOME: SESSION_TMP_HOME };
+    const git = (...a) => spawnSync('git', ['-C', dir, ...a], { encoding: 'utf-8', env });
+    // B: seeds and commits.
+    assert.equal(ensureProjectIndex(dir, 'fresh-project', rel, today), rel);
+    assert.equal(git('add', '-A').status, 0);
+    assert.equal(git('commit', '-q', '-m', 'seed by B').status, 0);
+    // A: edits the file, records it, then its close calls ensureProjectIndex.
+    const sid = newPinSession('idx-f1-schedule');
+    assert.equal(stampSessionRecord(dir, sid), 'stamped');
+    const edited = readFileSync(join(dir, rel), 'utf-8') + '\nsession A edit\n';
+    writeFileSync(join(dir, rel), edited);
+    const editedHash = createHash('sha256').update(edited).digest('hex');
     assert.equal(
-      record.hashes[rel],
-      createHash('sha256').update(seed).digest('hex'),
-      'by the seed hash',
+      recordTouchedPaths(dir, sid, [rel], { expectedHashes: { [rel]: editedHash } }),
+      true,
     );
+    assert.equal(ensureProjectIndex(dir, 'fresh-project', rel, today, sid), null);
+    // The Stop commit offers the dirty file to the commit instead of retiring its claim as spent.
+    // The commit here lands nothing, so the claim stays and the gate sees it.
+    let scope;
+    commitTouchedPaths(dir, sid, (paths) => {
+      scope = paths;
+      return { committed: false };
+    });
+    assert.deepEqual(scope, [rel], 'the edit is in the commit scope');
+    assert.deepEqual(readSessionRecord(dir, sid).paths, [rel], 'the claim is still recorded');
+    const gate = precompactGateStatus(dir, {
+      claudeHome: join(dir, '.claude-none'),
+      checkpointMode: true,
+      sessionId: sid,
+    });
+    const b = (gate.blockers || []).find((x) => x.file === rel);
+    assert.ok(b && b.type === 'known-session-write', JSON.stringify(gate));
   });
 });
 

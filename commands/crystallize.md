@@ -129,7 +129,7 @@ How to get out of a project-folder block:
 - The record is corrupt: look at the file the reason names (`.cache/sessions/<id>/touched-paths.json`, or `touched-hashes.json` beside it), check with `git status` that what this session wrote is committed, then delete it.
 - The record's lock could not be created (permissions or disk space on `.cache/sessions/<id>/`): deleting a file does not help. Fix the permissions or free disk space, then re-run.
 - A file that the failure flag names blocks whenever it is uncommitted, whatever its bytes. If it is this session's, commit or revert it. If it may be another session's, do not revert it: clear the flag as above.
-- An empty `index.md` in the project folder being closed: if this session's close made it, fill it in or delete it and close again. If another session made it, wait for that session to finish, or close from a new session.
+- An empty `index.md` in the project folder being closed: if this session's close made it, fill it in or delete it and close again. If another session left it half made (that session died), delete the file. A new session sees the same empty file and blocks again, so starting one does not help. An `index.md` with content is not blocked.
 - A call with no `--session-id`: pass the id.
 
 The checkpoint receipt is the thing the

@@ -6195,21 +6195,26 @@ function parseFailedFlagFile(path) {
   }
 }
 
-/** Every flag file of a session, sorted by name, as `{path, parsed}` (`path` null for a
- * directory that cannot be listed, which reads as an unreadable flag). */
+/** Every entry of a session's flag directory, sorted by name, as `{path, parsed}` (`path` null for
+ * a directory that cannot be listed, which reads as an unreadable flag; `parsed` undefined for an
+ * entry that is not a `.json` attempt). */
 function failedFlagSources(hypoDir, sessionId) {
   const sources = [];
   const dir = touchedPathsFailedDir(hypoDir, sessionId);
   let names = [];
   try {
-    names = readdirSync(dir)
-      .filter((n) => n.endsWith('.json'))
-      .sort();
+    names = readdirSync(dir).sort();
   } catch (err) {
     if (err?.code !== 'ENOENT') sources.push({ path: null, parsed: null });
   }
   for (const name of names) {
     const path = join(dir, name);
+    // A temp attempt (`<attempt>.json.<pid>.<random>.tmp`) is what a writer killed before its rename
+    // leaves. It counts as a flag (`any`) but names no path and is not parsed.
+    if (!name.endsWith('.json')) {
+      sources.push({ path, parsed: undefined });
+      continue;
+    }
     const parsed = parseFailedFlagFile(path);
     if (parsed !== undefined) sources.push({ path, parsed });
   }
@@ -6226,6 +6231,7 @@ function mergeFailedFlags(hypoDir, sessionId) {
   out.entries = {};
   out.reasons = [];
   for (const { parsed } of sources) {
+    if (parsed === undefined) continue; // a temp attempt: counted in `any` only
     if (!parsed) {
       out.unreadable = true;
       continue;
@@ -9473,7 +9479,7 @@ export function precompactGateStatus(hypoDir, opts = {}) {
             blockers.push({
               type: 'git',
               file: f,
-              reason: `empty index.md in the project folder being closed: ${f} (생성 도중 끊긴 파일이다. 이 세션 것이면 내용을 채우거나 지우고, 다른 세션 것이면 그 세션이 끝나길 기다리거나 새 세션에서 close 한다)`,
+              reason: `empty index.md in the project folder being closed: ${f} (생성 도중 끊긴 파일이다. 이 세션 것이면 내용을 채우거나 지운다. 다른 세션이 만들다 만 것이면(그 세션이 죽었으면) 그 파일을 지운다. 내용이 있는 index.md는 막지 않는다)`,
             });
           } else if (
             !cut() &&

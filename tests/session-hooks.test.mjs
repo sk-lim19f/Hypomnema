@@ -5603,6 +5603,59 @@ test("checkpointMode: no failure flag leaves another session's file a notice", (
   });
 });
 
+// Distinguishes (with the next two tests): a temp attempt (`<attempt>.json.<pid>.<random>.tmp`) that
+// a killed writer left before its rename, which counts as a flag and blocks the closed project
+// folder, from an empty flag directory, which is no flag, and from the old single flag file outside
+// the directory, which is ignored.
+// Disabling the fix: in failedFlagSources (hooks/hypo-shared.mjs) put the `.filter((n) =>
+// n.endsWith('.json'))` back on the readdirSync.
+test('failure flags: a temp attempt left by a killed writer still counts as a flag', () => {
+  withSyncedWiki((dir) => {
+    const sid = 'sess-flag-tmp';
+    assert.equal(stampSessionRecord(dir, sid), 'stamped');
+    mkdirSync(touchedPathsFailedDir(dir, sid), { recursive: true });
+    writeFileSync(join(touchedPathsFailedDir(dir, sid), 'x.json.123.abcd.tmp'), '{"entr');
+    const flag = readFailedFlag(dir, sid);
+    assert.equal(flag.any, true);
+    assert.deepEqual(flag.paths, [], 'a temp attempt names no path');
+    mkdirSync(join(dir, 'projects', 'demo'), { recursive: true });
+    writeFileSync(join(dir, 'projects', 'demo', 'note.md'), "# another session's note\n");
+    const gate = cpGate(dir, sid, { attributionScope: 'demo' });
+    const b = blockerOn(gate, 'projects/demo/note.md');
+    assert.ok(b && b.type === 'git', JSON.stringify(gate.blockers));
+  });
+});
+
+test('failure flags: an empty flag directory is no flag', () => {
+  withSyncedWiki((dir) => {
+    const sid = 'sess-flag-empty-dir';
+    assert.equal(stampSessionRecord(dir, sid), 'stamped');
+    mkdirSync(touchedPathsFailedDir(dir, sid), { recursive: true });
+    assert.equal(readFailedFlag(dir, sid).any, false);
+    mkdirSync(join(dir, 'projects', 'demo'), { recursive: true });
+    writeFileSync(join(dir, 'projects', 'demo', 'note.md'), "# another session's note\n");
+    const gate = cpGate(dir, sid, { attributionScope: 'demo' });
+    assert.equal(
+      blockerOn(gate, 'projects/demo/note.md'),
+      undefined,
+      JSON.stringify(gate.blockers),
+    );
+    assert.ok(noticeOn(gate, 'unresolved', 'projects/demo/note.md'), JSON.stringify(gate.notices));
+  });
+});
+
+test('failure flags: the old single flag file outside the directory is ignored', () => {
+  withSyncedWiki((dir) => {
+    const sid = 'sess-flag-old-file';
+    assert.equal(stampSessionRecord(dir, sid), 'stamped');
+    const old = join(dirname(touchedPathsFailedDir(dir, sid)), 'touched-paths-failed.json');
+    writeFileSync(old, JSON.stringify({ entries: { 'pages/a.md': {} }, reasons: ['old'] }));
+    const flag = readFailedFlag(dir, sid);
+    assert.equal(flag.any, false);
+    assert.deepEqual(flag.paths, []);
+  });
+});
+
 // Distinguishes: a path flagged by two attempts whose file names sort against their order (a clock
 // set back between them) blocking whichever recorded hash the disk now holds, from a reader that
 // lets the attempt last by name decide.
