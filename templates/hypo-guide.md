@@ -133,22 +133,24 @@ Ask: *"이 작업이 마무리되었나요? 세션을 정리(crystallize)할까�
    record-failure flag names it and HEAD has not moved past it. If the record lost
    paths it cannot name (the flag says so, or the record is unreadable), every
    uncommitted file in the project folder being closed (`projects/<project>/`)
-   blocks. So does a session that began before this version: SessionStart leaves a
-   record stamp (`.cache/sessions/<id>/record-stamp.json`) only for a session that starts
-   on this version, and a session without one may have missed writes with no flag to say
-   so (reloading plugins does not stamp it, a new session does). A call with no session
-   id is treated the same way. Any other
+   blocks. So does a session that began before 1.10.2: SessionStart leaves a
+   record stamp (`record-stamp.json`, in `.cache/sessions/<id>/`) only for a session that
+   starts on 1.10.2 or later, and a session without one may have missed writes with no flag
+   to say so (reloading plugins does not stamp it, a new session does). A call with no
+   session id is treated the same way: the whole project folder blocks. Any other
    uncommitted file is a notice, not a blocker: another session's, one of unknown
    ownership, or one this session wrote through a shell command (Bash leaves no
    record, so it shows up only as a notice). The transcript is not ownership
    evidence; it only widens the lint scope.
-   To get out of a project-folder block: if the flag lost paths, remove the file(s) under
-   `.cache/sessions/<id>/touched-paths-failed.d/` that name the path (or the whole directory;
-   the single `touched-paths-failed.json` older versions wrote still counts, so remove it
-   too) after checking with `git status` that the lost paths are already committed.
-   A session with no record stamp has no flag to remove: commit or revert the uncommitted
-   files in the project folder, or close from a new session. If the record is corrupt, look at
-   `.cache/sessions/<id>/touched-paths.json` and delete it the same way. If its lock
+   To get out of a project-folder block: if the flag lost paths, check that no uncommitted
+   file `git status` lists is one this session wrote, then delete the whole
+   `<vault>/.cache/sessions/<id>/touched-paths-failed.d/` directory.
+   A session with no record stamp has no flag to remove. The blocked files may be another
+   session's, so do not revert one that is another terminal's work: commit or revert only
+   the files you have confirmed are this session's, otherwise open a new session and close
+   from there. If the record is corrupt, look at the file the reason names
+   (`.cache/sessions/<id>/touched-paths.json`, or `touched-hashes.json` beside it), check
+   with `git status` that what this session wrote is committed, then delete it. If its lock
    could not be created, fix the permissions or disk space of
    `.cache/sessions/<id>/`, since deleting a file does not help. A file the flag
    names stops blocking once HEAD moves past it. Lint or feedback that could not run

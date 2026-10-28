@@ -7741,18 +7741,45 @@ function shrinkGateDeadline(root, ms) {
   writeFileSync(f, next);
 }
 // HOME and HYPO_DIR are pinned: a hook writes under ~/.claude and resolves the vault from HYPO_DIR.
-function spawnFromCopy(root, rel, args, hypoDir, input = '') {
+function spawnFromCopy(root, rel, args, hypoDir, input = '', env = {}) {
   return spawnSync(process.execPath, [join(root, rel), ...args], {
     input,
     encoding: 'utf-8',
-    env: { ...process.env, HOME: SESSION_TMP_HOME, HYPO_DIR: hypoDir },
+    env: { ...process.env, HOME: SESSION_TMP_HOME, HYPO_DIR: hypoDir, ...env },
   });
+}
+// A preload that injects the gate's clock into one process of the package copy, the one whose entry
+// script ends with `entry` (NODE_OPTIONS reaches every node child too, and lint and feedback-sync
+// keep the real clock). performance.now() reads 0 until the gate's lint spawn has returned and
+// `afterLintMs` after it, so whether the deadline is spent at each step is the test's choice and
+// not the machine's speed. A lint child still ends by the spawn timeout the gate gave it.
+function frozenGateClock(root, entry, afterLintMs = 0) {
+  const f = join(root, `clock-${entry.replace(/\.mjs$/, '')}.cjs`);
+  writeFileSync(
+    f,
+    `if ((process.argv[1] || '').endsWith(${JSON.stringify(entry)})) {
+  const cp = require('node:child_process');
+  const spawnSync = cp.spawnSync;
+  let lintDone = false;
+  cp.spawnSync = function (cmd, args, opts) {
+    try {
+      return spawnSync.call(this, cmd, args, opts);
+    } finally {
+      if ((args || []).some((a) => String(a).endsWith('lint.mjs'))) lintDone = true;
+    }
+  };
+  require('node:module').syncBuiltinESMExports();
+  performance.now = () => (lintDone ? ${afterLintMs} : 0);
+}
+`,
+  );
+  return { NODE_OPTIONS: `--require ${f}` };
 }
 const LINT_KILLED = "process.kill(process.pid, 'SIGKILL');\n";
 const LINT_SLOW = 'setTimeout(() => {}, 120000);\n';
 
 // A committed close whose receipt has not been issued yet, marked by the copied CLI.
-function markFromCopy(root, dir, sid, { json = true } = {}) {
+function markFromCopy(root, dir, sid, { json = true, env = {} } = {}) {
   const cleanup = seedCloseTranscript(sid);
   try {
     pinCommittedClose(dir, sid);
@@ -7767,6 +7794,8 @@ function markFromCopy(root, dir, sid, { json = true } = {}) {
         ...(json ? ['--json'] : []),
       ],
       dir,
+      '',
+      env,
     );
     return {
       r,
@@ -7796,12 +7825,19 @@ test('--mark-session-closed: a crashed lint withholds the receipt and names chec
   });
 });
 
+// The clock in the two tests below is frozen at 0 until lint has run out its own 2500 ms timeout and
+// at the 2500 ms deadline after, so the lint is always started and always cut by its timeout, and
+// nothing a loaded machine spends before it can cut another stage of the gate instead.
+// Disabling the time-limit route: in hooks/hypo-shared.mjs spawnEndKind, make
+// `res.error?.code === 'ETIMEDOUT'` `false` (the cut lint then reads as a spawn error).
 test('--mark-session-closed: a lint cut by the deadline still issues the receipt', () => {
   withPackageCopy((root) => {
     shrinkGateDeadline(root, 2500);
     writeFileSync(join(root, 'scripts', 'lint.mjs'), LINT_SLOW);
     withWiki(null, (dir) => {
-      const { r, out, receipt } = markFromCopy(root, dir, 's-t7-mark-slow');
+      const { r, out, receipt } = markFromCopy(root, dir, 's-t7-mark-slow', {
+        env: frozenGateClock(root, 'crystallize.mjs', 2500),
+      });
       assert.equal(r.status, 0, `${r.stdout}\n${r.stderr}`);
       assert.equal(out.ok, true);
       assert.ok(
@@ -7823,7 +7859,10 @@ test('--mark-session-closed (text): a lint cut by the deadline is printed as a g
     shrinkGateDeadline(root, 2500);
     writeFileSync(join(root, 'scripts', 'lint.mjs'), LINT_SLOW);
     withWiki(null, (dir) => {
-      const { r, receipt } = markFromCopy(root, dir, 's-t7-mark-slow-text', { json: false });
+      const { r, receipt } = markFromCopy(root, dir, 's-t7-mark-slow-text', {
+        json: false,
+        env: frozenGateClock(root, 'crystallize.mjs', 2500),
+      });
       assert.equal(r.status, 0, `${r.stdout}\n${r.stderr}`);
       assert.match(r.stdout, /session-closed marker written/);
       assert.match(r.stdout, /Gate notices \(not blockers\):/);
@@ -7876,9 +7915,16 @@ test('--apply-session-close (text): a demotion the gate made is printed as a gat
 // answers inside its 10000 ms stage budget although lint would sleep for minutes) from a gate that
 // leaves the wait to the 30 s lint timeout alone (the supervisor would kill the stage:
 // "timed out"). The three stages before it are stubs so only the real stage's time is measured.
+// The stage's clock is frozen at 0 until lint has returned and at its 2500 ms deadline after, so
+// the gate always starts lint (a late start under load used to spend the deadline first) and the
+// stage's real time is lint's 2500 ms timeout plus its own work, well inside the 10000 ms.
+// Disabling the bound: in hooks/hypo-shared.mjs startCheck, make `timeout: Math.min(30000, left)`
+// `timeout: 30000`.
 test('the copied Stop stage returns within its 10-second budget when lint would run long', () => {
   const sid = 's-t7-stop-budget';
   withPackageCopy((root) => {
+    shrinkGateDeadline(root, 2500);
+    const clock = frozenGateClock(root, 'hypo-auto-minimal-crystallize.mjs', 2500);
     const ok = 'console.log(JSON.stringify({ continue: true, suppressOutput: true }));\n';
     for (const stub of ['hypo-hot-rebuild', 'hypo-session-record', 'hypo-auto-commit'])
       writeFileSync(join(root, 'hooks', `${stub}.mjs`), ok);
@@ -7904,6 +7950,7 @@ test('the copied Stop stage returns within its 10-second budget when lint would 
           [],
           dir,
           JSON.stringify({ session_id: sid, transcript_path: t10Transcript(sid), cwd: T10_CWD }),
+          clock,
         );
         const ms = Date.now() - t0;
         const reply = JSON.parse(r.stdout.trim().split('\n').pop());

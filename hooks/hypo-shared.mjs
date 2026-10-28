@@ -9194,7 +9194,7 @@ export function precompactGateStatus(hypoDir, opts = {}) {
     const why =
       run.kind === 'deadline'
         ? `the gate deadline, ${GATE_DEADLINE_MS} ms, was used up before it could start`
-        : `it was still running after ${run.ms} ms, gate deadline ${GATE_DEADLINE_MS} ms`;
+        : `still running after ${run.ms} ms, gate deadline ${GATE_DEADLINE_MS} ms`;
     skippedWhy[check] = `time limit: ${why}`;
     notices.push({ type: check, reason: `${check} skipped (time limit, fail-open): ${why}` });
   };

@@ -32,7 +32,7 @@ node ${CLAUDE_PLUGIN_ROOT}/scripts/upgrade.mjs [--hypo-dir="<path>"]
 
 Show the output verbatim.
 
-> **Plugin installs**: if the output begins with `ℹ Plugin install detected`, the core hooks, slash commands, and `settings.json` wiring are managed by the Claude Code plugin loader — **not** by `/hypo:upgrade`. Do **not** run `--apply` expecting it to update them (it intentionally skips those to avoid double-registering every hook). To upgrade the plugin itself: `/plugin marketplace update hypomnema`, then `/reload-plugins` in **every session that is already open**, not only the one where you ran the update. A session that has not reloaded keeps running the old hooks and commands. It can go on blocking close under the old project-folder rule, and when old hooks mix with new commands a failed write record leaves no trace. Reloading does not fix a session that was already open before the upgrade: it has no record stamp, so it keeps the old project-folder rule until you start a new session. `--apply` alone never changes the plugin-managed hooks. **Then run `--apply` anyway**: hooks written by 1.8.4 through 1.10.0 read the sidecar before the enabled plugin, and older ones bake an install path, so reloading the plugin does not move them. `--apply` rewrites both onto the current resolver. `--apply` in plugin mode applies vault-side migrations (SCHEMA, `.hypoignore`), refreshes package metadata, and still syncs any vault extensions — but does **not** install the core hooks/commands/settings (the plugin provides those).
+> **Plugin installs**: if the output begins with `ℹ Plugin install detected`, the core hooks, slash commands, and `settings.json` wiring are managed by the Claude Code plugin loader, **not** by `/hypo:upgrade`. Do **not** run `--apply` expecting it to update them (it intentionally skips those to avoid double-registering every hook). To upgrade the plugin itself: `/plugin marketplace update hypomnema`, then `/reload-plugins` in **every session that is already open**, not only the one where you ran the update. A session that has not reloaded keeps running the old hooks with the new commands, and in that mix a failed write record leaves no trace. If a session's close is then blocked under the old project-folder rule (every uncommitted file in the project folder being closed blocks), end that session and open a new one: a session that was open before the upgrade has no record stamp (`record-stamp.json`), reloading does not give it one, and only a session started after the upgrade gets the rule that follows each session's own record of its writes. `--apply` alone never changes the plugin-managed hooks. **Then run `--apply` anyway**: hooks written by 1.8.4 through 1.10.0 read the sidecar before the enabled plugin, and older ones bake an install path, so reloading the plugin does not move them. `--apply` rewrites both onto the current resolver. `--apply` in plugin mode applies vault-side migrations (SCHEMA, `.hypoignore`), refreshes package metadata, and still syncs any vault extensions, but does **not** install the core hooks/commands/settings (the plugin provides those).
 
 > **Note**: A major SCHEMA bump is only **detected** in this step. The informational `MIGRATION-vX.Y.md` file is written later by `--apply` (Step 4) and only on a major bump. `SCHEMA.md` is never auto-overwritten.
 
@@ -77,6 +77,8 @@ If there is anything to update, ask the user:
 
 After applying, recommend running `/hypo:doctor` to verify the installation is healthy.
 
+On an npm install the same holds for a session that was already open before the upgrade: it has no record stamp (`record-stamp.json`), so its close keeps the old project-folder rule. If that blocks its close, end the session and open a new one.
+
 ---
 
 ## `--migrate-sessions` (a vault with a git remote)
@@ -91,7 +93,7 @@ This moves the vault from the tracked `hot.md` and `session-state.md` files to p
 
 1. loses the session view in what it injects at session start,
 2. stalls its whole sync if it holds an unpushed commit that edits `hot.md` or `session-state.md`, and
-3. if it uses the plugin channel, is not refreshed on its own (run `/plugin marketplace update hypomnema`, then `/reload-plugins` in every session that is already open). A session opened before the upgrade keeps the older close rule even after the reload (every uncommitted file in the project folder being closed blocks, because the session has no record stamp); only a session started after the upgrade gets the rule that follows each session's own record of its writes.
+3. if it uses the plugin channel, is not refreshed on its own (run `/plugin marketplace update hypomnema`, then `/reload-plugins` in every session that is already open; Step 2 says what to do when a session opened before the upgrade is still blocked at close).
 
 **When to ask.** If the user typed `/hypo:upgrade --migrate-sessions` directly, run it without asking again: typing the flag is their statement that all machines are upgraded. Only when you are the one proposing this flag, or about to run it during another flow, first ask the user whether every machine that uses the same vault has been upgraded, because the command pushes the migration commit at once.
 

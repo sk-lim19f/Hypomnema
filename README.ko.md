@@ -266,7 +266,7 @@ Hypomnema는 청크가 아니라 페이지를 지식 단위로 봅니다. 새 �
 | `hypo-cwd-change.mjs` | `CwdChanged` | cwd에 맞는 프로젝트 `hot.md`로 알림을 만든다(아래 전송 안내 참조) |
 | `hypo-file-watch.mjs` | `FileChanged` | 바뀐 위키 파일로 알림을 만든다(`.hypoignore` 준수). 이 패키지는 감시 경로를 등록하지 않아 기본 설치에서는 이벤트가 발생할 계기 자체가 없다(아래 전송 안내 참조) |
 | `hypo-auto-stage.mjs` | `PostToolUse(Write/Edit/MultiEdit)` | 위키 파일 자동 stage |
-| `hypo-stop.mjs` | `Stop` | 등록된 유일한 `Stop` 훅이다. 네 단계를 병렬이 아니라 순서대로 돌린다: 세션 현황 파일 재생성(`SessionStart`도 같은 생성기를 부른다), observability 점수와 auto-resume 신호용 세션 메타데이터 기록, commit + pull + push, 그리고 사용자가 마무리를 신호한 뒤 의미 있는 작업을 했는데 마무리가 확인되지 않으면 Stop을 막고 `crystallize.mjs --mark-session-closed` 명령을 돌려준다(이 세션이 쓴 미커밋 파일이나 진행 중인 작업이 있으면 명령 대신 지금 닫을지 되묻는다. 다른 세션의 미커밋 파일은 이 질문을 일으키지 않는다) |
+| `hypo-stop.mjs` | `Stop` | 등록된 유일한 `Stop` 훅이다. 네 단계를 병렬이 아니라 순서대로 돌린다: 세션 현황 파일 재생성(`SessionStart`도 같은 생성기를 부른다), observability 점수와 auto-resume 신호용 세션 메타데이터 기록, commit + pull + push, 그리고 사용자가 마무리를 신호한 뒤 의미 있는 작업을 했는데 마무리가 확인되지 않으면 Stop을 막고 `crystallize.mjs --mark-session-closed` 명령을 돌려준다(이 세션이 쓴 미커밋 파일이나 진행 중인 작업이 있으면 명령 대신 지금 닫을지 되묻는다. 다른 세션의 미커밋 파일로는 묻지 않는다. 업그레이드 전에 연 세션이나 기록이 경로를 잃은 세션은 예외다) |
 | `hypo-personal-check.mjs` | `PreCompact` | session-close 미완, 위키 커밋/푸시 누락, hot.md 구조 위반, lint 블로커를 `systemMessage`로 알린다. `/compact`는 여기서 막지 않는다. 세션 마무리 강제는 다른 자리에 남아 있다: `hypo-stop.mjs`의 crystallize 단계가 마무리 확인 없는 의미 있는 세션을 막고, `--mark-session-closed`는 여전히 red 게이트에서 마커를 거부한다 |
 | `hypo-session-end.mjs` | `SessionEnd` | SessionEnd 마커를 기록해 다음 SessionStart가 `source=clear` 복구를 감지하게 한다 |
 | `hypo-web-fetch-ingest.mjs` | `PostToolUse(WebFetch/WebSearch)` | WebFetch/WebSearch 뒤 `additionalContext`에 `/hypo:ingest` 권유를 주입한다(URL의 query/hash/userinfo는 제거) |
@@ -426,8 +426,8 @@ E. 멈춘 프로젝트 재개.
 
 | 설치 경로 | 슬래시 커맨드 위치 |
 |---|---|
-| 플러그인 (Path A) | Claude Code 플러그인 캐시. `/plugin marketplace update hypomnema` 후 `/reload-plugins`로 갱신. 캐시 디렉터리 이름이 매니페스트 버전이라, 그 버전이 바뀌어야 갱신이 반영된다. 버전을 그대로 둔 채 머지한 커밋은 이미 설치된 곳에 닿지 않는다. 업데이트 전에 열려 있던 세션은 reload 뒤에도 이전 마무리 규칙(닫는 프로젝트 폴더의 미커밋 파일이 막는다)을 그대로 쓴다. 세션이 쓴 파일의 기록으로 가르는 새 규칙은 새 세션을 시작해야 적용된다. |
-| npm CLI (Path B) | `~/.claude/commands/hypo/`. `hypomnema upgrade --apply`로 갱신, 파일별 SHA 추적. 사용자 수정본까지 덮어쓰려면 `--force-commands`(원본은 `.bak`으로 보존) |
+| 플러그인 (Path A) | Claude Code 플러그인 캐시. `/plugin marketplace update hypomnema` 후 `/reload-plugins`로 갱신. 캐시 디렉터리 이름이 매니페스트 버전이라, 그 버전이 바뀌어야 갱신이 반영된다. 버전을 그대로 둔 채 머지한 커밋은 이미 설치된 곳에 닿지 않는다. 업데이트 전에 열려 있던 세션은 reload 뒤에도 이전 마무리 규칙(닫는 프로젝트 폴더에 미커밋 파일이 있으면 마무리를 막는다)을 그대로 쓴다. 세션마다 자기가 쓴 파일만 따지는 새 규칙은 새 세션을 시작해야 적용된다. |
+| npm CLI (Path B) | `~/.claude/commands/hypo/`. `hypomnema upgrade --apply`로 갱신, 파일별 SHA 추적. 사용자 수정본까지 덮어쓰려면 `--force-commands`(원본은 `.bak`으로 보존). 업그레이드 전에 열려 있던 세션은 여기서도 이전 마무리 규칙을 그대로 쓴다. 새 세션이 받는 기록 스탬프는 설치 경로와 상관이 없다. 세션마다 자기가 쓴 파일만 따지는 새 규칙은 새 세션을 시작해야 적용된다. |
 
 ---
 

@@ -1725,15 +1725,25 @@ test('ensureProjectIndex: a claim an earlier close recorded for the same path su
 
 // Pair of the next test: the create died between the empty create and the write, so the record
 // holds the seed hash and the disk holds nothing. Stop's retirement keeps it. A create that
-// finished and was committed matches HEAD and is retired.
+// finished and was committed matches HEAD and is retired. Both record what the commit callback was
+// handed: it runs once in each. The empty index.md is left out of its scope (its bytes are not the
+// seed this session recorded), the committed one is in it (its bytes are the recorded ones, so the
+// commit takes it and finds nothing to add). A shortcut that answers `committed` without calling
+// the callback, or one that sweeps the empty file in, is told apart from the retirement that kept
+// the claim.
 test("an interrupted index.md create survives the Stop auto-commit's retirement", () => {
   withWiki(null, (dir, today) => {
     const rel = join('projects', 'test-project', 'index.md');
     const sid = newPinSession('idx-interrupted');
     ensureProjectIndex(dir, 'test-project', rel, today, sid);
     writeFileSync(join(dir, rel), '');
-    const r = commitTouchedPaths(dir, sid, () => ({ committed: true }));
+    const scopes = [];
+    const r = commitTouchedPaths(dir, sid, (scope) => {
+      scopes.push(scope);
+      return { committed: true };
+    });
     assert.equal(r.committed, true, JSON.stringify(r));
+    assert.deepEqual(scopes, [[]], 'one commit, with the interrupted index.md left out');
     assert.deepEqual(readTouchedPathsStrict(dir, sid).paths, [rel]);
   });
 });
@@ -1745,8 +1755,13 @@ test('a completed and committed index.md create is retired by the Stop auto-comm
     ensureProjectIndex(dir, 'test-project', rel, today, sid);
     spawnSync('git', ['-C', dir, 'add', '--', rel]);
     spawnSync('git', ['-C', dir, 'commit', '-q', '-m', 'index']);
-    const r = commitTouchedPaths(dir, sid, () => ({ committed: true }));
+    const scopes = [];
+    const r = commitTouchedPaths(dir, sid, (scope) => {
+      scopes.push(scope);
+      return { committed: true };
+    });
     assert.equal(r.committed, true, JSON.stringify(r));
+    assert.deepEqual(scopes, [[rel]], 'one commit, with the committed index.md in its scope');
     assert.equal(readTouchedPathsStrict(dir, sid).state, 'empty');
   });
 });
@@ -2689,9 +2704,20 @@ test("apply: another session's dirty file in the project folder being closed doe
     assert.equal(out.markerWritten, true, `stage: ${r.stdout}\n${r.stderr}`);
     assert.equal(out.markerSkipReason ?? null, null, r.stdout);
     assert.ok(existsSync(receiptPath(dir, sessionId)), 'the receipt is filed behind an open gate');
+    // Left as it was, and out of the close: its bytes, still untracked, and absent from the tree
+    // the close committed. A close that swept it into its commit leaves it on disk too, so
+    // existence alone tells nothing.
+    const scratch = 'projects/test-project/scratch.txt';
+    assert.equal(readFileSync(join(dir, scratch), 'utf-8'), 'unsaved work\n');
+    const git = (...a) => spawnSync('git', ['-C', dir, ...a], { encoding: 'utf-8' }).stdout;
+    assert.equal(git('status', '--porcelain', '--', scratch), `?? ${scratch}\n`);
     assert.ok(
-      existsSync(join(dir, 'projects', 'test-project', 'scratch.txt')),
-      "another session's file is left where it is",
+      !git('ls-tree', '-r', '--name-only', 'HEAD').split('\n').includes(scratch),
+      "another session's file is not in the close commit",
+    );
+    assert.ok(
+      git('show', '--name-only', '--format=', 'HEAD').includes('session-log'),
+      'precondition: HEAD is the close commit',
     );
   });
 });
@@ -5084,8 +5110,11 @@ test('two sessions close one project on different tracks one after the other: bo
 });
 
 // Two real `--apply-session-close` processes on one project, the second started `staggerMs`
-// after the first. Every run must end ok, committed and with its marker written.
-async function closeTwiceInParallel(staggerMs) {
+// after the first. Every run must end ok, committed and with its marker written. `stamp: false`
+// runs them as sessions opened before the upgrade (no record stamp): the folder rule then blocks
+// every unrecorded file in the project folder, so only the foreign-entry and foreign-append
+// exceptions, which the gate applies ahead of that rule, let each close past the other's work.
+async function closeTwiceInParallel(staggerMs, { stamp = true } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'hypo-wiki-'));
   try {
     const today = todayLocal();
@@ -5099,7 +5128,7 @@ async function closeTwiceInParallel(staggerMs) {
 
     const spawnClose = (label, trackId) => {
       const sessionId = newPinSession(label);
-      stampSessionRecord(dir, sessionId);
+      if (stamp) assert.equal(stampSessionRecord(dir, sessionId), 'stamped');
       const cleanup = seedCloseTranscript(sessionId);
       const payloadPath = join(tmpdir(), `hypo-payload-${sessionId}.json`);
       writeFileSync(
@@ -5159,6 +5188,15 @@ async function closeTwiceInParallel(staggerMs) {
 await testAsync(
   'two processes closing the same project at the same moment both succeed with no proposal and both write their marker',
   () => closeTwiceInParallel(0),
+);
+
+// The pair of the one above with two sessions that began before the upgrade: with the stamp
+// the other close's dirty files could also pass as ordinary unresolved notices, so the test above
+// stays green if the foreign-entry or foreign-append exception breaks. Here the folder rule would
+// block them, and only those exceptions let both closes land their marker.
+await testAsync(
+  'two unstamped sessions closing the same project at the same moment both succeed and both write their marker',
+  () => closeTwiceInParallel(0, { stamp: false }),
 );
 
 // A timing sample, not a pin. Started 400ms apart, the second close usually appends its

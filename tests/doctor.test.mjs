@@ -1343,6 +1343,18 @@ test('doctor: warns when a receipt names a file version its commit does not hold
     assert.match(check.detail, /sess-forged/);
     assert.match(check.detail, /close-receipt\.json/);
     assert.match(check.detail, /projects\/demo\/note\.md \(blob-mismatch\)/);
+    // the way out: the check for that session's close, and closing again if it is not closed
+    assert.ok(
+      check.detail.includes(
+        `--check-session-close --session-id=sess-forged --hypo-dir='${dir}' --json`,
+      ),
+      check.detail,
+    );
+    assert.match(check.detail, /scripts\/crystallize\.mjs" --check-session-close/);
+    assert.match(
+      check.detail,
+      /no longer proven by its commit: if the check does not report it closed, ask the user to close that project again and apply it with \/hypo:crystallize/,
+    );
   });
 });
 

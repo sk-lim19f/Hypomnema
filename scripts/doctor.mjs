@@ -1403,14 +1403,25 @@ function checkReceiptEvidence(hypoDir, namedByMarkerWalk = new Set()) {
     }
   }
   if (bad.length === 0) return;
+  // The close such a receipt certifies is no longer proven by its commit, so the advice is the
+  // check that says where that close stands now, and closing again when it is not closed.
+  const crystallize = join(PKG_ROOT, 'scripts', 'crystallize.mjs');
   warn(
     'Session-close receipt evidence',
     `${bad.length} close receipt(s) name file versions their commit does not hold: ` +
       bad
         .slice(0, 3)
-        .map((b) => `${b.sessionId} (${b.file}): ${describeMismatches(b.mismatches)}`)
+        .map(
+          (b) =>
+            `${b.sessionId} (${b.file}): ${describeMismatches(b.mismatches)}. Check with: ` +
+            `node "${crystallize}" --check-session-close --session-id=${b.sessionId} ` +
+            `--hypo-dir=${shellSingleQuote(hypoDir)} --json`,
+        )
         .join('; ') +
-      (bad.length > 3 ? ` (+${bad.length - 3} more)` : ''),
+      (bad.length > 3 ? ` (+${bad.length - 3} more)` : '') +
+      '. The close such a receipt certifies is no longer proven by its commit: if the check does ' +
+      'not report it closed, ask the user to close that project again and apply it with ' +
+      '/hypo:crystallize',
   );
 }
 

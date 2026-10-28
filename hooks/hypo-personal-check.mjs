@@ -438,14 +438,15 @@ process.stdin.on('end', () => {
 
   // What was skipped and why, from the gate's own `skippedWhy` (a missing tool, a time limit, an
   // error). A check that ended by an error already has a `check-skipped` blocker whose reason
-  // says so, so it is not listed twice. The cause follows a comma, not a parenthesis: both places
-  // that print these lines already wrap the whole list in one.
+  // says so, so it is not listed twice. The cause sits in one pair of parentheses with commas
+  // inside, never a second pair: after a comma it ran into the list's own commas and read as one
+  // more item ("reinstall the plugin, feedback-sync skipped, ...").
   const skipLines = Object.entries({ lint: 'lint', feedback: 'feedback-sync' })
     .filter(
       ([c]) =>
         gate.skipped[c] && !gate.blockers.some((b) => b.type === 'check-skipped' && b.check === c),
     )
-    .map(([c, name]) => `${name} skipped, ${gate.skippedWhy[c]}`);
+    .map(([c, name]) => `${name} skipped (${gate.skippedWhy[c]})`);
 
   // ── Bypass 3: HYPO_SKIP_GATE ──
   if (isGateSkipped()) {
