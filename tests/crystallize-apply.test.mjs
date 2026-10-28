@@ -1763,8 +1763,7 @@ test('ensureProjectIndex: an index.md this session already wrote keeps its own c
 test("close: a session's edit to index.md is still blocked after another session committed the seed", () => {
   withWiki(null, (dir, today) => {
     const rel = join('projects', 'fresh-project', 'index.md');
-    const env = { ...process.env, HOME: SESSION_TMP_HOME };
-    const git = (...a) => spawnSync('git', ['-C', dir, ...a], { encoding: 'utf-8', env });
+    const git = vaultGit(dir);
     // B: seeds and commits.
     assert.equal(ensureProjectIndex(dir, 'fresh-project', rel, today), rel);
     assert.equal(git('add', '-A').status, 0);
@@ -1780,22 +1779,91 @@ test("close: a session's edit to index.md is still blocked after another session
       true,
     );
     assert.equal(ensureProjectIndex(dir, 'fresh-project', rel, today, sid), null);
-    // The Stop commit offers the dirty file to the commit instead of retiring its claim as spent.
-    // The commit here lands nothing, so the claim stays and the gate sees it.
-    let scope;
-    commitTouchedPaths(dir, sid, (paths) => {
-      scope = paths;
-      return { committed: false };
-    });
-    assert.deepEqual(scope, [rel], 'the edit is in the commit scope');
-    assert.deepEqual(readSessionRecord(dir, sid).paths, [rel], 'the claim is still recorded');
-    const gate = precompactGateStatus(dir, {
-      claudeHome: join(dir, '.claude-none'),
-      checkpointMode: true,
-      sessionId: sid,
-    });
-    const b = (gate.blockers || []).find((x) => x.file === rel);
-    assert.ok(b && b.type === 'known-session-write', JSON.stringify(gate));
+    expectEditBlockedThenCommitted(dir, sid, rel, edited, git);
+  });
+});
+
+function vaultGit(dir) {
+  const env = { ...process.env, HOME: SESSION_TMP_HOME };
+  return (...a) => spawnSync('git', ['-C', dir, ...a], { encoding: 'utf-8', env });
+}
+
+// What the Stop commit has to do with a session's edit to a file HEAD holds in another form. First
+// a commit that lands nothing: the edit is in the scope and its claim stays, so the gate blocks it.
+// Then a commit that lands the scope: the edit reaches HEAD and the claim is retired. Without the
+// claim's own hash the scope is empty, the commit "succeeds" with nothing, the claim is retired
+// over a dirty file and HEAD never gets the edit.
+function expectEditBlockedThenCommitted(dir, sid, rel, edited, git) {
+  let scope;
+  commitTouchedPaths(dir, sid, (paths) => {
+    scope = paths;
+    return { committed: false };
+  });
+  assert.deepEqual(scope, [rel], 'the edit is in the commit scope');
+  assert.deepEqual(readSessionRecord(dir, sid).paths, [rel], 'the claim is still recorded');
+  const gate = precompactGateStatus(dir, {
+    claudeHome: join(dir, '.claude-none'),
+    checkpointMode: true,
+    sessionId: sid,
+  });
+  const b = (gate.blockers || []).find((x) => x.file === rel);
+  assert.ok(b && b.type === 'known-session-write', JSON.stringify(gate));
+  commitTouchedPaths(dir, sid, (paths) => {
+    if (paths.length > 0) {
+      assert.equal(git('add', '--', ...paths).status, 0);
+      assert.equal(git('commit', '-q', '-m', 'session A edit').status, 0);
+    }
+    return { committed: true };
+  });
+  assert.equal(
+    git('show', `HEAD:${rel.split('\\').join('/')}`).stdout,
+    edited,
+    'the edit is in HEAD',
+  );
+  assert.deepEqual(readSessionRecord(dir, sid).paths, [], 'the claim is retired once it landed');
+}
+
+// The window the test above leaves open. Session A's existence check saw no index.md (here the
+// check is told so), then A's own write landed and was recorded, then ensureProjectIndex recorded
+// its seed. The seed record must not replace the hash of the edit: HEAD holds the seed, so the
+// replaced hash would equal HEAD and the Stop commit would retire the claim of a dirty file.
+test('ensureProjectIndex: an edit recorded between the existence check and the seed record keeps its hash', () => {
+  withWiki(null, (dir, today) => {
+    const rel = join('projects', 'fresh-project', 'index.md');
+    const dest = join(dir, rel);
+    const git = vaultGit(dir);
+    assert.equal(ensureProjectIndex(dir, 'fresh-project', rel, today), rel);
+    assert.equal(git('add', '-A').status, 0);
+    assert.equal(git('commit', '-q', '-m', 'seed by B').status, 0);
+    const sid = newPinSession('idx-f1r-window');
+    assert.equal(stampSessionRecord(dir, sid), 'stamped');
+    const edited = readFileSync(dest, 'utf-8') + '\nsession A edit\n';
+    const editedHash = createHash('sha256').update(edited).digest('hex');
+    const realExistsSync = nodeFs.existsSync;
+    let raced = false;
+    nodeFs.existsSync = function (path, ...rest) {
+      if (!raced && path === dest) {
+        raced = true;
+        // The file is there, but this call is told it is not; the edit then lands and is recorded.
+        writeFileSync(dest, edited);
+        assert.equal(
+          recordTouchedPaths(dir, sid, [rel], { expectedHashes: { [rel]: editedHash } }),
+          true,
+        );
+        return false;
+      }
+      return realExistsSync.call(this, path, ...rest);
+    };
+    syncBuiltinESMExports();
+    try {
+      assert.equal(ensureProjectIndex(dir, 'fresh-project', rel, today, sid), null);
+    } finally {
+      nodeFs.existsSync = realExistsSync;
+      syncBuiltinESMExports();
+    }
+    assert.ok(raced, 'the existence check must have been reached');
+    assert.equal(readSessionRecord(dir, sid).hashes[rel], editedHash, 'the edit hash is kept');
+    expectEditBlockedThenCommitted(dir, sid, rel, edited, git);
   });
 });
 

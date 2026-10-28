@@ -6384,7 +6384,7 @@ function readTouchedPathsFile(path) {
  * @returns {{added: boolean}} whether at least one of `incoming` was NOT
  *   already present in the set before this call.
  */
-function mergeIncomingTouchedPaths(hypoDir, sessionId, incoming, hashFor) {
+function mergeIncomingTouchedPaths(hypoDir, sessionId, incoming, hashFor, onlyIfUnclaimed = false) {
   const path = touchedPathsPath(hypoDir, sessionId);
   // An unreadable hash file is left as it is: replacing it with this call's hashes would drop the
   // claims it holds. The record fails instead, and the caller's catch flags `incoming`.
@@ -6410,6 +6410,13 @@ function mergeIncomingTouchedPaths(hypoDir, sessionId, incoming, hashFor) {
     });
   }
   const merged = new Set(current === null ? [] : current);
+  // `onlyIfUnclaimed`: a path this session already claims (set entry or hash entry) keeps its
+  // claim and its hash untouched. The decision is made here, under the session lock, so a record
+  // that landed after the caller's own existence check cannot be overwritten by this one.
+  if (onlyIfUnclaimed) {
+    incoming = incoming.filter((p) => !merged.has(p) && !Object.hasOwn(hashes, p));
+    if (incoming.length === 0) return { added: false };
+  }
   let added = false;
   for (const p of incoming) {
     if (!merged.has(p)) added = true;
@@ -6617,7 +6624,7 @@ export function recordTouchedPaths(hypoDir, sessionId, relPaths, opts = {}) {
     (p) => typeof p === 'string' && p.length > 0,
   );
   if (incoming.length === 0) return true;
-  const { expectedHashes, deadline } = opts;
+  const { expectedHashes, deadline, onlyIfUnclaimed } = opts;
   const path = touchedPathsPath(hypoDir, sessionId);
   // With a `deadline` the lock wait leaves room to write the failure flag.
   const left = remainingSpawnTimeoutMs(deadline);
@@ -6629,10 +6636,15 @@ export function recordTouchedPaths(hypoDir, sessionId, relPaths, opts = {}) {
     withFileLock(
       path,
       () =>
-        mergeIncomingTouchedPaths(hypoDir, sessionId, incoming, (p) =>
-          expectedHashes && Object.hasOwn(expectedHashes, p)
-            ? expectedHashes[p]
-            : vaultFileHash(hypoDir, p),
+        mergeIncomingTouchedPaths(
+          hypoDir,
+          sessionId,
+          incoming,
+          (p) =>
+            expectedHashes && Object.hasOwn(expectedHashes, p)
+              ? expectedHashes[p]
+              : vaultFileHash(hypoDir, p),
+          onlyIfUnclaimed === true,
         ),
       lockOpts,
     );

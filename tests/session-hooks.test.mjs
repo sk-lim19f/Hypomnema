@@ -1808,6 +1808,47 @@ test('recordTouchedPaths with expectedHashes records the given hash', () => {
   });
 });
 
+// Distinguishes: a path this session already claims keeping the hash it was recorded with (the
+// second record is a no-op) from a path with no claim, which the same call records with the hash
+// it was given.
+test("recordTouchedPaths: onlyIfUnclaimed leaves an existing claim's hash alone", () => {
+  withSyncedWiki((dir) => {
+    const sid = 'sess-unclaimed-keep';
+    writeFileSync(join(dir, 'a.md'), 'on disk\n');
+    assert.equal(
+      recordTouchedPaths(dir, sid, 'a.md', { expectedHashes: { 'a.md': sha256('mine\n') } }),
+      true,
+    );
+    assert.equal(
+      recordTouchedPaths(dir, sid, ['a.md'], {
+        expectedHashes: { 'a.md': sha256('seed\n') },
+        onlyIfUnclaimed: true,
+      }),
+      true,
+    );
+    const rec = readSessionRecord(dir, sid);
+    assert.deepEqual(rec.paths, ['a.md']);
+    assert.equal(rec.hashes['a.md'], sha256('mine\n'), 'the earlier hash is not replaced');
+  });
+});
+
+test('recordTouchedPaths: onlyIfUnclaimed records a path that has no claim', () => {
+  withSyncedWiki((dir) => {
+    const sid = 'sess-unclaimed-new';
+    writeFileSync(join(dir, 'a.md'), 'on disk\n');
+    assert.equal(
+      recordTouchedPaths(dir, sid, ['a.md'], {
+        expectedHashes: { 'a.md': sha256('seed\n') },
+        onlyIfUnclaimed: true,
+      }),
+      true,
+    );
+    const rec = readSessionRecord(dir, sid);
+    assert.deepEqual(rec.paths, ['a.md']);
+    assert.equal(rec.hashes['a.md'], sha256('seed\n'), 'the new claim carries the given hash');
+  });
+});
+
 // Distinguishes: a file that cannot be read when flagged (no diskSha256 key, so the gate blocks on
 // it whenever it is dirty) from a file that does not exist (diskSha256: null, a confirmed absence).
 test('markTouchedPathsFailed: a file that cannot be read records the path with no hash, an absent path records null', () => {
