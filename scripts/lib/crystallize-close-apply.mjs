@@ -1076,7 +1076,7 @@ function priorReceiptCommitRewritten(hypoDir, sessionId) {
 // between this CLI and the auto-write at the tail of applySessionClose.
 //
 // Contract: the marker is written only when precompactGateStatus, run in
-// checkpointMode (the git axis narrowed), is green. A failed gate exits 1 with no
+// checkpointMode (which only makes an invalid session id a blocker), is green. A failed gate exits 1 with no
 // marker — the next Stop hook re-blocks.
 
 // `testHooks` is test-only, see settleCloseResolution.
@@ -1100,10 +1100,10 @@ export function runMarkSessionClosed(args, testHooks = null) {
   // The per-session marker is the THIRD session-close completion
   // signal (after the PreCompact gate and `--check-session-close`). It uses
   // precompactGateStatus, the gate the PreCompact notice reads, with one deliberate
-  // difference: `checkpointMode` (set below) replaces the git axis. The gate
-  // flags any uncommitted vault change, while the checkpoint blocks only
-  // on an uncommitted write THIS session still owns, so another session's
-  // dirty file can keep the gate red while this checkpoint still lands.
+  // difference: `checkpointMode` (set below) only makes an invalid session id a
+  // blocker of its own. The git axis is the same for every caller: it blocks
+  // only on an uncommitted write THIS session still owns (or failed to record),
+  // so another session's dirty file stays a notice for this checkpoint too.
   // Neither one stops /compact: PreCompact only shows a notice.
   // Every other axis is the same, so the marker still enforces feedback
   // projection (over-cap/conflict), W8 design-history staleness, and root
@@ -1123,11 +1123,10 @@ export function runMarkSessionClosed(args, testHooks = null) {
   // resolveGateProjectOverride (session-close-scope-boundary spec §2/§3): closeScope
   // above only widens THIS session's accountability set (evidence union for the
   // marker's attribution) -- it does not narrow closeAccountableScope's base, so a
-  // DIFFERENT project's dangling close files still land in the git-dirty check and
-  // block a `--project=<mine>` mark. Passed below as `attributionScope`: this is
-  // the value that feeds the mine/foreign partition in precompactGateStatus and
-  // demotes the foreign project's own close-file debt to a notice instead of
-  // block, and it also decides which projects the marker this call may go on to
+  // DIFFERENT project's dangling close files still land in the lint scope. Passed
+  // below as `attributionScope`: this is the value that feeds the mine/foreign
+  // partition in precompactGateStatus and demotes the foreign project's own
+  // close-file debt to a notice instead of block, and it also decides which projects the marker this call may go on to
   // write ends up attesting -- so passing `projectOverride` instead would narrow
   // sessionCloseGlobalStatus to args.project alone and turn the partition off,
   // which is the bug this key split fixes (a marker then claimed the demoted
@@ -1561,7 +1560,7 @@ export function runMarkSessionClosed(args, testHooks = null) {
     // computed once per run, so neither repeats on a later gate read.
     if (hostTagWarning) console.log(`\n⚠ ${hostTagWarning}`);
     if (receiptResult.leftUnverifiable) console.log(`  · ${LEFT_UNVERIFIABLE_NOTE}`);
-    for (const n of proofNotices) console.log(`  · ${n.reason}`);
+    printGateNotices(result.notices);
   }
   process.exit(0);
 }
@@ -1911,12 +1910,38 @@ export function ensureProjectIndex(hypoDir, project, relPath, today, sessionId) 
   const dest = join(hypoDir, relPath);
   const content = projectIndexSeed(project, today);
   if (content === null) return null; // template missing: nothing to scaffold from
+  // The close gate has to know the file is this session's before it exists: a death between the
+  // create and the write leaves a zero-byte index.md that nothing else would claim. So the record
+  // comes first, with the seed's hash rather than the empty file's, so the Stop auto-commit does
+  // not retire it (nor does it retire a claim whose file does not exist yet). A record that fails
+  // stops here, before the create: its failure flag names the path, and the gate blocks it.
+  //
+  // Only when the file is absent now: recordTouchedPaths overwrites the hash of a claim that is
+  // already there, and a file that exists may carry this session's own edit. Replacing that claim
+  // with the seed hash lets the Stop commit retire it when HEAD holds the seed (another session
+  // committed it), leaving the edit dirty and unclaimed. `onlyIfUnclaimed` closes the same hole for
+  // an edit recorded between this check and the record below: the session lock decides, so an
+  // existing claim keeps its hash. A file created between this check and the `wx` open below
+  // leaves the seed claim behind, which the coarse rule accepts: this session had no claim on it.
+  if (existsSync(dest)) return null;
+  const seedHash = bytesSha256(content);
+  if (
+    sessionId &&
+    !recordTouchedPaths(hypoDir, sessionId, [relPath], {
+      expectedHashes: { [relPath]: seedHash },
+      onlyIfUnclaimed: true,
+    })
+  )
+    return null;
   mkdirSync(dirname(dest), { recursive: true });
   let fd;
   try {
     fd = openSync(dest, 'wx');
   } catch (e) {
-    if (e && e.code === 'EEXIST') return null; // another writer already created it
+    // Another writer already created it. The claim just recorded stays: taking it back cannot tell
+    // this call's claim from a same-session one that overlaps it, so the coarse rule keeps it. The
+    // gate then blocks the file as this session's until it is committed, which retires the claim.
+    if (e && e.code === 'EEXIST') return null;
     throw e;
   }
   try {
@@ -4537,10 +4562,9 @@ function runMarkerPhase(args, project, appliedPaths, ok, hostTagWarning, receipt
         ...(closeTranscript ? { transcriptPath: closeTranscript } : {}),
         ...(autoMarkerOverride ? { attributionScope: autoMarkerOverride } : {}),
         // This is one of the two marker-writing paths that must share ONE
-        // `ok` invariant with `--mark-session-closed`. checkpointMode narrows the git axis to "is
-        // there an uncommitted write THIS session still owns" instead of
-        // refusing on any unattributed dirty root file; every other axis
-        // (close files, cwd, hot, lint, W8, feedback) is unchanged.
+        // `ok` invariant with `--mark-session-closed`. The git axis asks "is
+        // there an uncommitted write THIS session still owns" for every caller;
+        // checkpointMode only makes an invalid session id a blocker of its own.
         checkpointMode: true,
         sessionId: args.sessionId,
         closeOpen,
@@ -4993,7 +5017,8 @@ function buildCloseResult({
     gateNotices: gateNotices || [],
     // The checkpoint gate's own blockers when it refused the marker
     // (markerSkipReason compact-gate-not-ok); empty otherwise. --check-session-close
-    // judges the whole vault on a wider git axis, so it is not a substitute.
+    // runs the same git check but may lack this session's id, in which case it reads
+    // no record and blocks the whole project folder, so it is not a substitute.
     gateBlockers: gateBlockers || [],
     // Always present (possibly empty), same visibility contract as `notices`/
     // `otherDebtCount` above — a caller should not have to guess whether the
@@ -5026,6 +5051,24 @@ function buildCloseResult({
 const DOCTOR_HINT =
   'doctor (`/hypo:doctor` in Claude Code, or `hypomnema doctor` with the npm CLI)';
 
+// The gate's demotions (what it declined to block on, such as a lint the deadline cut short) in
+// the text report. JSON carries them as `notices` / `gateNotices`; without this a terminal user
+// reads a bare success for a close the gate could not fully check.
+function printGateNotices(notices) {
+  if (!notices || notices.length === 0) return;
+  console.log('  Gate notices (not blockers):');
+  for (const n of notices) console.log(`  · ${n.reason}`);
+}
+
+// The gate's blockers in the text report, one ✗ line each with its type, its file when it names
+// one, and its reason. JSON carries them as `gateBlockers`; without these lines the text report
+// named no blocker at all and sent the reader to --json to find out what to fix.
+function printGateBlockers(blockers) {
+  if (!blockers || blockers.length === 0) return;
+  console.log('  Gate blockers:');
+  for (const b of blockers) console.log(`  ✗ ${b.type}${b.file ? ` ${b.file}` : ''}: ${b.reason}`);
+}
+
 // The human-readable (non --json) rendering of the same settled state.
 function printCloseReport({
   project,
@@ -5051,6 +5094,8 @@ function printCloseReport({
   restructureWaivers,
   obsoleteNotices,
   hostTagWarning,
+  gateNotices,
+  gateBlockers,
 }) {
   console.log(`Session-close apply (project: ${project}, date: ${date}):`);
   for (const a of applied) console.log(`  ✓ wrote ${a}`);
@@ -5061,6 +5106,8 @@ function printCloseReport({
   for (const n of obsoleteNotices || []) console.log(`  · ${n}`);
   // What the verification saw but did not gate on (this close has no log lines under its date).
   for (const n of verification?.notices || []) console.log(`  · ${n.reason}`);
+  printGateNotices(gateNotices);
+  printGateBlockers(gateBlockers);
   // Surfaced unconditionally, success or failure. `restructure: true` no
   // longer waives the guard: the target below is still WITHHELD
   // and shows up in the conflicts loop right after this one. This line only
@@ -5211,11 +5258,14 @@ function printCloseReport({
               `    refused the per-session Stop-chain marker because a gate blocker\n` +
               `    remains. The session is NOT fully closed: the Stop hook will re-prompt\n` +
               `    until the marker is present. This is not a --session-id problem.\n` +
-              `    To fix: resolve the gate blocker (run git status in the vault: commit\n` +
-              `    or revert an uncommitted file in the project folder being closed, or\n` +
-              `    clear whichever other blocker the gate names), then re-run the same\n` +
-              `    close. No fresh close phrase is needed: a close signal is spent only\n` +
-              `    once the marker lands.\n`
+              `    To fix: resolve each gate blocker (the ✗ lines above name each blocker,\n` +
+              `    as gateBlockers[] does in --json): the uncommitted file this session\n` +
+              `    recorded writing, or a flagged one: commit or revert it; a project folder\n` +
+              `    blocked as a whole (type git: no record stamp, an incomplete record, or\n` +
+              `    no session id), which its reason says how to clear, since a file in it\n` +
+              `    may be another session's; or the cause of a skipped check. Then re-run\n` +
+              `    the same close. No fresh close phrase is needed: a close signal is spent\n` +
+              `    only once the marker lands.\n`
             : markerSkipReason === 'session-close-lock-timeout'
               ? `    The close files were applied and committed, but another close of this\n` +
                 `    session held its close lock past the timeout, so no receipt or marker\n` +
@@ -5876,6 +5926,8 @@ export function applySessionClose(args, testHooks = null) {
       restructureWaivers,
       obsoleteNotices: [...obsoleteNotices, ...notices],
       hostTagWarning: hostTagNotice,
+      gateNotices,
+      gateBlockers,
     });
   }
   process.exit(ok ? 0 : 1);

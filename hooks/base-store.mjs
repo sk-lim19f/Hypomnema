@@ -314,28 +314,42 @@ export function advanceBase(hypoDir, sessionId, relPath, hash) {
  * rule (spec line 40): only the session's OWN writes advance, so a concurrent
  * writer's change to the same target is still observed as drift.
  *
+ * `timeoutMs` caps the lock wait for a caller with a time budget (the auto-stage hook); a lock that
+ * is not free in time returns false like any other failure here.
+ *
  * @returns {boolean} true when the base file was updated
  */
-export function advanceBaseForWrite(hypoDir, sessionId, relPath, absPath, knownHash = null) {
+export function advanceBaseForWrite(
+  hypoDir,
+  sessionId,
+  relPath,
+  absPath,
+  knownHash = null,
+  { timeoutMs } = {},
+) {
   if (!sessionId) return false;
   const path = basePath(hypoDir, sessionId);
   try {
-    return withFileLock(path, () => {
-      const parsed = readBaseFile(hypoDir, sessionId);
-      if (!parsed) return false;
-      // Only a tracked target advances. hasOwnProperty, not truthiness: an
-      // observed-absent entry is `null` but still a legitimate key to advance from.
-      if (!Object.prototype.hasOwnProperty.call(parsed.targets, relPath)) return false;
-      const hash = typeof knownHash === 'string' ? knownHash : hashFile(absPath);
-      if (typeof hash !== 'string') return false; // absent/unreadable → leave base as-is
-      parsed.targets[relPath] = hash;
-      try {
-        atomicWrite(path, JSON.stringify(parsed, null, 2));
-        return true;
-      } catch {
-        return false;
-      }
-    });
+    return withFileLock(
+      path,
+      () => {
+        const parsed = readBaseFile(hypoDir, sessionId);
+        if (!parsed) return false;
+        // Only a tracked target advances. hasOwnProperty, not truthiness: an
+        // observed-absent entry is `null` but still a legitimate key to advance from.
+        if (!Object.prototype.hasOwnProperty.call(parsed.targets, relPath)) return false;
+        const hash = typeof knownHash === 'string' ? knownHash : hashFile(absPath);
+        if (typeof hash !== 'string') return false; // absent/unreadable → leave base as-is
+        parsed.targets[relPath] = hash;
+        try {
+          atomicWrite(path, JSON.stringify(parsed, null, 2));
+          return true;
+        } catch {
+          return false;
+        }
+      },
+      timeoutMs === undefined ? {} : { timeoutMs },
+    );
   } catch {
     return false;
   }

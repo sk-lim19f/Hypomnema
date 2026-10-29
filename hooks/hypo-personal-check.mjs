@@ -27,6 +27,8 @@ import { homedir } from 'os';
 import {
   HYPO_DIR,
   PKG_ROOT,
+  GATE_DEADLINE_MS,
+  remainingSpawnTimeoutMs,
   precompactGateStatus,
   readChecklist,
   isGateSkipped,
@@ -37,6 +39,24 @@ import {
 } from './hypo-shared.mjs';
 import { closeCheckpointState, isCloseComplete } from './close-receipt.mjs';
 import { closeGateStatus } from './close-gate-store.mjs';
+
+// The least time the drift self-heal --write is started with (ms): a node start plus the
+// write needs about this much, and a child given less only dies by its timeout.
+const MIN_HEAL_WRITE_MS = 1500;
+
+// The drift self-heal --write runs after the gate on a share of this hook's own limit, not on what
+// the gate left of GATE_DEADLINE_MS (a value set by Stop's 10 second limit): hooks.json gives
+// PreCompact 30 seconds, and a large vault whose gate takes most of 7000 ms would otherwise skip the
+// self-heal on every /compact. The share is what is left of the limit after the gate and the
+// report's own second, capped at HEAL_WRITE_CAP_MS. performance.now() counts from the process
+// start, the closest this hook gets to when the harness started its limit.
+const HOOK_LIMIT_MS = 30000;
+const REPORT_SHARE_MS = 1000;
+const HEAL_WRITE_CAP_MS = 20000;
+const hookDeadline = { end: HOOK_LIMIT_MS - REPORT_SHARE_MS };
+
+// A path for a command line a person copies: quoted when it holds anything a shell would split.
+const shellArg = (s) => (/^[\w@%+=:,./-]+$/.test(s) ? s : `'${s.replace(/'/g, `'\\''`)}'`);
 
 const WARNING_FILE = join(homedir(), '.claude', 'state', 'wiki-context-warning.json');
 
@@ -119,6 +139,10 @@ process.stdin.on('end', () => {
   const attributionScope = resolveGateProjectOverride(HYPO_DIR, { sessionCwd });
 
   let gate;
+  // One deadline for the gate and for the feedback notice check below, so a slow gate leaves it
+  // less time instead of stacking a second full budget on top of it. The drift self-heal --write
+  // has its own share of the hook limit (hookDeadline).
+  const deadline = { end: performance.now() + GATE_DEADLINE_MS };
   try {
     // The marker only scopes this gate (log-only mode, attribution) when
     // closeCheckpointState calls this session's close finished, the verdict
@@ -138,6 +162,7 @@ process.stdin.on('end', () => {
         : {}),
       ...(sessionCwd ? { sessionCwd } : {}),
       ...(attributionScope ? { attributionScope } : {}),
+      deadline,
     });
   } catch (err) {
     // Defense-in-depth: precompactGateStatus fails open per-check, but if it ever
@@ -166,24 +191,46 @@ process.stdin.on('end', () => {
   const healNotices = [];
   if (gate.ok && gate.driftTargets.length > 0) {
     const feedbackPath = PKG_ROOT ? join(PKG_ROOT, 'scripts', 'feedback-sync.mjs') : null;
-    const w = feedbackPath
-      ? spawnSync(
-          process.execPath,
-          [
-            feedbackPath,
-            '--write',
-            '--no-input',
-            '--json',
-            // this hook shows the report's warnings below, so notices an older hook run
-            // left pending can be reported (and cleared) here
-            '--ack-notices',
-            `--hypo-dir=${HYPO_DIR}`,
-            `--claude-home=${join(homedir(), '.claude')}`,
-          ],
-          { encoding: 'utf-8', timeout: 30000 },
-        )
-      : { status: 1 };
-    if (w.error || w.status === null || w.status !== 0) {
+    const writeLeft = Math.min(remainingSpawnTimeoutMs(hookDeadline), HEAL_WRITE_CAP_MS);
+    // The same write a person runs by hand when this one is cut: the arguments that decide what is
+    // written (the hook's own --json, --no-input and --ack-notices only shape its report).
+    const manualWrite = feedbackPath
+      ? `node ${shellArg(feedbackPath)} --write --hypo-dir=${shellArg(HYPO_DIR)} --claude-home=${shellArg(join(homedir(), '.claude'))}`
+      : 'hypomnema feedback-sync --write';
+    // Below the floor a node start plus a write cannot finish, so the child would only be
+    // killed by its timeout and the kill read as a failed sync.
+    const w =
+      writeLeft < MIN_HEAL_WRITE_MS
+        ? { skippedForTime: true }
+        : feedbackPath
+          ? spawnSync(
+              process.execPath,
+              [
+                feedbackPath,
+                '--write',
+                '--no-input',
+                '--json',
+                // this hook shows the report's warnings below, so notices an older hook run
+                // left pending can be reported (and cleared) here
+                '--ack-notices',
+                `--hypo-dir=${HYPO_DIR}`,
+                `--claude-home=${join(homedir(), '.claude')}`,
+              ],
+              { encoding: 'utf-8', timeout: writeLeft },
+            )
+          : { status: 1 };
+    if (w.skippedForTime) {
+      // No time left after the gate: not a failure of the sync, the next /compact repeats it.
+      healNotices.push(
+        `[WIKI CHECK] feedback projection drift (${gate.driftTargets.join(', ')}) was not re-synced: the gate left too little of the ${HOOK_LIMIT_MS} ms PreCompact hook limit to run the sync. The next /compact tries again, or run it now: ${manualWrite}`,
+      );
+    } else if (w.error?.code === 'ETIMEDOUT') {
+      // The write was started with the time that was left and ran out of it: the same
+      // time limit, not a sync that failed.
+      healNotices.push(
+        `[WIKI CHECK] feedback projection drift (${gate.driftTargets.join(', ')}) was not re-synced: the sync was still running when its ${writeLeft} ms share of the ${HOOK_LIMIT_MS} ms PreCompact hook limit ran out. The next /compact tries again, or run it now: ${manualWrite}`,
+      );
+    } else if (w.error || w.status === null || w.status !== 0) {
       gate.ok = false;
       gate.blockers.push({
         type: 'feedback',
@@ -223,40 +270,48 @@ process.stdin.on('end', () => {
     // notices and removes them on exit 0, so they reach a reader here. Only those notices are
     // shown: --check's other warnings (a skipped MEMORY projection) are not new information
     // on every compact. Fail open: any fault means no extra notice.
-    try {
-      const c = spawnSync(
-        process.execPath,
-        [
-          join(PKG_ROOT, 'scripts', 'feedback-sync.mjs'),
-          '--check',
-          '--no-input',
-          '--json',
-          '--ack-notices',
-          `--hypo-dir=${HYPO_DIR}`,
-          `--claude-home=${join(homedir(), '.claude')}`,
-        ],
-        { encoding: 'utf-8', timeout: 30000 },
+    const checkLeft = remainingSpawnTimeoutMs(deadline);
+    if (checkLeft === 0) {
+      healNotices.push(
+        `[WIKI CHECK] feedback-sync notice check skipped: the gate used up its ${GATE_DEADLINE_MS} ms deadline. Pending notices stay for the next /compact.`,
       );
-      if (!c.error && c.status === 0) {
-        const report = JSON.parse(c.stdout || '');
-        for (const m of Array.isArray(report.warnings) ? report.warnings : []) {
-          if (typeof m === 'string' && /kept the hand-written line in /.test(m))
-            healNotices.push(`[WIKI CHECK] feedback-sync notice: ${m}`);
+    } else {
+      try {
+        const c = spawnSync(
+          process.execPath,
+          [
+            join(PKG_ROOT, 'scripts', 'feedback-sync.mjs'),
+            '--check',
+            '--no-input',
+            '--json',
+            '--ack-notices',
+            `--hypo-dir=${HYPO_DIR}`,
+            `--claude-home=${join(homedir(), '.claude')}`,
+          ],
+          { encoding: 'utf-8', timeout: Math.min(30000, checkLeft) },
+        );
+        if (!c.error && c.status === 0) {
+          const report = JSON.parse(c.stdout || '');
+          for (const m of Array.isArray(report.warnings) ? report.warnings : []) {
+            if (typeof m === 'string' && /kept the hand-written line in /.test(m))
+              healNotices.push(`[WIKI CHECK] feedback-sync notice: ${m}`);
+          }
         }
+      } catch {
+        /* fail open */
       }
-    } catch {
-      /* fail open */
     }
   }
 
   // Non-blocking heads-up, one line per notice TYPE (session-close-scope-boundary
-  // spec §4). gate.notices can carry any of seven types: git, git-sync,
+  // spec §4). gate.notices can carry these types: unresolved, foreign-entry,
+  // foreign-append, local-entry, touched-paths-unreadable, git-sync,
   // close-debt, close-cwd-unresolved, lint, design-history, feedback. Folding
   // them all into one "pre-existing lint issue(s)" sentence (the old
   // renderer) mislabeled git/git-sync/close-cwd-unresolved as lint debt and
   // dropped close-cwd-unresolved plus most feedback notices outright: visible
   // but lying about what kind of issue it was and what fixes it. A count that
-  // can grow unbounded (foreign git paths, close-debt projects) is capped and
+  // can grow unbounded (unresolved paths, close-debt projects) is capped and
   // the rest folds into "+N more", mirroring the existing lint/design-history
   // fold (a vault-wide lint sweep once produced 125 lines here).
   const NOTICE_LIST_CAP = 5;
@@ -267,12 +322,34 @@ process.stdin.on('end', () => {
   const byType = (t) => gate.notices.filter((n) => n.type === t);
   const noticeLines = [];
 
-  // git: a dirty file outside this session's scope (§2b's structural demotion,
-  // or the trusted-transcript foreign-file demotion above it).
-  const foreignGit = byType('git');
-  if (foreignGit.length > 0) {
+  // unresolved: a dirty file this session has no record of writing, so it is
+  // not blocking and its owner is unknown (the gate's git axis, which is the
+  // same for every caller).
+  const unresolvedGit = byType('unresolved').filter((n) => n.file);
+  if (unresolvedGit.length > 0) {
     noticeLines.push(
-      `[WIKI CHECK] ${foreignGit.length} uncommitted file(s) outside this session's scope (not blocking): ${foldNames(foreignGit.map((n) => n.file || n.reason))}.`,
+      `[WIKI CHECK] ${unresolvedGit.length} uncommitted file(s) this session has no record of writing (not blocking): ${foldNames(unresolvedGit.map((n) => n.file))}.`,
+    );
+  }
+  // An enumeration the gate deadline cut has no file to name: its reason is the whole sentence.
+  for (const n of byType('unresolved').filter((x) => !x.file))
+    noticeLines.push(`[WIKI CHECK] ${n.reason}.`);
+  // foreign-entry, foreign-append, local-entry, touched-paths-unreadable: each
+  // carries its own full sentence in `reason` (what the file is and what to do
+  // or not do about it), so it is one line apiece. Past the cap the rest fold
+  // into a count with their names.
+  const reasonNotices = [
+    'foreign-entry',
+    'foreign-append',
+    'local-entry',
+    'touched-paths-unreadable',
+  ].flatMap(byType);
+  for (const n of reasonNotices.slice(0, NOTICE_LIST_CAP))
+    noticeLines.push(`[WIKI CHECK] ${n.reason}.`);
+  if (reasonNotices.length > NOTICE_LIST_CAP) {
+    const rest = reasonNotices.slice(NOTICE_LIST_CAP);
+    noticeLines.push(
+      `[WIKI CHECK] +${rest.length} more ownership notice(s) (not blocking): ${foldNames(rest.map((n) => n.file || n.type))}.`,
     );
   }
   // git-sync / close-cwd-unresolved: single-fact notices, their own `reason`
@@ -359,13 +436,21 @@ process.stdin.on('end', () => {
     return;
   }
 
+  // What was skipped and why, from the gate's own `skippedWhy` (a missing tool, a time limit, an
+  // error). A check that ended by an error already has a `check-skipped` blocker whose reason
+  // says so, so it is not listed twice. The cause sits in one pair of parentheses with commas
+  // inside, never a second pair: after a comma it ran into the list's own commas and read as one
+  // more item ("reinstall the plugin, feedback-sync skipped, ...").
+  const skipLines = Object.entries({ lint: 'lint', feedback: 'feedback-sync' })
+    .filter(
+      ([c]) =>
+        gate.skipped[c] && !gate.blockers.some((b) => b.type === 'check-skipped' && b.check === c),
+    )
+    .map(([c, name]) => `${name} skipped (${gate.skippedWhy[c]})`);
+
   // ── Bypass 3: HYPO_SKIP_GATE ──
   if (isGateSkipped()) {
-    const skipped = [
-      ...gate.blockers.map((b) => b.reason),
-      gate.skipped.lint ? 'lint skipped (hypo-pkg.json missing)' : '',
-      gate.skipped.feedback ? 'feedback-sync skipped (hypo-pkg.json missing)' : '',
-    ]
+    const skipped = [...gate.blockers.map((b) => b.reason), ...skipLines]
       .filter(Boolean)
       .join(', ');
     console.log(
@@ -385,10 +470,7 @@ process.stdin.on('end', () => {
   // gate.blockers already carry per-type reasons in the canonical order
   // (git, hot, close, lint, design-history, feedback) — same strings as before
   // Now sourced from the shared gate instead of inline checks.
-  const reasons = [
-    ...gate.blockers.map((b) => b.reason),
-    gate.skipped.lint ? 'lint skipped (run `hypomnema init` to enable lint gate)' : '',
-  ].filter(Boolean);
+  const reasons = [...gate.blockers.map((b) => b.reason), ...skipLines].filter(Boolean);
 
   const checklist = readChecklist(today);
   const checklistText =
@@ -413,7 +495,7 @@ process.stdin.on('end', () => {
       `  [ ] 13. git commit & push`,
       `  [ ] 14. verify: run /hypo:crystallize (--check-session-close --session-id=${sessionId ?? '<id>'});`,
       `           the close is recorded once it reports close_state: closed (or legacy-closed).`,
-      `           The Stop hook still checks this session's own project folder and has the final say.`,
+      `           The Stop hook runs the same check on this session's write record and has the final say.`,
     ].join('\n');
 
   const closeIntentNote = hasCloseIntent

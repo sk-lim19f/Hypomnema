@@ -84,6 +84,7 @@ import {
   isCloseReconfirmDeclined,
   CLOSE_RECONFIRM_MARK,
   resolveGateProjectOverride,
+  GATE_DEADLINE_MS,
   gitDirtyFiles,
   isForeignAppendOnlyShard,
   isForeignUncommittedEntry,
@@ -91,6 +92,19 @@ import {
 import { closeCheckpointState, isCloseComplete, receiptPath } from './close-receipt.mjs';
 import { closeGateStatus } from './close-gate-store.mjs';
 import { atomicWrite } from './atomic-write.mjs';
+
+// This stage's own share of the Stop budget: the `timeoutMs` of this file in the STAGES
+// table of hypo-stop.mjs, which passes it down as HYPO_STAGE_TIMEOUT_MS (hypo-stop runs on
+// import, so it cannot be imported for it). 10000 is the fallback when the variable is
+// missing or not a positive integer, such as a run of this file on its own.
+// The gate deadline is capped at that budget minus a reserve for the work after the gate,
+// measured from this process's start (performance.now() counts from there), so a slow
+// start leaves the gate less time instead of letting the stage be killed mid-gate.
+const STAGE_BUDGET_MS = (() => {
+  const n = Number(process.env.HYPO_STAGE_TIMEOUT_MS);
+  return Number.isInteger(n) && n > 0 ? n : 10000;
+})();
+const STAGE_RESERVE_MS = 1000;
 
 // Carrying a systemMessage does not turn this into a block: the session is
 // still free to end, the message just rides along on the same continue reply
@@ -365,6 +379,9 @@ process.stdin.on('end', () => {
             ? { closeMarker: isCloseComplete(checkpoint) ? checkpoint.marker : null }
             : {}),
           ...(attributionScope ? { attributionScope } : {}),
+          deadline: {
+            end: Math.min(performance.now() + GATE_DEADLINE_MS, STAGE_BUDGET_MS - STAGE_RESERVE_MS),
+          },
         });
       } catch {
         return null;
@@ -394,9 +411,17 @@ process.stdin.on('end', () => {
           return;
         }
         gate = computeGate();
-        const cwdBlocked = !!gate?.blockers?.some((b) => b.type === 'close-cwd');
+        // A close-cwd blocker with `incomplete` means the gate deadline cut the proof:
+        // the close did not fail, and a transient timeout must not become a block (see
+        // hypo-stop.mjs), so it is said and checked again on the next turn.
+        const cwdBlockers = (gate?.blockers || []).filter((b) => b.type === 'close-cwd');
+        const cwdBlocked = cwdBlockers.some((b) => !b.incomplete);
         if (!cwdBlocked) {
-          emitContinue(notice());
+          const cut = cwdBlockers.length
+            ? 'hypo: the close of this session was recorded, but the check of the session cwd project did not finish within the time limit. It will be checked again on the next turn (마감 안에 cwd 프로젝트 close 증명을 마치지 못함, 다음 턴에 다시 확인함).'
+            : null;
+          const n = notice();
+          emitContinue([n, cut].filter(Boolean).join('\n\n') || undefined);
           return;
         }
         // finished close, but the session's cwd project close is incomplete:
@@ -420,15 +445,23 @@ process.stdin.on('end', () => {
     // "work-incomplete" together are exactly the case where the transcript's
     // NL close phrase can't tell "close now" from "close once X is done" —
     // regex can't disambiguate this (see spec background). Narrowed to the
-    // work-incomplete signals only: an uncommitted wiki (`git` blocker; real
-    // unsaved work) OR pending background work — a non-terminal background task
+    // work-incomplete signals only: an uncommitted file this session wrote (a
+    // `known-session-write` blocker that names a file, or a `git` blocker for a
+    // project folder the write record lost track of; real unsaved work) OR
+    // pending background work — a non-terminal background task
     // (delegated subagent OR shell, e.g. a deferred push/CI wait) or a
     // scheduled cron wake (hasPendingBackgroundWork). `hot` / `lint` / `close`
     // / `design-history` / `feedback` blockers are real close blockers but not
     // evidence of "later" intent, so they keep the existing wording (unchanged
-    // from before this feature).
+    // from before this feature). The touched-paths lock timeout is a
+    // `known-session-write` blocker with no `file`: it says the record could not
+    // be read right now, not that work is unfinished.
     const workIncomplete =
-      (gate && gate.blockers && gate.blockers.some((b) => b.type === 'git')) ||
+      (gate &&
+        gate.blockers &&
+        gate.blockers.some(
+          (b) => (b.type === 'git' || b.type === 'known-session-write') && b.file,
+        )) ||
       hasPendingBackgroundWork(payload);
     if (workIncomplete && isCloseReconfirmDeclined(transcriptPath)) {
       // The user already answered "아직" to the ambiguous close signal that

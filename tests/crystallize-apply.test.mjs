@@ -20,6 +20,8 @@ import {
   readdirSync,
   chmodSync,
 } from 'node:fs';
+import nodeFs from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -58,6 +60,12 @@ import {
   recordShardAppend,
   readClosePin,
   readTouchedPathsStrict,
+  readSessionRecord,
+  commitTouchedPaths,
+  touchedHashesPath,
+  readTouchedPathsFailed,
+  recordTouchedPaths,
+  stampSessionRecord,
   writeClosePin,
   sessionProofCloseId,
   rootLogEntry,
@@ -1561,6 +1569,390 @@ test("ensureProjectIndex: a file created after the caller's missing-check surviv
   });
 });
 
+// Pair of the next test: a session id makes the create this session's write, none records nothing.
+// The recorded hash is the sha256 of the bytes the create put on disk, which is also what
+// vaultFileHash would read, so the bytesSha256 the record is made from is the same value.
+test("ensureProjectIndex: records the index path in this session's touched-paths with the seed hash once it owns the create", () => {
+  withTmpDir((dir) => {
+    const rel = join('projects', 'rec-project', 'index.md');
+    const sid = newPinSession('idx-record');
+    assert.equal(ensureProjectIndex(dir, 'rec-project', rel, '2026-06-01', sid), rel);
+    const touched = readTouchedPathsStrict(dir, sid);
+    assert.equal(touched.state, 'ok', JSON.stringify(touched));
+    assert.deepEqual(touched.paths, [rel]);
+    const hashes = JSON.parse(readFileSync(touchedHashesPath(dir, sid), 'utf-8'));
+    assert.equal(
+      hashes[rel],
+      createHash('sha256')
+        .update(readFileSync(join(dir, rel)))
+        .digest('hex'),
+    );
+    assert.ok(readFileSync(join(dir, rel), 'utf-8').length > 0, 'the seed landed');
+  });
+});
+
+// The two interrupted-create tests below finish ensureProjectIndex and then truncate the file, so
+// they would still pass if the record moved after the write. This one dies AT the first write of
+// the seed: the file is empty, and the record and the seed hash must already be on disk.
+test('ensureProjectIndex: the record and the seed hash are on disk when the seed write itself fails', () => {
+  withTmpDir((dir) => {
+    const rel = join('projects', 'rec-project', 'index.md');
+    const sid = newPinSession('idx-write-dies');
+    const realWriteSync = nodeFs.writeSync;
+    let seed = null;
+    nodeFs.writeSync = function (fd, data, ...rest) {
+      if (seed === null && typeof data === 'string' && data.includes('project-index')) {
+        seed = data;
+        const err = new Error('injected index write failure');
+        err.code = 'EIO';
+        throw err;
+      }
+      return realWriteSync.call(this, fd, data, ...rest);
+    };
+    syncBuiltinESMExports();
+    try {
+      assert.throws(
+        () => ensureProjectIndex(dir, 'rec-project', rel, '2026-06-01', sid),
+        /EIO|injected/,
+      );
+    } finally {
+      nodeFs.writeSync = realWriteSync;
+      syncBuiltinESMExports();
+    }
+    assert.ok(seed, 'the fault must have fired at the seed write');
+    assert.equal(readFileSync(join(dir, rel)).length, 0, 'the create died before any byte landed');
+    const touched = readTouchedPathsStrict(dir, sid);
+    assert.equal(touched.state, 'ok', JSON.stringify(touched));
+    assert.deepEqual(touched.paths, [rel]);
+    const hashes = JSON.parse(readFileSync(touchedHashesPath(dir, sid), 'utf-8'));
+    assert.equal(hashes[rel], createHash('sha256').update(seed).digest('hex'));
+  });
+});
+
+test('ensureProjectIndex: without a session id records nothing', () => {
+  withTmpDir((dir) => {
+    const rel = join('projects', 'rec-project', 'index.md');
+    assert.equal(ensureProjectIndex(dir, 'rec-project', rel, '2026-06-01'), rel);
+    assert.equal(existsSync(join(dir, '.cache', 'sessions')), false, 'no session dir was made');
+  });
+});
+
+// A create another writer wins after ensureProjectIndex's existence check: the file appears just
+// before the `wx` open, so the open fails with EEXIST. `fn` runs with that race in place.
+function withLostCreate(dest, bytes, fn) {
+  const realOpenSync = nodeFs.openSync;
+  let raced = false;
+  nodeFs.openSync = function (path, flags, ...rest) {
+    if (!raced && path === dest && flags === 'wx') {
+      raced = true;
+      mkdirSync(dirname(dest), { recursive: true });
+      writeFileSync(dest, bytes);
+    }
+    return realOpenSync.call(this, path, flags, ...rest);
+  };
+  syncBuiltinESMExports();
+  try {
+    fn();
+  } finally {
+    nodeFs.openSync = realOpenSync;
+    syncBuiltinESMExports();
+  }
+  assert.ok(raced, 'the other writer must have created the file before the open');
+}
+
+// Pair of the one above: a file this session created is recorded, and so is the seed claim of a
+// create another session got to first, between the existence check and the open (EEXIST). Since
+// 2026-10-28 (the coarse rule) that claim is not taken back: it stays until the file is committed.
+// It leaves no failure flag.
+test("ensureProjectIndex: another session's index.md (EEXIST) keeps this call's seed claim", () => {
+  withTmpDir((dir) => {
+    const rel = join('projects', 'rec-project', 'index.md');
+    const sid = newPinSession('idx-second');
+    withLostCreate(join(dir, rel), 'another session wrote this\n', () => {
+      assert.equal(ensureProjectIndex(dir, 'rec-project', rel, '2026-06-01', sid), null);
+    });
+    assert.deepEqual(readTouchedPathsStrict(dir, sid).paths, [rel]);
+    assert.equal(readTouchedPathsFailed(dir, sid).failed, false, 'no failure flag');
+  });
+});
+
+// Distinguishes: the record made before the create (a death between the create and the seed write
+// leaves an empty file that is already claimed) from one made after it. The create itself is where
+// the claim is read, so the order is seen directly, not inferred from the end state.
+test('ensureProjectIndex: the seed hash is recorded before the file exists', () => {
+  withTmpDir((dir) => {
+    const rel = join('projects', 'rec-project', 'index.md');
+    const dest = join(dir, rel);
+    const sid = newPinSession('idx-order');
+    const realOpenSync = nodeFs.openSync;
+    let atCreate = null;
+    nodeFs.openSync = function (path, flags, ...rest) {
+      if (atCreate === null && path === dest && flags === 'wx') {
+        atCreate = { exists: existsSync(dest), record: readSessionRecord(dir, sid) };
+      }
+      return realOpenSync.call(this, path, flags, ...rest);
+    };
+    syncBuiltinESMExports();
+    try {
+      assert.equal(ensureProjectIndex(dir, 'rec-project', rel, '2026-06-01', sid), rel);
+    } finally {
+      nodeFs.openSync = realOpenSync;
+      syncBuiltinESMExports();
+    }
+    assert.ok(atCreate, 'the create must have run');
+    assert.equal(atCreate.exists, false, 'the file did not exist yet');
+    assert.deepEqual(atCreate.record.paths, [rel]);
+    assert.equal(
+      atCreate.record.hashes[rel],
+      createHash('sha256').update(readFileSync(dest)).digest('hex'),
+      'the claim carries the seed hash, not the empty file',
+    );
+  });
+});
+
+// A create lost to another writer returns null and leaves the other writer's bytes as they are.
+// The claim this call recorded stays (2026-10-28, the coarse rule: no retraction), and a claim of
+// another path recorded earlier stays too.
+test("ensureProjectIndex: another session's index.md is left byte-for-byte, and the claim stays", () => {
+  withTmpDir((dir) => {
+    const rel = join('projects', 'rec-project', 'index.md');
+    const sid = newPinSession('idx-lost');
+    mkdirSync(join(dir, 'pages'), { recursive: true });
+    writeFileSync(join(dir, 'pages', 'other.md'), 'other\n');
+    assert.equal(recordTouchedPaths(dir, sid, ['pages/other.md']), true);
+    withLostCreate(join(dir, rel), 'another session wrote this\n', () => {
+      assert.equal(ensureProjectIndex(dir, 'rec-project', rel, '2026-06-01', sid), null);
+    });
+    const record = readSessionRecord(dir, sid);
+    assert.equal(record.complete, true, JSON.stringify(record.incompleteWhy));
+    assert.deepEqual(record.paths.slice().sort(), ['pages/other.md', rel].sort());
+    assert.equal(readFileSync(join(dir, rel), 'utf-8'), 'another session wrote this\n');
+  });
+});
+
+// Pair of the seed-claim test above (an absent index.md gets the seed claim before the create):
+// an index.md that is already on disk is not this call's to claim. This session's own edit to it
+// is recorded with its own hash, and that claim must not be replaced by the seed hash: with HEAD
+// holding the seed (another session committed it), the Stop commit would read "HEAD equals the
+// recorded hash" and retire the claim of a file that is still dirty.
+test('ensureProjectIndex: an index.md this session already wrote keeps its own claim hash', () => {
+  withTmpDir((dir) => {
+    const rel = join('projects', 'rec-project', 'index.md');
+    const sid = newPinSession('idx-earlier');
+    mkdirSync(join(dir, 'projects', 'rec-project'), { recursive: true });
+    const edited = 'this session edited the index\n';
+    writeFileSync(join(dir, rel), edited);
+    const editedHash = createHash('sha256').update(edited).digest('hex');
+    assert.equal(
+      recordTouchedPaths(dir, sid, [rel], { expectedHashes: { [rel]: editedHash } }),
+      true,
+    );
+    assert.equal(ensureProjectIndex(dir, 'rec-project', rel, '2026-06-01', sid), null);
+    const record = readSessionRecord(dir, sid);
+    assert.deepEqual(record.paths, [rel]);
+    assert.equal(record.hashes[rel], editedHash, 'the hash of the edit is not replaced');
+    assert.equal(readFileSync(join(dir, rel), 'utf-8'), edited);
+  });
+});
+
+// The schedule the test above guards, end to end. Session A's preflight saw no index.md. Session B
+// then created and committed the seed. A edited the file and recorded it, then its close called
+// ensureProjectIndex. The seed hash must not replace A's claim: with it, HEAD (the seed) equals the
+// recorded hash, the Stop commit retires the claim, and the edit that is still dirty reaches the
+// gate as an unclaimed file, a notice.
+test("close: a session's edit to index.md is still blocked after another session committed the seed", () => {
+  withWiki(null, (dir, today) => {
+    const rel = join('projects', 'fresh-project', 'index.md');
+    const git = vaultGit(dir);
+    // B: seeds and commits.
+    assert.equal(ensureProjectIndex(dir, 'fresh-project', rel, today), rel);
+    assert.equal(git('add', '-A').status, 0);
+    assert.equal(git('commit', '-q', '-m', 'seed by B').status, 0);
+    // A: edits the file, records it, then its close calls ensureProjectIndex.
+    const sid = newPinSession('idx-f1-schedule');
+    assert.equal(stampSessionRecord(dir, sid), 'stamped');
+    const edited = readFileSync(join(dir, rel), 'utf-8') + '\nsession A edit\n';
+    writeFileSync(join(dir, rel), edited);
+    const editedHash = createHash('sha256').update(edited).digest('hex');
+    assert.equal(
+      recordTouchedPaths(dir, sid, [rel], { expectedHashes: { [rel]: editedHash } }),
+      true,
+    );
+    assert.equal(ensureProjectIndex(dir, 'fresh-project', rel, today, sid), null);
+    expectEditBlockedThenCommitted(dir, sid, rel, edited, git);
+  });
+});
+
+function vaultGit(dir) {
+  const env = { ...process.env, HOME: SESSION_TMP_HOME };
+  return (...a) => spawnSync('git', ['-C', dir, ...a], { encoding: 'utf-8', env });
+}
+
+// What the Stop commit has to do with a session's edit to a file HEAD holds in another form. First
+// a commit that lands nothing: the edit is in the scope and its claim stays, so the gate blocks it.
+// Then a commit that lands the scope: the edit reaches HEAD and the claim is retired. Without the
+// claim's own hash the scope is empty, the commit "succeeds" with nothing, the claim is retired
+// over a dirty file and HEAD never gets the edit.
+function expectEditBlockedThenCommitted(dir, sid, rel, edited, git) {
+  let scope;
+  commitTouchedPaths(dir, sid, (paths) => {
+    scope = paths;
+    return { committed: false };
+  });
+  assert.deepEqual(scope, [rel], 'the edit is in the commit scope');
+  assert.deepEqual(readSessionRecord(dir, sid).paths, [rel], 'the claim is still recorded');
+  const gate = precompactGateStatus(dir, {
+    claudeHome: join(dir, '.claude-none'),
+    checkpointMode: true,
+    sessionId: sid,
+  });
+  const b = (gate.blockers || []).find((x) => x.file === rel);
+  assert.ok(b && b.type === 'known-session-write', JSON.stringify(gate));
+  commitTouchedPaths(dir, sid, (paths) => {
+    if (paths.length > 0) {
+      assert.equal(git('add', '--', ...paths).status, 0);
+      assert.equal(git('commit', '-q', '-m', 'session A edit').status, 0);
+    }
+    return { committed: true };
+  });
+  assert.equal(
+    git('show', `HEAD:${rel.split('\\').join('/')}`).stdout,
+    edited,
+    'the edit is in HEAD',
+  );
+  assert.deepEqual(readSessionRecord(dir, sid).paths, [], 'the claim is retired once it landed');
+}
+
+// The window the test above leaves open. Session A's existence check saw no index.md (here the
+// check is told so), then A's own write landed and was recorded, then ensureProjectIndex recorded
+// its seed. The seed record must not replace the hash of the edit: HEAD holds the seed, so the
+// replaced hash would equal HEAD and the Stop commit would retire the claim of a dirty file.
+test('ensureProjectIndex: an edit recorded between the existence check and the seed record keeps its hash', () => {
+  withWiki(null, (dir, today) => {
+    const rel = join('projects', 'fresh-project', 'index.md');
+    const dest = join(dir, rel);
+    const git = vaultGit(dir);
+    assert.equal(ensureProjectIndex(dir, 'fresh-project', rel, today), rel);
+    assert.equal(git('add', '-A').status, 0);
+    assert.equal(git('commit', '-q', '-m', 'seed by B').status, 0);
+    const sid = newPinSession('idx-f1r-window');
+    assert.equal(stampSessionRecord(dir, sid), 'stamped');
+    const edited = readFileSync(dest, 'utf-8') + '\nsession A edit\n';
+    const editedHash = createHash('sha256').update(edited).digest('hex');
+    const realExistsSync = nodeFs.existsSync;
+    let raced = false;
+    nodeFs.existsSync = function (path, ...rest) {
+      if (!raced && path === dest) {
+        raced = true;
+        // The file is there, but this call is told it is not; the edit then lands and is recorded.
+        writeFileSync(dest, edited);
+        assert.equal(
+          recordTouchedPaths(dir, sid, [rel], { expectedHashes: { [rel]: editedHash } }),
+          true,
+        );
+        return false;
+      }
+      return realExistsSync.call(this, path, ...rest);
+    };
+    syncBuiltinESMExports();
+    try {
+      assert.equal(ensureProjectIndex(dir, 'fresh-project', rel, today, sid), null);
+    } finally {
+      nodeFs.existsSync = realExistsSync;
+      syncBuiltinESMExports();
+    }
+    assert.ok(raced, 'the existence check must have been reached');
+    assert.equal(readSessionRecord(dir, sid).hashes[rel], editedHash, 'the edit hash is kept');
+    expectEditBlockedThenCommitted(dir, sid, rel, edited, git);
+  });
+});
+
+// Distinguishes: a Stop auto-commit that runs between the record and the create (nothing on disk,
+// nothing in HEAD yet) keeping the claim, so the create that follows lands claimed with the bytes
+// the record names, from a commit that reads "nothing anywhere" as clean and retires it. The vault
+// is a git repo with a commit: outside one, git cannot read the index, and the commit keeps the
+// claim for that reason alone, so this passed with the nothing-anywhere check removed.
+test('ensureProjectIndex: a Stop commit between the record and the create does not lose the claim', () => {
+  withWiki(null, (dir) => {
+    const rel = join('projects', 'rec-project', 'index.md');
+    const dest = join(dir, rel);
+    const sid = newPinSession('idx-stop-between');
+    const realOpenSync = nodeFs.openSync;
+    let between = null;
+    nodeFs.openSync = function (path, flags, ...rest) {
+      if (between === null && path === dest && flags === 'wx') {
+        let scope;
+        commitTouchedPaths(dir, sid, (paths) => {
+          scope = paths;
+          return { committed: true };
+        });
+        between = { scope, paths: readSessionRecord(dir, sid).paths };
+      }
+      return realOpenSync.call(this, path, flags, ...rest);
+    };
+    syncBuiltinESMExports();
+    try {
+      assert.equal(ensureProjectIndex(dir, 'rec-project', rel, '2026-06-01', sid), rel);
+    } finally {
+      nodeFs.openSync = realOpenSync;
+      syncBuiltinESMExports();
+    }
+    assert.ok(between, 'the commit ran between the record and the create');
+    assert.deepEqual(between.scope, [], 'nothing to commit yet');
+    assert.deepEqual(between.paths, [rel], 'the claim survived the commit');
+    const record = readSessionRecord(dir, sid);
+    assert.deepEqual(record.paths, [rel]);
+    assert.equal(
+      record.hashes[rel],
+      createHash('sha256').update(readFileSync(dest)).digest('hex'),
+      'the created file is the bytes the claim names',
+    );
+  });
+});
+
+// Pair of the next test: the create died between the empty create and the write, so the record
+// holds the seed hash and the disk holds nothing. Stop's retirement keeps it. A create that
+// finished and was committed matches HEAD and is retired. Both record what the commit callback was
+// handed: it runs once in each. The empty index.md is left out of its scope (its bytes are not the
+// seed this session recorded), the committed one is in it (its bytes are the recorded ones, so the
+// commit takes it and finds nothing to add). A shortcut that answers `committed` without calling
+// the callback, or one that sweeps the empty file in, is told apart from the retirement that kept
+// the claim.
+test("an interrupted index.md create survives the Stop auto-commit's retirement", () => {
+  withWiki(null, (dir, today) => {
+    const rel = join('projects', 'test-project', 'index.md');
+    const sid = newPinSession('idx-interrupted');
+    ensureProjectIndex(dir, 'test-project', rel, today, sid);
+    writeFileSync(join(dir, rel), '');
+    const scopes = [];
+    const r = commitTouchedPaths(dir, sid, (scope) => {
+      scopes.push(scope);
+      return { committed: true };
+    });
+    assert.equal(r.committed, true, JSON.stringify(r));
+    assert.deepEqual(scopes, [[]], 'one commit, with the interrupted index.md left out');
+    assert.deepEqual(readTouchedPathsStrict(dir, sid).paths, [rel]);
+  });
+});
+
+test('a completed and committed index.md create is retired by the Stop auto-commit', () => {
+  withWiki(null, (dir, today) => {
+    const rel = join('projects', 'test-project', 'index.md');
+    const sid = newPinSession('idx-completed');
+    ensureProjectIndex(dir, 'test-project', rel, today, sid);
+    spawnSync('git', ['-C', dir, 'add', '--', rel]);
+    spawnSync('git', ['-C', dir, 'commit', '-q', '-m', 'index']);
+    const scopes = [];
+    const r = commitTouchedPaths(dir, sid, (scope) => {
+      scopes.push(scope);
+      return { committed: true };
+    });
+    assert.equal(r.committed, true, JSON.stringify(r));
+    assert.deepEqual(scopes, [[rel]], 'one commit, with the committed index.md in its scope');
+    assert.equal(readTouchedPathsStrict(dir, sid).state, 'empty');
+  });
+});
+
 test('apply on a project that already has an index.md leaves it byte-for-byte untouched', () => {
   const existingIndex =
     '---\ntitle: test-project — Index\ntype: project-index\nstatus: active\nstarted: 2026-01-01\nupdated: 2026-01-01\nworking_dir: /real/path\n---\n\n# test-project\n\nhand-written content\n';
@@ -2450,11 +2842,12 @@ test('the console report for marker-did-not-land names the marker, not the recei
 test('a .hypoignore-excluded target commits the OLD bytes, and the receipt is withheld (receipt-proof-mismatch)', () => {
   withWiki(null, (dir, today) => {
     // The ignored target is the vault-root log.md, not a file under
-    // projects/test-project/. The checkpoint gate blocks any dirty file in the
-    // project folder being closed before the receipt proof runs, so a hot.md
-    // fixture no longer reaches receipt-proof-mismatch (the next test pins that
-    // refusal). A root file with no touched-paths record only demotes to a
-    // notice, which is what lets this proof still see the divergence.
+    // projects/test-project/. A project-folder file this session recorded is
+    // refused at the checkpoint gate before the receipt proof runs, so a hot.md
+    // fixture would not reach receipt-proof-mismatch (the second test below
+    // pins that refusal). A root file with no touched-paths record only
+    // demotes to a notice, which is what lets this proof still see the
+    // divergence.
     writeFileSync(join(dir, '.hypoignore'), 'log.md\n');
     const payload = payloadForCleanWiki(dir, today);
     const sessionId = 's-hypoignore-mismatch';
@@ -2478,31 +2871,70 @@ test('a .hypoignore-excluded target commits the OLD bytes, and the receipt is wi
   });
 });
 
-// The test above with a file inside the project folder being closed instead:
-// the gate blocks any dirty file there, so the close is refused one step
-// earlier, as compact-gate-not-ok, with no marker and no receipt. (Its original
-// fixture, an ignored project's entry, now passes the gate on its local proof:
-// see the .hypoignore suite below.)
-test('a dirty file in the project folder being closed refuses the gate (compact-gate-not-ok), no marker, no receipt', () => {
+// The test above with a file inside the project folder being closed instead. The record decides,
+// not the folder: another session's dirty file there is a notice and the close lands its marker
+// and receipt, while the same file in THIS session's touched-paths refuses the gate one step
+// earlier, as compact-gate-not-ok, with no marker and no receipt. Distinguishes: not recorded by
+// this session (markerWritten, receipt on disk) from recorded (gate withheld, known-session-write
+// naming the file). (The original fixture, an ignored project's entry, passes the gate on its
+// local proof: see the .hypoignore suite below.)
+test("apply: another session's dirty file in the project folder being closed does not withhold the marker", () => {
   withWiki(null, (dir, today) => {
     // Not a .md page, so preflight lint has nothing to say about it.
     writeFileSync(join(dir, 'projects', 'test-project', 'scratch.txt'), 'unsaved work\n');
     const payload = payloadForCleanWiki(dir, today);
-    const sessionId = 's-hypoignore-gate-refusal';
+    const sessionId = 's-folder-other-session';
+    stampSessionRecord(dir, sessionId);
+    const r = runApply(dir, payload, { sessionId });
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.committed, true, `the close itself committed: ${r.stdout}`);
+    assert.equal(out.markerWritten, true, `stage: ${r.stdout}\n${r.stderr}`);
+    assert.equal(out.markerSkipReason ?? null, null, r.stdout);
+    assert.ok(existsSync(receiptPath(dir, sessionId)), 'the receipt is filed behind an open gate');
+    // Left as it was, and out of the close: its bytes, still untracked, and absent from the tree
+    // the close committed. A close that swept it into its commit leaves it on disk too, so
+    // existence alone tells nothing.
+    const scratch = 'projects/test-project/scratch.txt';
+    assert.equal(readFileSync(join(dir, scratch), 'utf-8'), 'unsaved work\n');
+    const git = (...a) => spawnSync('git', ['-C', dir, ...a], { encoding: 'utf-8' }).stdout;
+    assert.equal(git('status', '--porcelain', '--', scratch), `?? ${scratch}\n`);
+    assert.ok(
+      !git('ls-tree', '-r', '--name-only', 'HEAD').split('\n').includes(scratch),
+      "another session's file is not in the close commit",
+    );
+    assert.ok(
+      git('show', '--name-only', '--format=', 'HEAD').includes('session-log'),
+      'precondition: HEAD is the close commit',
+    );
+  });
+});
+
+test("apply: the same file in this session's touched-paths withholds it", () => {
+  withWiki(null, (dir, today) => {
+    writeFileSync(join(dir, 'projects', 'test-project', 'scratch.txt'), 'unsaved work\n');
+    const sessionId = 's-folder-own-session';
+    assert.equal(
+      recordTouchedPaths(dir, sessionId, ['projects/test-project/scratch.txt']),
+      true,
+      'precondition: this session recorded the file',
+    );
+    const payload = payloadForCleanWiki(dir, today);
     const r = runApply(dir, payload, { sessionId });
     const out = JSON.parse(r.stdout);
     assert.equal(out.committed, true, `the close itself committed: ${r.stdout}`);
     assert.equal(out.markerSkipReason, 'compact-gate-not-ok', `stage: ${r.stdout}\n${r.stderr}`);
     assert.equal(out.markerWritten, false);
     // The result names the checkpoint gate's own blocker, so a caller does not
-    // have to reach for --check-session-close, which judges a wider git axis.
+    // have to run --check-session-close again to see why the marker was held.
     assert.ok(
-      (out.gateBlockers || []).some((b) => b.file === 'projects/test-project/scratch.txt'),
+      (out.gateBlockers || []).some(
+        (b) => b.type === 'known-session-write' && b.file === 'projects/test-project/scratch.txt',
+      ),
       `gateBlockers must name the refused file: ${JSON.stringify(out.gateBlockers)}`,
     );
     assert.ok(
       !existsSync(join(dir, '.cache', `session-closed-${sessionId}.marker`)),
-      'no marker may land while the project folder has an uncommitted file',
+      'no marker may land while this session has an uncommitted write of its own',
     );
     assert.equal(
       existsSync(receiptPath(dir, sessionId)),
@@ -2517,7 +2949,8 @@ test('a dirty file in the project folder being closed refuses the gate (compact-
 test('the console report for receipt-proof-mismatch says ok:false and points at the commit, not at --session-id', () => {
   withWiki(null, (dir, today) => {
     // Root log.md ignored, for the reason given in the receipt-proof-mismatch
-    // JSON test above: a project-folder file is refused at the gate instead.
+    // JSON test above: a project-folder file this session recorded is refused
+    // at the gate instead.
     writeFileSync(join(dir, '.hypoignore'), 'log.md\n');
     const payload = payloadForCleanWiki(dir, today);
     const sessionId = `s-hypoignore-mismatch-console-${process.pid}`;
@@ -2549,6 +2982,8 @@ test('the console report for compact-gate-not-ok names the gate blocker, not --s
     writeFileSync(join(dir, 'projects', 'test-project', 'scratch.txt'), 'unsaved work\n');
     const payload = payloadForCleanWiki(dir, today);
     const sessionId = `s-hypoignore-gate-console-${process.pid}`;
+    // The gate refuses what this session recorded writing, so record the file.
+    recordTouchedPaths(dir, sessionId, ['projects/test-project/scratch.txt']);
     const cleanup = seedCloseTranscript(sessionId);
     let r;
     try {
@@ -2566,6 +3001,33 @@ test('the console report for compact-gate-not-ok names the gate blocker, not --s
       'a gate refusal is not the ok:true policy withhold',
     );
     assert.doesNotMatch(r.stderr, /--session-id=<main-conversation-id>/);
+  });
+});
+
+// Distinguishes: the text report naming each gate blocker on its own ✗ line (type, file, reason)
+// from one that names none and sends the reader to --json for gateBlockers[].
+test('apply (text): a gate blocker is printed as a ✗ line with its reason', () => {
+  withWiki(null, (dir, today) => {
+    writeFileSync(join(dir, 'projects', 'test-project', 'scratch.txt'), 'unsaved work\n');
+    const payload = payloadForCleanWiki(dir, today);
+    const sessionId = `s-gate-blocker-line-${process.pid}`;
+    recordTouchedPaths(dir, sessionId, ['projects/test-project/scratch.txt']);
+    const cleanup = seedCloseTranscript(sessionId);
+    let r;
+    try {
+      r = runApplyConsole(dir, payload, sessionId);
+    } finally {
+      cleanup();
+    }
+    assert.match(r.stderr, /reason: compact-gate-not-ok/, `stderr: ${r.stderr}`);
+    assert.match(
+      r.stdout,
+      /^ {2}✗ known-session-write projects\/test-project\/scratch\.txt: \S.*$/m,
+      `stdout: ${r.stdout}`,
+    );
+    assert.match(r.stderr, /the ✗ lines above name each blocker/);
+    assert.match(r.stderr, /type git: no record stamp, an incomplete record, or\s+no session id/);
+    assert.doesNotMatch(r.stderr, /this text output does\s+not print it/);
   });
 });
 
@@ -4835,8 +5297,11 @@ test('two sessions close one project on different tracks one after the other: bo
 });
 
 // Two real `--apply-session-close` processes on one project, the second started `staggerMs`
-// after the first. Every run must end ok, committed and with its marker written.
-async function closeTwiceInParallel(staggerMs) {
+// after the first. Every run must end ok, committed and with its marker written. `stamp: false`
+// runs them as sessions opened before the upgrade (no record stamp): the folder rule then blocks
+// every unrecorded file in the project folder, so only the foreign-entry and foreign-append
+// exceptions, which the gate applies ahead of that rule, let each close past the other's work.
+async function closeTwiceInParallel(staggerMs, { stamp = true } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'hypo-wiki-'));
   try {
     const today = todayLocal();
@@ -4850,6 +5315,7 @@ async function closeTwiceInParallel(staggerMs) {
 
     const spawnClose = (label, trackId) => {
       const sessionId = newPinSession(label);
+      if (stamp) assert.equal(stampSessionRecord(dir, sessionId), 'stamped');
       const cleanup = seedCloseTranscript(sessionId);
       const payloadPath = join(tmpdir(), `hypo-payload-${sessionId}.json`);
       writeFileSync(
@@ -4909,6 +5375,18 @@ async function closeTwiceInParallel(staggerMs) {
 await testAsync(
   'two processes closing the same project at the same moment both succeed with no proposal and both write their marker',
   () => closeTwiceInParallel(0),
+);
+
+// The pair of the one above with two sessions that began before the upgrade: with the stamp
+// the other close's dirty files could also pass as ordinary unresolved notices, so the test above
+// stays green if the foreign-entry or foreign-append exception breaks. Here the folder rule would
+// block them, and only those exceptions let both closes land their marker. This is a sample test
+// that does not force the overlap: nothing makes either gate read while the other close's entry or
+// append is still uncommitted, so a schedule where one close commits first passes with those
+// exceptions removed. A red here is evidence, a green is not proof.
+await testAsync(
+  'two unstamped sessions closing the same project at the same moment both succeed and both write their marker',
+  () => closeTwiceInParallel(0, { stamp: false }),
 );
 
 // A timing sample, not a pin. Started 400ms apart, the second close usually appends its
@@ -6576,7 +7054,13 @@ test('a close that committed and failed at the receipt keeps its entry when retr
       JSON.stringify(retry.out.notices),
     );
     assert.ok(existsSync(receiptPath(dir, sid)), 'the receipt was issued');
-    assert.equal(gitHead(dir), head, 'no new commit');
+    // The blocked session directory also failed the first attempt's record of the project index,
+    // so that attempt did not create index.md (a create is never left unclaimed). The retry seeds
+    // it, and that is all it commits: the entry itself is not committed again.
+    const since = spawnSync('git', ['-C', dir, 'diff', '--name-only', head, 'HEAD'], {
+      encoding: 'utf-8',
+    }).stdout.trim();
+    assert.equal(since, 'projects/test-project/index.md', 'only the skipped index seed is new');
   });
 });
 
@@ -7489,26 +7973,38 @@ test("another session's seeded index.md, not committed yet, is committed with th
   });
 });
 
-test("an uncommitted index.md that is not this close's seed stays out of its commit and still blocks the marker (pair)", () => {
+// Pair of the seeded-index test above: a seed is adopted into this close's commit, anything else
+// stays out of it. The project folder blocks only what this session recorded, so a hand-made
+// index.md nobody here recorded is an unresolved notice and the marker lands.
+test("an uncommitted index.md that is not this close's seed stays out of its commit and is an unresolved notice, not a blocker (pair)", () => {
   withWiki(null, (dir, today) => {
     const rel = join('projects', 'test-project', 'index.md');
     writeFileSync(
       join(dir, rel),
       `---\ntitle: test-project\ntype: project-index\n---\n# hand made\n`,
     );
-    const { out } = applyJson(dir, v2Payload(today), newPinSession('index-hand'));
-    assert.equal(out.markerWritten, false, JSON.stringify(out));
+    const sid = newPinSession('index-hand');
+    stampSessionRecord(dir, sid);
+    const { out } = applyJson(dir, v2Payload(today), sid);
+    assert.equal(out.markerWritten, true, JSON.stringify(out));
     assert.ok(
-      (out.gateBlockers || []).some((b) => b.file === rel),
+      (out.gateNotices || []).some((n) => n.type === 'unresolved' && n.file === rel),
+      JSON.stringify(out.gateNotices),
+    );
+    assert.ok(
+      !(out.gateBlockers || []).some((b) => b.file === rel),
       JSON.stringify(out.gateBlockers),
     );
+    const tracked = spawnSync('git', ['ls-files', '--', rel], { cwd: dir, encoding: 'utf-8' });
+    assert.equal(tracked.stdout, '', 'not committed by this close');
   });
 });
 
 // Disabling the check (F1, checkpoint half): in precompactGateStatus's
 // checkpointMode loop delete the `isForeignUncommittedEntry` branch. The other
-// session's entry then blocks as a dirty file of the project folder:
-// markerWritten goes red. The modified-entry pair below stays green.
+// session's entry then reads as an unrecorded dirty file of the project folder,
+// an `unresolved` notice: the foreign-entry notice assertion goes red. The
+// modified-entry pair below stays green.
 test("another session's new entry, published and not committed yet, does not keep this close from its marker, and is left alone", () => {
   withWiki(null, (dir, today) => {
     const otherId = closeIdFor(newPinSession('other-close'), 0);
@@ -7536,7 +8032,10 @@ test("another session's new entry, published and not committed yet, does not kee
   });
 });
 
-test("another session's committed entry edited since its commit still keeps this close from its marker (pair)", () => {
+// Pair of the test above: an entry that still matches its own path is a foreign-entry notice,
+// one edited since its commit no longer does and falls to the unresolved notice. Neither blocks,
+// since the project folder blocks only what this session recorded.
+test("another session's committed entry edited since its commit is an unresolved notice, not a foreign-entry one (pair)", () => {
   withWiki(null, (dir, today) => {
     const otherId = closeIdFor(newPinSession('other-close-m'), 0);
     const file = writeEntryFile(dir, {
@@ -7545,10 +8044,20 @@ test("another session's committed entry edited since its commit still keeps this
       tracks: [{ id: 'other-track', new: true }],
     });
     appendFileSync(join(dir, file), '\nedited after its commit\n');
-    const { out } = applyJson(dir, v2Payload(today), newPinSession('mine-m'));
-    assert.equal(out.markerWritten, false, JSON.stringify(out));
+    const sid = newPinSession('mine-m');
+    stampSessionRecord(dir, sid);
+    const { out } = applyJson(dir, v2Payload(today), sid);
+    assert.equal(out.markerWritten, true, JSON.stringify(out));
     assert.ok(
-      (out.gateBlockers || []).some((b) => b.file === file),
+      (out.gateNotices || []).some((n) => n.type === 'unresolved' && n.file === file),
+      JSON.stringify(out.gateNotices),
+    );
+    assert.ok(
+      !(out.gateNotices || []).some((n) => n.type === 'foreign-entry' && n.file === file),
+      JSON.stringify(out.gateNotices),
+    );
+    assert.ok(
+      !(out.gateBlockers || []).some((b) => b.file === file),
       JSON.stringify(out.gateBlockers),
     );
   });

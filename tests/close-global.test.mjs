@@ -40,8 +40,12 @@ import {
   CLOSE_LOGS_MISSING_NOTICE_TYPE,
   freshDates,
   currentDevice,
+  isForeignUncommittedEntry,
   recordShardAppend,
   recordTouchedPaths,
+  migrationState,
+  stampSessionRecord,
+  touchedPathsPath,
   rootLogHeadingKey,
   sessionClosedMarkerPath,
   vaultCommitLockTarget,
@@ -49,6 +53,7 @@ import {
   readClosePin,
   sessionCloseFileStatus,
   sessionProofCloseId,
+  headBlob,
   VIEW_BACKUP_DIR_REL,
   rootHotBackupRecoveryNotice,
   consumeRootHotHealthNotice,
@@ -107,6 +112,7 @@ import {
   withTmpDir,
   withWiki,
   writeSessionClosedMarker,
+  nowPatchSrc,
 } from './helpers.mjs';
 
 // A session entry of `slug` dated `date` at `projects/<slug>/sessions/`, as a close
@@ -2016,10 +2022,13 @@ suite('hypo-auto-minimal-crystallize.mjs — conditional close reconfirm');
 
 test('uncommitted wiki + conditional close phrase, no decline → reconfirm block (not a silent nag)', () => {
   withGrowthWiki((dir) => {
-    // Leave a real uncommitted change so the `git` blocker fires (not the
-    // .cache phantom the fixture no longer produces).
+    // Leave a real uncommitted change this session recorded as its own write, so
+    // the `known-session-write` blocker fires (not the .cache phantom the fixture
+    // no longer produces). Stop reconfirms only for a blocker that names a file
+    // this session wrote (or a `git` one); the unrecorded twin is the next test.
     mkdirSync(join(dir, 'pages'), { recursive: true });
     writeFileSync(join(dir, 'pages', 'x.md'), '# wip\n');
+    recordTouchedPaths(dir, 's-reconfirm', ['pages/x.md']);
     const transcript = writeTranscript(dir, [
       {
         type: 'assistant',
@@ -2065,10 +2074,49 @@ test('uncommitted wiki + conditional close phrase, no decline → reconfirm bloc
   });
 });
 
+// Pair with the test above: the same dirty file and close phrase, but this session
+// never recorded the write. The file is an `unresolved` notice, not a blocker, so
+// there is nothing of this session's work to reconfirm: only the close blocker is
+// left and the plain crystallize wording stays.
+test('uncommitted wiki this session has no record of writing + conditional close phrase → no reconfirm', () => {
+  withGrowthWiki((dir) => {
+    mkdirSync(join(dir, 'pages'), { recursive: true });
+    writeFileSync(join(dir, 'pages', 'x.md'), '# wip\n');
+    const transcript = writeTranscript(dir, [
+      {
+        type: 'assistant',
+        message: {
+          content: [
+            { type: 'tool_use', name: 'Edit', input: { file_path: join(dir, 'pages', 'x.md') } },
+          ],
+        },
+      },
+      { type: 'user', message: { role: 'user', content: '구현 완료하면 세션 마무리하자' } },
+    ]);
+    const r = runAutoMinimal(dir, {
+      session_id: 's-reconfirm-unrecorded',
+      transcript_path: transcript,
+      stop_hook_active: false,
+    });
+    assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.decision, 'block', `the close blocker still blocks: ${JSON.stringify(out)}`);
+    assert.ok(
+      /crystallize/.test(out.reason),
+      `an unrecorded dirty file keeps the crystallize wording: ${out.reason}`,
+    );
+    assert.ok(
+      !/AskUserQuestion/.test(out.reason),
+      `an unrecorded dirty file must NOT trigger the reconfirm: ${out.reason}`,
+    );
+  });
+});
+
 test('a correlated "아직, 계속" decline suppresses the reconfirm → continue', () => {
   withGrowthWiki((dir) => {
     mkdirSync(join(dir, 'pages'), { recursive: true });
     writeFileSync(join(dir, 'pages', 'x.md'), '# wip\n');
+    recordTouchedPaths(dir, 's-declined', ['pages/x.md']);
     const transcript = writeTranscript(dir, [
       {
         type: 'assistant',
@@ -2111,6 +2159,7 @@ test('a NEW user close signal after a decline re-arms the reconfirm → block ag
   withGrowthWiki((dir) => {
     mkdirSync(join(dir, 'pages'), { recursive: true });
     writeFileSync(join(dir, 'pages', 'x.md'), '# wip\n');
+    recordTouchedPaths(dir, 's-rearm', ['pages/x.md']);
     const transcript = writeTranscript(dir, [
       { type: 'assistant', message: { content: [{ type: 'tool_use', name: 'Edit', input: {} }] } },
       { type: 'user', message: { role: 'user', content: '구현 완료하면 세션 마무리하자' } },
@@ -2144,6 +2193,10 @@ test('a NEW user close signal after a decline re-arms the reconfirm → block ag
       'block',
       `a new close signal after the decline must re-arm reconfirm: ${JSON.stringify(out)}`,
     );
+    assert.ok(
+      /AskUserQuestion/.test(out.reason),
+      `the re-armed block must be the reconfirm, not the plain crystallize wording: ${out.reason}`,
+    );
   });
 });
 
@@ -2151,6 +2204,7 @@ test('decline label variants ("나중에" / "later") also suppress (label-drift 
   withGrowthWiki((dir) => {
     mkdirSync(join(dir, 'pages'), { recursive: true });
     writeFileSync(join(dir, 'pages', 'x.md'), '# wip\n');
+    recordTouchedPaths(dir, 's-label-drift', ['pages/x.md']);
     const transcript = writeTranscript(dir, [
       {
         type: 'assistant',
@@ -2196,6 +2250,7 @@ test('genuine close-now + uncommitted, no decline → still reconfirm block (no 
   withGrowthWiki((dir) => {
     mkdirSync(join(dir, 'pages'), { recursive: true });
     writeFileSync(join(dir, 'pages', 'x.md'), '# wip\n');
+    recordTouchedPaths(dir, 's-close-now', ['pages/x.md']);
     const transcript = writeTranscript(dir, [
       {
         type: 'assistant',
@@ -2370,6 +2425,7 @@ test('absent background_tasks + uncommitted → in-flight fails open, git alone 
   withGrowthWiki((dir) => {
     mkdirSync(join(dir, 'pages'), { recursive: true });
     writeFileSync(join(dir, 'pages', 'x.md'), '# wip\n');
+    recordTouchedPaths(dir, 's-no-bg-tasks', ['pages/x.md']);
     const transcript = writeTranscript(dir, [
       {
         type: 'assistant',
@@ -2803,10 +2859,10 @@ test('--mark-session-closed: a dirty (uncommitted) append target withholds the c
   withWiki(null, (dir) => {
     const cleanup = seedCloseTranscript('s-mark-dirty-append');
     // The append target is the vault-root log.md (one of the proof's four files),
-    // not the session-log shard. The checkpoint gate now refuses any dirty file in
-    // the project folder being closed before this proof runs, so the shard fixture
-    // moved to the test below. A root file with no touched-paths record only
-    // demotes to a notice, which is what lets the proof still reach `incomplete`.
+    // not the session-log shard. A project-folder file this session recorded is
+    // refused by the checkpoint gate before this proof runs (the test below pins
+    // that). A root file with no touched-paths record only demotes to a notice,
+    // which is what lets the proof still reach `incomplete`.
     appendFileSync(join(dir, 'log.md'), '\nappended by Bash, never committed\n');
     const r = run('crystallize.mjs', [
       `--hypo-dir=${dir}`,
@@ -2830,15 +2886,18 @@ test('--mark-session-closed: a dirty (uncommitted) append target withholds the c
 
 // The original fixture of the test above (design.md test 28): a session-log shard
 // modified on disk with no commit. It sits inside the project folder being
-// closed, so the gate refuses it before the proof runs: exit 1, ok:false, the
-// file named in blockers[], no marker, no receipt.
-test('--mark-session-closed: a dirty session-log shard in the project folder is refused by the gate', () => {
+// closed and this session recorded writing it, so the gate refuses it before the
+// proof runs: exit 1, ok:false, the file named in blockers[], no marker, no
+// receipt. (An unrecorded shard no longer reaches the gate as a blocker: the
+// proof above catches it as `incomplete`.)
+test("--mark-session-closed: this session's dirty session-log shard in the project folder is refused by the gate", () => {
   withWiki(null, (dir, today) => {
     const sessionId = 's-mark-dirty-shard';
     const cleanup = seedCloseTranscript(sessionId);
     // buildCleanWikiTree seeds the LEGACY MONTHLY shard, not the daily one.
     const shardRel = join('projects', 'test-project', 'session-log', `${today.slice(0, 7)}.md`);
     appendFileSync(join(dir, shardRel), '\nappended by Bash, never committed\n');
+    assert.equal(recordTouchedPaths(dir, sessionId, [shardRel]), true, 'precondition: recorded');
     const r = run('crystallize.mjs', [
       `--hypo-dir=${dir}`,
       '--mark-session-closed',
@@ -2876,8 +2935,8 @@ test('--mark-session-closed: a close file staged but not committed withholds the
   withWiki(null, (dir) => {
     const cleanup = seedCloseTranscript('s-mark-staged-only');
     // The staged file is the vault-root log.md, not session-state.md: the gate
-    // refuses a dirty file in the project folder being closed before the proof
-    // runs (the test below keeps that fixture), and only a root file still
+    // refuses a project-folder file this session recorded before the proof runs
+    // (the test below keeps that fixture), and a root file with no record still
     // reaches the `incomplete` proof.
     const logRel = 'log.md';
     const logPath = join(dir, logRel);
@@ -2908,8 +2967,9 @@ test('--mark-session-closed: a close file staged but not committed withholds the
 });
 
 // The original fixture of the test above: session-state.md, inside the project
-// folder being closed, staged but not committed. The gate refuses it first.
-test('--mark-session-closed: a staged-only session-state.md in the project folder is refused by the gate', () => {
+// folder being closed, staged but not committed, and recorded as this session's
+// write. The gate refuses it first.
+test("--mark-session-closed: this session's staged-only session-state.md in the project folder is refused by the gate", () => {
   withWiki(null, (dir) => {
     const sessionId = 's-mark-staged-project-file';
     const cleanup = seedCloseTranscript(sessionId);
@@ -2917,6 +2977,7 @@ test('--mark-session-closed: a staged-only session-state.md in the project folde
     const ssPath = join(dir, ssRel);
     writeFileSync(ssPath, readFileSync(ssPath, 'utf-8') + '\nstaged only, never committed\n');
     spawnSync('git', ['-C', dir, 'add', '--', ssRel]);
+    assert.equal(recordTouchedPaths(dir, sessionId, [ssRel]), true, 'precondition: recorded');
     const r = run('crystallize.mjs', [
       `--hypo-dir=${dir}`,
       '--mark-session-closed',
@@ -3485,7 +3546,7 @@ test('--apply-session-close: a refused commit takes the shard append back, and t
 test('--apply-session-close: a retry leaves an unjournaled payload file uncommitted, receipt withheld', () => {
   withWiki(null, (dir, today) => {
     // The unjournaled file is the vault-root log.md, not session-state.md. The
-    // checkpoint gate refuses any dirty file in the project folder being closed
+    // checkpoint gate refuses a project-folder file this session recorded
     // before the receipt proof runs (the test below keeps that fixture), and a
     // root file with no touched-paths record only demotes to a notice, so this
     // is the fixture that still reaches receipt-proof-mismatch.
@@ -3544,14 +3605,17 @@ test('--apply-session-close: a retry leaves an unjournaled payload file uncommit
 });
 
 // The original fixture of the test above: session-state.md, inside the project
-// folder being closed, holds unjournaled bytes. The gate now refuses it before
-// the receipt proof: the marker is skipped as compact-gate-not-ok, no receipt is
-// filed, and the file still stays out of the commit.
-test('--apply-session-close: an unjournaled session-state.md in the project folder is refused by the gate', () => {
+// folder being closed, holds unjournaled bytes that this session recorded as its
+// write. The gate refuses it before the receipt proof: the marker is skipped as
+// compact-gate-not-ok, no receipt is filed, and the file still stays out of the
+// commit.
+test("--apply-session-close: this session's unjournaled session-state.md in the project folder is refused by the gate", () => {
   withWiki(null, (dir, today) => {
     const stateRel = join('projects', 'test-project', 'session-state.md');
     const stateContent = `${readFileSync(join(dir, stateRel), 'utf-8')}\n<!-- someone else -->\n`;
     writeFileSync(join(dir, stateRel), stateContent);
+    const sessionId = 's-apply-unjournaled-gate';
+    assert.equal(recordTouchedPaths(dir, sessionId, [stateRel]), true, 'precondition: recorded');
     const payload = {
       project: 'test-project',
       date: today,
@@ -3567,7 +3631,6 @@ test('--apply-session-close: an unjournaled session-state.md in the project fold
       `hypo-payload-${process.pid}-${Math.random().toString(36).slice(2, 10)}.json`,
     );
     writeFileSync(payloadPath, JSON.stringify(payload));
-    const sessionId = 's-apply-unjournaled-gate';
     const cleanup = seedCloseTranscript(sessionId);
     const r = run('crystallize.mjs', [
       `--hypo-dir=${dir}`,
@@ -5938,6 +6001,110 @@ test('P2: a complete cwd project close adds no blocker', () => {
   });
 });
 
+// A deadline that reads as ample for its first `n` reads of `end` and as spent after, so one
+// stage of the gate runs out while the stages before it finish (the same helper as in
+// session-hooks.test.mjs: one area each, nothing shared). On a clean tree the gate's one git
+// status run reads once, so `deadlineAfterReads(1)` is spent when the close proof starts.
+function deadlineAfterReads(n) {
+  let reads = 0;
+  return {
+    get end() {
+      return reads++ < n ? performance.now() + 600000 : 0;
+    },
+  };
+}
+const NO_TOOLS = () => ({
+  status: 0,
+  stdout: JSON.stringify({ errors: [], warns: [], targets: {} }),
+});
+
+// Distinguishes: a close proof the deadline cut short (git was never asked, so nothing says
+// the close failed) from one that ran: the first is an `incomplete` close-cwd blocker that tells
+// the user to retry, the second a complete close with no blocker.
+test('a session close proof cut by the deadline is an incomplete close-cwd blocker, not a missing-file report', () => {
+  const CWD = '/tmp/cwdproj-deadline';
+  withClosePartitionWiki([{ slug: 'cwd-proj', date: todayLocal() }], [], (dir) => {
+    setWorkingDir(dir, 'cwd-proj', CWD);
+    pinCommittedClose(dir, 's-t7-proof', { project: 'cwd-proj' });
+    const base = {
+      claudeHome: join(dir, '.claude-none'),
+      sessionCwd: CWD,
+      sessionId: 's-t7-proof',
+      closeOpen: false,
+      resolvedAtIndex: null,
+      runCheck: NO_TOOLS,
+    };
+    const roomy = precompactGateStatus(dir, base);
+    assert.equal(
+      roomy.blockers.some((b) => b.type === 'close-cwd'),
+      false,
+      `a finished proof of a committed close adds no blocker: ${JSON.stringify(roomy.blockers)}`,
+    );
+    const cut = precompactGateStatus(dir, { ...base, deadline: deadlineAfterReads(1) });
+    const b = cut.blockers.find((x) => x.type === 'close-cwd');
+    assert.ok(b, `the unfinished proof blocks: ${JSON.stringify(cut.blockers)}`);
+    assert.equal(b.project, 'cwd-proj');
+    assert.equal(
+      b.incomplete,
+      'deadline',
+      'the blocker says it is a time limit, not a failed close',
+    );
+    assert.ok(b.reason.includes('증명을 마치지 못함'), b.reason);
+    assert.ok(!/\((missing|stale)\)/.test(b.reason), `no file list: ${b.reason}`);
+    assert.ok(
+      !cut.blockers.some((x) => x.type === 'git'),
+      `precondition, the enumeration before the proof finished: ${JSON.stringify(cut.blockers)}`,
+    );
+  });
+});
+
+test('sessionCloseFileStatus: a spent deadline is incomplete, not stale and not missing', () => {
+  withClosePartitionWiki([{ slug: 'cwd-proj', date: todayLocal() }], [], (dir) => {
+    pinCommittedClose(dir, 's-t7-status', { project: 'cwd-proj' });
+    const args = {
+      scope: 'session',
+      closeId: closeIdFor('s-t7-status', 0),
+      projectOverride: 'cwd-proj',
+    };
+    const done = sessionCloseFileStatus(dir, args);
+    assert.equal(done.ok, true, JSON.stringify(done));
+    assert.equal(done.incomplete, undefined);
+    const spent = sessionCloseFileStatus(dir, { ...args, deadline: { end: 0 } });
+    assert.equal(spent.ok, false);
+    assert.equal(spent.incomplete, 'deadline');
+    assert.deepEqual([spent.stale, spent.missing], [[], []], 'the entry is not reported as a gap');
+  });
+});
+
+// Distinguishes: headBlob keeps handing back raw bytes (a Buffer that survives bytes which are
+// not valid UTF-8) with and without a deadline. A text decode would turn ff into U+FFFD.
+test('headBlob returns the committed bytes as a Buffer, with and without a deadline', () => {
+  withClosePartitionWiki([{ slug: 'cwd-proj', date: todayLocal() }], [], (dir) => {
+    const bytes = Buffer.from([0xff, 0x00, 0x61]);
+    writeFileSync(join(dir, 'raw.bin'), bytes);
+    for (const a of [
+      ['add', '--', 'raw.bin'],
+      ['commit', '-q', '-m', 'raw', '--', 'raw.bin'],
+    ]) {
+      const r = spawnSync('git', ['-C', dir, ...a], {
+        encoding: 'utf-8',
+        env: { ...process.env, HOME: SESSION_TMP_HOME },
+      });
+      assert.equal(r.status, 0, r.stderr);
+    }
+    for (const opts of [undefined, { deadline: { end: performance.now() + 600000 } }]) {
+      const got = headBlob(dir, 'raw.bin', opts);
+      assert.ok(Buffer.isBuffer(got), `a Buffer back, deadline=${Boolean(opts)}`);
+      assert.deepEqual([...got], [0xff, 0x00, 0x61]);
+    }
+    assert.equal(
+      headBlob(dir, 'raw.bin', { deadline: { end: 0 } }),
+      null,
+      'no time left: no answer',
+    );
+  });
+});
+
 test('P2: log-only exempts the cwd check', () => {
   const CWD = '/tmp/cwdproj-logonly';
   withClosePartitionWiki(
@@ -7251,6 +7418,82 @@ test("a project with today's session-log and no entry is a notice in a migrated 
   });
 });
 
+// Runs `fn` with a `git` first on PATH that logs each call and then runs the real one, and
+// returns how many calls it saw. The runner process is the only one that sees the changed PATH.
+function countGitCalls(fn) {
+  const realGit = spawnSync('which', ['git'], { encoding: 'utf-8' }).stdout.trim();
+  let calls = 0;
+  withTmpDir((shim) => {
+    const log = join(shim, 'calls.log');
+    writeFileSync(join(shim, 'git'), `#!/bin/sh\necho x >> '${log}'\nexec '${realGit}' "$@"\n`);
+    chmodSync(join(shim, 'git'), 0o755);
+    const savedPath = process.env.PATH;
+    process.env.PATH = `${shim}:${savedPath}`;
+    try {
+      fn();
+    } finally {
+      process.env.PATH = savedPath;
+    }
+    calls = existsSync(log) ? readFileSync(log, 'utf-8').split('\n').filter(Boolean).length : 0;
+  });
+  return calls;
+}
+
+// Distinguishes: a migration classification given the gate's deadline (an exhausted one starts no
+// git call, and the result is a notice that the classification did not finish, never a legacy
+// diagnosis and never a blocker) from the same state with time to spare (the legacy notice).
+// Disabling the fix: in migrationState (hooks/hypo-shared.mjs) make `git` ignore `deadline`
+// (`const t = undefined;`), or in sessionCloseFileStatus call `migrationState(hypoDir)` without it.
+test('the global close check hands the gate deadline to the migration classification', () => {
+  withMigratedLegacyVault(true, (dir) => {
+    const spent = { end: performance.now() - 1 };
+    let state;
+    const calls = countGitCalls(() => {
+      state = migrationState(dir, { deadline: spent });
+    });
+    assert.equal(state, 'unknown');
+    assert.equal(calls, 0, 'an exhausted deadline starts no git call');
+
+    let s;
+    const closeCalls = countGitCalls(() => {
+      s = sessionCloseGlobalStatus(dir, { deadline: spent });
+    });
+    assert.equal(s.ok, true, JSON.stringify(s));
+    assert.ok(
+      s.notices.some((n) => n.type === 'close-legacy-unclassified' && n.project === 'test-project'),
+      JSON.stringify(s.notices),
+    );
+    assert.ok(!s.notices.some((n) => n.type === 'close-legacy'), JSON.stringify(s.notices));
+    assert.equal(
+      closeCalls,
+      0,
+      'the global close check starts no git call once the deadline is spent',
+    );
+
+    const gate = precompactGateStatus(dir, {
+      claudeHome: join(dir, '.claude-none'),
+      deadline: spent,
+    });
+    assert.equal(
+      gate.blockers.some((b) => b.type === 'close'),
+      false,
+      JSON.stringify(gate.blockers),
+    );
+    assert.ok(
+      gate.notices.some((n) => n.type === 'close-legacy-unclassified'),
+      `the gate hands its own deadline down: ${JSON.stringify(gate.notices)}`,
+    );
+
+    // With time to spare the same state is the definitive legacy notice.
+    const roomy = sessionCloseGlobalStatus(dir, { deadline: { end: performance.now() + 60000 } });
+    assert.ok(
+      roomy.notices.some((n) => n.type === 'close-legacy'),
+      JSON.stringify(roomy.notices),
+    );
+    assert.equal(migrationState(dir, { deadline: { end: performance.now() + 60000 } }), 'migrated');
+  });
+});
+
 // Disabling the check: in crystallize-close-check.mjs make the `!entryOnDisk` notice
 // branch unreachable (`if (false)`). The test-project line gets a ✓ again.
 test('--check-session-close text: the entry line is ticked only when an entry is on disk, a heading-only close gets a notice line', () => {
@@ -7473,6 +7716,464 @@ test('Q7 (344): the Stop hook blocks on this session close in the X1 state', () 
   });
 });
 
+// ── The close gate through a copy of the package (end to end) ───────────────
+// PKG_ROOT is where the running hook or script lives, so a copy of hooks/, scripts/ and
+// package.json runs its own lint. The copy gets a defective lint or a shorter deadline and
+// nothing is written inside the checkout. One area, one file: session-hooks.test.mjs keeps its
+// own copy of these helpers.
+function withPackageCopy(fn) {
+  const root = mkdtempSync(join(tmpdir(), 'hypo-pkgcopy-'));
+  try {
+    for (const d of ['hooks', 'scripts']) cpSync(join(REPO, d), join(root, d), { recursive: true });
+    cpSync(join(REPO, 'package.json'), join(root, 'package.json'));
+    fn(root);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+function shrinkGateDeadline(root, ms) {
+  const f = join(root, 'hooks', 'hypo-shared.mjs');
+  const src = readFileSync(f, 'utf-8');
+  const next = src.replace(
+    'export const GATE_DEADLINE_MS = 7000;',
+    `export const GATE_DEADLINE_MS = ${ms};`,
+  );
+  assert.notEqual(next, src, 'the copy has the deadline constant to shrink');
+  writeFileSync(f, next);
+}
+// HOME and HYPO_DIR are pinned: a hook writes under ~/.claude and resolves the vault from HYPO_DIR.
+function spawnFromCopy(root, rel, args, hypoDir, input = '', env = {}) {
+  return spawnSync(process.execPath, [join(root, rel), ...args], {
+    input,
+    encoding: 'utf-8',
+    env: { ...process.env, HOME: SESSION_TMP_HOME, HYPO_DIR: hypoDir, ...env },
+  });
+}
+// A preload that injects the gate's clock into one process of the package copy, the one whose entry
+// script ends with `entry` (NODE_OPTIONS reaches every node child too, and lint and feedback-sync
+// keep the real clock). performance.now() reads 0 until the gate's lint spawn has returned and
+// `afterLintMs` after it, so whether the deadline is spent at each step is the test's choice and
+// not the machine's speed. A lint child still ends by the spawn timeout the gate gave it.
+function frozenGateClock(root, entry, afterLintMs = 0) {
+  const f = join(root, `clock-${entry.replace(/\.mjs$/, '')}.cjs`);
+  writeFileSync(
+    f,
+    `if ((process.argv[1] || '').endsWith(${JSON.stringify(entry)})) {
+  const cp = require('node:child_process');
+  const spawnSync = cp.spawnSync;
+  let lintDone = false;
+  cp.spawnSync = function (cmd, args, opts) {
+    try {
+      return spawnSync.call(this, cmd, args, opts);
+    } finally {
+      if ((args || []).some((a) => String(a).endsWith('lint.mjs'))) lintDone = true;
+    }
+  };
+  require('node:module').syncBuiltinESMExports();
+  ${nowPatchSrc(`() => (lintDone ? ${afterLintMs} : 0)`)}
+}
+`,
+  );
+  return { NODE_OPTIONS: `--require ${f}` };
+}
+const LINT_KILLED = "process.kill(process.pid, 'SIGKILL');\n";
+const LINT_SLOW = 'setTimeout(() => {}, 120000);\n';
+
+// A committed close whose receipt has not been issued yet, marked by the copied CLI.
+function markFromCopy(root, dir, sid, { json = true, env = {} } = {}) {
+  const cleanup = seedCloseTranscript(sid);
+  try {
+    pinCommittedClose(dir, sid);
+    const r = spawnFromCopy(
+      root,
+      'scripts/crystallize.mjs',
+      [
+        `--hypo-dir=${dir}`,
+        '--mark-session-closed',
+        `--session-id=${sid}`,
+        '--project=test-project',
+        ...(json ? ['--json'] : []),
+      ],
+      dir,
+      '',
+      env,
+    );
+    return {
+      r,
+      out: json ? JSON.parse(r.stdout) : null,
+      receipt: existsSync(join(dir, '.cache', 'sessions', sid, 'close-receipt.json')),
+    };
+  } finally {
+    cleanup();
+  }
+}
+
+// Distinguishes: a lint that died by an error (no verdict to certify: exit 1, a check-skipped
+// blocker, no receipt) from a lint that only ran out of the gate's time (a notice, the receipt is
+// issued). Spec: an error withholds the receipt, a time limit does not.
+test('--mark-session-closed: a crashed lint withholds the receipt and names check-skipped', () => {
+  withPackageCopy((root) => {
+    writeFileSync(join(root, 'scripts', 'lint.mjs'), LINT_KILLED);
+    withWiki(null, (dir) => {
+      const { r, out, receipt } = markFromCopy(root, dir, 's-t7-mark-crash');
+      assert.equal(r.status, 1, `${r.stdout}\n${r.stderr}`);
+      assert.ok(
+        (out.blockers || []).some((b) => b.type === 'check-skipped' && b.check === 'lint'),
+        JSON.stringify(out.blockers),
+      );
+      assert.equal(receipt, false, 'no receipt for a close whose lint never gave a verdict');
+    });
+  });
+});
+
+// The clock in the two tests below is frozen at 0 until lint has run out its own 2500 ms timeout and
+// at the 2500 ms deadline after, so the lint is always started and always cut by its timeout, and
+// nothing a loaded machine spends before it can cut another stage of the gate instead.
+// Disabling the time-limit route: in hooks/hypo-shared.mjs spawnEndKind, make
+// `res.error?.code === 'ETIMEDOUT'` `false` (the cut lint then reads as a spawn error).
+test('--mark-session-closed: a lint cut by the deadline still issues the receipt', () => {
+  withPackageCopy((root) => {
+    shrinkGateDeadline(root, 2500);
+    writeFileSync(join(root, 'scripts', 'lint.mjs'), LINT_SLOW);
+    withWiki(null, (dir) => {
+      const { r, out, receipt } = markFromCopy(root, dir, 's-t7-mark-slow', {
+        env: frozenGateClock(root, 'crystallize.mjs', 2500),
+      });
+      assert.equal(r.status, 0, `${r.stdout}\n${r.stderr}`);
+      assert.equal(out.ok, true);
+      assert.ok(
+        (out.notices || []).some((n) => n.type === 'lint' && /time limit/.test(n.reason)),
+        `the time limit is reported: ${JSON.stringify(out.notices)}`,
+      );
+      assert.equal(receipt, true, 'a time limit is not an error: the receipt is issued');
+    });
+  });
+});
+
+// Distinguishes: the text rendering of a mark that succeeded with a lint the deadline cut short
+// (the notice is printed under a heading) from one that prints the bare success line and drops
+// gate.notices, which only the JSON carried.
+// Disabling the fix: in scripts/lib/crystallize-close-apply.mjs make `printGateNotices` return
+// before it prints.
+test('--mark-session-closed (text): a lint cut by the deadline is printed as a gate notice', () => {
+  withPackageCopy((root) => {
+    shrinkGateDeadline(root, 2500);
+    writeFileSync(join(root, 'scripts', 'lint.mjs'), LINT_SLOW);
+    withWiki(null, (dir) => {
+      const { r, receipt } = markFromCopy(root, dir, 's-t7-mark-slow-text', {
+        json: false,
+        env: frozenGateClock(root, 'crystallize.mjs', 2500),
+      });
+      assert.equal(r.status, 0, `${r.stdout}\n${r.stderr}`);
+      assert.match(r.stdout, /session-closed marker written/);
+      assert.match(r.stdout, /Gate notices \(not blockers\):/);
+      assert.match(r.stdout, /·[^\n]*time limit/, `the lint time limit is named: ${r.stdout}`);
+      assert.equal(receipt, true, 'a time limit is not an error: the receipt is issued');
+    });
+  });
+});
+
+// Distinguishes: the text rendering of an apply whose gate demoted a file (printed under a heading)
+// from one that prints only the writes and drops gateNotices, which only the JSON carried.
+// Disabling the fix: in scripts/lib/crystallize-close-apply.mjs drop the `printGateNotices` call
+// in printCloseReport.
+test('--apply-session-close (text): a demotion the gate made is printed as a gate notice', () => {
+  withWiki(null, (dir, today) => {
+    seedUndiscoverableProject(dir, 'somebody-else');
+    writeFileSync(join(dir, 'projects', 'somebody-else', 'index.md'), '---\ntitle: edited\n---\n');
+    const payload = {
+      project: 'test-project',
+      date: today,
+      sessionState: {
+        content: readFileSync(join(dir, 'projects', 'test-project', 'session-state.md'), 'utf-8'),
+      },
+      projectHot: {
+        content: readFileSync(join(dir, 'projects', 'test-project', 'hot.md'), 'utf-8'),
+      },
+      sessionLog: { entry: `## [${today}] text gate notices\n` },
+      log: { entry: `## [${today}] session | test-project \u2014 text gate notices\n` },
+    };
+    const payloadPath = join(
+      tmpdir(),
+      `hypo-payload-${process.pid}-${Math.random().toString(36).slice(2, 10)}.json`,
+    );
+    writeFileSync(payloadPath, JSON.stringify(payload));
+    const cleanup = seedCloseTranscript('s-apply-gate-notices-text');
+    const r = run('crystallize.mjs', [
+      `--hypo-dir=${dir}`,
+      '--apply-session-close',
+      `--payload=${payloadPath}`,
+      '--session-id=s-apply-gate-notices-text',
+    ]);
+    cleanup();
+    assert.equal(r.status, 0, `apply failed: ${r.stdout}\n${r.stderr}`);
+    assert.match(r.stdout, /Gate notices \(not blockers\):/);
+    assert.match(r.stdout, /·[^\n]*somebody-else/, `the demoted file is named: ${r.stdout}`);
+  });
+});
+
+// Distinguishes: the Stop supervisor with the gate on its deadline (the copied crystallize stage
+// answers inside its 10000 ms stage budget although lint would sleep for minutes) from a gate that
+// leaves the wait to the 30 s lint timeout alone (the supervisor would kill the stage:
+// "timed out"). The three stages before it are stubs so only the real stage's time is measured.
+// The stage's clock is frozen at 0 until lint has returned and at its 2500 ms deadline after, so
+// the gate always starts lint (a late start under load used to spend the deadline first) and the
+// stage's real time is lint's 2500 ms timeout plus its own work, well inside the 10000 ms.
+// Disabling the bound: in hooks/hypo-shared.mjs startCheck, make `timeout: Math.min(30000, left)`
+// `timeout: 30000`.
+test('the copied Stop stage returns within its 10-second budget when lint would run long', () => {
+  const sid = 's-t7-stop-budget';
+  withPackageCopy((root) => {
+    shrinkGateDeadline(root, 2500);
+    const clock = frozenGateClock(root, 'hypo-auto-minimal-crystallize.mjs', 2500);
+    const ok = 'console.log(JSON.stringify({ continue: true, suppressOutput: true }));\n';
+    for (const stub of ['hypo-hot-rebuild', 'hypo-session-record', 'hypo-auto-commit'])
+      writeFileSync(join(root, 'hooks', `${stub}.mjs`), ok);
+    // The last stub stamps when it ended, so the real stage's own time can be told from the
+    // supervisor's and the stubs' (node start-up of four processes under load).
+    const stubEnded = join(root, 'stub-ended');
+    writeFileSync(
+      join(root, 'hooks', 'hypo-auto-commit.mjs'),
+      `import { writeFileSync } from 'node:fs'; writeFileSync(${JSON.stringify(stubEnded)}, String(Date.now()));\n${ok}`,
+    );
+    const started = join(root, 'lint-started');
+    writeFileSync(
+      join(root, 'scripts', 'lint.mjs'),
+      `import { writeFileSync } from 'node:fs'; writeFileSync(${JSON.stringify(started)}, 'x'); ${LINT_SLOW}`,
+    );
+    withWiki(anchorTestProject, (dir) => {
+      const cleanup = seedCloseTranscript(sid, { toolUseLines: [T10_EDIT_LINE] });
+      try {
+        const t0 = Date.now();
+        const r = spawnFromCopy(
+          root,
+          'hooks/hypo-stop.mjs',
+          [],
+          dir,
+          JSON.stringify({ session_id: sid, transcript_path: t10Transcript(sid), cwd: T10_CWD }),
+          clock,
+        );
+        const ms = Date.now() - t0;
+        const reply = JSON.parse(r.stdout.trim().split('\n').pop());
+        assert.ok(existsSync(started), `precondition, the gate started lint: ${r.stdout}`);
+        assert.ok(!/timed out/.test(reply.systemMessage || ''), `a stage timed out: ${r.stdout}`);
+        assert.equal(reply.decision, 'block', `the crystallize stage answered: ${r.stdout}`);
+        const stageMs = Date.now() - Number(readFileSync(stubEnded, 'utf-8'));
+        assert.ok(
+          stageMs < 10000,
+          `the crystallize stage took ${stageMs} ms (whole chain ${ms} ms)`,
+        );
+      } finally {
+        cleanup();
+      }
+    });
+  });
+});
+
+// Distinguishes: a finished close whose cwd proof the deadline cut (Stop continues and says the
+// check will be repeated) from a cwd project that really has no close of this session (Stop
+// blocks, the X1 pair). A deadline of 0 ms in the copied package is spent before the gate starts,
+// so the cut does not depend on the machine's speed.
+// Disabling the fix: in hooks/hypo-auto-minimal-crystallize.mjs make
+// `cwdBlockers.some((b) => !b.incomplete)` read `cwdBlockers.length > 0`: the first half goes red.
+test('Stop: a finished close whose cwd proof was cut by the gate deadline continues with a notice; a cwd project with no close still blocks', () => {
+  const stop = (root, dir, sid) =>
+    spawnFromCopy(
+      root,
+      'hooks/hypo-auto-minimal-crystallize.mjs',
+      [],
+      dir,
+      JSON.stringify({ session_id: sid, transcript_path: t10Transcript(sid), cwd: T10_CWD }),
+    );
+  const sid = 's-t10-stop-cut-proof';
+  withResolvedClose(sid, { secondSignal: false, toolUseLines: [T10_EDIT_LINE] }, (dir) => {
+    withPackageCopy((root) => {
+      shrinkGateDeadline(root, 0);
+      const gate = precompactGateStatus(dir, {
+        claudeHome: join(dir, '.claude-none'),
+        sessionCwd: T10_CWD,
+        sessionId: sid,
+        closeOpen: false,
+        resolvedAtIndex: null,
+        deadline: { end: 0 },
+      });
+      assert.ok(
+        gate.blockers.some((b) => b.type === 'close-cwd' && b.incomplete === 'deadline'),
+        `precondition, the spent deadline cuts the proof: ${JSON.stringify(gate.blockers)}`,
+      );
+      const r = stop(root, dir, sid);
+      const out = JSON.parse(r.stdout);
+      assert.notEqual(out.decision, 'block', `a time limit must not block Stop: ${r.stdout}`);
+      assert.equal(out.continue, true, r.stdout);
+      assert.match(out.systemMessage || '', /did not finish within the time limit/, r.stdout);
+    });
+  });
+  const open = 's-t10-stop-cut-proof-open';
+  withResolvedClose(open, { secondSignal: true, toolUseLines: [T10_EDIT_LINE] }, (dir) => {
+    withPackageCopy((root) => {
+      const r = stop(root, dir, open);
+      assert.equal(JSON.parse(r.stdout).decision, 'block', r.stdout);
+    });
+  });
+});
+
+// Distinguishes: a Stop gate deadline capped at what is left of the stage's own budget (the
+// stage's timeout minus a reserve, counted from process start) from the plain GATE_DEADLINE_MS
+// after a late start. A preload freezes performance.now(), so the clock at entry is exact whatever
+// the machine's speed, and the same finished-close fixture is run four ways:
+//   clock 0, no cap in play: the proof completes, no notice (control, the fixture is not cut by itself)
+//   clock 9500: the cap (9000) is already past, the proof is cut, Stop continues with the notice
+//   clock 9500 in a copy with the cap removed: a full 7000 ms is left, the proof completes, no notice
+//   clock 600 with HYPO_STAGE_TIMEOUT_MS=1500 (a smaller budget than the default 10000): cap is 500,
+//   past, so the notice; the same clock without the variable leaves the default budget and no notice
+// Disabling the cap: in hooks/hypo-auto-minimal-crystallize.mjs make the gate deadline `end` just
+// `performance.now() + GATE_DEADLINE_MS`. Disabling the env read: make STAGE_BUDGET_MS the literal
+// 10000. Either reddens the matching rows.
+test('Stop: the gate deadline is capped at the stage budget left, and the budget is the one hypo-stop passes down', () => {
+  const sid = 's-t10-stop-cap';
+  const NOTICE = /did not finish within the time limit/;
+  withResolvedClose(sid, { secondSignal: false, toolUseLines: [T10_EDIT_LINE] }, (dir) => {
+    withPackageCopy((root) => {
+      const freeze = (name, ms) => {
+        const f = join(root, name);
+        writeFileSync(f, `${nowPatchSrc(`() => ${ms}`)}\n`);
+        return { NODE_OPTIONS: `--require ${f}` };
+      };
+      const stop = (env, rootDir = root) => {
+        const r = spawnSync(
+          process.execPath,
+          [join(rootDir, 'hooks', 'hypo-auto-minimal-crystallize.mjs')],
+          {
+            input: JSON.stringify({
+              session_id: sid,
+              transcript_path: t10Transcript(sid),
+              cwd: T10_CWD,
+            }),
+            encoding: 'utf-8',
+            env: { ...process.env, HOME: SESSION_TMP_HOME, HYPO_DIR: dir, ...env },
+            timeout: 60000,
+          },
+        );
+        assert.equal(r.status, 0, `stderr: ${r.stderr}`);
+        const out = JSON.parse(r.stdout);
+        assert.notEqual(out.decision, 'block', `a time limit must not block Stop: ${r.stdout}`);
+        return out.systemMessage || '';
+      };
+      assert.ok(!NOTICE.test(stop(freeze('clock-0.cjs', 0))), 'control: clock 0, proof completes');
+      assert.match(stop(freeze('clock-9500.cjs', 9500)), NOTICE, 'the cap is past at entry');
+
+      withPackageCopy((uncapped) => {
+        const f = join(uncapped, 'hooks', 'hypo-auto-minimal-crystallize.mjs');
+        const src = readFileSync(f, 'utf-8');
+        const next = src.replace(
+          'end: Math.min(performance.now() + GATE_DEADLINE_MS, STAGE_BUDGET_MS - STAGE_RESERVE_MS),',
+          'end: performance.now() + GATE_DEADLINE_MS,',
+        );
+        assert.notEqual(next, src, 'the copy has the cap to remove');
+        writeFileSync(f, next);
+        const frozen = join(uncapped, 'clock-9500.cjs');
+        writeFileSync(frozen, `${nowPatchSrc('() => 9500')}\n`);
+        assert.ok(
+          !NOTICE.test(stop({ NODE_OPTIONS: `--require ${frozen}` }, uncapped)),
+          'without the cap the same clock leaves the full deadline',
+        );
+      });
+
+      const at600 = freeze('clock-600.cjs', 600);
+      assert.ok(!NOTICE.test(stop(at600)), 'default budget: 600 ms in leaves the full deadline');
+      assert.match(
+        stop({ ...at600, HYPO_STAGE_TIMEOUT_MS: '1500' }),
+        NOTICE,
+        'a smaller stage budget caps the deadline',
+      );
+      assert.ok(
+        !NOTICE.test(stop({ ...at600, HYPO_STAGE_TIMEOUT_MS: 'junk' })),
+        'a value that is not a positive integer falls back to the default budget',
+      );
+    });
+  });
+});
+
+// Distinguishes: a git blocker that names no file (the enumeration was cut by the deadline, the
+// session did record writing) from one that names a file: only the second says unsaved work is
+// waiting, so only the second asks to reconfirm. Disabling the fix: in
+// hooks/hypo-auto-minimal-crystallize.mjs drop `&& b.file` from the workIncomplete test.
+test('Stop: a git blocker with no file (listing cut by the deadline) does not ask to reconfirm the close', () => {
+  withGrowthWiki((dir) => {
+    mkdirSync(join(dir, 'pages'), { recursive: true });
+    writeFileSync(join(dir, 'pages', 'x.md'), '# wip\n');
+    recordTouchedPaths(dir, 's-reconfirm-cut', ['pages/x.md']);
+    const transcript = writeTranscript(dir, [
+      {
+        type: 'assistant',
+        message: {
+          content: [
+            { type: 'tool_use', name: 'Edit', input: { file_path: join(dir, 'pages', 'x.md') } },
+          ],
+        },
+      },
+      { type: 'user', message: { role: 'user', content: '구현 완료하면 세션 마무리하자' } },
+    ]);
+    const gate = precompactGateStatus(dir, {
+      claudeHome: join(dir, '.claude-none'),
+      sessionId: 's-reconfirm-cut',
+      deadline: { end: 0 },
+    });
+    const git = gate.blockers.filter((b) => b.type === 'git');
+    assert.ok(
+      git.length > 0 && git.every((b) => !b.file),
+      `precondition, a fileless git blocker: ${JSON.stringify(gate.blockers)}`,
+    );
+    withPackageCopy((root) => {
+      shrinkGateDeadline(root, 0);
+      const r = spawnFromCopy(
+        root,
+        'hooks/hypo-auto-minimal-crystallize.mjs',
+        [],
+        dir,
+        JSON.stringify({ session_id: 's-reconfirm-cut', transcript_path: transcript }),
+      );
+      const out = JSON.parse(r.stdout);
+      assert.equal(out.decision, 'block', r.stdout);
+      assert.ok(!/AskUserQuestion/.test(out.reason), `no reconfirm: ${out.reason}`);
+      assert.match(out.reason, /crystallize/, out.reason);
+    });
+  });
+});
+
+// Distinguishes: a check run with no usable session id, whose listing of uncommitted files the
+// deadline cut (the whole folder blocks by rule, so the cut blocks too) from a call that does
+// have a session id and no record of writing (a notice). Disabling the fix: in
+// precompactGateStatus make `recorded` start with `isValidSessionId(opts.sessionId) &&` again.
+test('the gate: a listing cut by the deadline blocks a call with no session id, and stays a notice for a session with no record', () => {
+  withGrowthWiki((dir) => {
+    mkdirSync(join(dir, 'pages'), { recursive: true });
+    writeFileSync(join(dir, 'pages', 'x.md'), '# wip\n');
+    const base = { claudeHome: join(dir, '.claude-none'), deadline: { end: 0 } };
+    const none = precompactGateStatus(dir, base);
+    assert.ok(
+      none.blockers.some((b) => b.type === 'git'),
+      `no session id: ${JSON.stringify(none.blockers)}`,
+    );
+    // With no session id there is no record to claim, so the reason must not say there is one:
+    // it says the listing was cut and tells the caller to pass --session-id.
+    const noIdReason = none.blockers.find((b) => b.type === 'git').reason;
+    assert.match(noIdReason, /no session id/, noIdReason);
+    assert.match(noIdReason, /--session-id/, noIdReason);
+    assert.ok(!/has a record of writing/.test(noIdReason), noIdReason);
+    const noRecord = precompactGateStatus(dir, { ...base, sessionId: 's-no-record' });
+    assert.deepEqual(
+      noRecord.blockers.filter((b) => b.type === 'git'),
+      [],
+      JSON.stringify(noRecord.blockers),
+    );
+    assert.ok(
+      noRecord.notices.some((n) => n.type === 'unresolved'),
+      JSON.stringify(noRecord.notices),
+    );
+  });
+});
+
 test('Q7 (772): --mark-session-closed with a session cwd refuses at its gate in the X1 state', () => {
   const sid = 's-t10-q7-mark';
   withResolvedClose(sid, { secondSignal: true }, (dir) => {
@@ -7665,12 +8366,13 @@ test('after the two closes, a new close request makes the cwd project open again
   });
 });
 
-// Another session's entry that is published and waiting for its own commit, on the
-// two git partitions outside checkpointMode (Stop, PreCompact, --check).
-// Disabling the check (F1, scoped half): in precompactGateStatus's scoped branch
-// set `foreignEntries` to `[]`. The first gate's assertions go red. (F1, unscoped
-// half): same in the trusted unscoped branch: the second gate's go red.
-test("another session's new uncommitted entry is a foreign-entry notice, not a git blocker, on the scoped and the trusted unscoped git partitions", () => {
+// Another session's entry that is published and waiting for its own commit, seen by
+// a session with no record of writing it, with and without an attribution scope
+// (the scope no longer picks a different rule). Pair with the recorded-path test
+// below. Disabling the check: in precompactGateStatus's dirty-file loop replace
+// `isForeignUncommittedEntry(hypoDir, pf, opts.sessionId)` with `false`. The entry
+// is then an unresolved notice and both gates' foreign-entry assertions go red.
+test('an unrecorded valid foreign entry is a foreign-entry notice, not a git blocker, with and without an attribution scope', () => {
   withWiki(anchorTestProject, (dir, today) => {
     const sid = 's-t10-foreign-entry';
     const rel = writeDatedEntry(dir, 'test-project', today, closeIdFor('s-t10-someone-else', 0));
@@ -7699,127 +8401,49 @@ test("another session's new uncommitted entry is a foreign-entry notice, not a g
   });
 });
 
-test("this session's own uncommitted entry, and another session's committed entry edited since, still block on the scoped partition (pair)", () => {
+// The same two files seen by a session that recorded them and by one that did not.
+// This session's own uncommitted entry, and another session's committed entry edited
+// since, block as known-session-write when this session recorded the write. A session
+// with no record of them gets an unresolved notice and no blocker: neither is a new
+// entry of another session, so neither is a foreign-entry notice either. Disabling
+// the check: in precompactGateStatus's dirty-file loop make `touchedSet.has(...)`
+// false (the recorded half goes red).
+test("this session's recorded uncommitted entry, and another session's committed entry edited since, block as known-session-write, and are unresolved notices when unrecorded (pair)", () => {
   withWiki(anchorTestProject, (dir, today) => {
     const sid = 's-t10-own-entry';
-    const own = writeDatedEntry(dir, 'test-project', today, closeIdFor(sid, 0));
-    const gate = precompactGateStatus(dir, {
-      claudeHome: join(dir, '.claude-none'),
-      attributionScope: 'test-project',
-      sessionId: sid,
-    });
-    assert.ok(
-      gate.blockers.some((b) => b.type === 'git' && b.reason.includes(own)),
-      JSON.stringify(gate.blockers),
-    );
-    rmSync(join(dir, own));
-    const theirs = commitEntry(dir, today, closeIdFor('s-t10-someone-else', 0));
-    appendFileSync(join(dir, theirs), '\nedited\n');
-    const edited = precompactGateStatus(dir, {
-      claudeHome: join(dir, '.claude-none'),
-      attributionScope: 'test-project',
-      sessionId: sid,
-    });
-    assert.ok(
-      edited.blockers.some((b) => b.type === 'git' && b.reason.includes(theirs)),
-      JSON.stringify(edited.blockers),
-    );
-  });
-});
-
-// S2: the name alone does not make a file another session's entry. Disabling the check:
-// in isForeignUncommittedEntry drop the `!parsed.ok || parsed.entry.closeId !== m[1]`
-// test (return before parsing). The no-frontmatter and mismatched-id files then turn
-// into foreign-entry notices and both assertions go red.
-test("a file named like another session's entry but not that entry still blocks on the scoped partition (S2)", () => {
-  withWiki(anchorTestProject, (dir, today) => {
-    const sid = 's-t10-s2-mine';
-    const otherId = closeIdFor('s-t10-s2-other', 0);
-    const relOf = (id) => `projects/test-project/sessions/${today}-${id}.md`;
-    mkdirSync(join(dir, 'projects', 'test-project', 'sessions'), { recursive: true });
-    const blocksOn = (rel) => {
-      const gate = precompactGateStatus(dir, {
-        claudeHome: join(dir, '.claude-none'),
-        attributionScope: 'test-project',
-        sessionId: sid,
-      });
-      assert.ok(
-        gate.blockers.some((b) => b.type === 'git' && b.reason.includes(rel)),
-        `${rel}: ${JSON.stringify(gate.blockers)}`,
-      );
-      assert.ok(
-        !gate.notices.some((n) => n.type === 'foreign-entry'),
-        JSON.stringify(gate.notices),
-      );
-      rmSync(join(dir, rel));
-    };
-    // No frontmatter at all: a hand-written note under an entry-shaped name.
-    writeFileSync(join(dir, relOf(otherId)), '# hand written\n');
-    blocksOn(relOf(otherId));
-    // A real entry, but of another close id than its name carries.
-    writeFileSync(
-      join(dir, relOf(otherId)),
-      formatSessionEntry({
-        project: 'test-project',
-        closeId: closeIdFor('s-t10-s2-third', 0),
-        date: today,
-        tracks: [],
-        summary: 'moved',
-        bodies: {},
-      }),
-    );
-    blocksOn(relOf(otherId));
-  });
-});
-
-// X4 (wave B, third review): the entry must also be the one its path names by project,
-// by date, and by the session its close id belongs to. Disabling the check (X4,
-// project and date): in isForeignUncommittedEntry drop `|| e.project !== project ||
-// e.date !== date`. (X4, session): drop the `e.sessionId` line. Either goes red.
-test("a file named like another session's entry whose project, date or session differ from its path still blocks on the scoped partition (X4)", () => {
-  withWiki(anchorTestProject, (dir, today) => {
-    const sid = 's-t10-x4-mine';
-    const otherId = closeIdFor('s-t10-x4-other', 0);
-    const rel = `projects/test-project/sessions/${today}-${otherId}.md`;
-    mkdirSync(join(dir, 'projects', 'test-project', 'sessions'), { recursive: true });
-    const entryOf = (over) =>
-      formatSessionEntry({
-        project: 'test-project',
-        closeId: otherId,
-        date: today,
-        tracks: [],
-        summary: 'x4',
-        bodies: {},
-        ...over,
-      });
-    const gate = () =>
+    stampSessionRecord(dir, sid);
+    const gate = (sessionId) =>
       precompactGateStatus(dir, {
         claudeHome: join(dir, '.claude-none'),
         attributionScope: 'test-project',
-        sessionId: sid,
+        sessionId,
       });
-    // Pair: the entry its path names is a notice.
-    writeFileSync(join(dir, rel), entryOf({ sessionId: 's-t10-x4-other' }));
-    assert.ok(
-      gate().notices.some((n) => n.type === 'foreign-entry' && n.file === rel),
-      'precondition: the matching entry is foreign',
-    );
-    for (const over of [
-      { project: 'another-project' },
-      { date: '2001-01-01' },
-      { sessionId: 's-t10-x4-third' },
-    ]) {
-      writeFileSync(join(dir, rel), entryOf(over));
-      const g = gate();
-      assert.ok(
-        g.blockers.some((b) => b.type === 'git' && b.reason.includes(rel)),
-        `${JSON.stringify(over)}: ${JSON.stringify(g.blockers)}`,
+    const writeBlockerOn = (g, rel) =>
+      g.blockers.some((b) => b.type === 'known-session-write' && b.file === rel);
+    const noticeOn = (g, type, rel) => g.notices.some((n) => n.type === type && n.file === rel);
+    const assertUnrecorded = (g, rel) => {
+      assert.deepEqual(
+        g.blockers.filter((b) => b.file === rel || (b.reason || '').includes(rel)),
+        [],
+        JSON.stringify(g.blockers),
       );
-      assert.ok(
-        !g.notices.some((n) => n.type === 'foreign-entry'),
-        `${JSON.stringify(over)}: ${JSON.stringify(g.notices)}`,
-      );
-    }
+      assert.ok(noticeOn(g, 'unresolved', rel), JSON.stringify(g.notices));
+      assert.ok(!noticeOn(g, 'foreign-entry', rel), JSON.stringify(g.notices));
+    };
+    const own = writeDatedEntry(dir, 'test-project', today, closeIdFor(sid, 0));
+    assertUnrecorded(gate(sid), own);
+    assert.equal(recordTouchedPaths(dir, sid, [own]), true, 'precondition: recorded');
+    const ownGate = gate(sid);
+    assert.ok(writeBlockerOn(ownGate, own), JSON.stringify(ownGate.blockers));
+    assert.ok(!noticeOn(ownGate, 'foreign-entry', own), JSON.stringify(ownGate.notices));
+    rmSync(join(dir, own));
+    const theirs = commitEntry(dir, today, closeIdFor('s-t10-someone-else', 0));
+    appendFileSync(join(dir, theirs), '\nedited\n');
+    assertUnrecorded(gate(sid), theirs);
+    assert.equal(recordTouchedPaths(dir, sid, [theirs]), true, 'precondition: recorded');
+    const edited = gate(sid);
+    assert.ok(writeBlockerOn(edited, theirs), JSON.stringify(edited.blockers));
+    assert.ok(!noticeOn(edited, 'foreign-entry', theirs), JSON.stringify(edited.notices));
   });
 });
 
@@ -7836,6 +8460,9 @@ function withCommittedShard(fn) {
       `---\ntitle: Session Log ${today} (test-project)\ntype: session-log\nupdated: ${today}\n---\n\n` +
       `# Session Log ${today} (test-project)\n\n## [${today}] own close\n`;
     writeFileSync(join(dir, rel), own);
+    // Both sessions began on a version that records every write.
+    stampSessionRecord(dir, S1_SID);
+    stampSessionRecord(dir, 's-t10-s1-fresh');
     recordTouchedPaths(dir, S1_SID, [rel]);
     const git = (...a) =>
       spawnSync('git', ['-C', dir, ...a], {
@@ -7867,6 +8494,24 @@ const blockersOn = (gate, rel) =>
   gate.blockers.filter((b) => b.file === rel || (b.reason || '').includes(rel));
 const appendNotice = (gate, rel) =>
   gate.notices.some((n) => n.type === 'foreign-append' && n.file === rel);
+const unresolvedNotice = (gate, rel) =>
+  gate.notices.some((n) => n.type === 'unresolved' && n.file === rel);
+const writeBlocker = (gate, rel) =>
+  blockersOn(gate, rel).some((b) => b.type === 'known-session-write');
+// A session that never recorded the shard, with the shard changed some way that is
+// not a recorded append: it is no blocker (only a recorded write or a lost record is),
+// no foreign-append notice (nobody recorded those bytes), but an unresolved notice.
+const assertUnresolvedNotice = (gate, rel) => {
+  assert.deepEqual(blockersOn(gate, rel), [], JSON.stringify(gate.blockers));
+  assert.ok(unresolvedNotice(gate, rel), JSON.stringify(gate.notices));
+  assert.ok(!appendNotice(gate, rel), JSON.stringify(gate.notices));
+};
+// This session recorded the shard and its bytes changed some way that is not a
+// recorded append: its own unresolved write, never a foreign append.
+const assertOwnWriteBlocks = (gate, rel) => {
+  assert.ok(writeBlocker(gate, rel), JSON.stringify(gate.blockers));
+  assert.ok(!appendNotice(gate, rel), JSON.stringify(gate.notices));
+};
 
 // Disabling the check (S1, checkpoint half): in precompactGateStatus's checkpointMode
 // loop delete the `isForeignAppendOnlyShard` branch. The shard then blocks as this
@@ -7912,89 +8557,76 @@ test('a shard committed with the other close heading while the real index kept o
   });
 });
 
-// The pairs: what is not a pure append by someone else keeps blocking. Disabling the
-// check (S1, prefix): drop the `!disk.subarray(0, head.length).equals(head)` test.
-// The edited-prefix assertions go red. (S1, recorded tail): make the tail walk accept
-// a missing record. The undated assertions go red. (S1, own write): in
-// isForeignAppendOnlyShard replace `if (!committed) return false;` with
-// `if (!committed) own = null;`. The reverted-write assertion goes red.
+// The pairs: what is not a pure append by someone else is not a foreign-append
+// notice. It blocks when this session recorded the shard (S1_SID, the write is its
+// own), and it is an unresolved notice when this session never did (the project
+// folder is blocked only for a lost record, not for an unrecorded file). Disabling
+// the check (S1, prefix): drop the `!disk.subarray(0, head.length).equals(head)` test.
+// The same-length prefix assertions go red (the fixture below is built so that only
+// this test blocks it). (S1, recorded tail): make the tail walk accept a missing
+// record. The undated assertions go red. (S1, own write): in isForeignAppendOnlyShard
+// replace `if (!committed) return false;` with `if (!committed) own = null;`. The
+// reverted-write assertion goes red.
 test('a shard whose committed part changed, an undated append, a deleted shard, and this session own uncommitted append still block the marker gate (S1 pair)', () => {
   withCommittedShard((dir, today, { rel, own }) => {
     writeFileSync(join(dir, rel), own.replace('own close', 'rewritten') + OTHER_HEADING(today));
-    const edited = checkpointGate(dir, S1_SID);
-    assert.ok(
-      blockersOn(edited, rel).some((b) => b.type === 'known-session-write'),
-      JSON.stringify(edited.blockers),
-    );
-    assert.ok(!appendNotice(edited, rel), JSON.stringify(edited.notices));
-    const editedFresh = checkpointGate(dir, 's-t10-s1-fresh');
-    assert.ok(
-      blockersOn(editedFresh, rel).some((b) => b.type === 'git'),
-      JSON.stringify(editedFresh.blockers),
-    );
+    assertOwnWriteBlocks(checkpointGate(dir, S1_SID), rel);
+    assertUnresolvedNotice(checkpointGate(dir, 's-t10-s1-fresh'), rel);
 
     // Lines with no dated heading are not what a close appends (a Bash append).
     writeFileSync(join(dir, rel), own + '\nappended by Bash, never committed\n');
-    const undated = checkpointGate(dir, 's-t10-s1-fresh');
-    assert.ok(
-      blockersOn(undated, rel).some((b) => b.type === 'git'),
-      JSON.stringify(undated.blockers),
-    );
-    assert.ok(!appendNotice(undated, rel), JSON.stringify(undated.notices));
+    assertOwnWriteBlocks(checkpointGate(dir, S1_SID), rel);
+    assertUnresolvedNotice(checkpointGate(dir, 's-t10-s1-fresh'), rel);
 
     rmSync(join(dir, rel));
-    const deleted = checkpointGate(dir, 's-t10-s1-fresh');
-    assert.ok(
-      blockersOn(deleted, rel).some((b) => b.type === 'git'),
-      JSON.stringify(deleted.blockers),
-    );
+    assertOwnWriteBlocks(checkpointGate(dir, S1_SID), rel);
+    assertUnresolvedNotice(checkpointGate(dir, 's-t10-s1-fresh'), rel);
 
     writeFileSync(join(dir, rel), own + `\n## [${today}] own second heading\n`);
     recordTouchedPaths(dir, S1_SID, [rel]);
-    const ownAppend = checkpointGate(dir, S1_SID);
-    assert.ok(
-      blockersOn(ownAppend, rel).some((b) => b.type === 'known-session-write'),
-      JSON.stringify(ownAppend.blockers),
-    );
-    assert.ok(!appendNotice(ownAppend, rel), JSON.stringify(ownAppend.notices));
+    assertOwnWriteBlocks(checkpointGate(dir, S1_SID), rel);
 
     // This session's recorded write never reached HEAD and is gone from disk (put
     // back by hand), and another close appended since: still this session's
     // unresolved write, not a clean foreign append.
     writeFileSync(join(dir, rel), own);
     appendAsOther(dir, rel, OTHER_HEADING(today));
-    const reverted = checkpointGate(dir, S1_SID);
-    assert.ok(
-      blockersOn(reverted, rel).some((b) => b.type === 'known-session-write'),
-      JSON.stringify(reverted.blockers),
-    );
-    assert.ok(!appendNotice(reverted, rel), JSON.stringify(reverted.notices));
+    assertOwnWriteBlocks(checkpointGate(dir, S1_SID), rel);
+  });
+});
+
+// The committed part rewritten with bytes of the same length, then another close's
+// recorded append on top of those bytes (its record's beforeSha256 names the rewritten
+// prefix). Every other check accepts this: the tail walk finds the record, this
+// session's recorded hash is HEAD's and the index equals HEAD. Only the prefix test
+// (disk starts with HEAD's bytes) tells it from a pure append. Disabling the check
+// (S1, prefix): see above. Red here only.
+test('a shard whose committed part was rewritten in place under another close recorded append stays this session own write (S1 prefix)', () => {
+  withCommittedShard((dir, today, { rel, own }) => {
+    const rewritten = own.replace('own close', 'xxx xxxxx');
+    assert.equal(rewritten.length, own.length, 'precondition: same length');
+    writeFileSync(join(dir, rel), rewritten);
+    appendAsOther(dir, rel, OTHER_HEADING(today));
+    assertOwnWriteBlocks(checkpointGate(dir, S1_SID), rel);
   });
 });
 
 // X3 (wave B, third review): only bytes another close recorded count as its append.
 // (a) A dated heading typed by hand, with no record anywhere, is not another close's.
 // (c) A hand note sitting in front of a recorded append makes the whole tail unowned.
-// Disabling the check (X3, tail walk): in isForeignAppendOnlyShard replace
-// `if (!r) return false;` with `if (!r) break;`. Both gates go red.
+// Both stay this session's write when it recorded the shard, and an unresolved notice
+// when it did not. Disabling the check (X3, tail walk): in isForeignAppendOnlyShard
+// replace `if (!r) return false;` with `if (!r) break;`. Both gates go red.
 test('a hand-typed dated heading, and a hand note ahead of another close recorded append, still block the marker gate (X3 a, c)', () => {
   withCommittedShard((dir, today, { rel, own }) => {
     appendFileSync(join(dir, rel), `\n## [${today}] typed by hand\n`);
-    const typed = checkpointGate(dir, 's-t10-s1-fresh');
-    assert.ok(
-      blockersOn(typed, rel).some((b) => b.type === 'git'),
-      JSON.stringify(typed.blockers),
-    );
-    assert.ok(!appendNotice(typed, rel), JSON.stringify(typed.notices));
+    assertOwnWriteBlocks(checkpointGate(dir, S1_SID), rel);
+    assertUnresolvedNotice(checkpointGate(dir, 's-t10-s1-fresh'), rel);
 
     writeFileSync(join(dir, rel), own + '\na note by hand\n');
     appendAsOther(dir, rel, OTHER_HEADING(today));
-    const noted = checkpointGate(dir, 's-t10-s1-fresh');
-    assert.ok(
-      blockersOn(noted, rel).some((b) => b.type === 'git'),
-      JSON.stringify(noted.blockers),
-    );
-    assert.ok(!appendNotice(noted, rel), JSON.stringify(noted.notices));
+    assertOwnWriteBlocks(checkpointGate(dir, S1_SID), rel);
+    assertUnresolvedNotice(checkpointGate(dir, 's-t10-s1-fresh'), rel);
   });
 });
 
@@ -8014,22 +8646,14 @@ test('a staged edit or staged deletion of a shard whose work tree is HEAD still 
     // work tree to that index).
     assert.equal(git('status', '--porcelain', '--', rel).stdout.slice(0, 2), 'MM');
     assert.equal(readFileSync(join(dir, rel), 'utf-8'), own);
-    const staged = checkpointGate(dir, 's-t10-s1-fresh');
-    assert.ok(
-      blockersOn(staged, rel).some((b) => b.type === 'git'),
-      JSON.stringify(staged.blockers),
-    );
-    assert.ok(!appendNotice(staged, rel), JSON.stringify(staged.notices));
+    assertOwnWriteBlocks(checkpointGate(dir, S1_SID), rel);
+    assertUnresolvedNotice(checkpointGate(dir, 's-t10-s1-fresh'), rel);
 
     git('reset', '-q', 'HEAD', '--', rel);
     git('rm', '-q', '--cached', '--', rel);
     assert.equal(git('status', '--porcelain', '--', rel).stdout.slice(0, 2), 'D ');
-    const removed = checkpointGate(dir, 's-t10-s1-fresh');
-    assert.ok(
-      blockersOn(removed, rel).some((b) => b.type === 'git'),
-      JSON.stringify(removed.blockers),
-    );
-    assert.ok(!appendNotice(removed, rel), JSON.stringify(removed.notices));
+    assertOwnWriteBlocks(checkpointGate(dir, S1_SID), rel);
+    assertUnresolvedNotice(checkpointGate(dir, 's-t10-s1-fresh'), rel);
 
     git('reset', '-q', 'HEAD', '--', rel);
     appendAsOther(dir, rel, OTHER_HEADING(today));
@@ -8040,31 +8664,171 @@ test('a staged edit or staged deletion of a shard whose work tree is HEAD still 
   });
 });
 
-// Disabling the check (S1, scoped half): in precompactGateStatus's scoped branch set
-// `foreignAppends` to `[]`. The first gate goes red. (S1, unscoped half): same in the
-// trusted unscoped branch. The second gate goes red.
-test("another session's append to the committed shard is a foreign-append notice on the scoped and the trusted unscoped git partitions (S1)", () => {
+// The marker-gate pair above, on the gate Stop, PreCompact and --check run: a session
+// that recorded the shard (S1_SID, as a close leaves it) and one that never did both
+// read another session's append as a foreign-append notice. Disabling the check: in
+// precompactGateStatus's dirty-file loop delete the `isForeignAppendOnlyShard` branch.
+// The recorded session then blocks as a known-session-write and the fresh one gets an
+// unresolved notice: both gates go red.
+test("another session's append to the committed shard is a foreign-append notice for a session that recorded the shard and one that did not (S1)", () => {
   withCommittedShard((dir, today, { rel }) => {
     appendAsOther(dir, rel, OTHER_HEADING(today));
-    const cleanup = seedCloseTranscript(S1_SID);
-    try {
-      const scoped = precompactGateStatus(dir, {
+    for (const sessionId of [S1_SID, 's-t10-s1-fresh']) {
+      const gate = precompactGateStatus(dir, {
         claudeHome: join(dir, '.claude-none'),
         attributionScope: 'test-project',
-        sessionId: S1_SID,
+        sessionId,
       });
-      assert.deepEqual(blockersOn(scoped, rel), [], JSON.stringify(scoped.blockers));
-      assert.ok(appendNotice(scoped, rel), JSON.stringify(scoped.notices));
-      const unscoped = precompactGateStatus(dir, {
-        claudeHome: join(dir, '.claude-none'),
-        transcriptPath: t10Transcript(S1_SID),
-        sessionId: S1_SID,
-      });
-      assert.deepEqual(blockersOn(unscoped, rel), [], JSON.stringify(unscoped.blockers));
-      assert.ok(appendNotice(unscoped, rel), JSON.stringify(unscoped.notices));
-    } finally {
-      cleanup();
+      assert.deepEqual(blockersOn(gate, rel), [], `${sessionId}: ${JSON.stringify(gate.blockers)}`);
+      assert.ok(appendNotice(gate, rel), `${sessionId}: ${JSON.stringify(gate.notices)}`);
     }
+  });
+});
+
+// isForeignUncommittedEntry is what tells another session's new entry from every
+// other dirty file, and a gate test cannot reach it for a recorded path (the record
+// blocks first). So each boundary is probed on the function: the matching entry is
+// foreign (precondition in the fixture), and one changed fact is not.
+const FE_MINE = 's-t5-fe-mine';
+const FE_OTHER = 's-t5-fe-other';
+function withForeignEntry(fn) {
+  withWiki(anchorTestProject, (dir, today) => {
+    const closeId = closeIdFor(FE_OTHER, 0);
+    const rel = `projects/test-project/sessions/${today}-${closeId}.md`;
+    mkdirSync(join(dir, 'projects', 'test-project', 'sessions'), { recursive: true });
+    const write = (over = {}) =>
+      writeFileSync(
+        join(dir, rel),
+        formatSessionEntry({
+          project: 'test-project',
+          closeId,
+          date: today,
+          sessionId: FE_OTHER,
+          tracks: [],
+          summary: 'fe',
+          bodies: {},
+          ...over,
+        }),
+      );
+    const probe = () => isForeignUncommittedEntry(dir, rel, FE_MINE);
+    stampSessionRecord(dir, FE_MINE);
+    write();
+    assert.equal(probe(), true, 'precondition: the entry its path names is foreign');
+    fn({ dir, today, rel, write, probe });
+  });
+}
+
+// Disabling the check: in entryMatchesPath return true before `parseSessionEntry`
+// (or drop the `!parsed.ok` test). The hand-written note turns foreign: red.
+test("isForeignUncommittedEntry: a name-only file with no entry frontmatter is not another session's entry", () => {
+  withForeignEntry(({ dir, rel, probe }) => {
+    writeFileSync(join(dir, rel), '# hand written\n');
+    assert.equal(probe(), false);
+  });
+});
+
+// Disabling the check: in entryMatchesPath drop `e.closeId !== closeId`. Red.
+test("isForeignUncommittedEntry: a close id that differs from the path's is not another session's entry", () => {
+  withForeignEntry(({ write, probe }) => {
+    write({ closeId: closeIdFor('s-t5-fe-third', 0) });
+    assert.equal(probe(), false);
+  });
+});
+
+// Disabling the check: in entryMatchesPath drop `e.project !== project`. Red.
+test("isForeignUncommittedEntry: a project that differs from the path's is not another session's entry", () => {
+  withForeignEntry(({ write, probe }) => {
+    write({ project: 'another-project' });
+    assert.equal(probe(), false);
+  });
+});
+
+// Disabling the check: in entryMatchesPath drop `e.date !== date`. Red.
+test("isForeignUncommittedEntry: a date that differs from the path's is not another session's entry", () => {
+  withForeignEntry(({ write, probe }) => {
+    write({ date: '2001-01-01' });
+    assert.equal(probe(), false);
+  });
+});
+
+// Disabling the check: in entryMatchesPath replace the last line's session test with
+// `return true`. Red.
+test("isForeignUncommittedEntry: a session that differs from the one the close id belongs to is not another session's entry", () => {
+  withForeignEntry(({ write, probe }) => {
+    write({ sessionId: 's-t5-fe-third' });
+    assert.equal(probe(), false);
+  });
+});
+
+// Disabling the check: in isForeignUncommittedEntry replace the final
+// `headPathState(...) === 'absent'` with `true`. The committed entry turns foreign: red.
+test("isForeignUncommittedEntry: an entry HEAD already holds is not another session's entry", () => {
+  withForeignEntry(({ dir, rel, probe }) => {
+    const git = (...a) =>
+      spawnSync('git', ['-C', dir, ...a], {
+        encoding: 'utf-8',
+        env: { ...process.env, HOME: SESSION_TMP_HOME },
+      });
+    git('add', '--', rel);
+    git('commit', '-q', '-m', 'other entry', '--', rel);
+    assert.equal(probe(), false, 'committed');
+    appendFileSync(join(dir, rel), '\nedited\n');
+    assert.equal(probe(), false, 'committed and edited since');
+  });
+});
+
+// The gate order: a recorded path is a known-session-write blocker before the
+// foreign-entry check ever runs, even for the entry its path names. Pair with the
+// unrecorded test earlier in this file (a foreign-entry notice, no blocker).
+// Disabling the check: in precompactGateStatus's dirty-file loop move the
+// `isForeignUncommittedEntry` branch ahead of `touchedSet.has(...)`. Red.
+test('a recorded entry-shaped path blocks as known-session-write before the foreign-entry check', () => {
+  withForeignEntry(({ dir, rel }) => {
+    assert.equal(recordTouchedPaths(dir, FE_MINE, [rel]), true, 'precondition: recorded');
+    const gate = precompactGateStatus(dir, {
+      claudeHome: join(dir, '.claude-none'),
+      attributionScope: 'test-project',
+      sessionId: FE_MINE,
+    });
+    assert.ok(writeBlocker(gate, rel), JSON.stringify(gate.blockers));
+    assert.ok(!gate.notices.some((n) => n.type === 'foreign-entry'), JSON.stringify(gate.notices));
+  });
+});
+
+// A name alone makes no entry: an unrecorded file under an entry-shaped name that is
+// not that entry is an unresolved notice, never a foreign-entry notice and no blocker.
+// Disabling the check: as in the boundary tests above, any one of the entryMatchesPath
+// tests. The file then reads as foreign and the unresolved assertion goes red.
+test("an unrecorded file named like another session's entry but not that entry is an unresolved notice, not a foreign-entry notice", () => {
+  withForeignEntry(({ dir, rel, write }) => {
+    const gate = () =>
+      precompactGateStatus(dir, {
+        claudeHome: join(dir, '.claude-none'),
+        attributionScope: 'test-project',
+        sessionId: FE_MINE,
+      });
+    const assertUnresolvedOnly = (label) => {
+      const g = gate();
+      // The lint axis may still name a malformed file; only the git axis is judged here.
+      assert.deepEqual(
+        blockersOn(g, rel).filter((b) => b.type === 'git' || b.type === 'known-session-write'),
+        [],
+        `${label}: ${JSON.stringify(g.blockers)}`,
+      );
+      assert.ok(unresolvedNotice(g, rel), `${label}: ${JSON.stringify(g.notices)}`);
+      assert.ok(
+        !g.notices.some((n) => n.type === 'foreign-entry'),
+        `${label}: ${JSON.stringify(g.notices)}`,
+      );
+    };
+    writeFileSync(join(dir, rel), '# hand written\n');
+    assertUnresolvedOnly('no frontmatter');
+    write({ project: 'another-project' });
+    assertUnresolvedOnly('project differs');
+    write({ date: '2001-01-01' });
+    assertUnresolvedOnly('date differs');
+    write({ sessionId: 's-t5-fe-third' });
+    assertUnresolvedOnly('session differs');
   });
 });
 
@@ -8144,4 +8908,253 @@ test("a retry of a close committed on an earlier day is verified by that day's l
       }
     },
   );
+});
+
+// ── the five close-gate callers on one vault state (T6a, T6b) ────────────────
+// check, --mark-session-closed, --apply-session-close, PreCompact and Stop all
+// run precompactGateStatus's one git axis. A close or a Stop changes the state
+// it reads (marker, receipt, commit), so each caller gets its own vault built by
+// the same lines instead of sharing one. session-hooks.test.mjs holds the gate
+// level pair and the no-session-id test, and the Stop pair on the hook alone.
+const FIVE_OWN = 'projects/test-project/own.md';
+const FIVE_FOREIGN = 'projects/test-project/foreign.md';
+const FIVE_OTHER = 'projects/other/foreign.md';
+
+// The flag an overwrite of an unreadable record leaves: paths were lost that
+// nobody can name.
+function fivePathsUnknownFlag(dir, sid) {
+  recordTouchedPaths(dir, sid, ['pages/seed.md']);
+  writeFileSync(touchedPathsPath(dir, sid), '{ not json');
+  assert.equal(recordTouchedPaths(dir, sid, ['pages/seed.md']), true);
+}
+
+// `recorded`: this session recorded writing own.md. `pathsUnknown`: its record lost
+// paths it cannot name. `foreign`: the file no record names.
+function withFiveCallerVault(sid, { recorded, pathsUnknown, foreign, pinned }, fn) {
+  withWiki(
+    (dir, today) => {
+      anchorTestProject(dir, today);
+      if (foreign === FIVE_OTHER) {
+        mkdirSync(join(dir, 'projects', 'other'), { recursive: true });
+        writeFileSync(join(dir, 'projects', 'other', 'index.md'), OTHER_INDEX(today));
+      }
+    },
+    (dir, today) => {
+      // The pin feeds --mark's proof of this close, not the git axis. apply opens its
+      // own close, so it runs without one.
+      if (pinned) pinCommittedClose(dir, sid);
+      stampSessionRecord(dir, sid);
+      writeFileSync(join(dir, foreign), '# another session wrote this\n');
+      if (pathsUnknown) fivePathsUnknownFlag(dir, sid);
+      if (recorded) {
+        writeFileSync(join(dir, FIVE_OWN), '# this session wrote this\n');
+        assert.equal(recordTouchedPaths(dir, sid, [FIVE_OWN]), true, 'precondition: recorded');
+      }
+      const cleanup = seedCloseTranscript(sid, { toolUseLines: [T10_EDIT_LINE] });
+      try {
+        fn(dir, today);
+      } finally {
+        cleanup();
+      }
+    },
+  );
+}
+
+// What each caller says about the files, in one shape: `blocked` is the files its git
+// axis blocks on, `unresolved` the ones it lists as an unresolved notice, `signal` what
+// proves the call ran to its own verdict (a refused run passes "nothing blocked").
+const gitBlockers = (blockers) =>
+  (blockers || []).filter((b) => b.type === 'known-session-write' || b.type === 'git');
+const unresolvedFiles = (notices) =>
+  (notices || [])
+    .filter((n) => n.type === 'unresolved')
+    .map((n) => n.file)
+    .sort();
+const FIVE_CALLERS = {
+  check: (dir, sid) => {
+    const out = JSON.parse(
+      run('crystallize.mjs', [
+        `--hypo-dir=${dir}`,
+        '--check-session-close',
+        `--session-id=${sid}`,
+        '--json',
+      ]).stdout,
+    );
+    return { blockers: gitBlockers(out.blockers), unresolved: unresolvedFiles(out.notices), out };
+  },
+  mark: (dir, sid) => {
+    const { r, out } = markJson(dir, sid);
+    assert.ok(out, `JSON expected: ${r.stdout}\n${r.stderr}`);
+    return { blockers: gitBlockers(out.blockers), unresolved: unresolvedFiles(out.notices), out };
+  },
+  apply: (dir, sid, today) => {
+    const out = JSON.parse(
+      runApply(
+        dir,
+        {
+          project: 'test-project',
+          date: today,
+          summary: 'five callers\n',
+          tracks: [{ id: 'main', new: true, next: '- next\n' }],
+          sessionLog: { entry: `## [${today}] five callers\n` },
+        },
+        { sessionId: sid },
+      ).stdout,
+    );
+    return {
+      blockers: gitBlockers(out.gateBlockers),
+      unresolved: unresolvedFiles(out.gateNotices),
+      out,
+    };
+  },
+  // The hook prints the blockers as one sentence and the unresolved files as one line.
+  precompact: (dir, sid) => {
+    const hook = runHook(
+      'hypo-personal-check.mjs',
+      { session_id: sid, transcript_path: t10Transcript(sid), cwd: T10_CWD },
+      { HYPO_DIR: dir },
+    );
+    const msg = JSON.parse(hook.stdout).systemMessage || '';
+    const unresolvedLine = msg.split('\n').find((l) => l.includes('no record of writing')) || '';
+    const files = [FIVE_OWN, FIVE_FOREIGN, FIVE_OTHER];
+    return {
+      blockers: files.filter(
+        (f) =>
+          msg.includes(`own write is still uncommitted: ${f}`) ||
+          msg.includes(`in the project folder being closed: ${f}`),
+      ),
+      unresolved: files.filter((f) => unresolvedLine.includes(f)).sort(),
+      out: msg,
+    };
+  },
+  // Stop names no file: a blocker that names one (or a `git` blocker) is a reconfirm.
+  stop: (dir, sid) => {
+    const r = runStop('hypo-auto-minimal-crystallize.mjs', dir, {
+      session_id: sid,
+      transcript_path: t10Transcript(sid),
+      cwd: T10_CWD,
+    });
+    const reason = JSON.parse(r.stdout).reason || '';
+    return {
+      reconfirm: reason.includes('AskUserQuestion'),
+      gateGreen: reason.includes('close gate green'),
+      out: r.stdout,
+    };
+  },
+};
+
+function runFiveCallers(label, opts) {
+  const seen = {};
+  for (const name of Object.keys(FIVE_CALLERS)) {
+    const sid = `s-five-${label}-${name}`;
+    const vault = { recorded: false, pathsUnknown: false, foreign: FIVE_FOREIGN, ...opts };
+    withFiveCallerVault(sid, { ...vault, pinned: name !== 'apply' }, (dir, today) => {
+      seen[name] = FIVE_CALLERS[name](dir, sid, today);
+    });
+  }
+  return seen;
+}
+const fiveJson = (v) => JSON.stringify(v.out);
+const blockedFiles = (v) => v.blockers.map((b) => b.file ?? b).sort();
+
+// Distinguishes: a file this session recorded blocks every caller, a file in the same
+// folder that no record names blocks none (the record decides, not the folder).
+// Disabling the check: in precompactGateStatus's dirty-file loop make
+// `touchedSet.has(posixPath(f))` false. The four callers that name the file and Stop
+// (no reconfirm) go red. Stop names no file, so its X half is the reconfirm itself.
+test("five callers: this session's recorded file blocks and another session's file does not, in the same project folder", () => {
+  const seen = runFiveCallers('x', { recorded: true });
+  for (const name of ['check', 'mark', 'apply', 'precompact']) {
+    assert.deepEqual(blockedFiles(seen[name]), [FIVE_OWN], `${name}: ${fiveJson(seen[name])}`);
+  }
+  for (const name of ['check', 'apply', 'precompact']) {
+    assert.deepEqual(seen[name].unresolved, [FIVE_FOREIGN], `${name}: ${fiveJson(seen[name])}`);
+  }
+  assert.equal(seen.check.out.ok, false, fiveJson(seen.check));
+  assert.equal(seen.mark.out.ok, false, fiveJson(seen.mark));
+  assert.equal(seen.apply.out.markerWritten, false, fiveJson(seen.apply));
+  assert.equal(seen.apply.out.markerSkipReason, 'compact-gate-not-ok', fiveJson(seen.apply));
+  assert.ok(seen.precompact.out.includes('Session close incomplete'), seen.precompact.out);
+  assert.equal(seen.stop.reconfirm, true, seen.stop.out);
+});
+
+// Distinguishes: the same folder with only another session's file, so all five judge
+// the git axis clear (each ran to its own success signal, not a refusal).
+// Disabling the check: in precompactGateStatus set `const folderWide = true;`. Every
+// caller then blocks foreign.md and this test goes red (so do the no-record pairs in
+// session-hooks.test.mjs, which pin the same value).
+test("five callers: another session's file alone blocks none of them", () => {
+  const seen = runFiveCallers('y', { recorded: false });
+  for (const name of ['check', 'mark', 'apply', 'precompact']) {
+    assert.deepEqual(seen[name].blockers, [], `${name}: ${fiveJson(seen[name])}`);
+    assert.deepEqual(seen[name].unresolved, [FIVE_FOREIGN], `${name}: ${fiveJson(seen[name])}`);
+  }
+  assert.equal(seen.check.out.ok, true, fiveJson(seen.check));
+  assert.equal(seen.mark.out.ok, true, fiveJson(seen.mark));
+  assert.equal(seen.apply.out.markerWritten, true, fiveJson(seen.apply));
+  assert.ok(!seen.precompact.out.includes('Session close incomplete'), seen.precompact.out);
+  assert.equal(seen.stop.reconfirm, false, seen.stop.out);
+  assert.equal(seen.stop.gateGreen, true, seen.stop.out);
+});
+
+// Where the callers differ, on purpose: a record that lost paths it cannot name blocks
+// every file of the project folder being closed, and only the check run with no
+// project knows no folder, so it reads every projects/ file as that folder. The other
+// four know test-project (--project, the cwd, the payload) and leave another
+// project's file a notice. Distinguishes: a caller that names no project from four
+// that do. Disabling the check: in precompactGateStatus make `closeSlug` null. The four
+// then block projects/other/foreign.md too, and the "blocks none" half goes red.
+test("with a paths-unknown record, only the check that names no project blocks another project's folder", () => {
+  const seen = runFiveCallers('lost', { pathsUnknown: true, foreign: FIVE_OTHER });
+  // The check ran its first call only: a re-run scoped to an inferred project would
+  // judge by that project's folder and say so with this key.
+  assert.ok(!('project_inferred_from_transcript' in seen.check.out), fiveJson(seen.check));
+  assert.equal(seen.check.out.scope, 'global', fiveJson(seen.check));
+  assert.deepEqual(blockedFiles(seen.check), [FIVE_OTHER], fiveJson(seen.check));
+  assert.equal(seen.check.blockers[0].type, 'git', fiveJson(seen.check));
+  assert.equal(seen.check.out.ok, false, fiveJson(seen.check));
+  for (const name of ['mark', 'apply', 'precompact']) {
+    assert.deepEqual(seen[name].blockers, [], `${name}: ${fiveJson(seen[name])}`);
+    assert.deepEqual(seen[name].unresolved, [FIVE_OTHER], `${name}: ${fiveJson(seen[name])}`);
+  }
+  assert.equal(seen.mark.out.ok, true, fiveJson(seen.mark));
+  assert.equal(seen.apply.out.markerWritten, true, fiveJson(seen.apply));
+  assert.ok(!seen.precompact.out.includes('Session close incomplete'), seen.precompact.out);
+  assert.equal(seen.stop.reconfirm, false, seen.stop.out);
+  assert.equal(seen.stop.gateGreen, true, seen.stop.out);
+});
+
+// The check that names no project, in a vault where discovery finds none: it infers
+// the one project this session's transcript touched and judges again. Distinguishes:
+// a re-run that carries the session id (this session's recorded file is a
+// known-session-write, the file nobody recorded blocks folder-wide as `git`) from one
+// that lost it (both files would read as `git`). The test above covers the check's
+// first call, where discovery found the project. Disabling the check: delete the
+// `sessionId` spread in the second precompactGateStatus call of
+// scripts/lib/crystallize-close-check.mjs (line 133). own.md turns `git`.
+test('with a paths-unknown record, the inferred-project check re-run judges the same way', () => {
+  withSyncedWiki((dir) => {
+    seedUndiscoverableProject(dir, 'hook-qa');
+    const sid = 's-five-inferred';
+    const own = 'projects/hook-qa/own.md';
+    const note = 'projects/hook-qa/note.md';
+    writeFileSync(join(dir, own), '# this session wrote this\n');
+    writeFileSync(join(dir, note), '# no record names this\n');
+    fivePathsUnknownFlag(dir, sid);
+    assert.equal(recordTouchedPaths(dir, sid, [own]), true, 'precondition: recorded');
+    const transcript = toolUseTranscript(dir, ['projects/hook-qa/index.md']);
+    const r = run('crystallize.mjs', [
+      `--hypo-dir=${dir}`,
+      '--check-session-close',
+      `--session-id=${sid}`,
+      `--transcript-path=${transcript}`,
+      '--json',
+    ]);
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.project_inferred_from_transcript, true, r.stdout);
+    assert.equal(out.scoped_project, 'hook-qa', r.stdout);
+    const typeOf = (file) => out.blockers.find((b) => b.file === file)?.type;
+    assert.equal(typeOf(own), 'known-session-write', r.stdout);
+    assert.equal(typeOf(note), 'git', r.stdout);
+  });
 });

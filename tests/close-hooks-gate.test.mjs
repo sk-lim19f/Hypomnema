@@ -2546,13 +2546,23 @@ test('an index.md side effect whose bytes changed since the failed commit is NOT
     cleanup2();
     const out2 = JSON.parse(r2.stdout);
     // index.md stays out of this close's scope entirely (still dirty, still
-    // unexplained), regardless of whether the marker lands.
+    // unexplained). Attempt 1 recorded it as this session's write, so the
+    // drifted file also keeps the retry's marker withheld: the gate names it as
+    // a known-session-write instead of the marker landing over it.
     assert.ok(
       gitDirtyFiles(dir).includes(indexRel.split('\\').join('/')),
       `index.md must remain dirty: ${JSON.stringify(gitDirtyFiles(dir))}`,
     );
-    if (out2.markerWritten) {
-      const receiptPath = join(dir, '.cache', 'sessions', sessionId, 'close-receipt.json');
+    assert.equal(out2.markerWritten, false, r2.stdout);
+    assert.equal(out2.markerSkipReason, 'compact-gate-not-ok', r2.stdout);
+    assert.ok(
+      (out2.gateBlockers || []).some(
+        (b) => b.type === 'known-session-write' && b.file === indexRel.split('\\').join('/'),
+      ),
+      `the drifted index.md is a recorded blocker: ${JSON.stringify(out2.gateBlockers)}`,
+    );
+    const receiptPath = join(dir, '.cache', 'sessions', sessionId, 'close-receipt.json');
+    if (existsSync(receiptPath)) {
       const receipt = JSON.parse(readFileSync(receiptPath, 'utf-8'));
       assert.ok(
         !(receipt.entries || []).some((e) => e.path === indexRel.split('\\').join('/')),

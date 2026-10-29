@@ -17,7 +17,7 @@
  *                            letters/marks/numbers of any script plus ._-, projects/<slug>/ must exist). On --check it NARROWS the
  *                            gate to that one project: a project-scoped diagnostic, NOT a global
  *                            close verdict. On --mark it is ATTRIBUTION only; the gate stays
- *                            global (the marker gate is the global gate with the git axis narrowed). Ignored on --apply.
+ *                            global (the marker gate is the same gate, and it runs the same git check as --check). Ignored on --apply.
  *   --apply-session-close    Apply a JSON payload that updates the 4 mandatory memory files
  *                            (+ optional open-questions). Idempotent — re-running with the same
  *                            payload is a no-op. Always finishes with the strict gate check.

@@ -1118,7 +1118,7 @@ test('doctor-close-artifacts: the same marker beside its valid receipt (closed) 
 // above starts from close artifacts and then reads markers, so it never sees
 // this state: doctor enumerates the receipts themselves. No close artifact is
 // planted here on purpose, the state must surface on its own.
-function fileDemoReceipt(dir, sessionId) {
+function fileDemoReceipt(dir, sessionId, scope = { mode: 'project', projects: ['demo'] }) {
   gitRepo(dir);
   const git = (args) =>
     spawnSync('git', ['-C', dir, ...args], {
@@ -1134,7 +1134,7 @@ function fileDemoReceipt(dir, sessionId) {
     sessionId,
     repo: { toplevel: git(['rev-parse', '--show-toplevel']).stdout.trim() },
     commit: git(['rev-parse', 'HEAD']).stdout.trim(),
-    scope: { mode: 'project', projects: ['demo'] },
+    scope,
     entries: [{ path: 'log.md', kind: 'append', expected: { entryBlocks: ['entry'] } }],
     skipped: { lint: false, feedback: false },
     createdAt: new Date().toISOString(),
@@ -1162,6 +1162,68 @@ test('doctor-close-checkpoint: a receipt with no marker is a broken checkpoint â
       existsSync(join(dir, '.cache', 'session-closed-sess-half.marker')),
       false,
       'doctor must not write the marker it found missing',
+    );
+  });
+});
+
+// The recovery command names the vault doctor checked and the scope the receipt certified. Without
+// `--hypo-dir` it can act on another vault, and without `--project` / `--log-only` an apply whose
+// project only appeared in its payload reaches no-attribution-evidence.
+test('doctor-close-checkpoint: the recovery command for a single-project receipt carries --hypo-dir and --project', () => {
+  withTmpDir((dir) => {
+    baseWiki(dir);
+    fileDemoReceipt(dir, 'sess-scope-one');
+    const check = doctorCheckpointCheck(dir);
+    assert.ok(check, 'a markerless receipt must surface');
+    assert.ok(
+      check.detail.includes(
+        `--mark-session-closed --session-id=sess-scope-one --hypo-dir='${dir}' --project='demo'`,
+      ),
+      check.detail,
+    );
+    assert.doesNotMatch(check.detail, /--log-only/);
+  });
+});
+
+test('doctor-close-checkpoint: the recovery command for a log-only receipt carries --hypo-dir and --log-only', () => {
+  withTmpDir((dir) => {
+    baseWiki(dir);
+    fileDemoReceipt(dir, 'sess-scope-log', { mode: 'log-only', projects: [] });
+    const check = doctorCheckpointCheck(dir);
+    assert.ok(check, 'a markerless receipt must surface');
+    assert.ok(
+      check.detail.includes(
+        `--mark-session-closed --session-id=sess-scope-log --hypo-dir='${dir}' --log-only`,
+      ),
+      check.detail,
+    );
+    assert.doesNotMatch(check.detail, /--project/);
+  });
+});
+
+test('doctor-close-checkpoint: a multi-project receipt gets no one-project command, it names the projects and the close-again path', () => {
+  withTmpDir((dir) => {
+    baseWiki(dir);
+    fileDemoReceipt(dir, 'sess-scope-many', { mode: 'project', projects: ['demo', 'other'] });
+    const check = doctorCheckpointCheck(dir);
+    assert.ok(check, 'a markerless receipt must surface');
+    assert.doesNotMatch(check.detail, /--mark-session-closed --session-id=sess-scope-many/);
+    assert.match(check.detail, /covers 2 projects \(demo, other\)/);
+    assert.match(check.detail, /\/hypo:crystallize/);
+  });
+});
+
+test('doctor-close-checkpoint: a receipt with no readable scope still gets --hypo-dir and asks for the scope', () => {
+  withTmpDir((dir) => {
+    baseWiki(dir);
+    fileDemoReceipt(dir, 'sess-scope-none', { mode: 'project', projects: [] });
+    const check = doctorCheckpointCheck(dir);
+    assert.ok(check, 'a markerless receipt must surface');
+    assert.ok(
+      check.detail.includes(
+        `--session-id=sess-scope-none --hypo-dir='${dir}' plus --project=<slug>`,
+      ),
+      check.detail,
     );
   });
 });
@@ -1210,6 +1272,186 @@ test('doctor-close-checkpoint: a markerless receipt older than the marker window
     const old = new Date(Date.now() - 8 * 24 * 60 * 60 * 1000);
     utimesSync(join(dir, '.cache', 'sessions', 'sess-old', 'close-receipt.json'), old, old);
     assert.equal(doctorCheckpointCheck(dir), undefined);
+  });
+});
+
+// Receipt evidence: doctor re-checks the commit-based entries of a valid receipt
+// against the commit it names. The fixture commits one file and files a receipt
+// for it (an overwrite entry plus a local-create entry for a file kept out of
+// the commit); `mutate` edits the receipt body before it is written.
+function fileEvidenceReceipt(dir, sessionId, { mutate } = {}) {
+  gitRepo(dir);
+  const git = (args) =>
+    spawnSync('git', ['-C', dir, ...args], {
+      encoding: 'utf-8',
+      env: { ...process.env, HOME: SESSION_TMP_HOME },
+    });
+  const sha = (text) => createHash('sha256').update(text).digest('hex');
+  mkdirSync(join(dir, 'projects', 'demo'), { recursive: true });
+  writeFileSync(join(dir, 'projects', 'demo', 'note.md'), 'committed note\n');
+  git(['add', '-A']);
+  assert.equal(git(['commit', '-q', '-m', 'init']).status, 0, 'fixture commit');
+  writeFileSync(join(dir, 'projects', 'demo', 'local.md'), 'local entry v1\n');
+  const receipt = {
+    schemaVersion: RECEIPT_SCHEMA_VERSION,
+    certification: CERT_CHECKPOINT,
+    generation: 'gen-evidence',
+    sessionId,
+    repo: { toplevel: git(['rev-parse', '--show-toplevel']).stdout.trim() },
+    commit: git(['rev-parse', 'HEAD']).stdout.trim(),
+    scope: { mode: 'project', projects: ['demo'] },
+    entries: [
+      {
+        path: 'projects/demo/note.md',
+        kind: 'overwrite',
+        expected: { bytesSha256: sha('committed note\n') },
+      },
+      {
+        path: 'projects/demo/local.md',
+        kind: 'local-create',
+        expected: { bytesSha256: sha('local entry v1\n') },
+      },
+    ],
+    skipped: { lint: false, feedback: false },
+    createdAt: new Date().toISOString(),
+  };
+  if (mutate) mutate(receipt);
+  const written = writeReceiptAtomic(dir, sessionId, receipt);
+  assert.equal(written.ok, true, JSON.stringify(written));
+}
+
+function doctorEvidenceCheck(dir) {
+  const { out } = runDoctorJson(dir);
+  return out.find((c) => c.label === 'Session-close receipt evidence');
+}
+
+const WRONG_SHA = 'f'.repeat(64);
+
+// Distinguishes: the receipt names bytes its commit does not hold (warn) versus
+// a receipt whose entries are all in the commit (silent).
+test('doctor: warns when a receipt names a file version its commit does not hold', () => {
+  withTmpDir((dir) => {
+    baseWiki(dir);
+    fileEvidenceReceipt(dir, 'sess-forged', {
+      mutate: (r) => {
+        r.entries[0].expected.bytesSha256 = WRONG_SHA;
+      },
+    });
+    const check = doctorEvidenceCheck(dir);
+    assert.ok(check, 'a receipt with unbacked evidence must surface');
+    assert.equal(check.status, 'warn', check.detail);
+    assert.match(check.detail, /sess-forged/);
+    assert.match(check.detail, /close-receipt\.json/);
+    assert.match(check.detail, /projects\/demo\/note\.md \(blob-mismatch\)/);
+    // the way out: the check for that session's close, and closing again if it is not closed
+    assert.ok(
+      check.detail.includes(
+        `--check-session-close --session-id=sess-forged --hypo-dir='${dir}' --json`,
+      ),
+      check.detail,
+    );
+    assert.match(check.detail, /scripts\/crystallize\.mjs" --check-session-close/);
+    assert.match(
+      check.detail,
+      /no longer proven by its commit: if the check does not report it closed, ask the user to close that project again and apply it with \/hypo:crystallize/,
+    );
+  });
+});
+
+test('doctor: a receipt whose entries are in its commit draws no evidence warning', () => {
+  withTmpDir((dir) => {
+    baseWiki(dir);
+    fileEvidenceReceipt(dir, 'sess-sound');
+    assert.equal(doctorEvidenceCheck(dir), undefined);
+  });
+});
+
+// Distinguishes: a local-create file edited after the close (not compared, silent)
+// versus a commit-based entry that disagrees (warn, the test above).
+test('doctor: a local-create entry whose bytes changed after the close draws no evidence warning', () => {
+  withTmpDir((dir) => {
+    baseWiki(dir);
+    fileEvidenceReceipt(dir, 'sess-edited');
+    writeFileSync(join(dir, 'projects', 'demo', 'local.md'), 'local entry v2, edited by hand\n');
+    assert.equal(doctorEvidenceCheck(dir), undefined);
+  });
+});
+
+// Distinguishes: a marker beside a receipt whose evidence disagrees with its
+// commit (covers nothing, warn naming the mismatch) versus the same marker
+// beside a sound receipt (covers the artifact, the closed test above).
+test('doctor: a marker whose receipt fails the evidence check does not cover its close artifacts', () => {
+  withTmpDir((dir) => {
+    baseWiki(dir);
+    fileEvidenceReceipt(dir, 'sessgen', {
+      mutate: (r) => {
+        r.entries[0].expected.bytesSha256 = WRONG_SHA;
+      },
+    });
+    demoCloseArtifactWithMarker(dir, { receipt_generation: 'gen-evidence' });
+    const check = doctorCloseArtifactCheck(dir);
+    assert.ok(check, 'check not found');
+    assert.equal(check.status, 'warn', `an unbacked receipt must not vouch: ${check?.detail}`);
+    assert.match(
+      check.detail,
+      /close checkpoint is broken: sessgen \(receipt evidence mismatch: projects\/demo\/note\.md \(blob-mismatch\)/,
+    );
+  });
+});
+
+// Distinguishes: one warning for a receipt whose evidence mismatch the marker walk already names,
+// from the receipt check staying the only warning when the marker walk names nothing (it found no
+// close artifact, so it passed). Disabling the dedupe: in scripts/doctor.mjs make
+// `namedByMarkerWalk.has(sessionId)` read `false`. Disabling the other half: make the marker walk
+// return an empty set.
+test('doctor: a receipt evidence mismatch with a marker is warned once, and still warned when the marker walk is silent', () => {
+  const mismatch = (r) => {
+    r.entries[0].expected.bytesSha256 = WRONG_SHA;
+  };
+  withTmpDir((dir) => {
+    baseWiki(dir);
+    fileEvidenceReceipt(dir, 'sessgen', { mutate: mismatch });
+    demoCloseArtifactWithMarker(dir, { receipt_generation: 'gen-evidence' });
+    const { out } = runDoctorJson(dir);
+    const walk = out.find((c) => c.label === 'Session-close artifacts');
+    assert.equal(walk?.status, 'warn', 'precondition: the marker walk names the mismatch');
+    assert.match(walk.detail, /receipt evidence mismatch/);
+    assert.equal(
+      out.find((c) => c.label === 'Session-close receipt evidence'),
+      undefined,
+      'the receipt check does not repeat it',
+    );
+  });
+  withTmpDir((dir) => {
+    baseWiki(dir);
+    fileEvidenceReceipt(dir, 'sessgen', { mutate: mismatch });
+    // a marker, but no close artifact for the marker walk to judge: it passes and names nothing
+    mkdirSync(join(dir, '.cache'), { recursive: true });
+    writeFileSync(
+      join(dir, '.cache', 'session-closed-sessgen.marker'),
+      JSON.stringify({
+        session_id: 'sessgen',
+        projects: ['demo'],
+        closed_at: recentUtcIso(1),
+        receipt_generation: 'gen-evidence',
+      }),
+    );
+    const { out } = runDoctorJson(dir);
+    assert.equal(out.find((c) => c.label === 'Session-close artifacts')?.status, 'pass');
+    const check = out.find((c) => c.label === 'Session-close receipt evidence');
+    assert.equal(check?.status, 'warn', 'the receipt check is the only warning here');
+    assert.match(check.detail, /sessgen/);
+  });
+});
+
+test('doctor: a marker beside a sound evidence receipt covers its close artifacts', () => {
+  withTmpDir((dir) => {
+    baseWiki(dir);
+    fileEvidenceReceipt(dir, 'sessgen');
+    demoCloseArtifactWithMarker(dir, { receipt_generation: 'gen-evidence' });
+    const check = doctorCloseArtifactCheck(dir);
+    assert.ok(check, 'check not found');
+    assert.equal(check.status, 'pass', `expected pass: ${check?.detail}`);
   });
 });
 

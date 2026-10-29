@@ -48,10 +48,30 @@ import {
   runHook,
   withFeedbackEnv,
   withWiki,
+  nowPatchSrc,
 } from './helpers.mjs';
 
 // where --bootstrap and --import-target-change write their drafts
 const fbDraftsDir = (wiki) => join(wiki, '.cache', 'feedback-drafts');
+
+// The PreCompact hook from the checkout with its clock frozen at 0 by a preload. Only the hook
+// process takes it (NODE_OPTIONS reaches every node child too, and lint and feedback-sync keep the
+// real clock), so the 7000 ms gate deadline is never spent and each check starts with its full
+// time: what these tests judge is what feedback-sync reported, and a loaded machine used to turn
+// that into a time-limit notice. The preload file goes in the test's own HOME.
+function runPreCompact(dir, home, env = {}) {
+  const f = join(home, 'frozen-clock.cjs');
+  writeFileSync(
+    f,
+    `if ((process.argv[1] || '').endsWith('hypo-personal-check.mjs')) ${nowPatchSrc('() => 0')}\n`,
+  );
+  return runHook('hypo-personal-check.mjs', '', {
+    HYPO_DIR: dir,
+    HOME: home,
+    NODE_OPTIONS: `--require ${f}`,
+    ...env,
+  });
+}
 
 // ── hypo-personal-check.mjs — feedback projection gate ──────
 // The PreCompact gate runs `feedback-sync --check --strict` when PKG_ROOT
@@ -80,7 +100,7 @@ test('feedback projection pure drift → self-heal (auto --write) + continue, no
         writeFileSync(join(home, '.claude', 'hypo-pkg.json'), JSON.stringify({ pkgRoot: REPO }));
         const claudePath = join(home, '.claude', 'CLAUDE.md');
         writeFileSync(claudePath, '# Global\n<learned_behaviors>\n</learned_behaviors>\n');
-        const r = runHook('hypo-personal-check.mjs', '', { HYPO_DIR: dir, HOME: home });
+        const r = runPreCompact(dir, home);
         const out = JSON.parse(r.stdout);
         // Pure drift self-heals: the gate runs --write and proceeds.
         assert.equal(out.continue, true, `pure drift must self-heal, not block: ${r.stdout}`);
@@ -131,7 +151,7 @@ test('feedback projection conflict (hand-edited block) → named in the notice, 
           claudePath,
           readFileSync(claudePath, 'utf-8').replace('always do A', 'HAND EDITED'),
         );
-        const r = runHook('hypo-personal-check.mjs', '', { HYPO_DIR: dir, HOME: home });
+        const r = runPreCompact(dir, home);
         const out = JSON.parse(r.stdout);
         // scope-boundary §1: PreCompact no longer blocks. What must survive is that
         // the condition is DETECTED and NAMED — a silent pass is the regression.
@@ -181,7 +201,7 @@ test('feedback projection over cap → still blocks, never auto-writes (ADR 0045
         writeFileSync(join(home, '.claude', 'hypo-pkg.json'), JSON.stringify({ pkgRoot: REPO }));
         const claudePath = join(home, '.claude', 'CLAUDE.md');
         writeFileSync(claudePath, '# Global\n<learned_behaviors>\n</learned_behaviors>\n');
-        const r = runHook('hypo-personal-check.mjs', '', { HYPO_DIR: dir, HOME: home });
+        const r = runPreCompact(dir, home);
         const out = JSON.parse(r.stdout);
         assert.notEqual(out.decision, 'block', `PreCompact must not block: ${r.stdout}`);
         assert.ok(
@@ -218,7 +238,7 @@ test('feedback gate: CLAUDE.md present but WITHOUT its container → BLOCKS (was
         // The file EXISTS (so this is NOT the benign first-run case) but the
         // managed <learned_behaviors> container is gone.
         writeFileSync(join(home, '.claude', 'CLAUDE.md'), '# Global\n\nNo container here.\n');
-        const r = runHook('hypo-personal-check.mjs', '', { HYPO_DIR: dir, HOME: home });
+        const r = runPreCompact(dir, home);
         const out = JSON.parse(r.stdout);
         assert.notEqual(out.decision, 'block', `PreCompact must not block: ${r.stdout}`);
         assert.ok(
@@ -255,7 +275,7 @@ test('feedback gate: CLAUDE.md exists but is UNREADABLE → BLOCKS, not fail-ope
         writeFileSync(claudeMdPath, '# Global\n<learned_behaviors>\n</learned_behaviors>\n');
         chmodSync(claudeMdPath, 0o000);
         try {
-          const r = runHook('hypo-personal-check.mjs', '', { HYPO_DIR: dir, HOME: home });
+          const r = runPreCompact(dir, home);
           const out = JSON.parse(r.stdout);
           assert.notEqual(out.decision, 'block', `PreCompact must not block: ${r.stdout}`);
           // The point of this case is NOT fail-open: an unreadable target must still
@@ -289,7 +309,7 @@ test('feedback gate: CLAUDE.md file absent entirely → still fail-open (first-r
         mkdirSync(join(home, '.claude'), { recursive: true });
         writeFileSync(join(home, '.claude', 'hypo-pkg.json'), JSON.stringify({ pkgRoot: REPO }));
         // No CLAUDE.md at all.
-        const r = runHook('hypo-personal-check.mjs', '', { HYPO_DIR: dir, HOME: home });
+        const r = runPreCompact(dir, home);
         const out = JSON.parse(r.stdout);
         assert.equal(
           out.continue,
@@ -314,7 +334,7 @@ test('feedback gate: no container AND no feedback pages → still fail-open (not
       mkdirSync(join(home, '.claude'), { recursive: true });
       writeFileSync(join(home, '.claude', 'hypo-pkg.json'), JSON.stringify({ pkgRoot: REPO }));
       writeFileSync(join(home, '.claude', 'CLAUDE.md'), '# Global\n\nNo container here.\n');
-      const r = runHook('hypo-personal-check.mjs', '', { HYPO_DIR: dir, HOME: home });
+      const r = runPreCompact(dir, home);
       const out = JSON.parse(r.stdout);
       assert.equal(out.continue, true, `no candidates must not block: ${r.stdout}`);
     } finally {
@@ -338,7 +358,7 @@ test('feedback gate: memory clean + missing CLAUDE.md → fail-open (no false bl
       writeFileSync(join(home, '.claude', 'hypo-pkg.json'), JSON.stringify({ pkgRoot: REPO }));
       writeFileSync(join(memDir, 'MEMORY.md'), '# Memory Index\n');
       // intentionally NO CLAUDE.md → claude target buildError
-      const r = runHook('hypo-personal-check.mjs', '', { HYPO_DIR: dir, HOME: home });
+      const r = runPreCompact(dir, home);
       const out = JSON.parse(r.stdout);
       assert.equal(out.continue, true, `missing CLAUDE.md must not block: ${r.stdout}`);
     } finally {
@@ -2025,7 +2045,7 @@ test('PreCompact self-heal surfaces the hand line the --write kept', () => {
         );
       },
       (dir) => {
-        const r = runHook('hypo-personal-check.mjs', '', { HYPO_DIR: dir, HOME: home });
+        const r = runPreCompact(dir, home);
         const out = JSON.parse(r.stdout);
         assert.match(
           out.systemMessage || '',
@@ -2739,7 +2759,7 @@ test('the hook blocker for a build-failed target names --ensure-container and th
         writeFileSync(join(home, '.claude', 'hypo-pkg.json'), JSON.stringify({ pkgRoot: REPO }));
         const claudeMdPath = join(home, '.claude', 'CLAUDE.md');
         writeFileSync(claudeMdPath, '# Global\n\nNo container here.\n');
-        const r = runHook('hypo-personal-check.mjs', '', { HYPO_DIR: dir, HOME: home });
+        const r = runPreCompact(dir, home);
         const out = JSON.parse(r.stdout);
         assert.notEqual(out.decision, 'block');
         const notice = out.systemMessage || '';
@@ -3114,7 +3134,7 @@ test('an unreadable side file does NOT block /compact (the hook reports a notice
         writeFileSync(side, '<!-- HYPO:FEEDBACK-SYNC source=rule-a -->\nstale\n');
         chmodSync(side, 0o000);
         try {
-          const r = runHook('hypo-personal-check.mjs', '', { HYPO_DIR: dir, HOME: home });
+          const r = runPreCompact(dir, home);
           const out = JSON.parse(r.stdout);
           assert.notEqual(
             out.decision,
@@ -3168,7 +3188,7 @@ test('a hand-written side file notice names the warning and gives no permissions
         const side = join(memDir, 'feedback_rule-a.md');
         const mine = '# My own rule A\n\nA body the wiki page does not have.\n';
         writeFileSync(side, mine);
-        const r = runHook('hypo-personal-check.mjs', '', { HYPO_DIR: dir, HOME: home });
+        const r = runPreCompact(dir, home);
         const out = JSON.parse(r.stdout);
         const msg = out.systemMessage || '';
         assert.notEqual(
@@ -4208,7 +4228,7 @@ test('PreCompact notices a side-file warning that comes with a clean (exit 0) ch
           (JSON.parse(chk.stdout).targets.memory.sideWarnings || []).length,
           'precondition: and still carries the side warning',
         );
-        const r = runHook('hypo-personal-check.mjs', '', { HYPO_DIR: dir, HOME: home });
+        const r = runPreCompact(dir, home);
         assert.match(
           JSON.parse(r.stdout).systemMessage || '',
           /side file warning \(memory\): not overwriting .*feedback_rule-a\.md/,
@@ -6223,7 +6243,7 @@ test('precompact-edited-side-file-is-reported: the gate names the side file and 
     const side = join(memDir, 'feedback_rule.md');
     writeFileSync(side, readFileSync(side, 'utf-8') + '\nMY OWN NOTES\n');
     assert.equal(run('feedback-sync.mjs', ['--check', ...fbArgs]).status, 3, 'precondition');
-    const r = runHook('hypo-personal-check.mjs', '', { HYPO_DIR: dir, HOME: home });
+    const r = runPreCompact(dir, home);
     const msg = JSON.parse(r.stdout).systemMessage || '';
     assert.match(msg, /feedback projection conflict/, r.stdout);
     assert.ok(msg.includes(side), `names the side file: ${msg}`);
@@ -6234,7 +6254,7 @@ test('precompact-edited-side-file-is-reported: the gate names the side file and 
 test('precompact-self-heal-reports-notices-an-older-hook-run-left: a pending kept-line notice reaches the hook message and is cleared', () => {
   withPrecompactFeedbackHome(FB_GLOBAL_L1, null, ({ dir, home, claudeHome }) => {
     fbSeedPending(claudeHome, dir);
-    const r = runHook('hypo-personal-check.mjs', '', { HYPO_DIR: dir, HOME: home });
+    const r = runPreCompact(dir, home);
     const msg = JSON.parse(r.stdout).systemMessage || '';
     assert.match(msg, /re-synced/, `precondition: self-healed: ${r.stdout}`);
     assert.ok(msg.includes(FB_PENDING), `the pending notice is shown: ${msg}`);
@@ -6251,7 +6271,7 @@ test('precompact-without-drift-still-reports-a-pending-notice: an older hook lef
       `--project-id=${process.cwd().replace(/[/.]/g, '-')}`,
     ];
     assert.equal(run('feedback-sync.mjs', ['--write', ...fbArgs]).status, 0);
-    const quiet = runHook('hypo-personal-check.mjs', '', { HYPO_DIR: dir, HOME: home });
+    const quiet = runPreCompact(dir, home);
     const quietMsg = JSON.parse(quiet.stdout).systemMessage || '';
     assert.doesNotMatch(
       quietMsg,
@@ -6259,12 +6279,12 @@ test('precompact-without-drift-still-reports-a-pending-notice: an older hook lef
       `nothing pending: no feedback line: ${quiet.stdout}`,
     );
     fbSeedPending(claudeHome, dir);
-    const r = runHook('hypo-personal-check.mjs', '', { HYPO_DIR: dir, HOME: home });
+    const r = runPreCompact(dir, home);
     const msg = JSON.parse(r.stdout).systemMessage || '';
     assert.doesNotMatch(msg, /re-synced/, `precondition: no drift to repair: ${r.stdout}`);
     assert.ok(msg.includes(FB_PENDING), `the pending notice is shown: ${msg}`);
     assert.ok(!existsSync(fbPendingFile(claudeHome, dir)), 'and cleared once shown');
-    const again = runHook('hypo-personal-check.mjs', '', { HYPO_DIR: dir, HOME: home });
+    const again = runPreCompact(dir, home);
     assert.ok(
       !(JSON.parse(again.stdout).systemMessage || '').includes(FB_PENDING),
       'and not shown twice',
@@ -6281,13 +6301,12 @@ test('precompact-bypassed-gate-still-shows-a-pending-notice: HYPO_SKIP_GATE answ
     ];
     assert.equal(run('feedback-sync.mjs', ['--write', ...fbArgs]).status, 0);
     fbSeedPending(claudeHome, dir);
-    // an uncommitted file in the vault makes the gate fail, so the bypass is what answers
-    writeFileSync(join(dir, 'uncommitted.txt'), 'x');
-    const r = runHook('hypo-personal-check.mjs', '', {
-      HYPO_DIR: dir,
-      HOME: home,
-      HYPO_SKIP_GATE: '1',
-    });
+    // an uncommitted file under projects/ makes the gate fail, so the bypass is what answers.
+    // The hook gets no session id, so the gate cannot read a write record and blocks every
+    // uncommitted projects/ file; a file at the root would only be a notice.
+    mkdirSync(join(dir, 'projects', 'p'), { recursive: true });
+    writeFileSync(join(dir, 'projects', 'p', 'uncommitted.txt'), 'x');
+    const r = runPreCompact(dir, home, { HYPO_SKIP_GATE: '1' });
     const msg = JSON.parse(r.stdout).systemMessage || '';
     assert.match(msg, /gate bypassed via HYPO_SKIP_GATE=1/, `precondition: bypassed: ${r.stdout}`);
     assert.ok(msg.includes(FB_PENDING), `the pending notice is shown: ${msg}`);
@@ -6301,7 +6320,7 @@ test('precompact-self-heal-shows-write-time-warnings: the --write --json warning
     // the vault's git does not ignore .cache/: the routine before-write copy is skipped
     (dir) => writeFileSync(join(dir, '.gitignore'), 'node_modules/\n'),
     ({ dir, home }) => {
-      const r = runHook('hypo-personal-check.mjs', '', { HYPO_DIR: dir, HOME: home });
+      const r = runPreCompact(dir, home);
       const msg = JSON.parse(r.stdout).systemMessage || '';
       assert.match(msg, /re-synced/, `precondition: self-healed: ${r.stdout}`);
       assert.match(

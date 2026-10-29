@@ -23,6 +23,7 @@ import { loadHypoIgnore, isScanIgnored } from './lib/hypo-ignore.mjs';
 import { readRenameMarker, renameMarkerPath, RENAME_MARKER_REL } from './lib/rename-marker.mjs';
 import {
   resolveGitHooksDir,
+  shellSingleQuote,
   WIKI_PRE_COMMIT_MARKER_START,
   parseWikiPreCommitRoot,
 } from './lib/git-hooks-dir.mjs';
@@ -86,7 +87,12 @@ import {
   computeHooksDigest,
 } from './lib/pkg-provenance.mjs';
 import { resolveCliOnPath, classifyInstall, upgradeApplyHint } from '../hooks/version-check.mjs';
-import { closeCheckpointState, isCloseComplete } from '../hooks/close-receipt.mjs';
+import {
+  closeCheckpointState,
+  isCloseComplete,
+  readReceiptStrict,
+  verifyEntriesInCommit,
+} from '../hooks/close-receipt.mjs';
 import {
   enabledHypomnemaPluginKey,
   usablePkgRoot,
@@ -1266,6 +1272,18 @@ function checkSessionCloseArtifacts(hypoDir) {
         brokenMarkers.push({ sessionId, reason: checkpoint.reason });
         continue;
       }
+      // A closed checkpoint whose receipt names file versions its commit does
+      // not hold vouches for nothing, the same as a missing receipt.
+      if (checkpoint.receipt) {
+        const bad = receiptEvidenceMismatches(hypoDir, checkpoint.receipt);
+        if (bad.length > 0) {
+          brokenMarkers.push({
+            sessionId,
+            reason: `receipt evidence mismatch: ${describeMismatches(bad)}`,
+          });
+          continue;
+        }
+      }
       // ONLY the v4 `projects` array counts as project-scope evidence. A
       // legacy flat `project` field can be a recency-derived misattribution
       // (the P1 bug resolveCloseScope's own doc comment describes) — the
@@ -1305,14 +1323,12 @@ function checkSessionCloseArtifacts(hypoDir) {
     .map((a) => `${a.where}${a.date ? ` (${a.date})` : ''}`)
     .join(', ');
   const extra = unmatched.length > 5 ? ` (+${unmatched.length - 5} more)` : '';
+  const namedBrokenMarkers = brokenMarkers.slice(0, 3);
   const brokenNote =
     brokenMarkers.length > 0
       ? `. ${brokenMarkers.length} session-closed marker(s) did not count because their close ` +
         `checkpoint is broken: ` +
-        brokenMarkers
-          .slice(0, 3)
-          .map((b) => `${b.sessionId} (${b.reason})`)
-          .join('; ')
+        namedBrokenMarkers.map((b) => `${b.sessionId} (${b.reason})`).join('; ')
       : '';
   // Not necessarily UNAPPROVED — an approved log-only marker (deliberately
   // empty `projects`) or one scoped to a different project would ALSO land
@@ -1324,6 +1340,129 @@ function checkSessionCloseArtifacts(hypoDir) {
     `${unmatched.length} close artifact(s) with no session-closed marker covering their ` +
       `date and project scope — may be an unapproved hand-made close, or an approved close ` +
       `whose marker doesn't attribute this project: ${sample}${extra}${brokenNote}`,
+  );
+  // The sessions whose receipt evidence mismatch the line above names, so the receipt check
+  // does not warn about the same receipt a second time. Only what was named counts: a marker
+  // walk that passes, or names no more than three, leaves the rest to the receipt check.
+  return new Set(
+    namedBrokenMarkers
+      .filter((b) => b.reason.startsWith('receipt evidence mismatch'))
+      .map((b) => b.sessionId),
+  );
+}
+
+// The commit-based entries of a receipt (everything but local-create) against
+// the commit it names. A local-create entry is the bytes on disk, which a human
+// may legitimately edit after the close, so it is not compared here. Reads git
+// objects only, so doctor stays read-only.
+function receiptEvidenceMismatches(hypoDir, receipt) {
+  return verifyEntriesInCommit(
+    hypoDir,
+    receipt.commit,
+    receipt.entries.filter((e) => e.kind !== 'local-create'),
+  ).mismatches;
+}
+
+function describeMismatches(mismatches) {
+  return (
+    mismatches
+      .slice(0, 3)
+      .map((m) => `${m.path} (${m.reason})`)
+      .join(', ') + (mismatches.length > 3 ? ` (+${mismatches.length - 3} more)` : '')
+  );
+}
+
+// Warn when a valid receipt in the 7-day window names file versions its commit
+// does not hold (a forged or hand-edited receipt, an older writer's defect, a
+// damaged git object). Silent when every receipt checks out, like
+// checkHalfClosedReceipts.
+function checkReceiptEvidence(hypoDir, namedByMarkerWalk = new Set()) {
+  const sessionsDir = join(hypoDir, '.cache', 'sessions');
+  let dirs = [];
+  try {
+    dirs = readdirSync(sessionsDir);
+  } catch {
+    return; // no sessions directory, or unreadable: nothing to judge
+  }
+  const bad = [];
+  for (const name of dirs) {
+    const file = join(sessionsDir, name, 'close-receipt.json');
+    try {
+      if (Date.now() - statSync(file).mtimeMs > SESSION_CLOSED_MARKER_STALE_MS) continue;
+      // The directory name is the sanitized id; the receipt body carries the real one.
+      const body = JSON.parse(readFileSync(file, 'utf-8'));
+      const sessionId =
+        typeof body?.sessionId === 'string' && body.sessionId ? body.sessionId : name;
+      if (namedByMarkerWalk.has(sessionId)) continue; // already warned by the marker walk
+      const read = readReceiptStrict(hypoDir, sessionId);
+      if (read.status !== 'valid') continue; // checkHalfClosedReceipts and the marker walk own these
+      const mismatches = receiptEvidenceMismatches(hypoDir, read.receipt);
+      if (mismatches.length > 0) bad.push({ sessionId, file, mismatches });
+    } catch {
+      // unreadable or corrupt receipt: not this check's job to diagnose
+    }
+  }
+  if (bad.length === 0) return;
+  // The close such a receipt certifies is no longer proven by its commit, so the advice is the
+  // check that says where that close stands now, and closing again when it is not closed.
+  const crystallize = join(PKG_ROOT, 'scripts', 'crystallize.mjs');
+  warn(
+    'Session-close receipt evidence',
+    `${bad.length} close receipt(s) name file versions their commit does not hold: ` +
+      bad
+        .slice(0, 3)
+        .map(
+          (b) =>
+            `${b.sessionId} (${b.file}): ${describeMismatches(b.mismatches)}. Check with: ` +
+            `node "${crystallize}" --check-session-close --session-id=${b.sessionId} ` +
+            `--hypo-dir=${shellSingleQuote(hypoDir)} --json`,
+        )
+        .join('; ') +
+      (bad.length > 3 ? ` (+${bad.length - 3} more)` : '') +
+      '. The close such a receipt certifies is no longer proven by its commit: if the check does ' +
+      'not report it closed, ask the user to close that project again and apply it with ' +
+      '/hypo:crystallize',
+  );
+}
+
+// The scope a receipt body names, when its shape is one a writer emits: a log-only receipt, or
+// a project receipt naming at least one slug. Anything else is unknown (null), so the recovery
+// text asks for the scope instead of guessing it.
+function receiptScope(body) {
+  const scope = body?.scope;
+  if (!scope || typeof scope !== 'object') return null;
+  if (scope.mode === 'log-only') return { logOnly: true, projects: [] };
+  const ok =
+    scope.mode === 'project' &&
+    Array.isArray(scope.projects) &&
+    scope.projects.length > 0 &&
+    scope.projects.every((p) => typeof p === 'string' && p);
+  return ok ? { logOnly: false, projects: scope.projects } : null;
+}
+
+// The recovery text for one markerless receipt. `--mark-session-closed` is told the vault and the
+// scope the receipt certified: without `--hypo-dir` it can act on another vault, and without
+// `--project` or `--log-only` an apply whose project only appeared in its payload leaves it no
+// attribution evidence (a Bash apply edits no close file the transcript could show). The writer
+// takes one `--project`, so a receipt that names several projects has no single command that
+// restores its full scope: that case sends the user back through the close instead.
+function recoveryAdvice(hypoDir, crystallize, b) {
+  const base = `node "${crystallize}" --mark-session-closed --session-id=${b.sessionId} --hypo-dir=${shellSingleQuote(hypoDir)}`;
+  const { scope } = b;
+  if (scope?.logOnly) return `Recover with: ${base} --log-only`;
+  if (scope?.projects.length === 1) {
+    return `Recover with: ${base} --project=${shellSingleQuote(scope.projects[0])}`;
+  }
+  if (scope) {
+    return (
+      `Its receipt covers ${scope.projects.length} projects (${scope.projects.join(', ')}) and ` +
+      `--mark-session-closed takes one --project, so it would attest only one of them. Ask the ` +
+      `user to close again and apply it with /hypo:crystallize`
+    );
+  }
+  return (
+    `Recover with: ${base} plus --project=<slug> for the project it closed, or --log-only for a ` +
+    `session that closed no project (the receipt names no readable scope)`
   );
 }
 
@@ -1363,7 +1502,7 @@ function checkHalfClosedReceipts(hypoDir) {
           0 &&
         spawnSync('git', ['-C', hypoDir, 'merge-base', '--is-ancestor', commit, 'HEAD']).status !==
           0;
-      broken.push({ sessionId, reason: checkpoint.reason, rewritten });
+      broken.push({ sessionId, reason: checkpoint.reason, rewritten, scope: receiptScope(body) });
     } catch {
       // unreadable or corrupt receipt: not this check's job to diagnose
     }
@@ -1378,7 +1517,7 @@ function checkHalfClosedReceipts(hypoDir) {
         .map((b) =>
           b.rewritten
             ? `${b.sessionId} (${b.reason}; the commit it certified is no longer in this branch's history). Restore that commit, or ask the user to close again and apply it with /hypo:crystallize`
-            : `${b.sessionId} (${b.reason}). Recover with: node "${crystallize}" --mark-session-closed --session-id=${b.sessionId}`,
+            : `${b.sessionId} (${b.reason}). ${recoveryAdvice(hypoDir, crystallize, b)}`,
         )
         .join('; ') +
       (broken.length > 3 ? ` (+${broken.length - 3} more)` : ''),
@@ -3179,8 +3318,9 @@ if (args.codex) checkCodexPaths();
 if (rootOk) checkExtensions(args.hypoDir, args.claudeHome, 'claude');
 if (rootOk && args.codex) checkExtensions(args.hypoDir, args.claudeHome, 'codex');
 if (rootOk) checkProjectIndexAnchors(args.hypoDir);
-if (rootOk) checkSessionCloseArtifacts(args.hypoDir);
+const namedByMarkerWalk = rootOk ? checkSessionCloseArtifacts(args.hypoDir) : undefined;
 if (rootOk) checkHalfClosedReceipts(args.hypoDir);
+if (rootOk) checkReceiptEvidence(args.hypoDir, namedByMarkerWalk);
 if (rootOk) checkBaselineIntegrity(args.hypoDir);
 if (rootOk) checkSessionEntries(args.hypoDir);
 if (rootOk) checkSyncState(args.hypoDir);

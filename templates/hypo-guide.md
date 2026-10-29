@@ -92,11 +92,15 @@ Ask: *"이 작업이 마무리되었나요? 세션을 정리(crystallize)할까�
 6. Check with `/hypo:crystallize` in its `--check-session-close` mode: a dry-run of the
    **full** set of checks the PreCompact hook itself runs (close files + lint + design-history + feedback
    projection), sharing one function (`precompactGateStatus`) with that hook. Its
-   **"Close check"** line is a diagnostic of the whole vault, not the bar for calling a
-   session closed. It goes red for a gate blocker anywhere in the vault, including an uncommitted file
-   another session wrote, so on a shared vault a normal close can finish while it is still
-   red. A "close files updated" check alone is not enough to turn it green: a lint error in
-   a close file or a feedback projection over-cap keeps it red on its own.
+   **"Close check"** line is a diagnostic, not the bar for calling a session closed.
+   Its git check is the one every close caller runs (step 7). Given `--session-id` it
+   blocks only an uncommitted file this session recorded writing (step 7 says when the
+   whole project folder blocks instead). Without the id it has no
+   record to read, so it blocks every uncommitted file in the project folder (or under
+   `projects/` when no project is named), including one another session wrote, and a
+   normal close can finish while that check is still red. A "close files updated" check alone is
+   not enough to turn it green: a lint error in a close file or a feedback projection
+   over-cap keeps it red on its own.
    The live hook can still see a different set than this check does, because of
    `HYPO_SKIP_GATE` or a transcript-scoped lint error (pass `--transcript-path`
    to include the last). Neither one stops `/compact` any more: the hook reports what it
@@ -123,23 +127,55 @@ Ask: *"이 작업이 마무리되었나요? 세션을 정리(crystallize)할까�
    checkpoint once the gate is green. Hand-edit recovery: after committing the
    files, run `/hypo:crystallize` (`--mark-session-closed --session-id=<id> --transcript-path=<path>`).
    Both writers gate the checkpoint on `precompactGateStatus`, the gate the PreCompact
-   notice reads, with one difference: the git check is narrower. An uncommitted file
-   inside the project folder being closed (`projects/<project>/`) blocks whether
-   or not this session has a record of writing it. An uncommitted file at the
-   root or in another project's folder blocks only when this session wrote it
-   through Write or Edit since its last auto-commit, and is otherwise a notice
-   (another session's, one of unknown ownership, or one this session changed
-   through a shell command). If the record of this session's writes cannot be
-   read, the check does not block on it and adds a notice that it could not
-   determine ownership. So it can land while step 6 still shows a git blocker
-   for someone else's dirty file.
+   notice and the Stop hook read, and all of them run the same git check. An
+   uncommitted file blocks only when this session's record of its writes names it
+   (the Write and Edit hook and the close's own writes fill that record), or when a
+   record-failure flag names it, whatever its bytes are now. If any record of this
+   session failed (a failure flag exists at all, even one naming only a path outside
+   the project) or the record lost paths it cannot name (or is unreadable), every
+   uncommitted file in the project folder being closed (`projects/<project>/`)
+   blocks until the flag is removed or the session ends. An empty `index.md` that
+   HEAD does not have, in the project folder being closed, blocks whatever the record
+   says: it is a project index whose create was cut short, and which session's it was cannot be
+   told. When a close finds that another session already created the project's
+   `index.md`, this session's claim on that file stays, so it blocks this session's
+   close as its own write until it is committed. The whole project folder also
+   blocks for a session that began before 1.10.2: SessionStart leaves a
+   record stamp (`record-stamp.json`, in `.cache/sessions/<id>/`) only for a session that
+   starts on 1.10.2 or later, and a session without one may have missed writes with no flag
+   to say so (reloading plugins does not stamp it, a new session does). A call with no
+   session id is treated the same way: the whole project folder blocks. Any other
+   uncommitted file is a notice, not a blocker: another session's, one of unknown
+   ownership, or one this session wrote through a shell command (Bash leaves no
+   record, so it shows up only as a notice). The transcript is not ownership
+   evidence; it only widens the lint scope.
+   To get out of a project-folder block: if the session has a failure flag, check that no
+   uncommitted file `git status` lists is one this session wrote, then delete the whole
+   `<vault>/.cache/sessions/<id>/touched-paths-failed.d/` directory, or open a new session
+   and close from there (the flag never clears on its own).
+   A session with no record stamp has no flag to remove. The blocked files may be another
+   session's, so do not revert one that is another terminal's work: commit or revert only
+   the files you have confirmed are this session's, otherwise open a new session and close
+   from there. If the record is corrupt, look at the file the reason names
+   (`.cache/sessions/<id>/touched-paths.json`, or `touched-hashes.json` beside it), check
+   with `git status` that what this session wrote is committed, then delete it. If its lock
+   could not be created, fix the permissions or disk space of
+   `.cache/sessions/<id>/`, since deleting a file does not help. A file the flag
+   names blocks whenever it is uncommitted, whatever its bytes: commit or revert it if it
+   is this session's, and if it may be another session's, leave it and clear the flag
+   instead. An empty `index.md` this session's close made: fill it in or delete it and
+   close again. One another session left half made (that session died): delete the file. A new
+   session sees the same empty file and blocks again. An `index.md` with content is
+   not blocked. Lint or feedback that could not run
+   because of an error blocks as `check-skipped` (run it by hand, fix the cause, close
+   again), while one that only ran out of time adds a notice and does not block.
    Every other check (close files, hot.md, lint, feedback) is the same as step 6.
    **This session's close is recorded once the checkpoint receipt is issued**: the writer's result
    reports `markerWritten: true` (apply) or `ok: true` (`--mark`), and
    `--check-session-close --session-id=<id>` then reports `close_state: closed`. (`legacy-closed` is an
    older marker written before receipts existed; it is still accepted, without a receipt.) Report the
-   close on that, not on the step 6 "Close check" line. The Stop hook still checks this session's own
-   project folder and has the final say. If the writer reports the marker as not written, or
+   close on that, not on the step 6 "Close check" line. The Stop hook runs the same git check and
+   has the final say. If the writer reports the marker as not written, or
    `close_state` is anything other than `closed` or `legacy-closed`, the close is not recorded whatever step 6 says.
    If `close_state` is `broken` because the commit an earlier close proved was dropped from
    history (a reset or rebase), `--mark-session-closed` refuses with

@@ -55,7 +55,16 @@ function walkMarkdown(dir, root, ignorePatterns, policy, acc) {
     if (policy.skipDotEntry && entry.startsWith('.')) continue;
     const full = join(dir, entry);
     if (isScanIgnored(full, root, ignorePatterns)) continue;
-    const st = policy.lstat ? lstatSync(full) : statSync(full);
+    let st;
+    try {
+      st = policy.lstat ? lstatSync(full) : statSync(full);
+    } catch (err) {
+      // readdir listed it, stat cannot find it: another session's atomic-write temp file that was
+      // renamed away in between, or a dangling symlink. Neither is a page; skip it instead of
+      // letting one vanished entry kill the whole scan.
+      if (err?.code === 'ENOENT' || err?.code === 'ENOTDIR') continue;
+      throw err;
+    }
     if (policy.lstat && st.isSymbolicLink()) continue;
     if (st.isDirectory()) {
       if (policy.skipUnderscoreDir && entry.startsWith('_')) continue;
