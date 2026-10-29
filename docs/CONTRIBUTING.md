@@ -367,6 +367,9 @@ $EDITOR ~/hypomnema/projects/hypomnema/specs/spec-v<version>.md
 
 # 1. Bump the version across package.json, plugin.json, marketplace.json,
 #    and templates/hypo-config.md. Takes a concrete semver (not patch/minor/major).
+#    Before picking it, check whether a `feat` merged since the last tag rules
+#    out a patch (a notice, exits 0 either way; CI prints the same line on PRs).
+npm run check:release-vehicle
 node scripts/bump-version.mjs <new-semver>   # e.g. 1.2.2 or 1.3.0-rc.1
 
 # 1b. bump-version does NOT touch package-lock.json — sync it so `npm ci` and the
@@ -400,6 +403,7 @@ npm run lint               # vault linter
 npm run check:versions     # all version-carrying files (incl. package-lock) agree
 npm run check:bilingual    # each gated CHANGELOG section has #### English + #### 한국어
 npm run smoke:plugin       # plugin manifest + hooks/commands/skills load-valid
+npm run check:pack-surface # the packed file list matches the committed snapshot
 npm run smoke-pack         # packed tarball installs and resolves
 npm run check:tracker-ids  # no private-tracker pointers leaked into shipped files
 npm run format:check       # every checked file matches Prettier's output
