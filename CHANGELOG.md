@@ -5,6 +5,18 @@ All notable changes to Hypomnema are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.10.2] - 2026-10-29
+
+### Bug Fixes
+#### English
+- Session close judges uncommitted files by this session's own write record, so another terminal's edit no longer blocks a close. When the record cannot be trusted (a session opened before this version, an unreadable record, a write that could not be recorded, a call without a session id) the whole project folder being closed blocks instead. A check that fails by a real error withholds the receipt and names the command to run; `hypomnema doctor` verifies receipt evidence against the commit it names; the gate runs one `git status`; a session that was already open keeps the older rule until a new session starts. ([#322](https://github.com/sk-lim19f/Hypomnema/pull/322))
+#### 한국어
+- 세션 close가 미커밋 파일을 이 세션의 쓰기 기록으로 판정해, 다른 터미널의 편집이 더는 close를 막지 않습니다. 기록을 믿을 수 없을 때(이 버전 전에 연 세션, 읽지 못하는 기록, 기록하지 못한 쓰기, session id 없는 호출)는 닫는 프로젝트 폴더 전체를 막습니다. 진짜 오류로 끝난 검사는 영수증을 보류하고 돌릴 명령을 안내하며, `hypomnema doctor`가 영수증 근거를 그 커밋과 대조하고, 게이트는 `git status`를 한 번만 돌립니다. 이미 열려 있던 세션은 새 세션을 열기 전까지 옛 규칙을 씁니다. ([#322](https://github.com/sk-lim19f/Hypomnema/pull/322))
+
+### Changelog
+- [#322](https://github.com/sk-lim19f/Hypomnema/pull/322) fix(close-gate): judge uncommitted files by the session's own write record
+Contributors: @sk-lim19f
+
 ## [1.10.1] - 2026-10-27
 
 ### Bug Fixes
