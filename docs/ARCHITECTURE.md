@@ -45,7 +45,7 @@ hypomnema/
 │   ├── init.mjs / upgrade.mjs / uninstall.mjs / doctor.mjs
 │   ├── ingest.mjs / query.mjs / lint.mjs / verify.mjs / graph.mjs / stats.mjs
 │   ├── crystallize.mjs / resume.mjs / feedback.mjs / feedback-sync.mjs
-│   ├── capture.mjs / rename.mjs / proposal.mjs / session-entries.mjs
+│   ├── capture.mjs / rename.mjs / proposal.mjs / session-entries.mjs / app-boundary.mjs
 │   ├── session-audit.mjs / weekly-report.mjs
 │   └── lib/                      ← helpers that scripts import (shipped set: `files` in package.json; one hook, hypo-pre-commit.mjs, also imports from here)
 ├── skills/                   ← directory-form Agent Skills (skills/<name>/SKILL.md)
@@ -437,6 +437,17 @@ that already holds it (`hypo-auto-commit.mjs` after its pull) calls `writeGenera
 instead. When the lock cannot be acquired within its timeout, the write is skipped rather than
 blocked on indefinitely, the result carries `lockTimeout: true`, and a health notice is left for
 the next SessionStart.
+
+An app that works beside the main session records through its own entry point,
+`scripts/app-boundary.mjs` (`write` and `--capabilities`; the body is `scripts/lib/app-boundary.mjs`).
+App records do not wait for a close signal: at every task boundary the entry point makes a local
+commit and nothing more. The Stop of a person's session pushes it, and the close rules of the main
+session stay as they are. The entry point takes the vault commit lock, refuses while a git
+operation is open in the vault, and commits only its own entry file, so anything a person staged
+stays staged. The entry holds sentences from a pinned code book, not free text, and the app's
+boundary id never reaches the vault: the close id is a hash of it. A marker under
+`.cache/app-boundaries/` lets a call that died halfway finish the same entry. The entry point
+imports no pull, push or sync function and runs no git remote command.
 
 ---
 

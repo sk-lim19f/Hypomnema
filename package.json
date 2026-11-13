@@ -8,6 +8,7 @@
     "hypomnema": "scripts/init.mjs"
   },
   "files": [
+    "scripts/app-boundary.mjs",
     "scripts/capture.mjs",
     "scripts/crystallize.mjs",
     "scripts/doctor.mjs",
@@ -28,6 +29,7 @@
     "scripts/upgrade.mjs",
     "scripts/verify.mjs",
     "scripts/weekly-report.mjs",
+    "scripts/lib/app-boundary.mjs",
     "scripts/lib/code-fence.mjs",
     "scripts/lib/core-hooks.mjs",
     "scripts/lib/crystallize-args.mjs",

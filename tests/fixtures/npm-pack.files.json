@@ -284,6 +284,10 @@
     "exec": false
   },
   {
+    "path": "scripts/app-boundary.mjs",
+    "exec": false
+  },
+  {
     "path": "scripts/capture.mjs",
     "exec": false
   },
@@ -313,6 +317,10 @@
   },
   {
     "path": "scripts/init.mjs",
+    "exec": false
+  },
+  {
+    "path": "scripts/lib/app-boundary.mjs",
     "exec": false
   },
   {
