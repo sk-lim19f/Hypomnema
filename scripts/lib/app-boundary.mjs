@@ -169,10 +169,27 @@ function readMarker(path) {
 
 const writeMarker = (path, marker) => atomicWrite(path, `${JSON.stringify(marker)}\n`);
 
-// sha256 of the entry file as HEAD holds it, `null` when HEAD has no such blob.
+// sha256 of the entry file as HEAD holds it, `null` when HEAD has no such blob. A lookup that
+// fails is not "absent": the answer is unknown, and an unknown answer never leads to a rewrite.
 function headEntryHash(hypoDir, entryPath) {
-  const r = git(hypoDir, ['cat-file', 'blob', `HEAD:./${entryPath}`]);
-  return r.status === 0 ? sha256(r.stdout) : null;
+  const head = git(hypoDir, ['rev-parse', '-q', '--verify', 'HEAD']);
+  if (head.status === 1) return null; // no commit yet
+  if (head.status !== 0) refuse('entry_not_committed');
+  const tree = git(hypoDir, ['ls-tree', '-z', 'HEAD', '--', entryPath], { encoding: 'utf-8' });
+  if (tree.status !== 0) refuse('entry_not_committed');
+  if (tree.stdout === '') return null;
+  const blob = git(hypoDir, ['cat-file', 'blob', `HEAD:./${entryPath}`]);
+  if (blob.status !== 0) refuse('entry_not_committed');
+  return sha256(blob.stdout);
+}
+
+// Was this path ever committed, on any branch or in any reflog entry? A commit a person reset away
+// is no longer in HEAD's history but stays in the reflog. A failed lookup counts as "yes".
+function everCommitted(hypoDir, entryPath) {
+  const r = git(hypoDir, ['log', '--all', '--reflog', '--format=%H', '--', entryPath], {
+    encoding: 'utf-8',
+  });
+  return r.status !== 0 || r.stdout.trim() !== '';
 }
 
 const lastCommitOf = (hypoDir, entryPath) => {
@@ -229,6 +246,9 @@ function writeLocked({ hypoDir, project, boundaryId, payload, codebookPath, code
     if (inHead === marker.renderedSha256) {
       return reusedResult(markCommitted(path, marker, lastCommitOf(hypoDir, marker.entryPath)));
     }
+    // The entry was committed once and is gone from HEAD: a person took it back (a reset). The
+    // stored bytes are not written again.
+    if (inHead === null && everCommitted(hypoDir, marker.entryPath)) refuse('entry_not_committed');
     // A different entry at this path (in HEAD, or edited in the work tree) is a person's: the
     // stored bytes are never written over it.
     const file = join(hypoDir, marker.entryPath);

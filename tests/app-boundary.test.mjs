@@ -448,6 +448,39 @@ test('(12) no remote function is imported, no remote git command is named, the o
   });
 });
 
+// A writing marker as a call leaves it before its commit: stored bytes, no entry file, no commit.
+function seedWritingMarker(c) {
+  const closeId = closeIdFor(BOUNDARY);
+  const closedAt = new Date().toISOString();
+  const entryPath = `projects/security-backoffice/sessions/${closedAt.slice(0, 10)}-${closeId}.md`;
+  const rendered = formatSessionEntry({
+    project: 'security-backoffice',
+    closeId,
+    date: closedAt.slice(0, 10),
+    closedAt,
+    tracks: [{ id: PAYLOAD.team }],
+    summary: '작업 경계에서 남긴 기록',
+  });
+  const payload = Object.fromEntries(
+    Object.entries({ project: 'security-backoffice', ...PAYLOAD }).sort(),
+  );
+  mkdirSync(markerDir(c.vault), { recursive: true });
+  writeFileSync(
+    join(markerDir(c.vault), `${closeId}.json`),
+    JSON.stringify({
+      state: 'writing',
+      closeId,
+      entryPath,
+      rendered,
+      renderedSha256: sha(rendered),
+      closedAt,
+      payloadSha256: sha(JSON.stringify(payload)),
+      codebookSha256: sha(c.bytes),
+    }),
+  );
+  return { closeId, entryPath, rendered, markerFile: join(markerDir(c.vault), `${closeId}.json`) };
+}
+
 suite('app boundary: history moved, marker faults, code book rules, lock diagnostics');
 
 test('a marker update that throws after a verified commit still reports the commit; the next call settles the marker', () => {
@@ -553,34 +586,7 @@ test('a staged deletion of a file with the entry bytes is not taken into the com
   withAb((c) => {
     // Recovery state: a writing marker, the entry in the work tree and the index, and a person's
     // staged deletion of human.md, whose bytes equal the entry's.
-    const closeId = closeIdFor(BOUNDARY);
-    const closedAt = new Date().toISOString();
-    const entryPath = `projects/security-backoffice/sessions/${closedAt.slice(0, 10)}-${closeId}.md`;
-    const rendered = formatSessionEntry({
-      project: 'security-backoffice',
-      closeId,
-      date: closedAt.slice(0, 10),
-      closedAt,
-      tracks: [{ id: PAYLOAD.team }],
-      summary: '작업 경계에서 남긴 기록',
-    });
-    const payload = Object.fromEntries(
-      Object.entries({ project: 'security-backoffice', ...PAYLOAD }).sort(),
-    );
-    mkdirSync(markerDir(c.vault), { recursive: true });
-    writeFileSync(
-      join(markerDir(c.vault), `${closeId}.json`),
-      JSON.stringify({
-        state: 'writing',
-        closeId,
-        entryPath,
-        rendered,
-        renderedSha256: sha(rendered),
-        closedAt,
-        payloadSha256: sha(JSON.stringify(payload)),
-        codebookSha256: sha(c.bytes),
-      }),
-    );
+    const { entryPath, rendered } = seedWritingMarker(c);
     writeFileSync(join(c.vault, 'human.md'), rendered);
     c.git('add', 'human.md');
     c.git('commit', '-q', '-m', 'human file');
@@ -600,5 +606,58 @@ test('a staged deletion of a file with the entry bytes is not taken into the com
       entryPath,
     ]);
     assert.equal(c.git('diff', '--cached', '--name-only').stdout.trim(), 'human.md');
+  });
+});
+
+test('a writing marker whose commit a person reset away is not written again', () => {
+  withAb((c) => {
+    assert.equal(c.call().status, 0);
+    const [name] = markerFiles(c.vault);
+    const file = join(markerDir(c.vault), name);
+    // As if the checks after the commit had failed: the marker still says writing.
+    writeFileSync(
+      file,
+      JSON.stringify({ ...JSON.parse(readFileSync(file, 'utf-8')), state: 'writing' }),
+    );
+    c.git('reset', '-q', '--hard', 'HEAD~1');
+    const before = head(c.git);
+    const r = c.call();
+    assert.deepEqual(r.json, { error: 'entry_not_committed' });
+    assert.equal(head(c.git), before);
+    assert.equal(c.git('status', '--porcelain').stdout, '');
+    assert.equal(existsSync(join(c.vault, 'projects')), false);
+  });
+});
+
+test('a writing marker that never reached a commit is written and committed on the next call', () => {
+  withAb((c) => {
+    const { entryPath } = seedWritingMarker(c);
+    const r = c.call();
+    assert.equal(r.status, 0, r.stdout + r.stderr);
+    assert.equal(r.json.reused, false);
+    assert.equal(r.json.entryPath, entryPath);
+    assert.equal(count(c.git), 2);
+  });
+});
+
+test('a failed history or blob lookup is not taken as proof that nothing was committed', () => {
+  withAb((c) => {
+    const real = spawnSync('which', ['git'], { encoding: 'utf-8' }).stdout.trim();
+    for (const failing of ['--reflog', 'ls-tree']) {
+      const bin = join(c.home, `bin-${failing.replace(/\W/g, '')}`);
+      mkdirSync(bin);
+      writeFileSync(
+        join(bin, 'git'),
+        `#!/bin/sh\nfor a in "$@"; do [ "$a" = "${failing}" ] && exit 128; done\nexec ${real} "$@"\n`,
+        { mode: 0o755 },
+      );
+      const { markerFile } = seedWritingMarker(c);
+      const before = head(c.git);
+      const r = c.call({}, { PATH: `${bin}:${process.env.PATH}` });
+      assert.deepEqual(r.json, { error: 'entry_not_committed' }, failing);
+      assert.equal(head(c.git), before, failing);
+      assert.equal(existsSync(join(c.vault, 'projects')), false, failing);
+      rmSync(markerFile);
+    }
   });
 });
